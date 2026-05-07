@@ -57,7 +57,7 @@ def add_trader():
             "profit": 0,
             "drawdown": 0,
             "profit_percent": 0,
-            "drawdown_percent": 0
+            "drawdown_percent": 0,
             "payment_status": data.get("payment_status", "pending"),
             "payment_proof_url": data.get("payment_proof_url", ""),
             "selected_plan": data.get("selected_plan", ""),
