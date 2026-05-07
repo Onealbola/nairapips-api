@@ -16,11 +16,16 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 @app.route("/")
 def home():
-    return jsonify({"status": "NairaPips API Live", "database": "connected"})
+    return jsonify({
+        "status": "NairaPips API Live",
+        "database": "connected"
+    })
 
 @app.route("/health")
 def health():
-    return jsonify({"health": "ok"})
+    return jsonify({
+        "health": "ok"
+    })
 
 @app.route("/traders", methods=["GET"])
 def get_traders():
@@ -31,6 +36,7 @@ def get_traders():
 def add_trader():
     try:
         data = request.json or {}
+
         balance_raw = str(data.get("balance") or data.get("account_size") or "0")
         balance = float(balance_raw.replace(",", "").replace("₦", "").strip())
 
@@ -55,11 +61,18 @@ def add_trader():
         }
 
         res = supabase.table("traders").insert(trader).execute()
-        return jsonify({"success": True, "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
 
     except Exception as e:
         print("ADD TRADER ERROR:", repr(e))
-        return jsonify({"success": False, "error": str(e)}), 400
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
 
 @app.route("/update_status", methods=["POST"])
 def update_status():
@@ -67,27 +80,47 @@ def update_status():
         data = request.json or {}
         trader_id = data.get("id")
 
+        if not trader_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing trader id"
+            }), 400
+
         update_data = {}
+
         for field in [
-            "status", "phase", "balance", "equity",
-            "profit", "drawdown", "profit_percent",
-            "drawdown_percent", "engine_group"
+            "status",
+            "phase",
+            "balance",
+            "equity",
+            "profit",
+            "drawdown",
+            "profit_percent",
+            "drawdown_percent",
+            "engine_group"
         ]:
             if field in data:
                 update_data[field] = data[field]
 
-        if not trader_id:
-            return jsonify({"success": False, "error": "Missing trader id"}), 400
-
         if not update_data:
-            return jsonify({"success": False, "error": "Nothing to update"}), 400
+            return jsonify({
+                "success": False,
+                "error": "Nothing to update"
+            }), 400
 
         res = supabase.table("traders").update(update_data).eq("id", trader_id).execute()
-        return jsonify({"success": True, "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
 
     except Exception as e:
         print("UPDATE ERROR:", repr(e))
-        return jsonify({"success": False, "error": str(e)}), 400
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
 
 @app.route("/delete_trader", methods=["POST"])
 def delete_trader():
@@ -96,32 +129,81 @@ def delete_trader():
         trader_id = data.get("id")
 
         if not trader_id:
-            return jsonify({"success": False, "error": "Missing trader id"}), 400
+            return jsonify({
+                "success": False,
+                "error": "Missing trader id"
+            }), 400
 
         res = supabase.table("traders").delete().eq("id", trader_id).execute()
-        return jsonify({"success": True, "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
 
     except Exception as e:
         print("DELETE ERROR:", repr(e))
-        return jsonify({"success": False, "error": str(e)}), 400
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
 
 @app.route("/activate_trader", methods=["POST"])
 def activate_trader():
     try:
-        trader_id = (request.json or {}).get("id")
-        res = supabase.table("traders").update({"status": "active"}).eq("id", trader_id).execute()
-        return jsonify({"success": True, "data": res.data})
+        data = request.json or {}
+        trader_id = data.get("id")
+
+        if not trader_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing trader id"
+            }), 400
+
+        res = supabase.table("traders").update({
+            "status": "active"
+        }).eq("id", trader_id).execute()
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
+
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 400
+        print("ACTIVATE ERROR:", repr(e))
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
 
 @app.route("/deactivate_trader", methods=["POST"])
 def deactivate_trader():
     try:
-        trader_id = (request.json or {}).get("id")
-        res = supabase.table("traders").update({"status": "inactive"}).eq("id", trader_id).execute()
-        return jsonify({"success": True, "data": res.data})
+        data = request.json or {}
+        trader_id = data.get("id")
+
+        if not trader_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing trader id"
+            }), 400
+
+        res = supabase.table("traders").update({
+            "status": "inactive"
+        }).eq("id", trader_id).execute()
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
+
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 400
+        print("DEACTIVATE ERROR:", repr(e))
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
