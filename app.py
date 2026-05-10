@@ -35,13 +35,11 @@ def clean_amount(value):
 
 
 def month_text():
-    d = datetime.now(timezone.utc)
-    return d.strftime("%B")
+    return datetime.now(timezone.utc).strftime("%B")
 
 
 def year_text():
-    d = datetime.now(timezone.utc)
-    return d.strftime("%Y")
+    return datetime.now(timezone.utc).strftime("%Y")
 
 
 # =========================
@@ -53,7 +51,7 @@ def home():
     return jsonify({
         "status": "NairaPips API Live",
         "database": "connected",
-        "version": "challenge-plans-mt5-pool-upgrade"
+        "version": "plans-delete-mt5-vault-upgrade"
     })
 
 
@@ -356,6 +354,7 @@ def create_challenge_plan():
         data = request.json or {}
 
         name = str(data.get("name", "")).strip()
+
         if not name:
             return jsonify({"success": False, "error": "Plan name is required"}), 400
 
@@ -369,7 +368,7 @@ def create_challenge_plan():
             "daily_drawdown": data.get("daily_drawdown", "None"),
             "payout_split": data.get("payout_split", "80%"),
             "description": data.get("description", ""),
-            "status": data.get("status", "active"),
+            "status": "active",
             "created_at": now_iso(),
             "updated_at": now_iso()
         }
@@ -391,19 +390,28 @@ def update_challenge_plan():
         if not plan_id:
             return jsonify({"success": False, "error": "Missing plan id"}), 400
 
-        update_data = {
-            "updated_at": now_iso()
-        }
+        update_data = {"updated_at": now_iso()}
 
-        fields = [
-            "name", "daily_drawdown", "payout_split",
-            "description", "status"
+        text_fields = [
+            "name",
+            "daily_drawdown",
+            "payout_split",
+            "description",
+            "status"
         ]
 
-        money_fields = ["account_size", "fee"]
-        number_fields = ["phase1_target", "phase2_target", "max_drawdown"]
+        money_fields = [
+            "account_size",
+            "fee"
+        ]
 
-        for field in fields:
+        number_fields = [
+            "phase1_target",
+            "phase2_target",
+            "max_drawdown"
+        ]
+
+        for field in text_fields:
             if field in data:
                 update_data[field] = data[field]
 
@@ -416,15 +424,20 @@ def update_challenge_plan():
                 update_data[field] = float(data.get(field) or 0)
 
         res = supabase.table("challenge_plans").update(update_data).eq("id", plan_id).execute()
-        return jsonify({"success": True, "message": "Challenge plan updated", "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "message": "Challenge plan updated",
+            "data": res.data
+        })
 
     except Exception as e:
         print("UPDATE PLAN ERROR:", repr(e))
         return jsonify({"success": False, "error": str(e)}), 400
 
 
-@app.route("/disable_challenge_plan", methods=["POST"])
-def disable_challenge_plan():
+@app.route("/delete_challenge_plan", methods=["POST"])
+def delete_challenge_plan():
     try:
         data = request.json or {}
         plan_id = data.get("id")
@@ -432,15 +445,16 @@ def disable_challenge_plan():
         if not plan_id:
             return jsonify({"success": False, "error": "Missing plan id"}), 400
 
-        res = supabase.table("challenge_plans").update({
-            "status": "disabled",
-            "updated_at": now_iso()
-        }).eq("id", plan_id).execute()
+        res = supabase.table("challenge_plans").delete().eq("id", plan_id).execute()
 
-        return jsonify({"success": True, "message": "Challenge plan disabled", "data": res.data})
+        return jsonify({
+            "success": True,
+            "message": "Challenge plan deleted",
+            "data": res.data
+        })
 
     except Exception as e:
-        print("DISABLE PLAN ERROR:", repr(e))
+        print("DELETE PLAN ERROR:", repr(e))
         return jsonify({"success": False, "error": str(e)}), 400
 
 
@@ -503,7 +517,12 @@ def create_challenge_purchase():
         }
 
         res = supabase.table("challenge_purchases").insert(purchase).execute()
-        return jsonify({"success": True, "message": "Challenge purchase submitted", "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "message": "Challenge purchase submitted",
+            "data": res.data
+        })
 
     except Exception as e:
         print("CREATE PURCHASE ERROR:", repr(e))
@@ -533,7 +552,6 @@ def approve_challenge_purchase():
             return jsonify({"success": False, "error": "Purchase not found"}), 404
 
         purchase = purchase_res.data[0]
-
         mt5_account = None
 
         if mt5_id:
@@ -667,7 +685,11 @@ def reject_challenge_purchase():
             "admin_note": data.get("admin_note", "Challenge purchase rejected")
         }).eq("id", purchase_id).execute()
 
-        return jsonify({"success": True, "message": "Challenge purchase rejected", "data": res.data})
+        return jsonify({
+            "success": True,
+            "message": "Challenge purchase rejected",
+            "data": res.data
+        })
 
     except Exception as e:
         print("REJECT PURCHASE ERROR:", repr(e))
@@ -716,7 +738,12 @@ def create_mt5_account():
         }
 
         res = supabase.table("mt5_pool").insert(account).execute()
-        return jsonify({"success": True, "message": "MT5 account added to vault", "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "message": "MT5 account added to vault",
+            "data": res.data
+        })
 
     except Exception as e:
         print("CREATE MT5 ERROR:", repr(e))
@@ -735,9 +762,13 @@ def update_mt5_account():
         update_data = {"updated_at": now_iso()}
 
         fields = [
-            "plan_name", "mt5_login", "mt5_server",
-            "mt5_master_password", "mt5_investor_password",
-            "status", "admin_note"
+            "plan_name",
+            "mt5_login",
+            "mt5_server",
+            "mt5_master_password",
+            "mt5_investor_password",
+            "status",
+            "admin_note"
         ]
 
         for field in fields:
@@ -748,7 +779,12 @@ def update_mt5_account():
             update_data["account_size"] = clean_amount(data.get("account_size"))
 
         res = supabase.table("mt5_pool").update(update_data).eq("id", mt5_id).execute()
-        return jsonify({"success": True, "message": "MT5 account updated", "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "message": "MT5 account updated",
+            "data": res.data
+        })
 
     except Exception as e:
         print("UPDATE MT5 ERROR:", repr(e))
@@ -765,7 +801,12 @@ def delete_mt5_account():
             return jsonify({"success": False, "error": "Missing MT5 account id"}), 400
 
         res = supabase.table("mt5_pool").delete().eq("id", mt5_id).execute()
-        return jsonify({"success": True, "message": "MT5 account deleted", "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "message": "MT5 account deleted",
+            "data": res.data
+        })
 
     except Exception as e:
         print("DELETE MT5 ERROR:", repr(e))
@@ -811,7 +852,12 @@ def create_payout():
         }
 
         res = supabase.table("payouts").insert(payout).execute()
-        return jsonify({"success": True, "message": "Payout request created", "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "message": "Payout request created",
+            "data": res.data
+        })
 
     except Exception as e:
         print("CREATE PAYOUT ERROR:", repr(e))
@@ -924,7 +970,12 @@ def create_support_ticket():
         }
 
         res = supabase.table("support_tickets").insert(ticket).execute()
-        return jsonify({"success": True, "message": "Support ticket created", "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "message": "Support ticket created",
+            "data": res.data
+        })
 
     except Exception as e:
         print("CREATE SUPPORT ERROR:", repr(e))
@@ -952,7 +1003,11 @@ def reply_support_ticket():
             "last_updated_at": now_iso()
         }).eq("id", ticket_id).execute()
 
-        return jsonify({"success": True, "message": "Support ticket replied", "data": res.data})
+        return jsonify({
+            "success": True,
+            "message": "Support ticket replied",
+            "data": res.data
+        })
 
     except Exception as e:
         print("REPLY SUPPORT ERROR:", repr(e))
@@ -974,7 +1029,11 @@ def close_support_ticket():
             "last_updated_at": now_iso()
         }).eq("id", ticket_id).execute()
 
-        return jsonify({"success": True, "message": "Support ticket closed", "data": res.data})
+        return jsonify({
+            "success": True,
+            "message": "Support ticket closed",
+            "data": res.data
+        })
 
     except Exception as e:
         print("CLOSE SUPPORT ERROR:", repr(e))
@@ -1027,7 +1086,12 @@ def create_announcement():
         }
 
         res = supabase.table("announcements").insert(announcement).execute()
-        return jsonify({"success": True, "message": "Announcement created", "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "message": "Announcement created",
+            "data": res.data
+        })
 
     except Exception as e:
         print("CREATE ANNOUNCEMENT ERROR:", repr(e))
@@ -1047,7 +1111,11 @@ def disable_announcement():
             "status": "disabled"
         }).eq("id", announcement_id).execute()
 
-        return jsonify({"success": True, "message": "Announcement disabled", "data": res.data})
+        return jsonify({
+            "success": True,
+            "message": "Announcement disabled",
+            "data": res.data
+        })
 
     except Exception as e:
         print("DISABLE ANNOUNCEMENT ERROR:", repr(e))
