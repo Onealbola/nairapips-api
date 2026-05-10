@@ -1,10 +1,688 @@
-# =========================
-# SUPPORT TICKET BACKEND
-# =========================
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from supabase import create_client
+import os
+from datetime import datetime, timezone
+import random
+
+app = Flask(__name__)
+CORS(app)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+# =========================================
+# HELPERS
+# =========================================
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def generate_reference():
+    return "NP-" + str(random.randint(100000, 999999))
+
+
+# =========================================
+# BASIC ROUTES
+# =========================================
+
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "NairaPips API Live",
+        "database": "connected"
+    })
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "health": "ok"
+    })
+
+
+# =========================================
+# TRADERS
+# =========================================
+
+@app.route("/traders", methods=["GET"])
+def get_traders():
+
+    try:
+
+        res = (
+            supabase
+            .table("traders")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        return jsonify(res.data)
+
+    except Exception as e:
+
+        print("GET TRADERS ERROR:", repr(e))
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
+
+@app.route("/traders", methods=["POST"])
+def add_trader():
+
+    try:
+
+        data = request.json or {}
+
+        balance_raw = str(
+            data.get("balance")
+            or data.get("account_size")
+            or "0"
+        )
+
+        balance = float(
+            balance_raw
+            .replace(",", "")
+            .replace("₦", "")
+            .strip()
+            or 0
+        )
+
+        trader = {
+
+            "name": data.get("name", ""),
+            "phone": data.get("phone", ""),
+            "email": data.get("email", ""),
+
+            "mt5_login": data.get("mt5_login", ""),
+            "mt5_server": data.get("mt5_server", ""),
+            "mt5_master_password": data.get("mt5_master_password", ""),
+            "mt5_investor_password": data.get("mt5_investor_password", ""),
+
+            "account_size": balance,
+            "balance": balance,
+            "equity": balance,
+
+            "phase": data.get("phase", "no_account"),
+            "status": data.get("status", "payment_pending"),
+
+            "profit": 0,
+            "drawdown": 0,
+            "profit_percent": 0,
+            "drawdown_percent": 0,
+
+            "payment_status": data.get("payment_status", "pending"),
+            "payment_proof_url": data.get("payment_proof_url", ""),
+            "selected_plan": data.get("selected_plan", ""),
+            "payment_note": data.get("payment_note", ""),
+
+            "approved_by": "",
+            "admin_note": "",
+
+            "account_reference":
+                data.get("account_reference")
+                or generate_reference(),
+
+            "challenge_started_at":
+                data.get("challenge_started_at"),
+
+            "approved_at":
+                data.get("approved_at"),
+
+            "funded_at":
+                data.get("funded_at"),
+
+            "last_login_at": None,
+
+            "trading_days_left":
+                data.get("trading_days_left", 30)
+        }
+
+        res = (
+            supabase
+            .table("traders")
+            .insert(trader)
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
+
+    except Exception as e:
+
+        print("ADD TRADER ERROR:", repr(e))
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
+
+@app.route("/login_trader", methods=["POST"])
+def login_trader():
+
+    try:
+
+        data = request.json or {}
+
+        lookup = str(
+            data.get("lookup", "")
+        ).strip().lower()
+
+        if not lookup:
+
+            return jsonify({
+                "success": False,
+                "error": "Missing lookup"
+            }), 400
+
+        res = (
+            supabase
+            .table("traders")
+            .select("*")
+            .or_(f"email.eq.{lookup},phone.eq.{lookup}")
+            .limit(1)
+            .execute()
+        )
+
+        if not res.data:
+
+            return jsonify({
+                "success": False,
+                "error": "Trader not found"
+            }), 404
+
+        trader = res.data[0]
+
+        login_time = now_iso()
+
+        supabase.table("traders").update({
+            "last_login_at": login_time
+        }).eq("id", trader["id"]).execute()
+
+        trader["last_login_at"] = login_time
+
+        return jsonify({
+            "success": True,
+            "data": trader
+        })
+
+    except Exception as e:
+
+        print("LOGIN ERROR:", repr(e))
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
+
+# =========================================
+# PAYMENT APPROVAL
+# =========================================
+
+@app.route("/approve_payment", methods=["POST"])
+def approve_payment():
+
+    try:
+
+        data = request.json or {}
+
+        trader_id = data.get("id")
+
+        if not trader_id:
+
+            return jsonify({
+                "success": False,
+                "error": "Missing trader id"
+            }), 400
+
+        update_data = {
+
+            "payment_status": "approved",
+            "status": "active",
+
+            "phase":
+                data.get("phase", "phase1"),
+
+            "mt5_login":
+                data.get("mt5_login", ""),
+
+            "mt5_server":
+                data.get("mt5_server", ""),
+
+            "mt5_master_password":
+                data.get("mt5_master_password", ""),
+
+            "mt5_investor_password":
+                data.get("mt5_investor_password", ""),
+
+            "approved_at": now_iso(),
+
+            "challenge_started_at":
+                now_iso(),
+
+            "approved_by":
+                data.get("approved_by", "admin"),
+
+            "admin_note":
+                data.get("admin_note", "")
+        }
+
+        if data.get("balance"):
+
+            balance_raw = str(data.get("balance"))
+
+            balance = float(
+                balance_raw
+                .replace(",", "")
+                .replace("₦", "")
+                .strip()
+                or 0
+            )
+
+            update_data["account_size"] = balance
+            update_data["balance"] = balance
+            update_data["equity"] = balance
+
+        res = (
+            supabase
+            .table("traders")
+            .update(update_data)
+            .eq("id", trader_id)
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
+
+    except Exception as e:
+
+        print("APPROVE PAYMENT ERROR:", repr(e))
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
+
+@app.route("/reject_payment", methods=["POST"])
+def reject_payment():
+
+    try:
+
+        data = request.json or {}
+
+        trader_id = data.get("id")
+
+        if not trader_id:
+
+            return jsonify({
+                "success": False,
+                "error": "Missing trader id"
+            }), 400
+
+        res = (
+            supabase
+            .table("traders")
+            .update({
+                "payment_status": "rejected",
+                "status": "payment_rejected",
+                "admin_note":
+                    data.get("admin_note", "")
+            })
+            .eq("id", trader_id)
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
+
+    except Exception as e:
+
+        print("REJECT PAYMENT ERROR:", repr(e))
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
+
+# =========================================
+# UPDATE STATUS
+# =========================================
+
+@app.route("/update_status", methods=["POST"])
+def update_status():
+
+    try:
+
+        data = request.json or {}
+
+        trader_id = data.get("id")
+
+        if not trader_id:
+
+            return jsonify({
+                "success": False,
+                "error": "Missing trader id"
+            }), 400
+
+        update_data = {}
+
+        allowed_fields = [
+
+            "status",
+            "phase",
+            "balance",
+            "equity",
+            "profit",
+            "drawdown",
+            "profit_percent",
+            "drawdown_percent",
+            "payment_status",
+            "payment_note",
+            "admin_note",
+            "trading_days_left"
+
+        ]
+
+        for field in allowed_fields:
+
+            if field in data:
+
+                update_data[field] = data[field]
+
+        if data.get("phase") == "funded":
+
+            update_data["funded_at"] = now_iso()
+
+        res = (
+            supabase
+            .table("traders")
+            .update(update_data)
+            .eq("id", trader_id)
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
+
+    except Exception as e:
+
+        print("UPDATE STATUS ERROR:", repr(e))
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
+
+# =========================================
+# PAYOUTS
+# =========================================
+
+@app.route("/payouts", methods=["GET"])
+def get_payouts():
+
+    try:
+
+        res = (
+            supabase
+            .table("payouts")
+            .select("*")
+            .order("requested_at", desc=True)
+            .execute()
+        )
+
+        return jsonify(res.data)
+
+    except Exception as e:
+
+        print("GET PAYOUTS ERROR:", repr(e))
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
+
+@app.route("/create_payout", methods=["POST"])
+def create_payout():
+
+    try:
+
+        data = request.json or {}
+
+        amount_raw = str(
+            data.get("amount", "0")
+        )
+
+        amount = float(
+            amount_raw
+            .replace(",", "")
+            .replace("₦", "")
+            .strip()
+            or 0
+        )
+
+        payout = {
+
+            "trader_id":
+                data.get("trader_id"),
+
+            "trader_name":
+                data.get("trader_name", ""),
+
+            "email":
+                data.get("email", ""),
+
+            "phone":
+                data.get("phone", ""),
+
+            "amount": amount,
+
+            "bank_name":
+                data.get("bank_name", ""),
+
+            "account_number":
+                data.get("account_number", ""),
+
+            "account_name":
+                data.get("account_name", ""),
+
+            "status": "pending",
+
+            "note":
+                data.get("note", ""),
+
+            "admin_note": "",
+
+            "requested_at":
+                now_iso()
+        }
+
+        res = (
+            supabase
+            .table("payouts")
+            .insert(payout)
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
+
+    except Exception as e:
+
+        print("CREATE PAYOUT ERROR:", repr(e))
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
+
+@app.route("/approve_payout", methods=["POST"])
+def approve_payout():
+
+    try:
+
+        data = request.json or {}
+
+        payout_id = data.get("id")
+
+        if not payout_id:
+
+            return jsonify({
+                "success": False,
+                "error": "Missing payout id"
+            }), 400
+
+        res = (
+            supabase
+            .table("payouts")
+            .update({
+                "status": "approved",
+                "approved_at": now_iso(),
+                "admin_note":
+                    data.get("admin_note", "")
+            })
+            .eq("id", payout_id)
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
+
+    except Exception as e:
+
+        print("APPROVE PAYOUT ERROR:", repr(e))
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
+
+@app.route("/reject_payout", methods=["POST"])
+def reject_payout():
+
+    try:
+
+        data = request.json or {}
+
+        payout_id = data.get("id")
+
+        if not payout_id:
+
+            return jsonify({
+                "success": False,
+                "error": "Missing payout id"
+            }), 400
+
+        res = (
+            supabase
+            .table("payouts")
+            .update({
+                "status": "rejected",
+                "rejected_at": now_iso(),
+                "admin_note":
+                    data.get("admin_note", "")
+            })
+            .eq("id", payout_id)
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
+
+    except Exception as e:
+
+        print("REJECT PAYOUT ERROR:", repr(e))
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
+
+@app.route("/mark_payout_paid", methods=["POST"])
+def mark_payout_paid():
+
+    try:
+
+        data = request.json or {}
+
+        payout_id = data.get("id")
+
+        if not payout_id:
+
+            return jsonify({
+                "success": False,
+                "error": "Missing payout id"
+            }), 400
+
+        res = (
+            supabase
+            .table("payouts")
+            .update({
+                "status": "paid",
+                "paid_at": now_iso(),
+                "admin_note":
+                    data.get("admin_note", "")
+            })
+            .eq("id", payout_id)
+            .execute()
+        )
+
+        return jsonify({
+            "success": True,
+            "data": res.data
+        })
+
+    except Exception as e:
+
+        print("MARK PAID ERROR:", repr(e))
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
+
+# =========================================
+# SUPPORT TICKETS
+# =========================================
 
 @app.route("/support_tickets", methods=["GET"])
 def get_support_tickets():
+
     try:
+
         res = (
             supabase
             .table("support_tickets")
@@ -16,7 +694,9 @@ def get_support_tickets():
         return jsonify(res.data)
 
     except Exception as e:
-        print("GET SUPPORT ERROR:", repr(e))
+
+        print("GET SUPPORT TICKETS ERROR:", repr(e))
+
         return jsonify({
             "success": False,
             "error": str(e)
@@ -25,46 +705,55 @@ def get_support_tickets():
 
 @app.route("/create_support_ticket", methods=["POST"])
 def create_support_ticket():
+
     try:
+
         data = request.json or {}
 
-        subject = str(data.get("subject", "")).strip()
-        message = str(data.get("message", "")).strip()
-
-        if not subject or not message:
-            return jsonify({
-                "success": False,
-                "error": "Subject and message are required"
-            }), 400
-
         ticket = {
-            "trader_id": data.get("trader_id"),
-            "trader_name": data.get("trader_name", ""),
-            "email": data.get("email", ""),
-            "phone": data.get("phone", ""),
 
-            "subject": subject,
-            "message": message,
+            "trader_id":
+                data.get("trader_id"),
+
+            "trader_name":
+                data.get("trader_name", ""),
+
+            "email":
+                data.get("email", ""),
+
+            "phone":
+                data.get("phone", ""),
+
+            "subject":
+                data.get("subject", ""),
+
+            "message":
+                data.get("message", ""),
 
             "status": "open",
-            "priority": data.get("priority", "normal"),
 
             "admin_reply": "",
 
-            "created_at": now_iso(),
-            "last_updated_at": now_iso()
+            "created_at":
+                now_iso()
         }
 
-        res = supabase.table("support_tickets").insert(ticket).execute()
+        res = (
+            supabase
+            .table("support_tickets")
+            .insert(ticket)
+            .execute()
+        )
 
         return jsonify({
             "success": True,
-            "message": "Support ticket created successfully",
             "data": res.data
         })
 
     except Exception as e:
+
         print("CREATE SUPPORT ERROR:", repr(e))
+
         return jsonify({
             "success": False,
             "error": str(e)
@@ -73,47 +762,44 @@ def create_support_ticket():
 
 @app.route("/reply_support_ticket", methods=["POST"])
 def reply_support_ticket():
+
     try:
+
         data = request.json or {}
+
         ticket_id = data.get("id")
 
         if not ticket_id:
+
             return jsonify({
                 "success": False,
                 "error": "Missing ticket id"
             }), 400
 
-        admin_reply = str(data.get("admin_reply", "")).strip()
-
-        if not admin_reply:
-            return jsonify({
-                "success": False,
-                "error": "Admin reply is required"
-            }), 400
-
-        update_data = {
-            "admin_reply": admin_reply,
-            "status": "replied",
-            "replied_at": now_iso(),
-            "last_updated_at": now_iso()
-        }
-
         res = (
             supabase
             .table("support_tickets")
-            .update(update_data)
+            .update({
+                "status": "replied",
+                "admin_reply":
+                    data.get("admin_reply", ""),
+
+                "replied_at":
+                    now_iso()
+            })
             .eq("id", ticket_id)
             .execute()
         )
 
         return jsonify({
             "success": True,
-            "message": "Support ticket replied successfully",
             "data": res.data
         })
 
     except Exception as e:
+
         print("REPLY SUPPORT ERROR:", repr(e))
+
         return jsonify({
             "success": False,
             "error": str(e)
@@ -122,39 +808,58 @@ def reply_support_ticket():
 
 @app.route("/close_support_ticket", methods=["POST"])
 def close_support_ticket():
+
     try:
+
         data = request.json or {}
+
         ticket_id = data.get("id")
 
         if not ticket_id:
+
             return jsonify({
                 "success": False,
                 "error": "Missing ticket id"
             }), 400
 
-        update_data = {
-            "status": "closed",
-            "closed_at": now_iso(),
-            "last_updated_at": now_iso()
-        }
-
         res = (
             supabase
             .table("support_tickets")
-            .update(update_data)
+            .update({
+                "status": "closed",
+                "closed_at":
+                    now_iso()
+            })
             .eq("id", ticket_id)
             .execute()
         )
 
         return jsonify({
             "success": True,
-            "message": "Support ticket closed successfully",
             "data": res.data
         })
 
     except Exception as e:
+
         print("CLOSE SUPPORT ERROR:", repr(e))
+
         return jsonify({
             "success": False,
             "error": str(e)
         }), 400
+
+
+# =========================================
+# START SERVER
+# =========================================
+
+if __name__ == "__main__":
+
+    port = int(
+        os.environ.get("PORT", 10000)
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
