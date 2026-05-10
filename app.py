@@ -17,6 +17,10 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
+# =========================
+# HELPERS
+# =========================
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -30,11 +34,26 @@ def clean_amount(value):
     return float(raw.replace(",", "").replace("₦", "").strip() or 0)
 
 
+def month_text():
+    d = datetime.now(timezone.utc)
+    return d.strftime("%B")
+
+
+def year_text():
+    d = datetime.now(timezone.utc)
+    return d.strftime("%Y")
+
+
+# =========================
+# BASIC ROUTES
+# =========================
+
 @app.route("/")
 def home():
     return jsonify({
         "status": "NairaPips API Live",
-        "database": "connected"
+        "database": "connected",
+        "version": "challenge-plans-mt5-pool-upgrade"
     })
 
 
@@ -147,6 +166,10 @@ def login_trader():
         return jsonify({"success": False, "error": str(e)}), 400
 
 
+# =========================
+# PAYMENT APPROVAL
+# =========================
+
 @app.route("/approve_payment", methods=["POST"])
 def approve_payment():
     try:
@@ -214,11 +237,7 @@ def reject_payment():
             "admin_note": data.get("admin_note", "")
         }).eq("id", trader_id).execute()
 
-        return jsonify({
-            "success": True,
-            "message": "Payment rejected",
-            "data": res.data
-        })
+        return jsonify({"success": True, "message": "Payment rejected", "data": res.data})
 
     except Exception as e:
         print("REJECT PAYMENT ERROR:", repr(e))
@@ -235,21 +254,10 @@ def update_status():
             return jsonify({"success": False, "error": "Missing trader id"}), 400
 
         update_data = {}
-
         allowed_fields = [
-            "status",
-            "phase",
-            "balance",
-            "equity",
-            "profit",
-            "drawdown",
-            "profit_percent",
-            "drawdown_percent",
-            "engine_group",
-            "payment_status",
-            "payment_note",
-            "admin_note",
-            "trading_days_left"
+            "status", "phase", "balance", "equity", "profit", "drawdown",
+            "profit_percent", "drawdown_percent", "engine_group",
+            "payment_status", "payment_note", "admin_note", "trading_days_left"
         ]
 
         for field in allowed_fields:
@@ -279,10 +287,7 @@ def activate_trader():
         if not trader_id:
             return jsonify({"success": False, "error": "Missing trader id"}), 400
 
-        res = supabase.table("traders").update({
-            "status": "active"
-        }).eq("id", trader_id).execute()
-
+        res = supabase.table("traders").update({"status": "active"}).eq("id", trader_id).execute()
         return jsonify({"success": True, "data": res.data})
 
     except Exception as e:
@@ -299,10 +304,7 @@ def deactivate_trader():
         if not trader_id:
             return jsonify({"success": False, "error": "Missing trader id"}), 400
 
-        res = supabase.table("traders").update({
-            "status": "inactive"
-        }).eq("id", trader_id).execute()
-
+        res = supabase.table("traders").update({"status": "inactive"}).eq("id", trader_id).execute()
         return jsonify({"success": True, "data": res.data})
 
     except Exception as e:
@@ -324,6 +326,449 @@ def delete_trader():
 
     except Exception as e:
         print("DELETE ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+# =========================
+# CHALLENGE PLANS
+# =========================
+
+@app.route("/challenge_plans", methods=["GET"])
+def get_challenge_plans():
+    try:
+        res = (
+            supabase
+            .table("challenge_plans")
+            .select("*")
+            .order("account_size", desc=False)
+            .execute()
+        )
+        return jsonify(res.data)
+
+    except Exception as e:
+        print("GET PLANS ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/create_challenge_plan", methods=["POST"])
+def create_challenge_plan():
+    try:
+        data = request.json or {}
+
+        name = str(data.get("name", "")).strip()
+        if not name:
+            return jsonify({"success": False, "error": "Plan name is required"}), 400
+
+        plan = {
+            "name": name,
+            "account_size": clean_amount(data.get("account_size")),
+            "fee": clean_amount(data.get("fee")),
+            "phase1_target": float(data.get("phase1_target") or 10),
+            "phase2_target": float(data.get("phase2_target") or 8),
+            "max_drawdown": float(data.get("max_drawdown") or 20),
+            "daily_drawdown": data.get("daily_drawdown", "None"),
+            "payout_split": data.get("payout_split", "80%"),
+            "description": data.get("description", ""),
+            "status": data.get("status", "active"),
+            "created_at": now_iso(),
+            "updated_at": now_iso()
+        }
+
+        res = supabase.table("challenge_plans").insert(plan).execute()
+        return jsonify({"success": True, "message": "Challenge plan created", "data": res.data})
+
+    except Exception as e:
+        print("CREATE PLAN ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/update_challenge_plan", methods=["POST"])
+def update_challenge_plan():
+    try:
+        data = request.json or {}
+        plan_id = data.get("id")
+
+        if not plan_id:
+            return jsonify({"success": False, "error": "Missing plan id"}), 400
+
+        update_data = {
+            "updated_at": now_iso()
+        }
+
+        fields = [
+            "name", "daily_drawdown", "payout_split",
+            "description", "status"
+        ]
+
+        money_fields = ["account_size", "fee"]
+        number_fields = ["phase1_target", "phase2_target", "max_drawdown"]
+
+        for field in fields:
+            if field in data:
+                update_data[field] = data[field]
+
+        for field in money_fields:
+            if field in data:
+                update_data[field] = clean_amount(data.get(field))
+
+        for field in number_fields:
+            if field in data:
+                update_data[field] = float(data.get(field) or 0)
+
+        res = supabase.table("challenge_plans").update(update_data).eq("id", plan_id).execute()
+        return jsonify({"success": True, "message": "Challenge plan updated", "data": res.data})
+
+    except Exception as e:
+        print("UPDATE PLAN ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/disable_challenge_plan", methods=["POST"])
+def disable_challenge_plan():
+    try:
+        data = request.json or {}
+        plan_id = data.get("id")
+
+        if not plan_id:
+            return jsonify({"success": False, "error": "Missing plan id"}), 400
+
+        res = supabase.table("challenge_plans").update({
+            "status": "disabled",
+            "updated_at": now_iso()
+        }).eq("id", plan_id).execute()
+
+        return jsonify({"success": True, "message": "Challenge plan disabled", "data": res.data})
+
+    except Exception as e:
+        print("DISABLE PLAN ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+# =========================
+# CHALLENGE PURCHASES
+# =========================
+
+@app.route("/challenge_purchases", methods=["GET"])
+def get_challenge_purchases():
+    try:
+        res = (
+            supabase
+            .table("challenge_purchases")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return jsonify(res.data)
+
+    except Exception as e:
+        print("GET PURCHASES ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/create_challenge_purchase", methods=["POST"])
+def create_challenge_purchase():
+    try:
+        data = request.json or {}
+
+        plan_name = str(data.get("plan_name", "")).strip()
+        payment_proof_url = str(data.get("payment_proof_url", "")).strip()
+
+        if not plan_name:
+            return jsonify({"success": False, "error": "Plan name is required"}), 400
+
+        if not payment_proof_url:
+            return jsonify({"success": False, "error": "Payment proof is required"}), 400
+
+        purchase = {
+            "trader_id": data.get("trader_id"),
+            "trader_name": data.get("trader_name", ""),
+            "email": data.get("email", ""),
+            "phone": data.get("phone", ""),
+
+            "plan_id": data.get("plan_id"),
+            "plan_name": plan_name,
+            "account_size": clean_amount(data.get("account_size")),
+            "fee": clean_amount(data.get("fee")),
+
+            "payment_proof_url": payment_proof_url,
+
+            "payment_status": "pending",
+            "status": "pending_review",
+
+            "admin_note": "",
+
+            "created_at": now_iso(),
+            "purchase_month": month_text(),
+            "purchase_year": year_text()
+        }
+
+        res = supabase.table("challenge_purchases").insert(purchase).execute()
+        return jsonify({"success": True, "message": "Challenge purchase submitted", "data": res.data})
+
+    except Exception as e:
+        print("CREATE PURCHASE ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/approve_challenge_purchase", methods=["POST"])
+def approve_challenge_purchase():
+    try:
+        data = request.json or {}
+        purchase_id = data.get("id")
+        mt5_id = data.get("mt5_id")
+
+        if not purchase_id:
+            return jsonify({"success": False, "error": "Missing purchase id"}), 400
+
+        purchase_res = (
+            supabase
+            .table("challenge_purchases")
+            .select("*")
+            .eq("id", purchase_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not purchase_res.data:
+            return jsonify({"success": False, "error": "Purchase not found"}), 404
+
+        purchase = purchase_res.data[0]
+
+        mt5_account = None
+
+        if mt5_id:
+            mt5_res = (
+                supabase
+                .table("mt5_pool")
+                .select("*")
+                .eq("id", mt5_id)
+                .limit(1)
+                .execute()
+            )
+            if mt5_res.data:
+                mt5_account = mt5_res.data[0]
+        else:
+            mt5_res = (
+                supabase
+                .table("mt5_pool")
+                .select("*")
+                .eq("status", "available")
+                .eq("account_size", purchase.get("account_size") or 0)
+                .limit(1)
+                .execute()
+            )
+            if mt5_res.data:
+                mt5_account = mt5_res.data[0]
+
+        if not mt5_account:
+            return jsonify({
+                "success": False,
+                "error": "No available MT5 account found for this plan/account size"
+            }), 400
+
+        approved_time = now_iso()
+
+        purchase_update = {
+            "payment_status": "approved",
+            "status": "approved_active",
+            "assigned_mt5_id": mt5_account.get("id"),
+            "mt5_login": mt5_account.get("mt5_login", ""),
+            "mt5_server": mt5_account.get("mt5_server", ""),
+            "approved_at": approved_time,
+            "assigned_at": approved_time,
+            "admin_note": data.get("admin_note", "Challenge approved and MT5 assigned")
+        }
+
+        supabase.table("challenge_purchases").update(purchase_update).eq("id", purchase_id).execute()
+
+        supabase.table("mt5_pool").update({
+            "status": "assigned",
+            "assigned_trader_id": purchase.get("trader_id"),
+            "assigned_trader_name": purchase.get("trader_name", ""),
+            "assigned_email": purchase.get("email", ""),
+            "assigned_at": approved_time,
+            "updated_at": approved_time,
+            "admin_note": "Assigned through challenge purchase approval"
+        }).eq("id", mt5_account.get("id")).execute()
+
+        trader_lookup = (
+            supabase
+            .table("traders")
+            .select("*")
+            .or_(f"email.eq.{purchase.get('email','')},phone.eq.{purchase.get('phone','')}")
+            .limit(1)
+            .execute()
+        )
+
+        trader_data = {
+            "name": purchase.get("trader_name", ""),
+            "phone": purchase.get("phone", ""),
+            "email": purchase.get("email", ""),
+
+            "mt5_login": mt5_account.get("mt5_login", ""),
+            "mt5_server": mt5_account.get("mt5_server", ""),
+            "mt5_master_password": mt5_account.get("mt5_master_password", ""),
+            "mt5_investor_password": mt5_account.get("mt5_investor_password", ""),
+
+            "account_size": purchase.get("account_size") or 0,
+            "balance": purchase.get("account_size") or 0,
+            "equity": purchase.get("account_size") or 0,
+
+            "phase": "phase1",
+            "status": "active",
+            "payment_status": "approved",
+            "payment_proof_url": purchase.get("payment_proof_url", ""),
+            "selected_plan": purchase.get("plan_name", ""),
+
+            "approved_at": approved_time,
+            "challenge_started_at": approved_time,
+            "approved_by": data.get("approved_by", "admin"),
+            "admin_note": data.get("admin_note", ""),
+            "trading_days_left": 30
+        }
+
+        if trader_lookup.data:
+            trader_id = trader_lookup.data[0]["id"]
+            supabase.table("traders").update(trader_data).eq("id", trader_id).execute()
+        else:
+            trader_data["account_reference"] = generate_reference()
+            trader_data["profit"] = 0
+            trader_data["drawdown"] = 0
+            trader_data["profit_percent"] = 0
+            trader_data["drawdown_percent"] = 0
+            supabase.table("traders").insert(trader_data).execute()
+
+        final_res = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute()
+
+        return jsonify({
+            "success": True,
+            "message": "Challenge purchase approved and MT5 assigned",
+            "data": final_res.data
+        })
+
+    except Exception as e:
+        print("APPROVE PURCHASE ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/reject_challenge_purchase", methods=["POST"])
+def reject_challenge_purchase():
+    try:
+        data = request.json or {}
+        purchase_id = data.get("id")
+
+        if not purchase_id:
+            return jsonify({"success": False, "error": "Missing purchase id"}), 400
+
+        res = supabase.table("challenge_purchases").update({
+            "payment_status": "rejected",
+            "status": "rejected",
+            "rejected_at": now_iso(),
+            "admin_note": data.get("admin_note", "Challenge purchase rejected")
+        }).eq("id", purchase_id).execute()
+
+        return jsonify({"success": True, "message": "Challenge purchase rejected", "data": res.data})
+
+    except Exception as e:
+        print("REJECT PURCHASE ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+# =========================
+# MT5 POOL / VAULT
+# =========================
+
+@app.route("/mt5_pool", methods=["GET"])
+def get_mt5_pool():
+    try:
+        res = supabase.table("mt5_pool").select("*").order("created_at", desc=True).execute()
+        return jsonify(res.data)
+
+    except Exception as e:
+        print("GET MT5 POOL ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/create_mt5_account", methods=["POST"])
+def create_mt5_account():
+    try:
+        data = request.json or {}
+
+        mt5_login = str(data.get("mt5_login", "")).strip()
+        mt5_server = str(data.get("mt5_server", "")).strip()
+        mt5_master_password = str(data.get("mt5_master_password", "")).strip()
+        mt5_investor_password = str(data.get("mt5_investor_password", "")).strip()
+
+        if not mt5_login or not mt5_server or not mt5_master_password or not mt5_investor_password:
+            return jsonify({"success": False, "error": "All MT5 details are required"}), 400
+
+        account = {
+            "plan_name": data.get("plan_name", ""),
+            "account_size": clean_amount(data.get("account_size")),
+            "mt5_login": mt5_login,
+            "mt5_server": mt5_server,
+            "mt5_master_password": mt5_master_password,
+            "mt5_investor_password": mt5_investor_password,
+            "status": data.get("status", "available"),
+            "admin_note": data.get("admin_note", ""),
+            "created_at": now_iso(),
+            "updated_at": now_iso()
+        }
+
+        res = supabase.table("mt5_pool").insert(account).execute()
+        return jsonify({"success": True, "message": "MT5 account added to vault", "data": res.data})
+
+    except Exception as e:
+        print("CREATE MT5 ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/update_mt5_account", methods=["POST"])
+def update_mt5_account():
+    try:
+        data = request.json or {}
+        mt5_id = data.get("id")
+
+        if not mt5_id:
+            return jsonify({"success": False, "error": "Missing MT5 account id"}), 400
+
+        update_data = {"updated_at": now_iso()}
+
+        fields = [
+            "plan_name", "mt5_login", "mt5_server",
+            "mt5_master_password", "mt5_investor_password",
+            "status", "admin_note"
+        ]
+
+        for field in fields:
+            if field in data:
+                update_data[field] = data[field]
+
+        if "account_size" in data:
+            update_data["account_size"] = clean_amount(data.get("account_size"))
+
+        res = supabase.table("mt5_pool").update(update_data).eq("id", mt5_id).execute()
+        return jsonify({"success": True, "message": "MT5 account updated", "data": res.data})
+
+    except Exception as e:
+        print("UPDATE MT5 ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/delete_mt5_account", methods=["POST"])
+def delete_mt5_account():
+    try:
+        data = request.json or {}
+        mt5_id = data.get("id")
+
+        if not mt5_id:
+            return jsonify({"success": False, "error": "Missing MT5 account id"}), 400
+
+        res = supabase.table("mt5_pool").delete().eq("id", mt5_id).execute()
+        return jsonify({"success": True, "message": "MT5 account deleted", "data": res.data})
+
+    except Exception as e:
+        print("DELETE MT5 ERROR:", repr(e))
         return jsonify({"success": False, "error": str(e)}), 400
 
 
@@ -366,12 +811,7 @@ def create_payout():
         }
 
         res = supabase.table("payouts").insert(payout).execute()
-
-        return jsonify({
-            "success": True,
-            "message": "Payout request created",
-            "data": res.data
-        })
+        return jsonify({"success": True, "message": "Payout request created", "data": res.data})
 
     except Exception as e:
         print("CREATE PAYOUT ERROR:", repr(e))
@@ -393,11 +833,7 @@ def approve_payout():
             "admin_note": data.get("admin_note", "")
         }).eq("id", payout_id).execute()
 
-        return jsonify({
-            "success": True,
-            "message": "Payout approved",
-            "data": res.data
-        })
+        return jsonify({"success": True, "message": "Payout approved", "data": res.data})
 
     except Exception as e:
         print("APPROVE PAYOUT ERROR:", repr(e))
@@ -419,11 +855,7 @@ def reject_payout():
             "admin_note": data.get("admin_note", "")
         }).eq("id", payout_id).execute()
 
-        return jsonify({
-            "success": True,
-            "message": "Payout rejected",
-            "data": res.data
-        })
+        return jsonify({"success": True, "message": "Payout rejected", "data": res.data})
 
     except Exception as e:
         print("REJECT PAYOUT ERROR:", repr(e))
@@ -445,11 +877,7 @@ def mark_payout_paid():
             "admin_note": data.get("admin_note", "")
         }).eq("id", payout_id).execute()
 
-        return jsonify({
-            "success": True,
-            "message": "Payout marked as paid",
-            "data": res.data
-        })
+        return jsonify({"success": True, "message": "Payout marked as paid", "data": res.data})
 
     except Exception as e:
         print("MARK PAYOUT PAID ERROR:", repr(e))
@@ -496,12 +924,7 @@ def create_support_ticket():
         }
 
         res = supabase.table("support_tickets").insert(ticket).execute()
-
-        return jsonify({
-            "success": True,
-            "message": "Support ticket created",
-            "data": res.data
-        })
+        return jsonify({"success": True, "message": "Support ticket created", "data": res.data})
 
     except Exception as e:
         print("CREATE SUPPORT ERROR:", repr(e))
@@ -529,11 +952,7 @@ def reply_support_ticket():
             "last_updated_at": now_iso()
         }).eq("id", ticket_id).execute()
 
-        return jsonify({
-            "success": True,
-            "message": "Support ticket replied",
-            "data": res.data
-        })
+        return jsonify({"success": True, "message": "Support ticket replied", "data": res.data})
 
     except Exception as e:
         print("REPLY SUPPORT ERROR:", repr(e))
@@ -555,11 +974,7 @@ def close_support_ticket():
             "last_updated_at": now_iso()
         }).eq("id", ticket_id).execute()
 
-        return jsonify({
-            "success": True,
-            "message": "Support ticket closed",
-            "data": res.data
-        })
+        return jsonify({"success": True, "message": "Support ticket closed", "data": res.data})
 
     except Exception as e:
         print("CLOSE SUPPORT ERROR:", repr(e))
@@ -598,10 +1013,7 @@ def create_announcement():
         message = str(data.get("message", "")).strip()
 
         if not title or not message:
-            return jsonify({
-                "success": False,
-                "error": "Title and message are required"
-            }), 400
+            return jsonify({"success": False, "error": "Title and message are required"}), 400
 
         announcement = {
             "title": title,
@@ -615,12 +1027,7 @@ def create_announcement():
         }
 
         res = supabase.table("announcements").insert(announcement).execute()
-
-        return jsonify({
-            "success": True,
-            "message": "Announcement created",
-            "data": res.data
-        })
+        return jsonify({"success": True, "message": "Announcement created", "data": res.data})
 
     except Exception as e:
         print("CREATE ANNOUNCEMENT ERROR:", repr(e))
@@ -634,20 +1041,13 @@ def disable_announcement():
         announcement_id = data.get("id")
 
         if not announcement_id:
-            return jsonify({
-                "success": False,
-                "error": "Missing announcement id"
-            }), 400
+            return jsonify({"success": False, "error": "Missing announcement id"}), 400
 
         res = supabase.table("announcements").update({
             "status": "disabled"
         }).eq("id", announcement_id).execute()
 
-        return jsonify({
-            "success": True,
-            "message": "Announcement disabled",
-            "data": res.data
-        })
+        return jsonify({"success": True, "message": "Announcement disabled", "data": res.data})
 
     except Exception as e:
         print("DISABLE ANNOUNCEMENT ERROR:", repr(e))
