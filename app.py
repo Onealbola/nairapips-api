@@ -187,7 +187,12 @@ def approve_payment():
             update_data["equity"] = balance
 
         res = supabase.table("traders").update(update_data).eq("id", trader_id).execute()
-        return jsonify({"success": True, "message": "Payment approved and trader activated", "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "message": "Payment approved and trader activated",
+            "data": res.data
+        })
 
     except Exception as e:
         print("APPROVE PAYMENT ERROR:", repr(e))
@@ -209,7 +214,11 @@ def reject_payment():
             "admin_note": data.get("admin_note", "")
         }).eq("id", trader_id).execute()
 
-        return jsonify({"success": True, "message": "Payment rejected", "data": res.data})
+        return jsonify({
+            "success": True,
+            "message": "Payment rejected",
+            "data": res.data
+        })
 
     except Exception as e:
         print("REJECT PAYMENT ERROR:", repr(e))
@@ -357,7 +366,12 @@ def create_payout():
         }
 
         res = supabase.table("payouts").insert(payout).execute()
-        return jsonify({"success": True, "message": "Payout request created", "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "message": "Payout request created",
+            "data": res.data
+        })
 
     except Exception as e:
         print("CREATE PAYOUT ERROR:", repr(e))
@@ -379,7 +393,11 @@ def approve_payout():
             "admin_note": data.get("admin_note", "")
         }).eq("id", payout_id).execute()
 
-        return jsonify({"success": True, "message": "Payout approved", "data": res.data})
+        return jsonify({
+            "success": True,
+            "message": "Payout approved",
+            "data": res.data
+        })
 
     except Exception as e:
         print("APPROVE PAYOUT ERROR:", repr(e))
@@ -401,7 +419,11 @@ def reject_payout():
             "admin_note": data.get("admin_note", "")
         }).eq("id", payout_id).execute()
 
-        return jsonify({"success": True, "message": "Payout rejected", "data": res.data})
+        return jsonify({
+            "success": True,
+            "message": "Payout rejected",
+            "data": res.data
+        })
 
     except Exception as e:
         print("REJECT PAYOUT ERROR:", repr(e))
@@ -423,7 +445,11 @@ def mark_payout_paid():
             "admin_note": data.get("admin_note", "")
         }).eq("id", payout_id).execute()
 
-        return jsonify({"success": True, "message": "Payout marked as paid", "data": res.data})
+        return jsonify({
+            "success": True,
+            "message": "Payout marked as paid",
+            "data": res.data
+        })
 
     except Exception as e:
         print("MARK PAYOUT PAID ERROR:", repr(e))
@@ -470,7 +496,12 @@ def create_support_ticket():
         }
 
         res = supabase.table("support_tickets").insert(ticket).execute()
-        return jsonify({"success": True, "message": "Support ticket created", "data": res.data})
+
+        return jsonify({
+            "success": True,
+            "message": "Support ticket created",
+            "data": res.data
+        })
 
     except Exception as e:
         print("CREATE SUPPORT ERROR:", repr(e))
@@ -498,7 +529,11 @@ def reply_support_ticket():
             "last_updated_at": now_iso()
         }).eq("id", ticket_id).execute()
 
-        return jsonify({"success": True, "message": "Support ticket replied", "data": res.data})
+        return jsonify({
+            "success": True,
+            "message": "Support ticket replied",
+            "data": res.data
+        })
 
     except Exception as e:
         print("REPLY SUPPORT ERROR:", repr(e))
@@ -520,10 +555,102 @@ def close_support_ticket():
             "last_updated_at": now_iso()
         }).eq("id", ticket_id).execute()
 
-        return jsonify({"success": True, "message": "Support ticket closed", "data": res.data})
+        return jsonify({
+            "success": True,
+            "message": "Support ticket closed",
+            "data": res.data
+        })
 
     except Exception as e:
         print("CLOSE SUPPORT ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+# =========================
+# ANNOUNCEMENTS
+# =========================
+
+@app.route("/announcements", methods=["GET"])
+def get_announcements():
+    try:
+        res = (
+            supabase
+            .table("announcements")
+            .select("*")
+            .eq("status", "active")
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        return jsonify(res.data)
+
+    except Exception as e:
+        print("GET ANNOUNCEMENTS ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/create_announcement", methods=["POST"])
+def create_announcement():
+    try:
+        data = request.json or {}
+
+        title = str(data.get("title", "")).strip()
+        message = str(data.get("message", "")).strip()
+
+        if not title or not message:
+            return jsonify({
+                "success": False,
+                "error": "Title and message are required"
+            }), 400
+
+        announcement = {
+            "title": title,
+            "message": message,
+            "type": data.get("type", "public_notice"),
+            "status": "active",
+            "show_on_landing": data.get("show_on_landing", True),
+            "show_on_dashboard": data.get("show_on_dashboard", True),
+            "created_by": data.get("created_by", "admin"),
+            "created_at": now_iso()
+        }
+
+        res = supabase.table("announcements").insert(announcement).execute()
+
+        return jsonify({
+            "success": True,
+            "message": "Announcement created",
+            "data": res.data
+        })
+
+    except Exception as e:
+        print("CREATE ANNOUNCEMENT ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e)}), 400
+
+
+@app.route("/disable_announcement", methods=["POST"])
+def disable_announcement():
+    try:
+        data = request.json or {}
+        announcement_id = data.get("id")
+
+        if not announcement_id:
+            return jsonify({
+                "success": False,
+                "error": "Missing announcement id"
+            }), 400
+
+        res = supabase.table("announcements").update({
+            "status": "disabled"
+        }).eq("id", announcement_id).execute()
+
+        return jsonify({
+            "success": True,
+            "message": "Announcement disabled",
+            "data": res.data
+        })
+
+    except Exception as e:
+        print("DISABLE ANNOUNCEMENT ERROR:", repr(e))
         return jsonify({"success": False, "error": str(e)}), 400
 
 
