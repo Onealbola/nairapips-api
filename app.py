@@ -382,6 +382,235 @@ def disable_announcement():
         return ok(supabase.table("announcements").update({"status":"disabled"}).eq("id",aid).execute().data, "Announcement disabled")
     except Exception as e: return bad(e)
 
+
+
+
+# ================================
+# NAIRAPIPS AUTO-PILOT MONITORING
+# FX BLUE / SNAPSHOT FOUNDATION
+# ================================
+
+MAX_DRAWDOWN_LIMIT = 20.0
+
+def _num(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+def _risk_zone(max_dd_used):
+    dd = _num(max_dd_used)
+    if dd >= 100:
+        return "breached"
+    if dd >= 91:
+        return "critical"
+    if dd >= 76:
+        return "danger"
+    if dd >= 51:
+        return "warning"
+    return "safe"
+
+def _priority_for_zone(zone):
+    return {"safe":"normal","warning":"medium","danger":"high","critical":"urgent","breached":"closed"}.get(zone, "normal")
+
+def _now_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+def _get_trader_by_id(trader_id):
+    res = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute()
+    data = getattr(res, "data", None) or []
+    return data[0] if data else None
+
+def _insert_monitoring_event(trader, event_type, zone, message, balance, equity, max_dd_used):
+    try:
+        supabase.table("monitoring_events").insert({
+            "trader_id": trader.get("id"),
+            "trader_name": trader.get("name"),
+            "email": trader.get("email"),
+            "mt5_login": trader.get("mt5_login"),
+            "event_type": event_type,
+            "risk_zone": zone,
+            "message": message,
+            "balance": balance,
+            "equity": equity,
+            "max_drawdown_used": max_dd_used
+        }).execute()
+    except Exception as e:
+        print("monitoring event insert failed:", e)
+
+def _apply_monitoring_snapshot(trader, payload, source="manual"):
+    balance = _num(payload.get("balance"), _num(trader.get("balance"), _num(trader.get("account_size"))))
+    equity = _num(payload.get("equity"), balance)
+    account_size = _num(trader.get("account_size"), balance)
+
+    profit = equity - account_size if account_size else _num(payload.get("profit"), 0)
+    profit_percent = (profit / account_size * 100) if account_size else 0
+
+    previous_highest = _num(trader.get("highest_equity"), 0)
+    previous_lowest = _num(trader.get("lowest_equity"), 0)
+
+    highest_equity = max(previous_highest, equity, account_size)
+    lowest_equity = equity if previous_lowest <= 0 else min(previous_lowest, equity)
+
+    peak_base = max(highest_equity, account_size, balance)
+    equity_damage = max(0, peak_base - lowest_equity)
+    drawdown_percent = (equity_damage / peak_base * 100) if peak_base else 0
+    max_dd_used = (drawdown_percent / MAX_DRAWDOWN_LIMIT * 100) if MAX_DRAWDOWN_LIMIT else 0
+
+    zone = _risk_zone(max_dd_used)
+    priority = _priority_for_zone(zone)
+    old_zone = (trader.get("risk_zone") or "safe").lower()
+    old_status = (trader.get("status") or "").lower()
+
+    update_data = {
+        "balance": balance,
+        "equity": equity,
+        "profit": profit,
+        "profit_percent": profit_percent,
+        "drawdown": equity_damage,
+        "drawdown_percent": drawdown_percent,
+        "highest_equity": highest_equity,
+        "lowest_equity": lowest_equity,
+        "peak_balance": max(_num(trader.get("peak_balance"), 0), balance, account_size),
+        "last_equity_snapshot": equity,
+        "max_drawdown_used": max_dd_used,
+        "risk_zone": zone,
+        "critical_mode": zone in ["danger", "critical"],
+        "monitoring_priority": priority,
+        "last_sync_at": _now_iso()
+    }
+
+    if zone == "breached":
+        update_data.update({
+            "status": "breached",
+            "breach_time": trader.get("breach_time") or _now_iso(),
+            "breach_equity": equity,
+            "breach_reason": "Maximum drawdown violation recorded by NairaPips monitoring engine.",
+            "admin_note": "Auto-breach: maximum drawdown violation recorded by monitoring engine."
+        })
+
+    supabase.table("traders").update(update_data).eq("id", trader.get("id")).execute()
+
+    try:
+        supabase.table("monitoring_snapshots").insert({
+            "trader_id": trader.get("id"),
+            "trader_name": trader.get("name"),
+            "email": trader.get("email"),
+            "mt5_login": trader.get("mt5_login"),
+            "balance": balance,
+            "equity": equity,
+            "profit": profit,
+            "profit_percent": profit_percent,
+            "drawdown": equity_damage,
+            "drawdown_percent": drawdown_percent,
+            "max_drawdown_used": max_dd_used,
+            "risk_zone": zone,
+            "source": source,
+            "raw_data": payload
+        }).execute()
+    except Exception as e:
+        print("monitoring snapshot insert failed:", e)
+
+    if zone != old_zone:
+        _insert_monitoring_event(trader, "risk_zone_change", zone, f"Risk zone changed from {old_zone} to {zone}.", balance, equity, max_dd_used)
+
+    if zone == "breached" and old_status != "breached":
+        _insert_monitoring_event(trader, "breach_detected", zone, "Permanent breach recorded due to maximum drawdown violation.", balance, equity, max_dd_used)
+
+    return {
+        "trader_id": trader.get("id"),
+        "balance": balance,
+        "equity": equity,
+        "profit": profit,
+        "profit_percent": profit_percent,
+        "drawdown_percent": drawdown_percent,
+        "max_drawdown_used": max_dd_used,
+        "risk_zone": zone,
+        "critical_mode": zone in ["danger", "critical"],
+        "monitoring_priority": priority,
+        "status": update_data.get("status", trader.get("status"))
+    }
+
+@app.route("/register_fxblue", methods=["POST"])
+def register_fxblue():
+    data = request.get_json(force=True) or {}
+    trader_id = data.get("trader_id") or data.get("id")
+    if not trader_id:
+        return jsonify({"success": False, "error": "trader_id is required"}), 400
+
+    res = supabase.table("traders").update({
+        "fxblue_url": data.get("fxblue_url"),
+        "fxblue_account_id": data.get("fxblue_account_id")
+    }).eq("id", trader_id).execute()
+    return jsonify({"success": True, "data": getattr(res, "data", None)})
+
+@app.route("/monitoring_snapshot", methods=["POST"])
+def monitoring_snapshot():
+    data = request.get_json(force=True) or {}
+    trader_id = data.get("trader_id") or data.get("id")
+    if not trader_id:
+        return jsonify({"success": False, "error": "trader_id is required"}), 400
+    trader = _get_trader_by_id(trader_id)
+    if not trader:
+        return jsonify({"success": False, "error": "Trader not found"}), 404
+    return jsonify({"success": True, "data": _apply_monitoring_snapshot(trader, data, data.get("source", "manual"))})
+
+@app.route("/sync_fxblue_account", methods=["POST"])
+def sync_fxblue_account():
+    data = request.get_json(force=True) or {}
+    trader_id = data.get("trader_id") or data.get("id")
+    if not trader_id:
+        return jsonify({"success": False, "error": "trader_id is required"}), 400
+    trader = _get_trader_by_id(trader_id)
+    if not trader:
+        return jsonify({"success": False, "error": "Trader not found"}), 404
+    return jsonify({"success": True, "data": _apply_monitoring_snapshot(trader, data, "fxblue")})
+
+@app.route("/monitoring_events", methods=["GET"])
+def monitoring_events():
+    trader_id = request.args.get("trader_id")
+    query = supabase.table("monitoring_events").select("*").order("created_at", desc=True).limit(100)
+    if trader_id:
+        query = query.eq("trader_id", trader_id)
+    res = query.execute()
+    return jsonify(getattr(res, "data", []) or [])
+
+@app.route("/monitoring_snapshots", methods=["GET"])
+def monitoring_snapshots():
+    trader_id = request.args.get("trader_id")
+    query = supabase.table("monitoring_snapshots").select("*").order("created_at", desc=True).limit(100)
+    if trader_id:
+        query = query.eq("trader_id", trader_id)
+    res = query.execute()
+    return jsonify(getattr(res, "data", []) or [])
+
+@app.route("/breach_evidence/<trader_id>", methods=["GET"])
+def breach_evidence(trader_id):
+    trader = _get_trader_by_id(trader_id)
+    if not trader:
+        return jsonify({"success": False, "error": "Trader not found"}), 404
+
+    events = supabase.table("monitoring_events").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(20).execute()
+    snapshots = supabase.table("monitoring_snapshots").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(20).execute()
+
+    return jsonify({"success": True, "data": {
+        "trader_id": trader_id,
+        "status": trader.get("status"),
+        "risk_zone": trader.get("risk_zone"),
+        "highest_equity": trader.get("highest_equity"),
+        "lowest_equity": trader.get("lowest_equity"),
+        "max_drawdown_used": trader.get("max_drawdown_used"),
+        "breach_time": trader.get("breach_time"),
+        "breach_equity": trader.get("breach_equity"),
+        "breach_reason": trader.get("breach_reason"),
+        "events": getattr(events, "data", []) or [],
+        "snapshots": getattr(snapshots, "data", []) or []
+    }})
+
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
