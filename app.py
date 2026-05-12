@@ -704,6 +704,151 @@ def test_monitoring_timeline(trader_id):
     return jsonify({"success": True, "message": "Test monitoring timeline created", "data": results})
 
 
+
+
+
+# ================================
+# FX BLUE AUTO-FEED RECEIVER
+# Accepts live MT5/FXBlue snapshot values and feeds NairaPips monitoring engine.
+# ================================
+
+def _find_trader_for_fxblue(data):
+    trader_id = data.get("trader_id") or data.get("id")
+    if trader_id:
+        return _get_trader_by_id(trader_id)
+
+    mt5_login = str(data.get("mt5_login") or data.get("login") or data.get("account") or "").strip()
+    if mt5_login:
+        res = supabase.table("traders").select("*").eq("mt5_login", mt5_login).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        if rows:
+            return rows[0]
+
+    fxblue_account_id = str(data.get("fxblue_account_id") or data.get("account_id") or "").strip()
+    if fxblue_account_id:
+        res = supabase.table("traders").select("*").eq("fxblue_account_id", fxblue_account_id).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        if rows:
+            return rows[0]
+
+    email = str(data.get("email") or "").strip().lower()
+    if email:
+        res = supabase.table("traders").select("*").eq("email", email).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        if rows:
+            return rows[0]
+
+    return None
+
+def _normalize_fxblue_payload(data):
+    """
+    Accepts different naming styles from FXBlue bridge/EA/webhook:
+    balance, equity, floating_pl, closed_profit, login, account, mt5_login.
+    """
+    balance = data.get("balance") or data.get("Balance") or data.get("account_balance")
+    equity = data.get("equity") or data.get("Equity") or data.get("account_equity")
+    profit = data.get("profit") or data.get("Profit") or data.get("floating_pl") or data.get("floating_profit")
+
+    normalized = dict(data)
+    normalized["balance"] = _num(balance, 0)
+    normalized["equity"] = _num(equity, normalized["balance"])
+    if profit is not None and profit != "":
+        normalized["profit"] = _num(profit, 0)
+
+    normalized["mt5_login"] = data.get("mt5_login") or data.get("login") or data.get("account")
+    normalized["source"] = data.get("source", "fxblue_auto_feed")
+    return normalized
+
+@app.route("/fxblue_webhook", methods=["POST", "GET"])
+def fxblue_webhook():
+    """
+    Main automatic feed route.
+
+    It accepts either:
+    GET:
+      /fxblue_webhook?login=123456&balance=1000000&e equity=950000
+
+    POST JSON:
+      {
+        "login": "123456",
+        "balance": 1000000,
+        "equity": 950000,
+        "server": "Exness-MT5Trial9"
+      }
+
+    Optional security:
+      Set FXBLUE_WEBHOOK_SECRET in Render env.
+      Then send ?secret=YOUR_SECRET or header X-NAIRAPIPS-SECRET.
+    """
+    import os
+
+    expected_secret = os.getenv("FXBLUE_WEBHOOK_SECRET", "").strip()
+    if expected_secret:
+        supplied = (
+            request.headers.get("X-NAIRAPIPS-SECRET")
+            or request.args.get("secret")
+            or ""
+        ).strip()
+        if supplied != expected_secret:
+            return jsonify({"success": False, "error": "Unauthorized FXBlue feed"}), 401
+
+    if request.method == "GET":
+        data = dict(request.args)
+    else:
+        data = request.get_json(force=True, silent=True) or dict(request.form)
+
+    data = _normalize_fxblue_payload(data)
+    trader = _find_trader_for_fxblue(data)
+
+    if not trader:
+        return jsonify({
+            "success": False,
+            "error": "Trader not found. Send trader_id, mt5_login/login, fxblue_account_id, or email.",
+            "received": data
+        }), 404
+
+    result = _apply_monitoring_snapshot(trader, data, "fxblue_auto_feed")
+
+    # Update fxblue ID/server if sent
+    try:
+        extra = {}
+        if data.get("fxblue_account_id"):
+            extra["fxblue_account_id"] = data.get("fxblue_account_id")
+        if data.get("fxblue_url"):
+            extra["fxblue_url"] = data.get("fxblue_url")
+        if data.get("server") or data.get("mt5_server"):
+            extra["mt5_server"] = data.get("server") or data.get("mt5_server")
+        if extra:
+            supabase.table("traders").update(extra).eq("id", trader.get("id")).execute()
+    except Exception as e:
+        print("fxblue extra update failed:", e)
+
+    return jsonify({
+        "success": True,
+        "message": "FXBlue snapshot received and processed by NairaPips monitoring engine.",
+        "data": result
+    })
+
+@app.route("/fxblue_test/<mt5_login>", methods=["GET"])
+def fxblue_test(mt5_login):
+    """
+    Simple browser test route.
+    Example:
+    /fxblue_test/123456?balance=1000000&equity=950000
+    """
+    data = dict(request.args)
+    data["login"] = mt5_login
+    data["source"] = "fxblue_browser_test"
+
+    trader = _find_trader_for_fxblue(data)
+    if not trader:
+        return jsonify({"success": False, "error": "Trader not found for this MT5 login"}), 404
+
+    data = _normalize_fxblue_payload(data)
+    result = _apply_monitoring_snapshot(trader, data, "fxblue_browser_test")
+    return jsonify({"success": True, "data": result})
+
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
