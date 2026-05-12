@@ -441,6 +441,40 @@ def _insert_monitoring_event(trader, event_type, zone, message, balance, equity,
     except Exception as e:
         print("monitoring event insert failed:", e)
 
+
+def _snapshot_event_message(zone, balance, equity, profit_percent, drawdown_percent, max_dd_used):
+    zone = (zone or "safe").lower()
+    if zone == "breached":
+        return f"BREACH DETECTED: Maximum drawdown violation recorded. Equity: {equity:,.2f}, DD: {drawdown_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
+    if zone == "critical":
+        return f"CRITICAL MODE: Account is very close to breach. Equity: {equity:,.2f}, DD: {drawdown_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
+    if zone == "danger":
+        return f"DANGER ZONE: Drawdown pressure is high. Equity: {equity:,.2f}, DD: {drawdown_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
+    if zone == "warning":
+        return f"WARNING ZONE: Account drawdown has entered warning level. Equity: {equity:,.2f}, DD: {drawdown_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
+    return f"SAFE SNAPSHOT: Account remains within safe monitoring zone. Equity: {equity:,.2f}, Profit: {profit_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
+
+def _should_record_snapshot_event(old_zone, zone, max_dd_used):
+    """
+    Keeps timeline useful without flooding:
+    - always record zone changes
+    - always record critical/danger/breach
+    - record warning at meaningful points
+    - record safe snapshots only lightly
+    """
+    old_zone = (old_zone or "safe").lower()
+    zone = (zone or "safe").lower()
+
+    if zone != old_zone:
+        return True
+    if zone in ["breached", "critical", "danger"]:
+        return True
+    if zone == "warning" and max_dd_used >= 60:
+        return True
+    if zone == "safe" and max_dd_used in [0, 25, 50]:
+        return True
+    return False
+
 def _apply_monitoring_snapshot(trader, payload, source="manual"):
     balance = _num(payload.get("balance"), _num(trader.get("balance"), _num(trader.get("account_size"))))
     equity = _num(payload.get("equity"), balance)
@@ -514,11 +548,39 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
     except Exception as e:
         print("monitoring snapshot insert failed:", e)
 
-    if zone != old_zone:
-        _insert_monitoring_event(trader, "risk_zone_change", zone, f"Risk zone changed from {old_zone} to {zone}.", balance, equity, max_dd_used)
+    # Auto Timeline + Evidence Population
+    # Every important snapshot now becomes readable evidence for admin/trader dashboards.
+    if _should_record_snapshot_event(old_zone, zone, round(max_dd_used)):
+        event_type = "monitoring_snapshot"
+        if zone != old_zone:
+            event_type = "risk_zone_change"
+        if zone == "critical":
+            event_type = "critical_mode"
+        if zone == "danger":
+            event_type = "danger_zone"
+        if zone == "breached":
+            event_type = "breach_detected"
+
+        _insert_monitoring_event(
+            trader,
+            event_type,
+            zone,
+            _snapshot_event_message(zone, balance, equity, profit_percent, drawdown_percent, max_dd_used),
+            balance,
+            equity,
+            max_dd_used
+        )
 
     if zone == "breached" and old_status != "breached":
-        _insert_monitoring_event(trader, "breach_detected", zone, "Permanent breach recorded due to maximum drawdown violation.", balance, equity, max_dd_used)
+        _insert_monitoring_event(
+            trader,
+            "account_locked",
+            zone,
+            "Account locked permanently by NairaPips monitoring engine after maximum drawdown violation.",
+            balance,
+            equity,
+            max_dd_used
+        )
 
     return {
         "trader_id": trader.get("id"),
@@ -609,6 +671,37 @@ def breach_evidence(trader_id):
         "events": getattr(events, "data", []) or [],
         "snapshots": getattr(snapshots, "data", []) or []
     }})
+
+
+
+
+
+@app.route("/test_monitoring_timeline/<trader_id>", methods=["POST", "GET"])
+def test_monitoring_timeline(trader_id):
+    """
+    Creates a safe -> warning -> danger -> critical -> breach timeline for one trader.
+    Use only for testing the evidence system.
+    """
+    trader = _get_trader_by_id(trader_id)
+    if not trader:
+        return jsonify({"success": False, "error": "Trader not found"}), 404
+
+    size = _num(trader.get("account_size"), _num(trader.get("balance"), 1000000))
+
+    test_points = [
+        {"balance": size, "equity": size, "source": "timeline_test_safe"},
+        {"balance": size, "equity": size * 0.88, "source": "timeline_test_warning"},
+        {"balance": size, "equity": size * 0.84, "source": "timeline_test_danger"},
+        {"balance": size, "equity": size * 0.815, "source": "timeline_test_critical"},
+        {"balance": size, "equity": size * 0.79, "source": "timeline_test_breach"},
+    ]
+
+    results = []
+    for p in test_points:
+        trader = _get_trader_by_id(trader_id)
+        results.append(_apply_monitoring_snapshot(trader, p, p["source"]))
+
+    return jsonify({"success": True, "message": "Test monitoring timeline created", "data": results})
 
 
 if __name__ == "__main__":
