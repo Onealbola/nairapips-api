@@ -847,7 +847,21 @@ def fxblue_test(mt5_login):
     data = _normalize_fxblue_payload(data)
     result = _apply_monitoring_snapshot(trader, data, "fxblue_browser_test")
     return jsonify({"success": True, "data": result})
+@app.route("/api/admin/traders", methods=["GET"])
+def get_all_traders():
 
+    try:
+
+        response = supabase.table("traders").select("*").execute()
+
+        return jsonify(response.data), 200
+
+    except Exception as e:
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
