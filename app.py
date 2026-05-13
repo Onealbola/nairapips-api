@@ -487,9 +487,9 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
     previous_lowest = _num(trader.get("lowest_equity"), 0)
 
     highest_equity = max(previous_highest, equity, account_size)
-    lowest_equity = equity if previous_lowest <= 0 else min(previous_lowest, equity)
+    lowest_equity = min(previous_lowest, equity) if previous_lowest > 0 else equity
 
-    peak_base = max(highest_equity, account_size, balance)
+    peak_base = max(highest_equity, account_size)
     equity_damage = max(0, peak_base - lowest_equity)
     drawdown_percent = (equity_damage / peak_base * 100) if peak_base else 0
     max_dd_used = (drawdown_percent / MAX_DRAWDOWN_LIMIT * 100) if MAX_DRAWDOWN_LIMIT else 0
