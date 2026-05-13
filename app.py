@@ -847,44 +847,22 @@ def fxblue_test(mt5_login):
     data = _normalize_fxblue_payload(data)
     result = _apply_monitoring_snapshot(trader, data, "fxblue_browser_test")
     return jsonify({"success": True, "data": result})
-@app.route("/api/admin/traders", methods=["GET"])
-def get_all_traders():
-
+@app.route("/debug/supabase", methods=["GET"])
+def debug_supabase():
     try:
-        response = (
-            supabase.table("traders")
-            .select("*")
-            .execute()
-        )
-
-        traders = response.data or []
-
-        monitorable = []
-
-        for trader in traders:
-
-            mt5_login = trader.get("mt5_login")
-
-            server = trader.get("mt5_server") or trader.get("server")
-
-            investor_password = trader.get("mt5_investor_password") or trader.get("investor_password")
-
-            if mt5_login and server and investor_password:
-
-                trader["mt5_server"] = server
-
-                trader["mt5_investor_password"] = investor_password
-
-                trader["monitoring_enabled"] = True
-
-                monitorable.append(trader)
-
-        return jsonify(monitorable), 200
-
-    except Exception as e:
+        response = supabase.table("traders").select("id,name,mt5_login,mt5_server,mt5_investor_password,status,monitoring_enabled").limit(5).execute()
 
         return jsonify({
+            "success": True,
+            "supabase_url": SUPABASE_URL,
+            "count": len(response.data or []),
+            "sample": response.data or []
+        }), 200
+
+    except Exception as e:
+        return jsonify({
             "success": False,
+            "supabase_url": SUPABASE_URL,
             "error": str(e)
         }), 500
 
