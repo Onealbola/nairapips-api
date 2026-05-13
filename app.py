@@ -851,10 +851,35 @@ def fxblue_test(mt5_login):
 def get_all_traders():
 
     try:
+        response = (
+            supabase.table("traders")
+            .select("*")
+            .execute()
+        )
 
-        response = supabase.table("traders").select("*").execute()
+        traders = response.data or []
 
-        return jsonify(response.data), 200
+        monitorable = []
+
+        for trader in traders:
+
+            mt5_login = trader.get("mt5_login")
+
+            server = trader.get("mt5_server") or trader.get("server")
+
+            investor_password = trader.get("mt5_investor_password") or trader.get("investor_password")
+
+            if mt5_login and server and investor_password:
+
+                trader["mt5_server"] = server
+
+                trader["mt5_investor_password"] = investor_password
+
+                trader["monitoring_enabled"] = True
+
+                monitorable.append(trader)
+
+        return jsonify(monitorable), 200
 
     except Exception as e:
 
