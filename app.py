@@ -523,7 +523,9 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
             "breach_time": trader.get("breach_time") or _now_iso(),
             "breach_equity": equity,
             "breach_reason": "Maximum drawdown violation recorded by NairaPips monitoring engine.",
-            "admin_note": "Auto-breach: maximum drawdown violation recorded by monitoring engine."
+            "admin_note": "Auto-breach: maximum drawdown violation recorded by monitoring engine.",
+            "mt5_access_disabled": True if zone == "breached" else False,
+"breach_detected_at": datetime.now(timezone.utc).isoformat() if zone == "breached" else trader.get("breach_detected_at"),
         })
 
     supabase.table("traders").update(update_data).eq("id", trader.get("id")).execute()
