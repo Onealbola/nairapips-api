@@ -865,7 +865,18 @@ def debug_supabase():
             "supabase_url": SUPABASE_URL,
             "error": str(e)
         }), 500
+@app.route("/api/admin/traders", methods=["GET"])
+def get_admin_traders():
+    try:
+        response = supabase.table("traders").select("*").execute()
 
+        return jsonify(response.data), 200
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
