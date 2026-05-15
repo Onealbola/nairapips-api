@@ -74,7 +74,52 @@ def add_trader():
         }
         return ok(supabase.table("traders").insert(row).execute().data, "Trader added")
     except Exception as e: return bad(e)
+@app.route("/delete_trader", methods=["POST"])
+def delete_trader():
+    try:
+        trader_id = (request.json or {}).get("id")
 
+        if not trader_id:
+            return bad("Missing trader id")
+
+        found = supabase.table("traders").select("*").eq("id", trader_id).execute().data
+        trader = found[0] if found else {}
+
+        email = trader.get("email")
+        phone = trader.get("phone")
+
+        related_tables = [
+            "challenge_purchases",
+            "payouts",
+            "support_tickets",
+            "monitoring_snapshots",
+            "monitoring_events"
+        ]
+
+        for table in related_tables:
+            try:
+                supabase.table(table).delete().eq("trader_id", trader_id).execute()
+            except Exception:
+                pass
+
+            if email:
+                try:
+                    supabase.table(table).delete().eq("email", email).execute()
+                except Exception:
+                    pass
+
+            if phone:
+                try:
+                    supabase.table(table).delete().eq("phone", phone).execute()
+                except Exception:
+                    pass
+
+        supabase.table("traders").delete().eq("id", trader_id).execute()
+
+        return ok([], "Trader and all related activity deleted")
+
+    except Exception as e:
+        return bad(e)
 @app.route("/login_trader", methods=["POST"])
 def login_trader():
     try:
