@@ -669,7 +669,55 @@ def sync_fxblue_account():
     if not trader:
         return jsonify({"success": False, "error": "Trader not found"}), 404
     return jsonify({"success": True, "data": _apply_monitoring_snapshot(trader, data, "fxblue")})
+@app.route("/sync_trades", methods=["POST"])
+def sync_trades():
+    try:
+        d = request.json or {}
+        trades = d.get("trades", [])
 
+        if not isinstance(trades, list):
+            return bad("trades must be a list")
+
+        saved = []
+
+        for t in trades:
+            row = {
+                "trader_id": t.get("trader_id"),
+                "trader_name": t.get("trader_name"),
+                "email": t.get("email"),
+                "mt5_login": str(t.get("mt5_login") or ""),
+                "symbol": t.get("symbol"),
+                "ticket": str(t.get("ticket") or ""),
+                "trade_type": t.get("trade_type"),
+                "volume": t.get("volume") or 0,
+                "open_price": t.get("open_price") or 0,
+                "current_price": t.get("current_price") or 0,
+                "sl": t.get("sl") or 0,
+                "tp": t.get("tp") or 0,
+                "profit": t.get("profit") or 0,
+                "swap": t.get("swap") or 0,
+                "commission": t.get("commission") or 0,
+                "status": t.get("status") or "open",
+                "opened_at": t.get("opened_at"),
+                "closed_at": t.get("closed_at"),
+                "synced_at": now_iso()
+            }
+
+            existing = supabase.table("trader_trades").select("id").eq("ticket", row["ticket"]).limit(1).execute().data
+
+            if existing:
+                saved.append(
+                    supabase.table("trader_trades").update(row).eq("ticket", row["ticket"]).execute().data
+                )
+            else:
+                saved.append(
+                    supabase.table("trader_trades").insert(row).execute().data
+                )
+
+        return ok(saved, "Trades synced")
+
+    except Exception as e:
+        return bad(e)
 @app.route("/monitoring_events", methods=["GET"])
 def monitoring_events():
     trader_id = request.args.get("trader_id")
