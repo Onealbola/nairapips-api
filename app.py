@@ -184,43 +184,6 @@ def deactivate_trader():
         return ok(supabase.table("traders").update({"status":"inactive"}).eq("id",tid).execute().data)
     except Exception as e: return bad(e)
 
-@app.route("/delete_trader", methods=["POST"])
-def delete_trader():
-    try:
-        trader_id = (request.json or {}).get("id")
-
-        if not trader_id:
-            return jsonify({
-                "success": False,
-                "error": "Missing trader id"
-            }), 400
-
-        related_tables = [
-            "challenge_purchases",
-            "payouts",
-            "support_tickets",
-            "monitoring_snapshots",
-            "monitoring_events"
-        ]
-
-        for table in related_tables:
-            try:
-                supabase.table(table).delete().eq("trader_id", trader_id).execute()
-            except Exception:
-                pass
-
-        supabase.table("traders").delete().eq("id", trader_id).execute()
-
-        return jsonify({
-            "success": True,
-            "message": "Trader and all related activities deleted"
-        })
-
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
 @app.route("/challenge_plans", methods=["GET"])
 def challenge_plans():
     try: return jsonify(supabase.table("challenge_plans").select("*").order("account_size", desc=False).execute().data)
