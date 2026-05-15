@@ -717,8 +717,8 @@ def sync_trades():
         return ok(saved, "Trades synced")
 
     except Exception as e:
-        return bad(e)
-        @app.route("/trader_trades", methods=["GET"])
+        return bad(e) 
+@app.route("/trader_trades", methods=["GET"])
 def get_trader_trades():
     try:
         q = supabase.table("trader_trades").select("*").order("synced_at", desc=True).limit(200).execute()
