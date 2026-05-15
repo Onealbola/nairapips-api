@@ -718,6 +718,14 @@ def sync_trades():
 
     except Exception as e:
         return bad(e)
+        @app.route("/trader_trades", methods=["GET"])
+def get_trader_trades():
+    try:
+        q = supabase.table("trader_trades").select("*").order("synced_at", desc=True).limit(200).execute()
+        return jsonify(q.data)
+    except Exception as e:
+        return bad(e)
+
 @app.route("/monitoring_events", methods=["GET"])
 def monitoring_events():
     trader_id = request.args.get("trader_id")
