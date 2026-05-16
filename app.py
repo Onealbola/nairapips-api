@@ -717,7 +717,43 @@ def sync_trades():
         return ok(saved, "Trades synced")
 
     except Exception as e:
-        return bad(e) 
+    return bad(e)
+
+@app.route("/disable_mt5_access", methods=["POST"])
+def disable_mt5_access():
+    try:
+        d = request.json or {}
+        trader_id = d.get("trader_id")
+        mt5_login = str(d.get("mt5_login") or "")
+        reason = d.get("reason") or "Account breached. MT5 access disabled by risk engine."
+
+        if not trader_id and not mt5_login:
+            return bad("trader_id or mt5_login is required")
+
+        update = {
+            "status": "breached",
+            "phase": "breached",
+            "mt5_access_disabled": True,
+            "monitoring_enabled": False,
+            "admin_note": reason,
+            "updated_at": now_iso()
+        }
+
+        query = supabase.table("traders").update(update)
+
+        if trader_id:
+            res = query.eq("id", trader_id).execute()
+        else:
+            res = query.eq("mt5_login", mt5_login).execute()
+
+        return ok(res.data, "MT5 access disabled")
+
+    except Exception as e:
+        return bad(e)
+
+@app.route("/trader_trades", methods=["GET"])
+def get_trader_trades():
+        
 @app.route("/trader_trades", methods=["GET"])
 def get_trader_trades():
     try:
