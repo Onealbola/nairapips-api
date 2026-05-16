@@ -719,13 +719,14 @@ def sync_trades():
     except Exception as e:
     return bad(e)
 
+
 @app.route("/disable_mt5_access", methods=["POST"])
 def disable_mt5_access():
     try:
         d = request.json or {}
         trader_id = d.get("trader_id")
         mt5_login = str(d.get("mt5_login") or "")
-        reason = d.get("reason") or "Account breached. MT5 access disabled by risk engine."
+        reason = d.get("reason") or "This MT5 account breached NairaPips rules and is no longer payout eligible."
 
         if not trader_id and not mt5_login:
             return bad("trader_id or mt5_login is required")
@@ -733,8 +734,9 @@ def disable_mt5_access():
         update = {
             "status": "breached",
             "phase": "breached",
-            "mt5_access_disabled": True,
             "monitoring_enabled": False,
+            "mt5_account_active": False,
+            "payout_eligible": False,
             "admin_note": reason,
             "updated_at": now_iso()
         }
@@ -746,10 +748,15 @@ def disable_mt5_access():
         else:
             res = query.eq("mt5_login", mt5_login).execute()
 
-        return ok(res.data, "MT5 access disabled")
+        return ok(res.data, "Breached MT5 account locked. Trader profile remains active.")
 
     except Exception as e:
         return bad(e)
+
+
+@app.route("/trader_trades", methods=["GET"])
+def get_trader_trades():
+
 
 @app.route("/trader_trades", methods=["GET"])
 def get_trader_trades():
