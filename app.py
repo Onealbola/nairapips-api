@@ -752,6 +752,114 @@ def disable_mt5_access():
 
     except Exception as e:
         return bad(e)
+ @app.route("/users_database", methods=["GET"])
+def users_database():
+    try:
+        status = request.args.get("status", "active")
+        search = request.args.get("search", "").strip()
+
+        q = supabase.table("traders").select(
+            "id,full_name,name,email,phone,whatsapp,country,status,phase,created_at,updated_at,marketing_deleted,marketing_consent,source"
+        ).order("created_at", desc=True)
+
+        if status == "deleted":
+            q = q.eq("marketing_deleted", True)
+        else:
+            q = q.or_("marketing_deleted.is.null,marketing_deleted.eq.false")
+
+        res = q.execute()
+        rows = getattr(res, "data", []) or []
+
+        if search:
+            s = search.lower()
+            rows = [
+                r for r in rows
+                if s in str(r.get("full_name") or r.get("name") or "").lower()
+                or s in str(r.get("email") or "").lower()
+                or s in str(r.get("phone") or "").lower()
+                or s in str(r.get("whatsapp") or "").lower()
+            ]
+
+        return jsonify(rows)
+
+    except Exception as e:
+        return bad(e)
+
+
+@app.route("/users_database/delete", methods=["POST"])
+def users_database_delete():
+    try:
+        d = request.json or {}
+        user_id = d.get("id")
+
+        if not user_id:
+            return bad("User id is required")
+
+        update = {
+            "marketing_deleted": True,
+            "deleted_at": now_iso(),
+            "updated_at": now_iso()
+        }
+
+        res = supabase.table("traders").update(update).eq("id", user_id).execute()
+        return ok(res.data, "User moved to deleted list")
+
+    except Exception as e:
+        return bad(e)
+
+
+@app.route("/users_database/restore", methods=["POST"])
+def users_database_restore():
+    try:
+        d = request.json or {}
+        user_id = d.get("id")
+
+        if not user_id:
+            return bad("User id is required")
+
+        update = {
+            "marketing_deleted": False,
+            "restored_at": now_iso(),
+            "updated_at": now_iso()
+        }
+
+        res = supabase.table("traders").update(update).eq("id", user_id).execute()
+        return ok(res.data, "User restored")
+
+    except Exception as e:
+        return bad(e)
+
+
+@app.route("/users_database/export", methods=["GET"])
+def users_database_export():
+    try:
+        field = request.args.get("field", "phone")
+
+        res = supabase.table("traders").select(
+            "email,phone,whatsapp,marketing_deleted,marketing_consent"
+        ).or_("marketing_deleted.is.null,marketing_deleted.eq.false").execute()
+
+        rows = getattr(res, "data", []) or []
+
+        values = []
+        for r in rows:
+            if r.get("marketing_consent") is False:
+                continue
+
+            value = r.get("whatsapp") or r.get("phone") if field == "phone" else r.get("email")
+
+            if value:
+                values.append(str(value).strip())
+
+        return jsonify({
+            "count": len(values),
+            "field": field,
+            "data": values,
+            "copy_text": "\n".join(values)
+        })
+
+    except Exception as e:
+        return bad(e)       
 @app.route("/trader_trades", methods=["GET"])
 def get_trader_trades():
     try:
