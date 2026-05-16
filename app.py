@@ -717,7 +717,7 @@ def sync_trades():
         return ok(saved, "Trades synced")
 
     except Exception as e:
-    return bad(e)
+        return bad(e)
 
 
 @app.route("/disable_mt5_access", methods=["POST"])
