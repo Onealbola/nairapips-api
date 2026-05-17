@@ -752,7 +752,7 @@ def disable_mt5_access():
 
     except Exception as e:
         return bad(e)
- @app.route("/users_database", methods=["GET"])
+@app.route("/users_database", methods=["GET"])
 def users_database():
     try:
         status = request.args.get("status", "active")
