@@ -1118,6 +1118,97 @@ def get_admin_traders():
             "success": False,
             "error": str(e)
         }), 500
+        @app.get('/marketing_deleted_contacts')
+def marketing_deleted_contacts():
+    try:
+        res = supabase.table('marketing_deleted_contacts').select('contact_id').execute()
+        return jsonify(res.data or [])
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/marketing_deleted_contacts/save')
+def save_marketing_deleted_contacts():
+    try:
+        body = request.get_json(silent=True) or {}
+        contact_ids = [str(x) for x in body.get('contact_ids', []) if str(x).strip()]
+
+        # Replace the admin soft-delete list in Supabase.
+        supabase.table('marketing_deleted_contacts').delete().neq('contact_id', '__never__').execute()
+        if contact_ids:
+            rows = [{'contact_id': cid, 'deleted_by': 'admin'} for cid in sorted(set(contact_ids))]
+            supabase.table('marketing_deleted_contacts').insert(rows).execute()
+
+        return jsonify({'success': True, 'contact_ids': contact_ids})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.get('/referral_settings')
+def get_referral_settings():
+    try:
+        res = supabase.table('referral_settings').select('*').eq('id', 'main').limit(1).execute()
+        row = (res.data or [{}])[0]
+        data = {
+            'programName': row.get('program_name') or 'NairaPips Referral Program',
+            'baseUrl': row.get('base_url') or 'https://nairapips.com',
+            'defaultCode': row.get('default_code') or 'NAIRAPIPS',
+            'rebateType': row.get('rebate_type') or 'percent',
+            'rebateValue': str(row.get('rebate_value') or '10'),
+            'customerBonus': row.get('customer_bonus') or '0',
+            'cookieDays': str(row.get('cookie_days') or '30'),
+            'minPayout': str(row.get('min_payout') or '5000'),
+            'status': row.get('status') or 'active',
+            'publicMessage': row.get('public_message') or 'Refer a trader to NairaPips and earn rebate when they buy a challenge.',
+            'payoutRule': row.get('payout_rule') or 'Rebate is approved only after a referred trader pays and passes payment verification.'
+        }
+        return jsonify({'success': True, 'data': data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/referral_settings')
+def update_referral_settings():
+    try:
+        body = request.get_json(silent=True) or {}
+        row = {
+            'id': 'main',
+            'program_name': body.get('programName'),
+            'base_url': body.get('baseUrl'),
+            'default_code': body.get('defaultCode'),
+            'rebate_type': body.get('rebateType'),
+            'rebate_value': body.get('rebateValue') or 0,
+            'customer_bonus': body.get('customerBonus'),
+            'cookie_days': int(body.get('cookieDays') or 30),
+            'min_payout': body.get('minPayout') or 0,
+            'status': body.get('status'),
+            'public_message': body.get('publicMessage'),
+            'payout_rule': body.get('payoutRule')
+        }
+        supabase.table('referral_settings').upsert(row, on_conflict='id').execute()
+        return get_referral_settings()
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/referral_settings/reset')
+def reset_referral_settings():
+    try:
+        default_row = {
+            'id': 'main',
+            'program_name': 'NairaPips Referral Program',
+            'base_url': 'https://nairapips.com',
+            'default_code': 'NAIRAPIPS',
+            'rebate_type': 'percent',
+            'rebate_value': 10,
+            'customer_bonus': '0',
+            'cookie_days': 30,
+            'min_payout': 5000,
+            'status': 'active',
+            'public_message': 'Refer a trader to NairaPips and earn rebate when they buy a challenge.',
+            'payout_rule': 'Rebate is approved only after a referred trader pays and passes payment verification.'
+        }
+        supabase.table('referral_settings').upsert(default_row, on_conflict='id').execute()
+        return get_referral_settings()
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
