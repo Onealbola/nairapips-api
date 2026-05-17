@@ -1119,7 +1119,7 @@ def get_admin_traders():
             "error": str(e)
         }), 500
         @app.get('/marketing_deleted_contacts')
-def marketing_deleted_contacts():
+        def marketing_deleted_contacts():
     try:
         res = supabase.table('marketing_deleted_contacts').select('contact_id').execute()
         return jsonify(res.data or [])
