@@ -1209,6 +1209,118 @@ def reset_referral_settings():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+# ===== NAIRAPIPS STAFF RBAC ROUTES =====
+# Paste above: if __name__ == "__main__":
+
+@app.get('/staff_members')
+def staff_members():
+    try:
+        res = supabase.table('admin_staff_members').select('*').order('created_at', desc=True).execute()
+        rows = res.data or []
+        for r in rows:
+            r.pop('password', None)
+        return jsonify(rows)
+    except Exception as e:
+        return jsonify([])
+
+@app.post('/staff_login')
+def staff_login():
+    try:
+        data = request.get_json() or {}
+        username = (data.get('username') or '').strip()
+        password = data.get('password') or ''
+        res = supabase.table('admin_staff_members').select('*').eq('username', username).eq('password', password).limit(1).execute()
+        rows = res.data or []
+        if not rows:
+            return jsonify({'success': False, 'error': 'Invalid login'}), 401
+        staff = rows[0]
+        if (staff.get('status') or 'active') != 'active':
+            return jsonify({'success': False, 'error': 'Staff account is not active'}), 403
+        supabase.table('admin_staff_members').update({'last_login_at': 'now()'}).eq('id', staff['id']).execute()
+        audit_log(staff, 'auth', 'login', 'Staff logged in')
+        staff.pop('password', None)
+        return jsonify({'success': True, 'staff': staff})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/staff_members')
+def create_staff_member():
+    try:
+        data = request.get_json() or {}
+        payload = {
+            'name': data.get('name'),
+            'email': data.get('email'),
+            'username': data.get('username'),
+            'password': data.get('password'),
+            'role': data.get('role') or 'support',
+            'permissions': data.get('permissions') or {},
+            'status': data.get('status') or 'active'
+        }
+        res = supabase.table('admin_staff_members').insert(payload).execute()
+        return jsonify({'success': True, 'data': res.data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/staff_members/update')
+def update_staff_member():
+    try:
+        data = request.get_json() or {}
+        staff_id = data.get('id')
+        payload = {k: data.get(k) for k in ['name','email','role','permissions'] if k in data}
+        res = supabase.table('admin_staff_members').update(payload).eq('id', staff_id).execute()
+        return jsonify({'success': True, 'data': res.data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/staff_members/status')
+def staff_member_status():
+    try:
+        data = request.get_json() or {}
+        res = supabase.table('admin_staff_members').update({'status': data.get('status')}).eq('id', data.get('id')).execute()
+        return jsonify({'success': True, 'data': res.data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/staff_members/password')
+def staff_member_password():
+    try:
+        data = request.get_json() or {}
+        res = supabase.table('admin_staff_members').update({'password': data.get('password')}).eq('id', data.get('id')).execute()
+        return jsonify({'success': True, 'data': res.data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/staff_members/delete')
+def staff_member_delete():
+    try:
+        data = request.get_json() or {}
+        res = supabase.table('admin_staff_members').delete().eq('id', data.get('id')).execute()
+        return jsonify({'success': True, 'data': res.data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.get('/audit_logs')
+def audit_logs():
+    try:
+        res = supabase.table('admin_audit_logs').select('*').order('created_at', desc=True).limit(100).execute()
+        return jsonify(res.data or [])
+    except Exception as e:
+        return jsonify([])
+
+def audit_log(staff, module, action, details=''):
+    try:
+        supabase.table('admin_audit_logs').insert({
+            'staff_id': str(staff.get('id','')),
+            'staff_name': staff.get('name'),
+            'username': staff.get('username'),
+            'role': staff.get('role'),
+            'module': module,
+            'action': action,
+            'details': details
+        }).execute()
+    except Exception:
+        pass
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
