@@ -1321,6 +1321,45 @@ def audit_log(staff, module, action, details=''):
     except Exception:
         pass
 
+# ===== NAIRAPIPS PAYMENT ACCOUNTS ROUTES =====
+# Paste above: if __name__ == "__main__":
+
+@app.get('/payment_accounts')
+def payment_accounts():
+    try:
+        res = supabase.table('payment_accounts').select('*').order('display_order', desc=False).execute()
+        return jsonify(res.data or [])
+    except Exception as e:
+        return jsonify([])
+
+@app.post('/save_payment_accounts')
+def save_payment_accounts():
+    try:
+        body = request.get_json(silent=True) or {}
+        accounts = body.get('accounts', []) or []
+
+        clean_rows = []
+        for idx, account in enumerate(accounts, start=1):
+            row = {
+                'label': str(account.get('label') or f'Payment Account {idx}').strip(),
+                'bank_name': str(account.get('bank_name') or '').strip(),
+                'account_name': str(account.get('account_name') or '').strip(),
+                'account_number': str(account.get('account_number') or '').strip(),
+                'account_type': str(account.get('account_type') or 'Bank Transfer').strip(),
+                'instructions': str(account.get('instructions') or 'Upload your proof of payment after transfer so admin can verify and activate your challenge.').strip(),
+                'status': str(account.get('status') or 'active').strip(),
+                'display_order': int(account.get('display_order') or idx)
+            }
+            clean_rows.append(row)
+
+        supabase.table('payment_accounts').delete().neq('id', -1).execute()
+        if clean_rows:
+            supabase.table('payment_accounts').insert(clean_rows).execute()
+
+        return jsonify({'success': True, 'data': clean_rows})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
