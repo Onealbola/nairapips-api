@@ -122,7 +122,7 @@ server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
 server.login(SMTP_EMAIL, SMTP_PASSWORD)
 server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
 server.quit()
-try:
+
     server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
     server.login(SMTP_EMAIL, SMTP_PASSWORD)
     server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
