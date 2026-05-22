@@ -1414,7 +1414,32 @@ def save_payment_accounts():
         return jsonify({'success': True, 'data': clean_rows})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+@app.route("/test_email")
+def test_email():
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = SMTP_EMAIL
+        msg["Subject"] = "NairaPips Email Test"
 
+        body = """
+NairaPips email system is working.
+
+This confirms support@nairapips.com can send automated emails from Render.
+
+NairaPips Team
+"""
+        msg.attach(MIMEText(body, "plain"))
+
+        server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.sendmail(SMTP_EMAIL, SMTP_EMAIL, msg.as_string())
+        server.quit()
+
+        return {"success": True, "message": "Test email sent"}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
