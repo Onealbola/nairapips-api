@@ -122,15 +122,20 @@ server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
 server.login(SMTP_EMAIL, SMTP_PASSWORD)
 server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
 server.quit()
+try:
+    server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
+    server.login(SMTP_EMAIL, SMTP_PASSWORD)
+    server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
+    server.quit()
 
-                server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
-                server.login(SMTP_EMAIL, SMTP_PASSWORD)
-                server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
-                server.quit()
+except Exception as mail_error:
+    print("Email error:", mail_error)
 
-        
 return ok(supabase.table("traders").insert(row).execute().data, "Trader added")
-except Exception as e: return bad(e)
+
+except Exception as e:
+    return bad(e)
+               
 @app.route("/delete_trader", methods=["POST"])
 def delete_trader():
     try:
