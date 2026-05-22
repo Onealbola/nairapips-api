@@ -124,8 +124,8 @@ server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
 server.quit()
 try:
     if SMTP_EMAIL and SMTP_PASSWORD and row.get("email"):
-        msg = MIMEMultipart()
 
+        msg = MIMEMultipart()
         msg["From"] = SMTP_EMAIL
         msg["To"] = row["email"]
         msg["Subject"] = "Welcome to NairaPips"
