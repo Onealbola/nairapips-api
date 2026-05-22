@@ -122,45 +122,15 @@ server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
 server.login(SMTP_EMAIL, SMTP_PASSWORD)
 server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
 server.quit()
-try:
-    if SMTP_EMAIL and SMTP_PASSWORD and row.get("email"):
-
-        msg = MIMEMultipart()
-        msg["From"] = SMTP_EMAIL
-        msg["To"] = row["email"]
-        msg["Subject"] = "Welcome to NairaPips"
-
-        body = f"""
-Welcome to NairaPips, {row['name']}.
-
-Your trader account has been created successfully.
-
-You can now login to your dashboard and begin your challenge.
-
-NairaPips Team
-"""
-
-        msg.attach(MIMEText(body, "plain"))
-
-        server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
-        server.quit()
-
-except Exception as mail_error:
-    print("Email error:", mail_error)        
-
-                msg.attach(MIMEText(body, "plain"))
 
                 server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
                 server.login(SMTP_EMAIL, SMTP_PASSWORD)
                 server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
                 server.quit()
 
-        except Exception as mail_error:
-            print("Email error:", mail_error)
+        
 return ok(supabase.table("traders").insert(row).execute().data, "Trader added")
-    except Exception as e: return bad(e)
+except Exception as e: return bad(e)
 @app.route("/delete_trader", methods=["POST"])
 def delete_trader():
     try:
