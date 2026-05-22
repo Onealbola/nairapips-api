@@ -5,12 +5,17 @@ from supabase import create_client
 from werkzeug.utils import secure_filename
 from datetime import datetime, timezone
 import os, random, uuid
-
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 app = Flask(__name__)
 CORS(app)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SMTP_EMAIL = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASS")
+
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
