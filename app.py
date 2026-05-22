@@ -19,7 +19,31 @@ SMTP_PASSWORD = os.getenv("SMTP_PASS")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+SMTP_HOST = os.getenv("SMTP_HOST", "mail.nairapips.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_EMAIL)
 
+def send_email(to_email, subject, message):
+    try:
+        if not to_email:
+            return False
+
+        msg = MIMEMultipart()
+        msg["From"] = FROM_EMAIL
+        msg["To"] = to_email
+        msg["Subject"] = subject
+
+        msg.attach(MIMEText(message, "plain"))
+
+        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.sendmail(FROM_EMAIL, to_email, msg.as_string())
+        server.quit()
+
+        return True
+    except Exception as e:
+        print("EMAIL ERROR:", str(e))
+        return False
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def ref(): return "NP-" + str(random.randint(100000,999999))
 def clean(v):
@@ -77,7 +101,54 @@ def add_trader():
             "account_reference":d.get("account_reference") or ref(),"challenge_started_at":d.get("challenge_started_at"),
             "approved_at":d.get("approved_at"),"funded_at":d.get("funded_at"),"last_login_at":None,"trading_days_left":d.get("trading_days_left",30)
         }
-        return ok(supabase.table("traders").insert(row).execute().data, "Trader added")
+msg = MIMEMultipart()
+msg["From"] = SMTP_EMAIL
+msg["To"] = row["email"]
+msg["Subject"] = "Welcome to NairaPips"
+
+body = f"""
+Welcome to NairaPips, {row['name']}.
+
+Your trader account has been created successfully.
+
+You can now login to your dashboard and begin your challenge.
+
+NairaPips Team
+"""
+
+msg.attach(MIMEText(body, "plain"))
+
+server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
+server.login(SMTP_EMAIL, SMTP_PASSWORD)
+server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
+server.quit()
+        try:
+            if SMTP_EMAIL and SMTP_PASSWORD and row.get("email"):
+                msg = MIMEMultipart()
+                msg["From"] = SMTP_EMAIL
+                msg["To"] = row["email"]
+                msg["Subject"] = "Welcome to NairaPips"
+
+                body = f"""
+                                 Welcome to NairaPips, {row['name']}.
+
+                                 Your trader account has been created successfully.
+
+                                 You can now login to your dashboard and begin your challenge.
+
+                                 NairaPips Team
+                                 """
+
+                msg.attach(MIMEText(body, "plain"))
+
+                server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
+                server.login(SMTP_EMAIL, SMTP_PASSWORD)
+                server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
+                server.quit()
+
+        except Exception as mail_error:
+            print("Email error:", mail_error)
+return ok(supabase.table("traders").insert(row).execute().data, "Trader added")
     except Exception as e: return bad(e)
 @app.route("/delete_trader", methods=["POST"])
 def delete_trader():
