@@ -122,22 +122,33 @@ server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
 server.login(SMTP_EMAIL, SMTP_PASSWORD)
 server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
 server.quit()
-        try:
-            if SMTP_EMAIL and SMTP_PASSWORD and row.get("email"):
-                msg = MIMEMultipart()
-                msg["From"] = SMTP_EMAIL
-                msg["To"] = row["email"]
-                msg["Subject"] = "Welcome to NairaPips"
+try:
+    if SMTP_EMAIL and SMTP_PASSWORD and row.get("email"):
+        msg = MIMEMultipart()
 
-                body = f"""
-                                 Welcome to NairaPips, {row['name']}.
+        msg["From"] = SMTP_EMAIL
+        msg["To"] = row["email"]
+        msg["Subject"] = "Welcome to NairaPips"
 
-                                 Your trader account has been created successfully.
+        body = f"""
+Welcome to NairaPips, {row['name']}.
 
-                                 You can now login to your dashboard and begin your challenge.
+Your trader account has been created successfully.
 
-                                 NairaPips Team
-                                 """
+You can now login to your dashboard and begin your challenge.
+
+NairaPips Team
+"""
+
+        msg.attach(MIMEText(body, "plain"))
+
+        server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
+        server.login(SMTP_EMAIL, SMTP_PASSWORD)
+        server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
+        server.quit()
+
+except Exception as mail_error:
+    print("Email error:", mail_error)        
 
                 msg.attach(MIMEText(body, "plain"))
 
