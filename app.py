@@ -89,53 +89,46 @@ def get_traders():
 @app.route("/traders", methods=["POST"])
 def add_trader():
     try:
-        d=request.json or {}; bal=clean(d.get("balance") or d.get("account_size"))
-        row={
-            "name":d.get("name",""),"phone":d.get("phone",""),"email":d.get("email",""),
-            "mt5_login":d.get("mt5_login",""),"mt5_server":d.get("mt5_server",""),
-            "mt5_master_password":d.get("mt5_master_password",""),"mt5_investor_password":d.get("mt5_investor_password",""),
-            "account_size":bal,"balance":bal,"equity":bal,"phase":d.get("phase","no_account"),"status":d.get("status","payment_pending"),
-            "engine_group":d.get("engine_group","engine_1"),"profit":0,"drawdown":0,"profit_percent":0,"drawdown_percent":0,
-            "payment_status":d.get("payment_status","pending"),"payment_proof_url":d.get("payment_proof_url",""),
-            "selected_plan":d.get("selected_plan",""),"payment_note":d.get("payment_note",""),"approved_by":"","admin_note":"",
-            "account_reference":d.get("account_reference") or ref(),"challenge_started_at":d.get("challenge_started_at"),
-            "approved_at":d.get("approved_at"),"funded_at":d.get("funded_at"),"last_login_at":None,"trading_days_left":d.get("trading_days_left",30)
+        d = request.json or {}
+        bal = clean(d.get("balance") or d.get("account_size"))
+
+        row = {
+            "name": d.get("name", ""),
+            "phone": d.get("phone", ""),
+            "email": d.get("email", ""),
+            "mt5_login": d.get("mt5_login", ""),
+            "mt5_server": d.get("mt5_server", ""),
+            "mt5_master_password": d.get("mt5_master_password", ""),
+            "mt5_investor_password": d.get("mt5_investor_password", ""),
+            "account_size": bal,
+            "balance": bal,
+            "equity": bal,
+            "phase": d.get("phase", "no_account"),
+            "status": d.get("status", "payment_pending"),
+            "engine_group": d.get("engine_group", "engine_1"),
+            "profit": 0,
+            "drawdown": 0,
+            "profit_percent": 0,
+            "drawdown_percent": 0,
+            "payment_status": d.get("payment_status", "pending"),
+            "payment_proof_url": d.get("payment_proof_url", ""),
+            "selected_plan": d.get("selected_plan", ""),
+            "payment_note": d.get("payment_note", ""),
+            "approved_by": "",
+            "admin_note": "",
+            "account_reference": d.get("account_reference") or ref(),
+            "challenge_started_at": d.get("challenge_started_at"),
+            "approved_at": d.get("approved_at"),
+            "funded_at": d.get("funded_at"),
+            "last_login_at": None,
+            "trading_days_left": d.get("trading_days_left", 30)
         }
-msg = MIMEMultipart()
-msg["From"] = SMTP_EMAIL
-msg["To"] = row["email"]
-msg["Subject"] = "Welcome to NairaPips"
 
-body = f"""
-Welcome to NairaPips, {row['name']}.
+        return ok(supabase.table("traders").insert(row).execute().data, "Trader added")
 
-Your trader account has been created successfully.
-
-You can now login to your dashboard and begin your challenge.
-
-NairaPips Team
-"""
-
-msg.attach(MIMEText(body, "plain"))
-
-server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
-server.login(SMTP_EMAIL, SMTP_PASSWORD)
-server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
-server.quit()
-
-    server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
-    server.login(SMTP_EMAIL, SMTP_PASSWORD)
-    server.sendmail(SMTP_EMAIL, row["email"], msg.as_string())
-    server.quit()
-
-except Exception as mail_error:
-    print("Email error:", mail_error)
-
-return ok(supabase.table("traders").insert(row).execute().data, "Trader added")
-
-except Exception as e:
-    return bad(e)
-               
+    except Exception as e:
+        return bad(e)
+              
 @app.route("/delete_trader", methods=["POST"])
 def delete_trader():
     try:
