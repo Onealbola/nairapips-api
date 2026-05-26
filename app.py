@@ -39,6 +39,7 @@ def _ok(data=None, status=200):
 def _fail(message, status=400):
     return _ok({"success": False, "error": message}, status)
 
+
 @app.route("/update_trader_mt5", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
 def update_trader_mt5():
@@ -46,7 +47,6 @@ def update_trader_mt5():
         return _ok({})
 
     data = request.get_json(silent=True) or {}
-
     trader_id = data.get("id") or data.get("trader_id")
     if not trader_id:
         return _fail("Trader ID is required")
@@ -56,44 +56,35 @@ def update_trader_mt5():
 
     if not mt5_login:
         return _fail("MT5 login is required")
-
     if not mt5_server:
         return _fail("MT5 server is required")
 
-    master_password = (
-        data.get("mt5_password")
-        or data.get("master_password")
-        or data.get("mt5_master_password")
-        or ""
-    )
-
-    investor_password = (
-        data.get("mt5_investor_password")
-        or data.get("investor_password")
-        or ""
-    )
+    master_password = data.get("mt5_password") or data.get("master_password") or data.get("mt5_master_password") or ""
+    investor_password = data.get("mt5_investor_password") or data.get("investor_password") or ""
+    now = datetime.now(timezone.utc).isoformat()
 
     update_data = {
         "mt5_login": mt5_login,
         "mt5_server": mt5_server,
         "mt5_password": master_password,
         "master_password": master_password,
+        "mt5_master_password": master_password,
         "mt5_investor_password": investor_password,
         "investor_password": investor_password,
         "phase": data.get("phase") or "phase1",
         "status": data.get("status") or "active",
         "payment_status": data.get("payment_status") or "approved",
-        "mt5_updated_at": datetime.now(timezone.utc).isoformat(),
+        "mt5_updated_at": now,
+        "updated_at": now,
         "mt5_updated_by": data.get("mt5_updated_by") or "admin",
         "mt5_reset_reason": data.get("mt5_reset_reason") or "MT5 login details updated",
         "admin_note": data.get("admin_note") or "MT5 login details updated",
     }
 
-    # Remove empty password values only if you do not want blank fields to overwrite old password.
-    # Keep this if you want empty prompt to preserve old password.
     if not str(master_password).strip():
         update_data.pop("mt5_password", None)
         update_data.pop("master_password", None)
+        update_data.pop("mt5_master_password", None)
 
     if not str(investor_password).strip():
         update_data.pop("mt5_investor_password", None)
@@ -101,68 +92,57 @@ def update_trader_mt5():
 
     try:
         result = supabase.table("traders").update(update_data).eq("id", trader_id).execute()
-        return _ok({"success": True, "message": "MT5 details updated", "data": getattr(result, "data", None)})
+        trader_rows = getattr(result, "data", []) or []
+        trader_email = trader_rows[0].get("email") if trader_rows else ""
+        trader_phone = trader_rows[0].get("phone") if trader_rows else ""
+
+        purchase_update = {
+            "mt5_login": mt5_login,
+            "mt5_server": mt5_server,
+            "mt5_password": master_password,
+            "master_password": master_password,
+            "mt5_master_password": master_password,
+            "mt5_investor_password": investor_password,
+            "investor_password": investor_password,
+            "assigned_at": now,
+            "updated_at": now,
+            "payment_status": "approved",
+            "status": "approved",
+            "admin_note": data.get("admin_note") or "MT5 login details updated",
+        }
+
+        if not str(master_password).strip():
+            purchase_update.pop("mt5_password", None)
+            purchase_update.pop("master_password", None)
+            purchase_update.pop("mt5_master_password", None)
+
+        if not str(investor_password).strip():
+            purchase_update.pop("mt5_investor_password", None)
+            purchase_update.pop("investor_password", None)
+
+        try:
+            supabase.table("challenge_purchases").update(purchase_update).eq("trader_id", trader_id).execute()
+        except Exception:
+            pass
+
+        if trader_email:
+            try:
+                supabase.table("challenge_purchases").update(purchase_update).eq("email", trader_email).execute()
+            except Exception:
+                pass
+
+        if trader_phone:
+            try:
+                supabase.table("challenge_purchases").update(purchase_update).eq("phone", trader_phone).execute()
+            except Exception:
+                pass
+
+        return _ok({"success": True, "message": "MT5 details updated and synced", "data": trader_rows})
     except Exception as e:
         return _fail(str(e), 500)
 
 
 # Optional compatibility endpoint if admin calls /update_trader
-@app.route("/update_trader", methods=["POST", "OPTIONS"])
-def update_trader():
-    if request.method == "OPTIONS":
-        return _ok({})
-
-    data = request.get_json(silent=True) or {}
-    trader_id = data.get("id") or data.get("trader_id")
-    if not trader_id:
-        return _fail("Trader ID is required")
-
-    allowed = [
-        "name", "email", "phone", "selected_plan", "account_size", "balance",
-        "mt5_login", "mt5_server", "mt5_password", "master_password",
-        "mt5_investor_password", "investor_password", "phase", "status",
-        "payment_status", "admin_note", "mt5_updated_at", "mt5_updated_by",
-        "mt5_reset_reason"
-    ]
-
-    update_data = {k: data[k] for k in allowed if k in data and data[k] is not None}
-    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-    try:
-        result = supabase.table("traders").update(update_data).eq("id", trader_id).execute()
-          trader_rows = getattr(result, "data", []) or []
-          trader_email = trader_rows[0].get("email") if trader_rows else ""
-          trader_phone = trader_rows[0].get("phone") if trader_rows else ""
-
-         purchase_update = {
-         "mt5_login": mt5_login,
-         "mt5_server": mt5_server,
-         "mt5_password": master_password,
-         "master_password": master_password,
-         "mt5_investor_password": investor_password,
-         "investor_password": investor_password,
-         "assigned_at": datetime.now(timezone.utc).isoformat(),
-         "payment_status": "approved",
-         "status": "approved",
-         "admin_note": data.get("admin_note") or "MT5 login details updated"
-    }
-
-    if trader_email:
-        supabase.table("challenge_purchases").update(purchase_update).eq("email", trader_email).execute()
-
-    if trader_phone:
-        supabase.table("challenge_purchases").update(purchase_update).eq("phone", trader_phone).execute()
-
-        except Exception:
-            pass
-        return _ok({"success": True, "message": "Trader updated", "data": getattr(result, "data", None)})
-    except Exception as e:
-        return _fail(str(e), 500)
-
-
-   
-
-
 
 
 SMTP_HOST = os.getenv("SMTP_HOST", "mail.nairapips.com")
@@ -321,18 +301,53 @@ def delete_trader():
 
     except Exception as e:
         return bad(e)
+
 @app.route("/login_trader", methods=["POST"])
 def login_trader():
     try:
-        lookup=str((request.json or {}).get("lookup","")).strip().lower()
-        if not lookup: return bad("Missing lookup")
-        res=supabase.table("traders").select("*").or_(f"email.eq.{lookup},phone.eq.{lookup}").limit(1).execute()
-        if not res.data: return bad("Trader not found",404)
-        trader=res.data[0]; t=now_iso()
-        supabase.table("traders").update({"last_login_at":t}).eq("id",trader["id"]).execute()
-        trader["last_login_at"]=t
+        lookup = str((request.json or {}).get("lookup", "")).strip().lower()
+        if not lookup:
+            return bad("Missing lookup")
+
+        res = supabase.table("traders").select("*").execute()
+        rows = getattr(res, "data", []) or []
+        matches = []
+
+        for t in rows:
+            email = str(t.get("email") or "").strip().lower()
+            phone = str(t.get("phone") or "").strip().lower()
+            mt5 = str(t.get("mt5_login") or "").strip().lower()
+            ref_code = str(t.get("account_reference") or "").strip().lower()
+            if lookup in [email, phone, mt5, ref_code]:
+                matches.append(t)
+
+        if not matches:
+            return bad("Trader not found", 404)
+
+        def row_score(t):
+            score = 0
+            if str(t.get("mt5_login") or "").strip():
+                score += 10000
+            if str(t.get("mt5_updated_at") or "").strip():
+                score += 20000
+            for key in ["mt5_updated_at", "updated_at", "approved_at", "created_at"]:
+                value = t.get(key)
+                if value:
+                    try:
+                        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                        score += int(dt.timestamp())
+                        break
+                    except Exception:
+                        pass
+            return score
+
+        trader = sorted(matches, key=row_score, reverse=True)[0]
+        t = now_iso()
+        supabase.table("traders").update({"last_login_at": t}).eq("id", trader["id"]).execute()
+        trader["last_login_at"] = t
         return ok(trader, "Login successful")
-    except Exception as e: return bad(e)
+    except Exception as e:
+        return bad(e)
 
 @app.route("/approve_payment", methods=["POST"])
 def approve_payment():
