@@ -134,6 +134,231 @@ def update_trader():
     except Exception as e:
         return _fail(str(e), 500)
 
+# ============================================================
+# NAIRAPIPS MT5 SOURCE-OF-TRUTH BACKEND PATCH
+# Paste this in app.py AFTER supabase = create_client(...)
+#
+# What this fixes:
+# 1. Admin Reset MT5 updates traders table
+# 2. It also syncs challenge_purchases table so old purchase MT5 does not keep showing
+# 3. /login_trader always returns the latest trader record from traders table
+# ============================================================
+
+from datetime import datetime, timezone
+from flask import request, jsonify
+
+def np_ok(data=None, status=200):
+    res = jsonify(data or {"success": True})
+    res.status_code = status
+    res.headers["Access-Control-Allow-Origin"] = "*"
+    res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return res
+
+def np_fail(message, status=400):
+    return np_ok({"success": False, "error": message}, status)
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+def clean(v):
+    return str(v or "").strip()
+
+def lower(v):
+    return clean(v).lower()
+
+def latest_record(rows):
+    if not rows:
+        return None
+
+    def score(row):
+        s = 0
+        if clean(row.get("mt5_login")):
+            s += 5000
+        if clean(row.get("mt5_updated_at")):
+            s += 8000
+        for key in ["mt5_updated_at", "updated_at", "approved_at", "created_at"]:
+            try:
+                dt = datetime.fromisoformat(str(row.get(key, "")).replace("Z", "+00:00"))
+                s += int(dt.timestamp())
+                break
+            except Exception:
+                pass
+        return s
+
+    return sorted(rows, key=score, reverse=True)[0]
+
+
+@app.route("/login_trader", methods=["POST", "OPTIONS"])
+def login_trader():
+    if request.method == "OPTIONS":
+        return np_ok({})
+
+    data = request.get_json(silent=True) or {}
+    lookup = lower(data.get("lookup") or data.get("email") or data.get("phone"))
+
+    if not lookup:
+        return np_fail("Email or phone is required")
+
+    try:
+        traders_result = supabase.table("traders").select("*").execute()
+        rows = getattr(traders_result, "data", []) or []
+
+        matches = []
+        for t in rows:
+            if (
+                lower(t.get("email")) == lookup or
+                lower(t.get("phone")) == lookup or
+                lower(t.get("mt5_login")) == lookup or
+                lower(t.get("account_reference")) == lookup
+            ):
+                matches.append(t)
+
+        if not matches:
+            return np_fail("Trader not found", 404)
+
+        trader = latest_record(matches)
+
+        return np_ok({
+            "success": True,
+            "data": trader,
+            "trader": trader
+        })
+
+    except Exception as e:
+        return np_fail(str(e), 500)
+
+
+@app.route("/update_trader_mt5", methods=["POST", "OPTIONS"])
+@app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
+def update_trader_mt5():
+    if request.method == "OPTIONS":
+        return np_ok({})
+
+    data = request.get_json(silent=True) or {}
+
+    trader_id = data.get("id") or data.get("trader_id")
+    if not trader_id:
+        return np_fail("Trader ID is required")
+
+    mt5_login = clean(data.get("mt5_login"))
+    mt5_server = clean(data.get("mt5_server"))
+
+    if not mt5_login:
+        return np_fail("MT5 login is required")
+
+    if not mt5_server:
+        return np_fail("MT5 server is required")
+
+    master_password = (
+        data.get("mt5_password")
+        or data.get("master_password")
+        or data.get("mt5_master_password")
+        or ""
+    )
+
+    investor_password = (
+        data.get("mt5_investor_password")
+        or data.get("investor_password")
+        or ""
+    )
+
+    updated_at = now_iso()
+
+    update_data = {
+        "mt5_login": mt5_login,
+        "mt5_server": mt5_server,
+        "mt5_password": master_password,
+        "master_password": master_password,
+        "mt5_investor_password": investor_password,
+        "investor_password": investor_password,
+        "phase": data.get("phase") or "phase1",
+        "status": data.get("status") or "active",
+        "payment_status": data.get("payment_status") or "approved",
+        "mt5_updated_at": updated_at,
+        "updated_at": updated_at,
+        "mt5_updated_by": data.get("mt5_updated_by") or "admin",
+        "mt5_reset_reason": data.get("mt5_reset_reason") or "MT5 login details updated",
+        "admin_note": data.get("admin_note") or "MT5 login details updated",
+    }
+
+    # Preserve old passwords if admin leaves them blank
+    if not clean(master_password):
+        update_data.pop("mt5_password", None)
+        update_data.pop("master_password", None)
+
+    if not clean(investor_password):
+        update_data.pop("mt5_investor_password", None)
+        update_data.pop("investor_password", None)
+
+    try:
+        # 1. Update traders table - this is the trader dashboard source of truth
+        trader_result = supabase.table("traders").update(update_data).eq("id", trader_id).execute()
+        trader_rows = getattr(trader_result, "data", []) or []
+
+        trader_email = ""
+        trader_phone = ""
+
+        if trader_rows:
+            trader_email = clean(trader_rows[0].get("email"))
+            trader_phone = clean(trader_rows[0].get("phone"))
+        else:
+            # fallback: fetch trader to get email/phone
+            fetch_result = supabase.table("traders").select("*").eq("id", trader_id).execute()
+            fetched = getattr(fetch_result, "data", []) or []
+            if fetched:
+                trader_email = clean(fetched[0].get("email"))
+                trader_phone = clean(fetched[0].get("phone"))
+
+        # 2. Also sync challenge_purchases because dashboard may show account details from purchase history
+        purchase_update = {
+            "mt5_login": mt5_login,
+            "mt5_server": mt5_server,
+            "mt5_password": master_password,
+            "master_password": master_password,
+            "mt5_investor_password": investor_password,
+            "investor_password": investor_password,
+            "assigned_at": updated_at,
+            "updated_at": updated_at,
+            "payment_status": "approved",
+            "status": "approved",
+            "admin_note": data.get("admin_note") or "MT5 login details updated",
+        }
+
+        if not clean(master_password):
+            purchase_update.pop("mt5_password", None)
+            purchase_update.pop("master_password", None)
+
+        if not clean(investor_password):
+            purchase_update.pop("mt5_investor_password", None)
+            purchase_update.pop("investor_password", None)
+
+        try:
+            supabase.table("challenge_purchases").update(purchase_update).eq("trader_id", trader_id).execute()
+        except Exception:
+            pass
+
+        if trader_email:
+            try:
+                supabase.table("challenge_purchases").update(purchase_update).eq("email", trader_email).execute()
+            except Exception:
+                pass
+
+        if trader_phone:
+            try:
+                supabase.table("challenge_purchases").update(purchase_update).eq("phone", trader_phone).execute()
+            except Exception:
+                pass
+
+        return np_ok({
+            "success": True,
+            "message": "MT5 details updated and synced",
+            "data": trader_rows
+        })
+
+    except Exception as e:
+        return np_fail(str(e), 500)
+
 SMTP_HOST = os.getenv("SMTP_HOST", "mail.nairapips.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_EMAIL)
