@@ -21,7 +21,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ================================
-# NAIRAPIPS MT5 SOURCE OF TRUTH ROUTES
+# NAIRAPIPS MT5 SOURCE-OF-TRUTH CORE
 # ================================
 
 def _np_ok(data=None, status=200):
@@ -35,7 +35,7 @@ def _np_ok(data=None, status=200):
 def _np_fail(message, status=400):
     return _np_ok({"success": False, "error": str(message)}, status)
 
-def _safe_dt_score(value):
+def _dt_score(value):
     try:
         if not value:
             return 0
@@ -43,25 +43,47 @@ def _safe_dt_score(value):
     except Exception:
         return 0
 
-def _trader_source_score(t):
+def _row_score(t):
     status = str(t.get("status") or "").strip().lower()
     pay = str(t.get("payment_status") or "").strip().lower()
     score = 0
+
     if pay == "approved":
-        score += 20000000000
+        score += 90_000_000_000
     if status in ["active", "funded", "live"]:
-        score += 15000000000
-    if pay == "rejected" or status in ["rejected", "payment_rejected"]:
-        score -= 30000000000
+        score += 80_000_000_000
     if str(t.get("mt5_login") or "").strip():
-        score += 10000000000
+        score += 70_000_000_000
     if str(t.get("mt5_updated_at") or "").strip():
-        score += 5000000000
-    for key in ["mt5_updated_at", "updated_at", "approved_at", "challenge_started_at", "created_at", "last_login_at"]:
-        score += _safe_dt_score(t.get(key))
-        if _safe_dt_score(t.get(key)):
+        score += 60_000_000_000
+    if pay == "rejected" or status in ["rejected", "payment_rejected"]:
+        score -= 99_000_000_000
+    if status in ["no_account", "new_signup", "pending", "payment_pending"]:
+        score -= 50_000_000_000
+
+    for key in ["mt5_updated_at", "updated_at", "approved_at", "challenge_started_at", "assigned_at", "created_at", "last_login_at"]:
+        d = _dt_score(t.get(key))
+        if d:
+            score += d
             break
+
     return score
+
+def _dedupe_traders(rows):
+    groups = {}
+    for row in rows or []:
+        email = str(row.get("email") or "").strip().lower()
+        phone = str(row.get("phone") or "").strip().lower()
+        key = email or phone or str(row.get("id") or "")
+        groups.setdefault(key, []).append(row)
+
+    output = []
+    for key, items in groups.items():
+        items = sorted(items, key=_row_score, reverse=True)
+        output.append(items[0])
+
+    output.sort(key=_row_score, reverse=True)
+    return output
 
 def _latest_trader_for_lookup(lookup):
     lookup = str(lookup or "").strip().lower()
@@ -86,7 +108,7 @@ def _latest_trader_for_lookup(lookup):
     if not matches:
         return None
 
-    return sorted(matches, key=_trader_source_score, reverse=True)[0]
+    return sorted(matches, key=_row_score, reverse=True)[0]
 
 def _safe_update_table(table, payload, column, value):
     try:
@@ -171,6 +193,7 @@ def update_trader_mt5():
             "updated_at": now,
             "admin_note": data.get("admin_note") or "MT5 login details updated",
         }
+
         if not str(master_password).strip():
             for k in ["mt5_master_password", "mt5_password", "master_password"]:
                 purchase_update.pop(k, None)
@@ -197,7 +220,7 @@ def trader_source():
         return _np_fail("Trader not found", 404)
     return _np_ok({"success": True, "data": trader, "trader": trader})
 
-@app.route("/trader_source/<lookup>", methods=["GET"])
+@app.route("/trader_source/<path:lookup>", methods=["GET"])
 def trader_source_get(lookup):
     trader = _latest_trader_for_lookup(lookup)
     if not trader:
@@ -268,10 +291,21 @@ def upload_payment_proof():
         print("UPLOAD PAYMENT PROOF ERROR:", repr(e))
         return jsonify({"success": False, "error": str(e), "hint": "Create a PUBLIC Supabase Storage bucket named payment-proofs."}), 400
 
+@app.route("/traders_raw", methods=["GET"])
+def get_traders_raw():
+    try:
+        return jsonify(supabase.table("traders").select("*").order("created_at", desc=True).execute().data)
+    except Exception as e:
+        return bad(e)
+
 @app.route("/traders", methods=["GET"])
 def get_traders():
-    try: return jsonify(supabase.table("traders").select("*").order("created_at", desc=True).execute().data)
-    except Exception as e: return bad(e)
+    try:
+        res = supabase.table("traders").select("*").execute()
+        rows = getattr(res, "data", []) or []
+        return jsonify(_dedupe_traders(rows))
+    except Exception as e:
+        return bad(e)
 
 @app.route("/traders", methods=["POST"])
 def add_trader():
@@ -362,7 +396,6 @@ def delete_trader():
 
     except Exception as e:
         return bad(e)
-
 @app.route("/login_trader", methods=["POST"])
 def login_trader():
     try:
