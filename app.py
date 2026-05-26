@@ -21,14 +21,10 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ================================
-# NAIRAPIPS MT5 RESET BACKEND PATCH
-# Add this inside your Flask app.py AFTER supabase is initialized.
+# NAIRAPIPS MT5 SOURCE OF TRUTH ROUTES
 # ================================
 
-from datetime import datetime, timezone
-from flask import request, jsonify
-
-def _ok(data=None, status=200):
+def _np_ok(data=None, status=200):
     res = jsonify(data or {"success": True})
     res.status_code = status
     res.headers["Access-Control-Allow-Origin"] = "*"
@@ -36,44 +32,106 @@ def _ok(data=None, status=200):
     res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return res
 
-def _fail(message, status=400):
-    return _ok({"success": False, "error": message}, status)
+def _np_fail(message, status=400):
+    return _np_ok({"success": False, "error": str(message)}, status)
 
+def _safe_dt_score(value):
+    try:
+        if not value:
+            return 0
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return 0
+
+def _trader_source_score(t):
+    status = str(t.get("status") or "").strip().lower()
+    pay = str(t.get("payment_status") or "").strip().lower()
+    score = 0
+    if pay == "approved":
+        score += 20000000000
+    if status in ["active", "funded", "live"]:
+        score += 15000000000
+    if pay == "rejected" or status in ["rejected", "payment_rejected"]:
+        score -= 30000000000
+    if str(t.get("mt5_login") or "").strip():
+        score += 10000000000
+    if str(t.get("mt5_updated_at") or "").strip():
+        score += 5000000000
+    for key in ["mt5_updated_at", "updated_at", "approved_at", "challenge_started_at", "created_at", "last_login_at"]:
+        score += _safe_dt_score(t.get(key))
+        if _safe_dt_score(t.get(key)):
+            break
+    return score
+
+def _latest_trader_for_lookup(lookup):
+    lookup = str(lookup or "").strip().lower()
+    if not lookup:
+        return None
+
+    res = supabase.table("traders").select("*").execute()
+    rows = getattr(res, "data", []) or []
+
+    matches = []
+    for t in rows:
+        keys = [
+            str(t.get("email") or "").strip().lower(),
+            str(t.get("phone") or "").strip().lower(),
+            str(t.get("mt5_login") or "").strip().lower(),
+            str(t.get("account_reference") or "").strip().lower(),
+            str(t.get("id") or "").strip().lower(),
+        ]
+        if lookup in keys:
+            matches.append(t)
+
+    if not matches:
+        return None
+
+    return sorted(matches, key=_trader_source_score, reverse=True)[0]
+
+def _safe_update_table(table, payload, column, value):
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return supabase.table(table).update(payload).eq(column, value).execute()
+    except Exception as e:
+        print(f"SAFE UPDATE FAILED {table}.{column}:", e)
+        return None
 
 @app.route("/update_trader_mt5", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
 def update_trader_mt5():
     if request.method == "OPTIONS":
-        return _ok({})
+        return _np_ok({})
 
     data = request.get_json(silent=True) or {}
     trader_id = data.get("id") or data.get("trader_id")
     if not trader_id:
-        return _fail("Trader ID is required")
+        return _np_fail("Trader ID is required")
 
     mt5_login = str(data.get("mt5_login") or "").strip()
     mt5_server = str(data.get("mt5_server") or "").strip()
-
     if not mt5_login:
-        return _fail("MT5 login is required")
+        return _np_fail("MT5 login is required")
     if not mt5_server:
-        return _fail("MT5 server is required")
+        return _np_fail("MT5 server is required")
 
     master_password = data.get("mt5_password") or data.get("master_password") or data.get("mt5_master_password") or ""
     investor_password = data.get("mt5_investor_password") or data.get("investor_password") or ""
     now = datetime.now(timezone.utc).isoformat()
 
-    update_data = {
+    trader_update = {
         "mt5_login": mt5_login,
         "mt5_server": mt5_server,
-        "mt5_password": master_password,
-        "master_password": master_password,
         "mt5_master_password": master_password,
         "mt5_investor_password": investor_password,
+        "mt5_password": master_password,
+        "master_password": master_password,
         "investor_password": investor_password,
         "phase": data.get("phase") or "phase1",
         "status": data.get("status") or "active",
         "payment_status": data.get("payment_status") or "approved",
+        "approved_at": data.get("approved_at") or now,
+        "challenge_started_at": data.get("challenge_started_at") or now,
         "mt5_updated_at": now,
         "updated_at": now,
         "mt5_updated_by": data.get("mt5_updated_by") or "admin",
@@ -82,67 +140,70 @@ def update_trader_mt5():
     }
 
     if not str(master_password).strip():
-        update_data.pop("mt5_password", None)
-        update_data.pop("master_password", None)
-        update_data.pop("mt5_master_password", None)
-
+        for k in ["mt5_master_password", "mt5_password", "master_password"]:
+            trader_update.pop(k, None)
     if not str(investor_password).strip():
-        update_data.pop("mt5_investor_password", None)
-        update_data.pop("investor_password", None)
+        for k in ["mt5_investor_password", "investor_password"]:
+            trader_update.pop(k, None)
 
     try:
-        result = supabase.table("traders").update(update_data).eq("id", trader_id).execute()
+        result = supabase.table("traders").update(trader_update).eq("id", trader_id).execute()
         trader_rows = getattr(result, "data", []) or []
-        trader_email = trader_rows[0].get("email") if trader_rows else ""
-        trader_phone = trader_rows[0].get("phone") if trader_rows else ""
+        if not trader_rows:
+            fetched = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute()
+            trader_rows = getattr(fetched, "data", []) or []
+
+        trader_email = (trader_rows[0].get("email") if trader_rows else "") or data.get("email") or ""
+        trader_phone = (trader_rows[0].get("phone") if trader_rows else "") or data.get("phone") or ""
 
         purchase_update = {
             "mt5_login": mt5_login,
             "mt5_server": mt5_server,
-            "mt5_password": master_password,
-            "master_password": master_password,
             "mt5_master_password": master_password,
             "mt5_investor_password": investor_password,
+            "mt5_password": master_password,
+            "master_password": master_password,
             "investor_password": investor_password,
-            "assigned_at": now,
-            "updated_at": now,
             "payment_status": "approved",
             "status": "approved",
+            "assigned_at": now,
+            "approved_at": now,
+            "updated_at": now,
             "admin_note": data.get("admin_note") or "MT5 login details updated",
         }
-
         if not str(master_password).strip():
-            purchase_update.pop("mt5_password", None)
-            purchase_update.pop("master_password", None)
-            purchase_update.pop("mt5_master_password", None)
-
+            for k in ["mt5_master_password", "mt5_password", "master_password"]:
+                purchase_update.pop(k, None)
         if not str(investor_password).strip():
-            purchase_update.pop("mt5_investor_password", None)
-            purchase_update.pop("investor_password", None)
+            for k in ["mt5_investor_password", "investor_password"]:
+                purchase_update.pop(k, None)
 
-        try:
-            supabase.table("challenge_purchases").update(purchase_update).eq("trader_id", trader_id).execute()
-        except Exception:
-            pass
+        _safe_update_table("challenge_purchases", purchase_update, "trader_id", trader_id)
+        _safe_update_table("challenge_purchases", purchase_update, "email", trader_email)
+        _safe_update_table("challenge_purchases", purchase_update, "phone", trader_phone)
 
-        if trader_email:
-            try:
-                supabase.table("challenge_purchases").update(purchase_update).eq("email", trader_email).execute()
-            except Exception:
-                pass
-
-        if trader_phone:
-            try:
-                supabase.table("challenge_purchases").update(purchase_update).eq("phone", trader_phone).execute()
-            except Exception:
-                pass
-
-        return _ok({"success": True, "message": "MT5 details updated and synced", "data": trader_rows})
+        return _np_ok({"success": True, "message": "MT5 details updated and synced", "data": trader_rows})
     except Exception as e:
-        return _fail(str(e), 500)
+        return _np_fail(e, 500)
 
+@app.route("/trader_source", methods=["POST", "OPTIONS"])
+def trader_source():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    data = request.get_json(silent=True) or {}
+    lookup = data.get("lookup") or data.get("email") or data.get("phone") or data.get("id")
+    trader = _latest_trader_for_lookup(lookup)
+    if not trader:
+        return _np_fail("Trader not found", 404)
+    return _np_ok({"success": True, "data": trader, "trader": trader})
 
-# Optional compatibility endpoint if admin calls /update_trader
+@app.route("/trader_source/<lookup>", methods=["GET"])
+def trader_source_get(lookup):
+    trader = _latest_trader_for_lookup(lookup)
+    if not trader:
+        return _np_fail("Trader not found", 404)
+    return _np_ok({"success": True, "data": trader, "trader": trader})
+
 
 
 SMTP_HOST = os.getenv("SMTP_HOST", "mail.nairapips.com")
@@ -308,40 +369,9 @@ def login_trader():
         lookup = str((request.json or {}).get("lookup", "")).strip().lower()
         if not lookup:
             return bad("Missing lookup")
-
-        res = supabase.table("traders").select("*").execute()
-        rows = getattr(res, "data", []) or []
-        matches = []
-
-        for t in rows:
-            email = str(t.get("email") or "").strip().lower()
-            phone = str(t.get("phone") or "").strip().lower()
-            mt5 = str(t.get("mt5_login") or "").strip().lower()
-            ref_code = str(t.get("account_reference") or "").strip().lower()
-            if lookup in [email, phone, mt5, ref_code]:
-                matches.append(t)
-
-        if not matches:
+        trader = _latest_trader_for_lookup(lookup)
+        if not trader:
             return bad("Trader not found", 404)
-
-        def row_score(t):
-            score = 0
-            if str(t.get("mt5_login") or "").strip():
-                score += 10000
-            if str(t.get("mt5_updated_at") or "").strip():
-                score += 20000
-            for key in ["mt5_updated_at", "updated_at", "approved_at", "created_at"]:
-                value = t.get(key)
-                if value:
-                    try:
-                        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-                        score += int(dt.timestamp())
-                        break
-                    except Exception:
-                        pass
-            return score
-
-        trader = sorted(matches, key=row_score, reverse=True)[0]
         t = now_iso()
         supabase.table("traders").update({"last_login_at": t}).eq("id", trader["id"]).execute()
         trader["last_login_at"] = t
@@ -480,7 +510,9 @@ def approve_purchase():
         lookup=supabase.table("traders").select("*").or_(f"email.eq.{p.get('email','')},phone.eq.{p.get('phone','')}").limit(1).execute()
         td={"name":p.get("trader_name",""),"phone":p.get("phone",""),"email":p.get("email",""),
             "mt5_login":m.get("mt5_login",""),"mt5_server":m.get("mt5_server",""),"mt5_master_password":m.get("mt5_master_password",""),
-            "mt5_investor_password":m.get("mt5_investor_password",""),"account_size":p.get("account_size") or 0,
+            "mt5_password":m.get("mt5_master_password",""),"master_password":m.get("mt5_master_password",""),
+            "mt5_investor_password":m.get("mt5_investor_password",""),"investor_password":m.get("mt5_investor_password",""),
+            "mt5_updated_at":t,"updated_at":t,"account_size":p.get("account_size") or 0,
             "balance":p.get("account_size") or 0,"equity":p.get("account_size") or 0,"phase":"phase1","status":"active",
             "payment_status":"approved","payment_proof_url":p.get("payment_proof_url",""),"selected_plan":p.get("plan_name",""),
             "approved_at":t,"challenge_started_at":t,"approved_by":d.get("approved_by","admin"),"admin_note":d.get("admin_note",""),"trading_days_left":30}
