@@ -19,6 +19,121 @@ SMTP_PASSWORD = os.getenv("SMTP_PASS")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ================================
+# NAIRAPIPS MT5 RESET BACKEND PATCH
+# Add this inside your Flask app.py AFTER supabase is initialized.
+# ================================
+
+from datetime import datetime, timezone
+from flask import request, jsonify
+
+def _ok(data=None, status=200):
+    res = jsonify(data or {"success": True})
+    res.status_code = status
+    res.headers["Access-Control-Allow-Origin"] = "*"
+    res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return res
+
+def _fail(message, status=400):
+    return _ok({"success": False, "error": message}, status)
+
+@app.route("/update_trader_mt5", methods=["POST", "OPTIONS"])
+@app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
+def update_trader_mt5():
+    if request.method == "OPTIONS":
+        return _ok({})
+
+    data = request.get_json(silent=True) or {}
+
+    trader_id = data.get("id") or data.get("trader_id")
+    if not trader_id:
+        return _fail("Trader ID is required")
+
+    mt5_login = str(data.get("mt5_login") or "").strip()
+    mt5_server = str(data.get("mt5_server") or "").strip()
+
+    if not mt5_login:
+        return _fail("MT5 login is required")
+
+    if not mt5_server:
+        return _fail("MT5 server is required")
+
+    master_password = (
+        data.get("mt5_password")
+        or data.get("master_password")
+        or data.get("mt5_master_password")
+        or ""
+    )
+
+    investor_password = (
+        data.get("mt5_investor_password")
+        or data.get("investor_password")
+        or ""
+    )
+
+    update_data = {
+        "mt5_login": mt5_login,
+        "mt5_server": mt5_server,
+        "mt5_password": master_password,
+        "master_password": master_password,
+        "mt5_investor_password": investor_password,
+        "investor_password": investor_password,
+        "phase": data.get("phase") or "phase1",
+        "status": data.get("status") or "active",
+        "payment_status": data.get("payment_status") or "approved",
+        "mt5_updated_at": datetime.now(timezone.utc).isoformat(),
+        "mt5_updated_by": data.get("mt5_updated_by") or "admin",
+        "mt5_reset_reason": data.get("mt5_reset_reason") or "MT5 login details updated",
+        "admin_note": data.get("admin_note") or "MT5 login details updated",
+    }
+
+    # Remove empty password values only if you do not want blank fields to overwrite old password.
+    # Keep this if you want empty prompt to preserve old password.
+    if not str(master_password).strip():
+        update_data.pop("mt5_password", None)
+        update_data.pop("master_password", None)
+
+    if not str(investor_password).strip():
+        update_data.pop("mt5_investor_password", None)
+        update_data.pop("investor_password", None)
+
+    try:
+        result = supabase.table("traders").update(update_data).eq("id", trader_id).execute()
+        return _ok({"success": True, "message": "MT5 details updated", "data": getattr(result, "data", None)})
+    except Exception as e:
+        return _fail(str(e), 500)
+
+
+# Optional compatibility endpoint if admin calls /update_trader
+@app.route("/update_trader", methods=["POST", "OPTIONS"])
+def update_trader():
+    if request.method == "OPTIONS":
+        return _ok({})
+
+    data = request.get_json(silent=True) or {}
+    trader_id = data.get("id") or data.get("trader_id")
+    if not trader_id:
+        return _fail("Trader ID is required")
+
+    allowed = [
+        "name", "email", "phone", "selected_plan", "account_size", "balance",
+        "mt5_login", "mt5_server", "mt5_password", "master_password",
+        "mt5_investor_password", "investor_password", "phase", "status",
+        "payment_status", "admin_note", "mt5_updated_at", "mt5_updated_by",
+        "mt5_reset_reason"
+    ]
+
+    update_data = {k: data[k] for k in allowed if k in data and data[k] is not None}
+    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        result = supabase.table("traders").update(update_data).eq("id", trader_id).execute()
+        return _ok({"success": True, "message": "Trader updated", "data": getattr(result, "data", None)})
+    except Exception as e:
+        return _fail(str(e), 500)
+
 SMTP_HOST = os.getenv("SMTP_HOST", "mail.nairapips.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_EMAIL)
