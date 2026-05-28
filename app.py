@@ -307,6 +307,119 @@ def get_traders():
     except Exception as e:
         return bad(e)
 
+def _find_existing_trader(email="", phone=""):
+    email = str(email or "").strip().lower()
+    phone = str(phone or "").strip()
+
+    if email:
+        rows = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
+        if rows:
+            return rows[0]
+
+    if phone:
+        rows = supabase.table("traders").select("*").eq("phone", phone).limit(1).execute().data or []
+        if rows:
+            return rows[0]
+
+    return None
+
+@app.route("/register_trader", methods=["POST", "OPTIONS"])
+def register_trader():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+
+    try:
+        d = request.json or {}
+        name = str(d.get("name", "")).strip()
+        email = str(d.get("email", "")).strip().lower()
+        phone = str(d.get("phone", "")).strip()
+
+        if not name:
+            return bad("Name is required")
+        if not email and not phone:
+            return bad("Email or phone is required")
+
+        existing = _find_existing_trader(email, phone)
+        if existing:
+            return ok(existing, "Trader already exists")
+
+        row = {
+            "name": name,
+            "phone": phone,
+            "email": email,
+            "mt5_login": "",
+            "mt5_server": "",
+            "mt5_master_password": "",
+            "mt5_investor_password": "",
+            "account_size": 0,
+            "balance": 0,
+            "equity": 0,
+            "phase": "no_account",
+            "status": d.get("status", "new_signup"),
+            "engine_group": d.get("engine_group", "engine_1"),
+            "profit": 0,
+            "drawdown": 0,
+            "profit_percent": 0,
+            "drawdown_percent": 0,
+            "payment_status": d.get("payment_status", "none"),
+            "payment_proof_url": "",
+            "selected_plan": "",
+            "payment_note": "",
+            "approved_by": "",
+            "admin_note": "",
+            "account_reference": d.get("account_reference") or ref(),
+            "challenge_started_at": None,
+            "approved_at": None,
+            "funded_at": None,
+            "last_login_at": None,
+            "trading_days_left": d.get("trading_days_left", 30),
+            "source": d.get("source", "public_register"),
+        }
+
+        created = supabase.table("traders").insert(row).execute().data
+        return ok(created[0] if created else row, "Trader registered")
+    except Exception as e:
+        return bad(e)
+
+@app.route("/update_trader", methods=["POST", "OPTIONS"])
+def update_trader():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+
+    try:
+        d = request.json or {}
+        tid = d.get("id") or d.get("trader_id")
+        if not tid:
+            return bad("Missing trader id")
+
+        allowed = [
+            "name", "phone", "email", "status", "phase", "balance", "equity",
+            "profit", "drawdown", "profit_percent", "drawdown_percent",
+            "engine_group", "payment_status", "payment_note", "admin_note",
+            "trading_days_left", "selected_plan", "account_size",
+            "mt5_login", "mt5_server", "mt5_master_password",
+            "mt5_investor_password", "mt5_password", "master_password",
+            "investor_password", "mt5_updated_by", "mt5_reset_reason",
+            "trader_note", "mt5_notice"
+        ]
+        upd = {k: d[k] for k in allowed if k in d}
+
+        for money_key in ["account_size", "balance", "equity"]:
+            if money_key in upd:
+                upd[money_key] = clean(upd[money_key])
+
+        if any(k in upd for k in ["mt5_login", "mt5_server", "mt5_password", "master_password", "mt5_master_password"]):
+            upd["mt5_updated_at"] = now_iso()
+
+        upd["updated_at"] = now_iso()
+
+        if not upd:
+            return bad("Nothing to update")
+
+        return ok(supabase.table("traders").update(upd).eq("id", tid).execute().data, "Trader updated")
+    except Exception as e:
+        return bad(e)
+
 @app.route("/traders", methods=["POST"])
 def add_trader():
     try:
@@ -468,15 +581,22 @@ def challenge_plans():
     try: return jsonify(supabase.table("challenge_plans").select("*").order("account_size", desc=False).execute().data)
     except Exception as e: return bad(e)
 
+@app.route("/plans", methods=["GET"])
+def plans_alias():
+    return challenge_plans()
+
 @app.route("/create_challenge_plan", methods=["POST"])
 def create_plan():
     try:
         d=request.json or {}; name=str(d.get("name","")).strip()
         if not name: return bad("Plan name is required")
+        mt5_server = d.get("mt5_server") or d.get("default_server") or ""
         row={"name":name,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
              "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":float(d.get("phase2_target") or 8),
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":d.get("daily_drawdown","None"),
-             "payout_split":d.get("payout_split","80%"),"description":d.get("description",""),"status":"active","created_at":now_iso(),"updated_at":now_iso()}
+             "payout_split":d.get("payout_split","80%"),"description":d.get("description",""),
+             "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
+             "status":d.get("status","active"),"created_at":now_iso(),"updated_at":now_iso()}
         return ok(supabase.table("challenge_plans").insert(row).execute().data, "Challenge plan created")
     except Exception as e: return bad(e)
 
@@ -486,8 +606,12 @@ def update_plan():
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing plan id")
         upd={"updated_at":now_iso()}
-        for k in ["name","daily_drawdown","payout_split","description","status"]:
+        for k in ["name","daily_drawdown","payout_split","description","status","mt5_server","default_server"]:
             if k in d: upd[k]=d[k]
+        if "mt5_server" in d and "default_server" not in d:
+            upd["default_server"] = d.get("mt5_server")
+        if "default_server" in d and "mt5_server" not in d:
+            upd["mt5_server"] = d.get("default_server")
         for k in ["account_size","fee"]:
             if k in d: upd[k]=clean(d[k])
         for k in ["phase1_target","phase2_target","max_drawdown"]:
@@ -535,16 +659,21 @@ def approve_purchase():
             mres=supabase.table("mt5_pool").select("*").eq("status","available").eq("account_size",p.get("account_size") or 0).limit(1).execute()
         if not mres.data: return bad("No available MT5 account found for this plan/account size")
         m=mres.data[0]; t=now_iso()
+        master_password=m.get("mt5_master_password","")
+        investor_password=m.get("mt5_investor_password","")
         supabase.table("challenge_purchases").update({"payment_status":"approved","status":"approved_active","assigned_mt5_id":m.get("id"),
-            "mt5_login":m.get("mt5_login",""),"mt5_server":m.get("mt5_server",""),"approved_at":t,"assigned_at":t,
+            "mt5_login":m.get("mt5_login",""),"mt5_server":m.get("mt5_server",""),
+            "mt5_master_password":master_password,"mt5_password":master_password,"master_password":master_password,
+            "mt5_investor_password":investor_password,"investor_password":investor_password,
+            "approved_at":t,"assigned_at":t,"updated_at":t,
             "admin_note":d.get("admin_note","Challenge approved and MT5 assigned")}).eq("id",pid).execute()
         supabase.table("mt5_pool").update({"status":"assigned","assigned_trader_id":p.get("trader_id"),"assigned_trader_name":p.get("trader_name",""),
             "assigned_email":p.get("email",""),"assigned_at":t,"updated_at":t,"admin_note":"Assigned through challenge purchase approval"}).eq("id",m.get("id")).execute()
         lookup=supabase.table("traders").select("*").or_(f"email.eq.{p.get('email','')},phone.eq.{p.get('phone','')}").limit(1).execute()
         td={"name":p.get("trader_name",""),"phone":p.get("phone",""),"email":p.get("email",""),
-            "mt5_login":m.get("mt5_login",""),"mt5_server":m.get("mt5_server",""),"mt5_master_password":m.get("mt5_master_password",""),
-            "mt5_password":m.get("mt5_master_password",""),"master_password":m.get("mt5_master_password",""),
-            "mt5_investor_password":m.get("mt5_investor_password",""),"investor_password":m.get("mt5_investor_password",""),
+            "mt5_login":m.get("mt5_login",""),"mt5_server":m.get("mt5_server",""),"mt5_master_password":master_password,
+            "mt5_password":master_password,"master_password":master_password,
+            "mt5_investor_password":investor_password,"investor_password":investor_password,
             "mt5_updated_at":t,"updated_at":t,"account_size":p.get("account_size") or 0,
             "balance":p.get("account_size") or 0,"equity":p.get("account_size") or 0,"phase":"phase1","status":"active",
             "payment_status":"approved","payment_proof_url":p.get("payment_proof_url",""),"selected_plan":p.get("plan_name",""),
