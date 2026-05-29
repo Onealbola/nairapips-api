@@ -263,6 +263,7 @@ def send_email(to_email, subject, message):
             print("EMAIL SKIPPED: SMTP environment is incomplete")
             return False
 
+        print("EMAIL ATTEMPT:", to_email)
         msg = MIMEMultipart()
         msg["From"] = FROM_EMAIL
         msg["To"] = to_email
@@ -270,11 +271,17 @@ def send_email(to_email, subject, message):
 
         msg.attach(MIMEText(message, "plain"))
 
-        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT)
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.sendmail(FROM_EMAIL, to_email, msg.as_string())
-        server.quit()
+        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10)
+        try:
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.sendmail(FROM_EMAIL, to_email, msg.as_string())
+        finally:
+            try:
+                server.quit()
+            except Exception:
+                pass
 
+        print("EMAIL SENT:", to_email)
         return True
     except Exception as e:
         print("EMAIL ERROR:", str(e))
@@ -284,7 +291,7 @@ def send_email_safe(to_email, subject, message):
     try:
         return send_email(to_email, subject, message)
     except Exception as e:
-        print("EMAIL SAFE ERROR:", str(e))
+        print("EMAIL ERROR:", str(e))
         return False
 
 def send_admin_alert(subject, message):
@@ -2207,6 +2214,11 @@ def save_payment_accounts():
 @app.route("/test_email")
 def test_email():
     try:
+        if not SMTP_EMAIL or not SMTP_PASSWORD:
+            print("EMAIL ERROR:", "SMTP credentials are missing")
+            return {"success": False, "error": "SMTP credentials are missing"}
+
+        print("EMAIL ATTEMPT:", SMTP_EMAIL)
         msg = MIMEMultipart()
         msg["From"] = SMTP_EMAIL
         msg["To"] = SMTP_EMAIL
@@ -2221,14 +2233,21 @@ NairaPips Team
 """
         msg.attach(MIMEText(body, "plain"))
 
-        server = smtplib.SMTP_SSL("mail.nairapips.com", 465)
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.sendmail(SMTP_EMAIL, SMTP_EMAIL, msg.as_string())
-        server.quit()
+        server = smtplib.SMTP_SSL("mail.nairapips.com", 465, timeout=10)
+        try:
+            server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            server.sendmail(SMTP_EMAIL, SMTP_EMAIL, msg.as_string())
+        finally:
+            try:
+                server.quit()
+            except Exception:
+                pass
 
+        print("EMAIL SENT:", SMTP_EMAIL)
         return {"success": True, "message": "Test email sent"}
 
     except Exception as e:
+        print("EMAIL ERROR:", str(e))
         return {"success": False, "error": str(e)}
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
