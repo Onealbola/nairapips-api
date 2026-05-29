@@ -205,6 +205,27 @@ def update_trader_mt5():
         _safe_update_table("challenge_purchases", purchase_update, "email", trader_email)
         _safe_update_table("challenge_purchases", purchase_update, "phone", trader_phone)
 
+        trader_row = trader_rows[0] if trader_rows else get_trader_by_id(trader_id)
+        send_mt5_reset_email(
+            trader_row,
+            mt5_login,
+            mt5_server,
+            master_password,
+            investor_password,
+            data.get("mt5_reset_reason") or data.get("admin_note") or "MT5 login details updated"
+        )
+        send_admin_alert(
+            "NairaPips MT5 login reset",
+            f"""A trader MT5 login/account was updated.
+
+Trader: {trader_row.get("name") if trader_row else ""}
+Email: {trader_email}
+Phone: {trader_phone}
+MT5 Login: {mt5_login}
+Server: {mt5_server}
+Reason: {data.get("mt5_reset_reason") or data.get("admin_note") or "MT5 login details updated"}"""
+        )
+
         return _np_ok({"success": True, "message": "MT5 details updated and synced", "data": trader_rows})
     except Exception as e:
         return _np_fail(e, 500)
@@ -232,10 +253,14 @@ def trader_source_get(lookup):
 SMTP_HOST = os.getenv("SMTP_HOST", "mail.nairapips.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_EMAIL)
+ADMIN_ALERT_EMAIL = os.getenv("ADMIN_ALERT_EMAIL") or SMTP_EMAIL or FROM_EMAIL
 
 def send_email(to_email, subject, message):
     try:
         if not to_email:
+            return False
+        if not SMTP_HOST or not SMTP_PORT or not SMTP_EMAIL or not SMTP_PASSWORD or not FROM_EMAIL:
+            print("EMAIL SKIPPED: SMTP environment is incomplete")
             return False
 
         msg = MIMEMultipart()
@@ -254,6 +279,84 @@ def send_email(to_email, subject, message):
     except Exception as e:
         print("EMAIL ERROR:", str(e))
         return False
+
+def send_email_safe(to_email, subject, message):
+    try:
+        return send_email(to_email, subject, message)
+    except Exception as e:
+        print("EMAIL SAFE ERROR:", str(e))
+        return False
+
+def send_admin_alert(subject, message):
+    return send_email_safe(ADMIN_ALERT_EMAIL, subject, message)
+
+def email_money(value):
+    try:
+        return "₦" + f"{float(value or 0):,.0f}"
+    except Exception:
+        return "₦0"
+
+def trader_display_name(row):
+    return (row or {}).get("trader_name") or (row or {}).get("name") or "Trader"
+
+def get_payout_by_id(pid):
+    rows = supabase.table("payouts").select("*").eq("id", pid).limit(1).execute().data or []
+    return rows[0] if rows else {}
+
+def get_purchase_by_id(pid):
+    rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
+    return rows[0] if rows else {}
+
+def get_trader_by_id(tid):
+    rows = supabase.table("traders").select("*").eq("id", tid).limit(1).execute().data or []
+    return rows[0] if rows else {}
+
+def send_mt5_reset_email(trader, mt5_login="", mt5_server="", master_password="", investor_password="", reason="MT5 login details updated"):
+    if not trader:
+        return False
+    name = trader.get("name") or trader.get("trader_name") or "Trader"
+    return send_email_safe(
+        trader.get("email"),
+        "NairaPips MT5 login details updated",
+        f"""Hello {name},
+
+Your NairaPips MT5 login details have been updated/reset.
+
+MT5 Login: {mt5_login or trader.get("mt5_login", "")}
+Server: {mt5_server or trader.get("mt5_server", "")}
+Master Password: {master_password or trader.get("mt5_master_password") or trader.get("mt5_password") or trader.get("master_password") or ""}
+Investor Password: {investor_password or trader.get("mt5_investor_password") or trader.get("investor_password") or ""}
+
+Reason: {reason}
+
+If you did not request this reset, contact NairaPips support immediately.
+
+NairaPips Team"""
+    )
+
+def send_account_status_email(trader, subject, title, details=""):
+    if not trader:
+        return False
+    name = trader.get("name") or trader.get("trader_name") or "Trader"
+    return send_email_safe(
+        trader.get("email"),
+        subject,
+        f"""Hello {name},
+
+{title}
+
+{details}
+
+NairaPips Team"""
+    )
+
+def send_challenge_certificate_email(trader, details=""):
+    return send_account_status_email(
+        trader,
+        "NairaPips challenge passed - certificate earned",
+        "Congratulations. You have passed your NairaPips challenge and your certificate has been earned.",
+        details or "Your challenge pass/certificate status has been updated. Log in to your dashboard to review the latest account status."
+    )
 def now_iso(): return datetime.now(timezone.utc).isoformat()
 def ref(): return "NP-" + str(random.randint(100000,999999))
 def clean(v):
@@ -377,7 +480,30 @@ def register_trader():
         }
 
         created = supabase.table("traders").insert(row).execute().data
-        return ok(created[0] if created else row, "Trader registered")
+        trader_row = created[0] if created else row
+
+        send_email_safe(
+            email,
+            "Welcome to NairaPips",
+            f"""Hello {name},
+
+Welcome to NairaPips. Your trader account has been created successfully.
+
+Next step: log in to your trader dashboard, choose a challenge plan, and upload your payment proof for admin approval.
+
+NairaPips Team"""
+        )
+        send_admin_alert(
+            "New NairaPips trader registration",
+            f"""A new trader registered on NairaPips.
+
+Name: {name}
+Email: {email or "Not provided"}
+Phone: {phone or "Not provided"}
+Reference: {trader_row.get("account_reference", "Not generated")}"""
+        )
+
+        return ok(trader_row, "Trader registered")
     except Exception as e:
         return bad(e)
 
@@ -416,7 +542,28 @@ def update_trader():
         if not upd:
             return bad("Nothing to update")
 
-        return ok(supabase.table("traders").update(upd).eq("id", tid).execute().data, "Trader updated")
+        result = supabase.table("traders").update(upd).eq("id", tid).execute().data
+        trader_row = result[0] if result else get_trader_by_id(tid)
+
+        if any(k in upd for k in ["mt5_login", "mt5_server", "mt5_password", "master_password", "mt5_master_password"]):
+            send_mt5_reset_email(
+                trader_row,
+                upd.get("mt5_login", ""),
+                upd.get("mt5_server", ""),
+                upd.get("mt5_master_password") or upd.get("mt5_password") or upd.get("master_password") or "",
+                upd.get("mt5_investor_password") or upd.get("investor_password") or "",
+                upd.get("mt5_reset_reason") or upd.get("admin_note") or "MT5 login details updated"
+            )
+
+        if str(upd.get("status", "")).lower() in ["reset", "account_reset"] or str(upd.get("phase", "")).lower() in ["reset", "account_reset"]:
+            send_account_status_email(
+                trader_row,
+                "NairaPips account reset completed",
+                "Your NairaPips trading account has been reset.",
+                upd.get("admin_note") or "You can log in to your trader dashboard to review the updated account status."
+            )
+
+        return ok(result, "Trader updated")
     except Exception as e:
         return bad(e)
 
@@ -537,7 +684,25 @@ def approve_payment():
                     "challenge_started_at":now_iso(),"approved_by":d.get("approved_by","admin"),"admin_note":d.get("admin_note","")})
         if d.get("balance") or d.get("account_size"):
             bal=clean(d.get("balance") or d.get("account_size")); upd.update({"account_size":bal,"balance":bal,"equity":bal})
-        return ok(supabase.table("traders").update(upd).eq("id",tid).execute().data, "Payment approved")
+        result = supabase.table("traders").update(upd).eq("id",tid).execute().data
+        trader_row = result[0] if result else _get_trader_by_id(tid) or {}
+
+        send_email_safe(
+            trader_row.get("email"),
+            "NairaPips payment approved - MT5 details",
+            f"""Hello {trader_row.get("name") or "Trader"},
+
+Your NairaPips payment has been approved and your MT5 account has been activated.
+
+MT5 Login: {upd.get("mt5_login", "")}
+Server: {upd.get("mt5_server", "")}
+Master Password: {upd.get("mt5_master_password", "")}
+Investor Password: {upd.get("mt5_investor_password", "")}
+
+NairaPips Team"""
+        )
+
+        return ok(result, "Payment approved")
     except Exception as e: return bad(e)
 
 @app.route("/reject_payment", methods=["POST"])
@@ -545,7 +710,23 @@ def reject_payment():
     try:
         d=request.json or {}; tid=d.get("id")
         if not tid: return bad("Missing trader id")
-        return ok(supabase.table("traders").update({"payment_status":"rejected","status":"payment_rejected","admin_note":d.get("admin_note","")}).eq("id",tid).execute().data, "Payment rejected")
+        trader_row = _get_trader_by_id(tid) or {}
+        note = d.get("admin_note","")
+        result = supabase.table("traders").update({"payment_status":"rejected","status":"payment_rejected","admin_note":note}).eq("id",tid).execute().data
+
+        send_email_safe(
+            trader_row.get("email"),
+            "NairaPips payment rejected",
+            f"""Hello {trader_row.get("name") or "Trader"},
+
+Your NairaPips payment was rejected after review.
+
+Reason / Admin Note: {note or "Please contact support for details."}
+
+NairaPips Team"""
+        )
+
+        return ok(result, "Payment rejected")
     except Exception as e: return bad(e)
 
 @app.route("/update_status", methods=["POST"])
@@ -557,7 +738,23 @@ def update_status():
         upd={k:d[k] for k in allowed if k in d}
         if d.get("phase")=="funded" or d.get("status")=="funded": upd["funded_at"]=now_iso()
         if not upd: return bad("Nothing to update")
-        return ok(supabase.table("traders").update(upd).eq("id",tid).execute().data)
+        result = supabase.table("traders").update(upd).eq("id",tid).execute().data
+        trader_row = result[0] if result else get_trader_by_id(tid)
+        status = str(upd.get("status") or "").lower()
+        phase = str(upd.get("phase") or "").lower()
+        if status in ["reset", "account_reset"] or phase in ["reset", "account_reset"]:
+            send_account_status_email(
+                trader_row,
+                "NairaPips account reset completed",
+                "Your NairaPips trading account has been reset.",
+                upd.get("admin_note") or "You can log in to your trader dashboard to review the updated account status."
+            )
+        if status in ["funded", "passed", "phase2_passed"] or phase in ["funded", "passed", "phase2_passed"]:
+            send_challenge_certificate_email(
+                trader_row,
+                upd.get("admin_note") or f"Current status: {upd.get('status', trader_row.get('status', 'updated'))}. Current phase: {upd.get('phase', trader_row.get('phase', 'updated'))}."
+            )
+        return ok(result)
     except Exception as e: return bad(e)
 
 @app.route("/activate_trader", methods=["POST"])
@@ -575,6 +772,77 @@ def deactivate_trader():
         if not tid: return bad("Missing trader id")
         return ok(supabase.table("traders").update({"status":"inactive"}).eq("id",tid).execute().data)
     except Exception as e: return bad(e)
+
+@app.route("/mark_certificate_passed", methods=["POST"])
+@app.route("/pass_certificate", methods=["POST"])
+def mark_certificate_passed():
+    try:
+        d = request.json or {}
+        tid = d.get("id") or d.get("trader_id")
+        if not tid:
+            return bad("Missing trader id")
+        t = now_iso()
+        upd = {
+            "certificate_status": d.get("certificate_status") or "passed",
+            "certificate_passed_at": d.get("certificate_passed_at") or t,
+            "certificate_note": d.get("certificate_note") or d.get("admin_note") or "Certificate passed",
+            "updated_at": t
+        }
+        result = supabase.table("traders").update(upd).eq("id", tid).execute().data
+        trader_row = result[0] if result else get_trader_by_id(tid)
+        send_challenge_certificate_email(
+            trader_row,
+            upd["certificate_note"]
+        )
+        send_admin_alert(
+            "NairaPips challenge passed certificate earned",
+            f"""A trader challenge certificate was marked as earned after passing a challenge.
+
+Trader: {trader_row.get("name") if trader_row else ""}
+Email: {trader_row.get("email") if trader_row else ""}
+Note: {upd["certificate_note"]}"""
+        )
+        return ok(result, "Certificate marked passed")
+    except Exception as e:
+        return bad(e)
+
+@app.route("/update_kyc_status", methods=["POST"])
+@app.route("/kyc_passed", methods=["POST"])
+def update_kyc_status():
+    try:
+        d = request.json or {}
+        tid = d.get("id") or d.get("trader_id")
+        if not tid:
+            return bad("Missing trader id")
+        status = d.get("kyc_status") or d.get("status") or "passed"
+        t = now_iso()
+        upd = {
+            "kyc_status": status,
+            "kyc_note": d.get("kyc_note") or d.get("admin_note") or f"KYC {status}",
+            "updated_at": t
+        }
+        if str(status).lower() in ["passed", "approved", "verified"]:
+            upd["kyc_passed_at"] = d.get("kyc_passed_at") or t
+        result = supabase.table("traders").update(upd).eq("id", tid).execute().data
+        trader_row = result[0] if result else get_trader_by_id(tid)
+        if str(status).lower() in ["passed", "approved", "verified"]:
+            send_account_status_email(
+                trader_row,
+                "NairaPips KYC passed",
+                "Your NairaPips KYC verification has passed.",
+                upd["kyc_note"]
+            )
+            send_admin_alert(
+                "NairaPips KYC passed",
+                f"""A trader KYC was marked as passed.
+
+Trader: {trader_row.get("name") if trader_row else ""}
+Email: {trader_row.get("email") if trader_row else ""}
+Note: {upd["kyc_note"]}"""
+            )
+        return ok(result, "KYC status updated")
+    except Exception as e:
+        return bad(e)
 
 @app.route("/challenge_plans", methods=["GET"])
 def challenge_plans():
@@ -642,7 +910,37 @@ def create_purchase():
              "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
              "payment_proof_url":proof,"payment_status":"pending","status":"pending_review","admin_note":"",
              "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
-        return ok(supabase.table("challenge_purchases").insert(row).execute().data, "Challenge purchase submitted")
+        created = supabase.table("challenge_purchases").insert(row).execute().data
+
+        send_email_safe(
+            row.get("email"),
+            "NairaPips challenge purchase submitted",
+            f"""Hello {row.get("trader_name") or "Trader"},
+
+Your NairaPips challenge purchase has been submitted successfully.
+
+Plan: {plan}
+Account Size: {email_money(row.get("account_size"))}
+Challenge Fee: {email_money(row.get("fee"))}
+
+Admin will review your payment proof and assign your MT5 details after approval.
+
+NairaPips Team"""
+        )
+        send_admin_alert(
+            "New NairaPips challenge purchase/payment proof",
+            f"""A new challenge purchase was submitted.
+
+Trader: {row.get("trader_name") or "Trader"}
+Email: {row.get("email") or "Not provided"}
+Phone: {row.get("phone") or "Not provided"}
+Plan: {plan}
+Account Size: {email_money(row.get("account_size"))}
+Fee: {email_money(row.get("fee"))}
+Proof URL: {proof}"""
+        )
+
+        return ok(created, "Challenge purchase submitted")
     except Exception as e: return bad(e)
 
 @app.route("/approve_challenge_purchase", methods=["POST"])
@@ -683,7 +981,29 @@ def approve_purchase():
         else:
             td.update({"account_reference":ref(),"profit":0,"drawdown":0,"profit_percent":0,"drawdown_percent":0})
             supabase.table("traders").insert(td).execute()
-        return ok(supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute().data, "Challenge purchase approved and MT5 assigned")
+        approved_rows = supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute().data
+
+        send_email_safe(
+            p.get("email"),
+            "NairaPips challenge approved - MT5 details",
+            f"""Hello {p.get("trader_name") or "Trader"},
+
+Your NairaPips challenge has been approved and your MT5 account has been assigned.
+
+Plan: {p.get("plan_name", "Challenge")}
+Account Size: {email_money(p.get("account_size"))}
+
+MT5 Login: {m.get("mt5_login", "")}
+Server: {m.get("mt5_server", "")}
+Master Password: {master_password}
+Investor Password: {investor_password}
+
+Please log in to your trader dashboard to view your account details and begin your challenge.
+
+NairaPips Team"""
+        )
+
+        return ok(approved_rows, "Challenge purchase approved and MT5 assigned")
     except Exception as e: return bad(e)
 
 @app.route("/reject_challenge_purchase", methods=["POST"])
@@ -691,7 +1011,26 @@ def reject_purchase():
     try:
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing purchase id")
-        return ok(supabase.table("challenge_purchases").update({"payment_status":"rejected","status":"rejected","rejected_at":now_iso(),"admin_note":d.get("admin_note","Challenge purchase rejected")}).eq("id",pid).execute().data, "Challenge purchase rejected")
+        purchase = get_purchase_by_id(pid)
+        note = d.get("admin_note","Challenge purchase rejected")
+        result = supabase.table("challenge_purchases").update({"payment_status":"rejected","status":"rejected","rejected_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+
+        send_email_safe(
+            purchase.get("email"),
+            "NairaPips challenge purchase rejected",
+            f"""Hello {purchase.get("trader_name") or "Trader"},
+
+Your NairaPips challenge purchase was rejected after review.
+
+Plan: {purchase.get("plan_name", "Challenge")}
+Reason / Admin Note: {note}
+
+Please contact NairaPips support from your dashboard if you need help.
+
+NairaPips Team"""
+        )
+
+        return ok(result, "Challenge purchase rejected")
     except Exception as e: return bad(e)
 
 @app.route("/mt5_pool", methods=["GET"])
@@ -745,7 +1084,36 @@ def create_payout():
         row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
              "amount":amount,"bank_name":d.get("bank_name",""),"account_number":d.get("account_number",""),"account_name":d.get("account_name",""),
              "status":"pending","note":d.get("note",""),"admin_note":"","requested_at":now_iso()}
-        return ok(supabase.table("payouts").insert(row).execute().data, "Payout request created")
+        created = supabase.table("payouts").insert(row).execute().data
+
+        send_email_safe(
+            row.get("email"),
+            "NairaPips payout request received",
+            f"""Hello {row.get("trader_name") or "Trader"},
+
+Your payout request has been received.
+
+Amount: {email_money(amount)}
+Bank: {row.get("bank_name") or "Not provided"}
+Account Number: {row.get("account_number") or "Not provided"}
+
+Admin will review your account and payout request.
+
+NairaPips Team"""
+        )
+        send_admin_alert(
+            "New NairaPips payout request",
+            f"""A trader submitted a payout request.
+
+Trader: {row.get("trader_name") or "Trader"}
+Email: {row.get("email") or "Not provided"}
+Phone: {row.get("phone") or "Not provided"}
+Amount: {email_money(amount)}
+Bank: {row.get("bank_name") or "Not provided"}
+Account Number: {row.get("account_number") or "Not provided"}"""
+        )
+
+        return ok(created, "Payout request created")
     except Exception as e: return bad(e)
 
 @app.route("/approve_payout", methods=["POST"])
@@ -753,7 +1121,24 @@ def approve_payout():
     try:
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing payout id")
-        return ok(supabase.table("payouts").update({"status":"approved","approved_at":now_iso(),"admin_note":d.get("admin_note","")}).eq("id",pid).execute().data, "Payout approved")
+        payout = get_payout_by_id(pid)
+        note = d.get("admin_note","")
+        result = supabase.table("payouts").update({"status":"approved","approved_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+
+        send_email_safe(
+            payout.get("email"),
+            "NairaPips payout approved",
+            f"""Hello {payout.get("trader_name") or "Trader"},
+
+Your payout request has been approved.
+
+Amount: {email_money(payout.get("amount"))}
+Admin Note: {note or "Approved after review."}
+
+NairaPips Team"""
+        )
+
+        return ok(result, "Payout approved")
     except Exception as e: return bad(e)
 
 @app.route("/reject_payout", methods=["POST"])
@@ -761,7 +1146,24 @@ def reject_payout():
     try:
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing payout id")
-        return ok(supabase.table("payouts").update({"status":"rejected","rejected_at":now_iso(),"admin_note":d.get("admin_note","")}).eq("id",pid).execute().data, "Payout rejected")
+        payout = get_payout_by_id(pid)
+        note = d.get("admin_note","")
+        result = supabase.table("payouts").update({"status":"rejected","rejected_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+
+        send_email_safe(
+            payout.get("email"),
+            "NairaPips payout rejected",
+            f"""Hello {payout.get("trader_name") or "Trader"},
+
+Your payout request was rejected after review.
+
+Amount: {email_money(payout.get("amount"))}
+Reason / Admin Note: {note or "Please contact support for details."}
+
+NairaPips Team"""
+        )
+
+        return ok(result, "Payout rejected")
     except Exception as e: return bad(e)
 
 @app.route("/mark_payout_paid", methods=["POST"])
@@ -769,7 +1171,24 @@ def mark_paid():
     try:
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing payout id")
-        return ok(supabase.table("payouts").update({"status":"paid","paid_at":now_iso(),"admin_note":d.get("admin_note","")}).eq("id",pid).execute().data, "Payout marked paid")
+        payout = get_payout_by_id(pid)
+        note = d.get("admin_note","")
+        result = supabase.table("payouts").update({"status":"paid","paid_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+
+        send_email_safe(
+            payout.get("email"),
+            "NairaPips payout marked paid",
+            f"""Hello {payout.get("trader_name") or "Trader"},
+
+Your payout has been marked as paid.
+
+Amount: {email_money(payout.get("amount"))}
+Admin Note: {note or "Payment completed."}
+
+NairaPips Team"""
+        )
+
+        return ok(result, "Payout marked paid")
     except Exception as e: return bad(e)
 
 @app.route("/support_tickets", methods=["GET"])
@@ -785,7 +1204,23 @@ def create_ticket():
         row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
              "subject":subject,"message":message,"status":"open","priority":d.get("priority","normal"),"admin_reply":"",
              "created_at":now_iso(),"last_updated_at":now_iso()}
-        return ok(supabase.table("support_tickets").insert(row).execute().data, "Support ticket created")
+        created = supabase.table("support_tickets").insert(row).execute().data
+
+        send_admin_alert(
+            "New NairaPips support ticket",
+            f"""A trader submitted a new support ticket.
+
+Trader: {row.get("trader_name") or "Trader"}
+Email: {row.get("email") or "Not provided"}
+Phone: {row.get("phone") or "Not provided"}
+Subject: {subject}
+Priority: {row.get("priority")}
+
+Message:
+{message}"""
+        )
+
+        return ok(created, "Support ticket created")
     except Exception as e: return bad(e)
 
 @app.route("/reply_support_ticket", methods=["POST"])
