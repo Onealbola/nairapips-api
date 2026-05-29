@@ -489,26 +489,7 @@ def register_trader():
         created = supabase.table("traders").insert(row).execute().data
         trader_row = created[0] if created else row
 
-        send_email_safe(
-            email,
-            "Welcome to NairaPips",
-            f"""Hello {name},
-
-Welcome to NairaPips. Your trader account has been created successfully.
-
-Next step: log in to your trader dashboard, choose a challenge plan, and upload your payment proof for admin approval.
-
-NairaPips Team"""
-        )
-        send_admin_alert(
-            "New NairaPips trader registration",
-            f"""A new trader registered on NairaPips.
-
-Name: {name}
-Email: {email or "Not provided"}
-Phone: {phone or "Not provided"}
-Reference: {trader_row.get("account_reference", "Not generated")}"""
-        )
+        # Registration must return fast. Use /test_email to test SMTP separately.
 
         return ok(trader_row, "Trader registered")
     except Exception as e:
