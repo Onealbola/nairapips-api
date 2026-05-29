@@ -250,7 +250,6 @@ def trader_source_get(lookup):
 FROM_EMAIL = os.getenv("FROM_EMAIL") or "support@nairapips.com"
 ADMIN_ALERT_EMAIL = os.getenv("ADMIN_ALERT_EMAIL") or FROM_EMAIL
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
-BREVO_EMAIL_URL = "https://api.brevo.com/v3/smtp/email"
 
 def text_to_html_content(message):
     return "<p>" + html.escape(str(message or "")).replace("\n", "<br>") + "</p>"
@@ -271,7 +270,7 @@ def send_email_brevo(to_email, subject, html_content):
             "htmlContent": html_content
         }
         res = requests.post(
-            BREVO_EMAIL_URL,
+            "https://api.brevo.com/v3/smtp/email",
             headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
             json=payload,
             timeout=10
