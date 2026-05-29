@@ -4,11 +4,15 @@ from flask_cors import CORS
 from supabase import create_client
 from werkzeug.utils import secure_filename
 from datetime import datetime, timezone
-import os, random, uuid
+import os, random, uuid, re, time
 import html
 import requests
 app = Flask(__name__)
 CORS(app)
+
+REGISTER_RATE_WINDOW_SECONDS = 15 * 60
+REGISTER_RATE_MAX = 5
+REGISTER_RATE_BUCKET = {}
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -418,6 +422,73 @@ def get_traders():
     except Exception as e:
         return bad(e)
 
+def _request_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.headers.get("X-Real-IP") or request.remote_addr or "unknown"
+
+def _registration_rate_limited(ip):
+    now = time.time()
+    bucket = [t for t in REGISTER_RATE_BUCKET.get(ip, []) if now - t < REGISTER_RATE_WINDOW_SECONDS]
+    if len(bucket) >= REGISTER_RATE_MAX:
+        REGISTER_RATE_BUCKET[ip] = bucket
+        return True
+    bucket.append(now)
+    REGISTER_RATE_BUCKET[ip] = bucket
+    return False
+
+def _valid_email(email):
+    if not email:
+        return True
+    if len(email) > 120:
+        return False
+    return bool(re.match(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", email, re.I))
+
+def _phone_digits(phone):
+    return re.sub(r"\D", "", str(phone or ""))
+
+def _valid_phone(phone):
+    if not phone:
+        return True
+    digits = _phone_digits(phone)
+    return 7 <= len(digits) <= 15
+
+def _phone_variants(phone):
+    raw = str(phone or "").strip()
+    digits = _phone_digits(raw)
+    variants = {raw, digits}
+    if digits:
+        variants.add("+" + digits)
+    if digits.startswith("0") and len(digits) >= 10:
+        ng = "234" + digits[1:]
+        variants.update({ng, "+" + ng})
+    if digits.startswith("234") and len(digits) >= 13:
+        local = "0" + digits[3:]
+        variants.update({local, digits, "+" + digits})
+    return [v for v in variants if v]
+
+def _clean_phone(phone):
+    phone = str(phone or "").strip()
+    return re.sub(r"[^\d+]", "", phone)
+
+def _valid_name(name):
+    value = str(name or "").strip()
+    lowered = value.lower()
+    letters = re.findall(r"[a-zA-Z]", value)
+    blocked = {"test", "fake", "admin", "null", "undefined", "unknown", "n/a", "na", "none", "asdf", "qwerty"}
+    if len(value) < 2 or len(value) > 80:
+        return False
+    if len(letters) < 2:
+        return False
+    if lowered in blocked:
+        return False
+    if re.search(r"https?://|www\.|\.com|\.net|\.org", lowered):
+        return False
+    if re.fullmatch(r"([a-zA-Z])\1{2,}", value):
+        return False
+    return True
+
 def _find_existing_trader(email="", phone=""):
     email = str(email or "").strip().lower()
     phone = str(phone or "").strip()
@@ -426,13 +497,32 @@ def _find_existing_trader(email="", phone=""):
         rows = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
         if rows:
             return rows[0]
+        all_rows = supabase.table("traders").select("*").execute().data or []
+        for row in all_rows:
+            if str(row.get("email") or "").strip().lower() == email:
+                return row
 
     if phone:
-        rows = supabase.table("traders").select("*").eq("phone", phone).limit(1).execute().data or []
-        if rows:
-            return rows[0]
+        digits = _phone_digits(phone)
+        for variant in _phone_variants(phone):
+            rows = supabase.table("traders").select("*").eq("phone", variant).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+        all_rows = supabase.table("traders").select("*").execute().data or []
+        for row in all_rows:
+            if digits and _phone_digits(row.get("phone")) == digits:
+                return row
 
     return None
+
+def _safe_insert_trader(row):
+    try:
+        return supabase.table("traders").insert(row).execute().data
+    except Exception as e:
+        optional = ["source", "user_agent", "ip_address", "registration_source", "registration_user_agent", "registration_ip"]
+        safe_row = {k: v for k, v in row.items() if k not in optional}
+        print("REGISTRATION OPTIONAL TRACKING SKIPPED:", str(e))
+        return supabase.table("traders").insert(safe_row).execute().data
 
 @app.route("/register_trader", methods=["POST", "OPTIONS"])
 def register_trader():
@@ -441,14 +531,26 @@ def register_trader():
 
     try:
         d = request.json or {}
+        ip_address = _request_ip()
+        user_agent = request.headers.get("User-Agent", "")
+        if str(d.get("website") or d.get("company_url") or d.get("url") or "").strip():
+            print("REGISTRATION SPAM HONEYPOT:", ip_address)
+            return ok({"received": True}, "Registration received")
+        if _registration_rate_limited(ip_address):
+            return bad("Too many registration attempts. Please wait a few minutes and try again.", 429)
+
         name = str(d.get("name", "")).strip()
         email = str(d.get("email", "")).strip().lower()
-        phone = str(d.get("phone", "")).strip()
+        phone = _clean_phone(d.get("phone", ""))
 
-        if not name:
-            return bad("Name is required")
+        if not _valid_name(name):
+            return bad("Please enter your real full name.")
         if not email and not phone:
             return bad("Email or phone is required")
+        if not _valid_email(email):
+            return bad("Please enter a valid email address.")
+        if not _valid_phone(phone):
+            return bad("Please enter a valid WhatsApp or phone number.")
 
         existing = _find_existing_trader(email, phone)
         if existing:
@@ -485,12 +587,38 @@ def register_trader():
             "last_login_at": None,
             "trading_days_left": d.get("trading_days_left", 30),
             "source": d.get("source", "public_register"),
+            "registration_source": d.get("source", "public_register"),
+            "user_agent": user_agent[:250],
+            "registration_user_agent": user_agent[:250],
+            "ip_address": ip_address,
+            "registration_ip": ip_address,
         }
 
-        created = supabase.table("traders").insert(row).execute().data
+        created = _safe_insert_trader(row)
         trader_row = created[0] if created else row
 
-        # Registration must return fast. Use /test_email to test SMTP separately.
+        send_email_safe(
+            email,
+            "Welcome to NairaPips",
+            f"""Hello {name},
+
+Welcome to NairaPips. Your trader account has been created successfully.
+
+Next step: log in to your trader dashboard, choose a challenge plan, and upload your payment proof for admin approval.
+
+Reference: {trader_row.get("account_reference", "Not generated")}
+
+NairaPips Team"""
+        )
+        send_admin_alert(
+            "New NairaPips trader registration",
+            f"""A new trader registered on NairaPips.
+
+Name: {name}
+Email: {email or "Not provided"}
+Phone: {phone or "Not provided"}
+Reference: {trader_row.get("account_reference", "Not generated")}"""
+        )
 
         return ok(trader_row, "Trader registered")
     except Exception as e:
@@ -594,7 +722,31 @@ def add_trader():
             "trading_days_left": d.get("trading_days_left", 30)
         }
 
-        return ok(supabase.table("traders").insert(row).execute().data, "Trader added")
+        created = supabase.table("traders").insert(row).execute().data
+        trader_row = created[0] if created else row
+
+        send_email_safe(
+            row.get("email"),
+            "Welcome to NairaPips",
+            f"""Hello {row.get("name") or "Trader"},
+
+Your NairaPips trader account has been created successfully.
+
+Reference: {trader_row.get("account_reference", "Not generated")}
+
+NairaPips Team"""
+        )
+        send_admin_alert(
+            "New NairaPips trader registration",
+            f"""A trader account was created on NairaPips.
+
+Name: {row.get("name") or "Not provided"}
+Email: {row.get("email") or "Not provided"}
+Phone: {row.get("phone") or "Not provided"}
+Reference: {trader_row.get("account_reference", "Not generated")}"""
+        )
+
+        return ok(created, "Trader added")
 
     except Exception as e:
         return bad(e)
@@ -742,6 +894,16 @@ def update_status():
             send_challenge_certificate_email(
                 trader_row,
                 upd.get("admin_note") or f"Current status: {upd.get('status', trader_row.get('status', 'updated'))}. Current phase: {upd.get('phase', trader_row.get('phase', 'updated'))}."
+            )
+            send_admin_alert(
+                "NairaPips challenge passed certificate earned",
+                f"""A trader challenge status was marked as passed/funded.
+
+Trader: {trader_row.get("name") if trader_row else ""}
+Email: {trader_row.get("email") if trader_row else ""}
+Status: {upd.get("status", trader_row.get("status", ""))}
+Phase: {upd.get("phase", trader_row.get("phase", ""))}
+Note: {upd.get("admin_note") or "Challenge pass/certificate status updated."}"""
             )
         return ok(result)
     except Exception as e: return bad(e)
@@ -901,6 +1063,20 @@ def create_purchase():
              "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
         created = supabase.table("challenge_purchases").insert(row).execute().data
 
+        send_email_safe(
+            row.get("email"),
+            "NairaPips payment proof received",
+            f"""Hello {row.get("trader_name") or "Trader"},
+
+Your NairaPips payment proof has been received.
+
+Plan: {plan}
+Challenge Fee: {email_money(row.get("fee"))}
+
+Admin will review your proof and notify you after approval or rejection.
+
+NairaPips Team"""
+        )
         send_email_safe(
             row.get("email"),
             "NairaPips challenge purchase submitted",
@@ -1218,7 +1394,28 @@ def reply_ticket():
         d=request.json or {}; tid=d.get("id"); reply=str(d.get("admin_reply","")).strip()
         if not tid: return bad("Missing ticket id")
         if not reply: return bad("Admin reply is required")
-        return ok(supabase.table("support_tickets").update({"admin_reply":reply,"status":"replied","replied_at":now_iso(),"last_updated_at":now_iso()}).eq("id",tid).execute().data, "Support ticket replied")
+        existing = supabase.table("support_tickets").select("*").eq("id",tid).limit(1).execute().data or []
+        ticket = existing[0] if existing else {}
+        result = supabase.table("support_tickets").update({"admin_reply":reply,"status":"replied","replied_at":now_iso(),"last_updated_at":now_iso()}).eq("id",tid).execute().data
+
+        send_email_safe(
+            ticket.get("email"),
+            "NairaPips support ticket reply",
+            f"""Hello {ticket.get("trader_name") or "Trader"},
+
+NairaPips support has replied to your ticket.
+
+Subject: {ticket.get("subject") or "Support Ticket"}
+
+Reply:
+{reply}
+
+Please log in to your trader dashboard if you need to continue the conversation.
+
+NairaPips Team"""
+        )
+
+        return ok(result, "Support ticket replied")
     except Exception as e: return bad(e)
 
 @app.route("/close_support_ticket", methods=["POST"])
