@@ -271,7 +271,11 @@ def send_email(to_email, subject, message):
 
         msg.attach(MIMEText(message, "plain"))
 
-        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10)
+        if SMTP_PORT == 587:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+            server.starttls()
+        else:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10)
         try:
             server.login(SMTP_EMAIL, SMTP_PASSWORD)
             server.sendmail(FROM_EMAIL, to_email, msg.as_string())
@@ -2214,7 +2218,11 @@ NairaPips Team
 """
         msg.attach(MIMEText(body, "plain"))
 
-        server = smtplib.SMTP_SSL("mail.nairapips.com", 465, timeout=10)
+        if SMTP_PORT == 587:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+            server.starttls()
+        else:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10)
         try:
             server.login(SMTP_EMAIL, SMTP_PASSWORD)
             server.sendmail(SMTP_EMAIL, SMTP_EMAIL, msg.as_string())
