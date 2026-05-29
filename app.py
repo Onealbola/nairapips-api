@@ -271,13 +271,8 @@ def send_email(to_email, subject, message):
 
         msg.attach(MIMEText(message, "plain"))
 
-        if SMTP_PORT == 587:
-            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-        else:
-            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10)
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+        server.starttls()
         try:
             server.login(SMTP_EMAIL, SMTP_PASSWORD)
             server.sendmail(FROM_EMAIL, to_email, msg.as_string())
@@ -2220,13 +2215,8 @@ NairaPips Team
 """
         msg.attach(MIMEText(body, "plain"))
 
-        if SMTP_PORT == 587:
-            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-        else:
-            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10)
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+        server.starttls()
         try:
             server.login(SMTP_EMAIL, SMTP_PASSWORD)
             server.sendmail(SMTP_EMAIL, SMTP_EMAIL, msg.as_string())
