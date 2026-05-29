@@ -273,7 +273,9 @@ def send_email(to_email, subject, message):
 
         if SMTP_PORT == 587:
             server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+            server.ehlo()
             server.starttls()
+            server.ehlo()
         else:
             server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10)
         try:
@@ -2220,7 +2222,9 @@ NairaPips Team
 
         if SMTP_PORT == 587:
             server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
+            server.ehlo()
             server.starttls()
+            server.ehlo()
         else:
             server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10)
         try:
