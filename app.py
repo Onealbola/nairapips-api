@@ -5,16 +5,13 @@ from supabase import create_client
 from werkzeug.utils import secure_filename
 from datetime import datetime, timezone
 import os, random, uuid
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import html
+import requests
 app = Flask(__name__)
 CORS(app)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SMTP_EMAIL = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_PASS")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
@@ -250,52 +247,53 @@ def trader_source_get(lookup):
 
 
 
-SMTP_HOST = os.getenv("SMTP_HOST", "mail.nairapips.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_EMAIL)
-ADMIN_ALERT_EMAIL = os.getenv("ADMIN_ALERT_EMAIL") or SMTP_EMAIL or FROM_EMAIL
+FROM_EMAIL = os.getenv("FROM_EMAIL") or "support@nairapips.com"
+ADMIN_ALERT_EMAIL = os.getenv("ADMIN_ALERT_EMAIL") or FROM_EMAIL
+BREVO_API_KEY = os.getenv("BREVO_API_KEY")
+BREVO_EMAIL_URL = "https://api.brevo.com/v3/smtp/email"
 
-def send_email(to_email, subject, message):
+def text_to_html_content(message):
+    return "<p>" + html.escape(str(message or "")).replace("\n", "<br>") + "</p>"
+
+def send_email_brevo(to_email, subject, html_content):
     try:
         if not to_email:
             return False
-        if not SMTP_HOST or not SMTP_PORT or not SMTP_EMAIL or not SMTP_PASSWORD or not FROM_EMAIL:
-            print("EMAIL SKIPPED: SMTP environment is incomplete")
+        if not BREVO_API_KEY or not FROM_EMAIL:
+            print("BREVO EMAIL ERROR:", "BREVO_API_KEY or FROM_EMAIL is missing")
             return False
 
-        print("EMAIL ATTEMPT:", to_email)
-        print("SMTP CONFIG:", SMTP_HOST, SMTP_PORT, SMTP_EMAIL, FROM_EMAIL)
-        msg = MIMEMultipart()
-        msg["From"] = FROM_EMAIL
-        msg["To"] = to_email
-        msg["Subject"] = subject
+        print("BREVO EMAIL ATTEMPT:", to_email)
+        payload = {
+            "sender": {"name": "NairaPips", "email": FROM_EMAIL},
+            "to": [{"email": to_email}],
+            "subject": subject,
+            "htmlContent": html_content
+        }
+        res = requests.post(
+            BREVO_EMAIL_URL,
+            headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+            timeout=10
+        )
+        if res.status_code >= 400:
+            print("BREVO EMAIL ERROR:", res.status_code, res.text[:500])
+            return False
 
-        msg.attach(MIMEText(message, "plain"))
-
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
-        server.starttls()
-        print("SMTP STARTTLS OK")
-        try:
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            print("SMTP LOGIN OK")
-            server.sendmail(FROM_EMAIL, to_email, msg.as_string())
-        finally:
-            try:
-                server.quit()
-            except Exception:
-                pass
-
-        print("EMAIL SENT:", to_email)
+        print("BREVO EMAIL SENT:", to_email)
         return True
     except Exception as e:
-        print("EMAIL ERROR:", str(e))
+        print("BREVO EMAIL ERROR:", str(e))
         return False
+
+def send_email(to_email, subject, message):
+    return send_email_brevo(to_email, subject, text_to_html_content(message))
 
 def send_email_safe(to_email, subject, message):
     try:
         return send_email(to_email, subject, message)
     except Exception as e:
-        print("EMAIL ERROR:", str(e))
+        print("BREVO EMAIL ERROR:", str(e))
         return False
 
 def send_admin_alert(subject, message):
@@ -2199,41 +2197,18 @@ def save_payment_accounts():
 @app.route("/test_email")
 def test_email():
     try:
-        if not SMTP_EMAIL or not SMTP_PASSWORD:
-            print("EMAIL ERROR:", "SMTP credentials are missing")
-            return {"success": False, "error": "SMTP credentials are missing"}
-
-        print("EMAIL ATTEMPT:", SMTP_EMAIL)
-        msg = MIMEMultipart()
-        msg["From"] = SMTP_EMAIL
-        msg["To"] = SMTP_EMAIL
-        msg["Subject"] = "NairaPips Email Test"
-
-        body = """
-NairaPips email system is working.
-
-This confirms support@nairapips.com can send automated emails from Render.
-
-NairaPips Team
-"""
-        msg.attach(MIMEText(body, "plain"))
-
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
-        server.starttls()
-        try:
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            server.sendmail(SMTP_EMAIL, SMTP_EMAIL, msg.as_string())
-        finally:
-            try:
-                server.quit()
-            except Exception:
-                pass
-
-        print("EMAIL SENT:", SMTP_EMAIL)
-        return {"success": True, "message": "Test email sent"}
+        recipient = ADMIN_ALERT_EMAIL or FROM_EMAIL
+        sent = send_email_brevo(
+            recipient,
+            "NairaPips Email Test",
+            "<p>NairaPips email system is working.</p><p>This confirms Brevo HTTP email sending works from Render.</p><p>NairaPips Team</p>"
+        )
+        if sent:
+            return {"success": True, "message": "Test email sent"}
+        return {"success": False, "error": "Brevo email send failed. Check Render logs."}
 
     except Exception as e:
-        print("EMAIL ERROR:", str(e))
+        print("BREVO EMAIL ERROR:", str(e))
         return {"success": False, "error": str(e)}
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
