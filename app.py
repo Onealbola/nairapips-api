@@ -264,6 +264,7 @@ def send_email(to_email, subject, message):
             return False
 
         print("EMAIL ATTEMPT:", to_email)
+        print("SMTP CONFIG:", SMTP_HOST, SMTP_PORT, SMTP_EMAIL, FROM_EMAIL)
         msg = MIMEMultipart()
         msg["From"] = FROM_EMAIL
         msg["To"] = to_email
@@ -273,8 +274,10 @@ def send_email(to_email, subject, message):
 
         server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10)
         server.starttls()
+        print("SMTP STARTTLS OK")
         try:
             server.login(SMTP_EMAIL, SMTP_PASSWORD)
+            print("SMTP LOGIN OK")
             server.sendmail(FROM_EMAIL, to_email, msg.as_string())
         finally:
             try:
