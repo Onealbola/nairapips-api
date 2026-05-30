@@ -308,6 +308,38 @@ def email_money(value):
     except Exception:
         return "₦0"
 
+def public_money(value):
+    try:
+        return "₦" + f"{float(value or 0):,.0f}"
+    except Exception:
+        return "₦0"
+
+def public_first_name(row):
+    raw = str((row or {}).get("trader_name") or (row or {}).get("name") or (row or {}).get("full_name") or "").strip()
+    if not raw:
+        return "A trader"
+    first = raw.split()[0].strip()
+    first = re.sub(r"[^A-Za-zÀ-ÿ'-]", "", first)
+    if len(first) < 2:
+        return "A trader"
+    return first
+
+def public_activity_time(row):
+    for key in ["paid_at", "approved_at", "assigned_at", "requested_at", "created_at", "updated_at"]:
+        score = _dt_score((row or {}).get(key))
+        if score:
+            return score
+    return 0
+
+def nairapips_system_activity():
+    return [
+        {"type": "system", "message": "NairaPips challenge plans are live"},
+        {"type": "system", "message": "NairaPips MT5 assignment system is active"},
+        {"type": "system", "message": "NairaPips payout review desk is active"},
+        {"type": "system", "message": "NairaPips monitoring engine is active"},
+        {"type": "system", "message": "NairaPips support desk is online"},
+    ]
+
 def trader_display_name(row):
     return (row or {}).get("trader_name") or (row or {}).get("name") or "Trader"
 
@@ -385,6 +417,60 @@ def home():
 @app.route("/health")
 def health():
     return jsonify({"health":"ok"})
+
+@app.route("/public_activity", methods=["GET"])
+def public_activity():
+    activity = []
+
+    try:
+        rows = supabase.table("payouts").select("*").order("created_at", desc=True).limit(20).execute().data or []
+        for row in rows:
+            status = str(row.get("status") or "").lower()
+            if status not in ["approved", "paid"]:
+                continue
+            amount = public_money(row.get("amount"))
+            activity.append({
+                "type": "payout",
+                "message": f"{amount} payout approved",
+                "_score": public_activity_time(row)
+            })
+    except Exception as e:
+        print("PUBLIC ACTIVITY PAYOUTS ERROR:", str(e))
+
+    try:
+        rows = supabase.table("traders").select("*").order("created_at", desc=True).limit(20).execute().data or []
+        for row in rows:
+            name = public_first_name(row)
+            message = "A trader just joined NairaPips" if name == "A trader" else f"{name} just joined NairaPips"
+            activity.append({
+                "type": "registration",
+                "message": message,
+                "_score": public_activity_time(row)
+            })
+    except Exception as e:
+        print("PUBLIC ACTIVITY TRADERS ERROR:", str(e))
+
+    try:
+        rows = supabase.table("challenge_purchases").select("*").order("created_at", desc=True).limit(20).execute().data or []
+        for row in rows:
+            status = str(row.get("status") or "").lower()
+            payment_status = str(row.get("payment_status") or "").lower()
+            if status not in ["approved", "approved_active"] and payment_status != "approved":
+                continue
+            amount = public_money(row.get("account_size"))
+            activity.append({
+                "type": "challenge",
+                "message": f"{amount} challenge approved",
+                "_score": public_activity_time(row)
+            })
+    except Exception as e:
+        print("PUBLIC ACTIVITY CHALLENGES ERROR:", str(e))
+
+    activity.sort(key=lambda item: item.get("_score", 0), reverse=True)
+    public_rows = [{k: v for k, v in item.items() if k != "_score"} for item in activity]
+    if len(public_rows) < 20:
+        public_rows.extend(nairapips_system_activity())
+    return jsonify(public_rows[:20])
 
 @app.route("/upload_payment_proof", methods=["POST"])
 def upload_payment_proof():
