@@ -120,6 +120,59 @@ def _safe_update_table(table, payload, column, value):
         print(f"SAFE UPDATE FAILED {table}.{column}:", e)
         return None
 
+
+# ================================
+# NAIRAPIPS PRODUCTION SAFETY CORE
+# ================================
+PROTECTED_DELETE_TABLES = {"payouts", "payments"}
+SAFE_FLAG_TABLES = {"traders", "challenge_purchases", "payouts", "payments", "referrals"}
+
+
+def _admin_from_payload(data):
+    return {
+        "id": data.get("admin_id") or data.get("staff_id") or "",
+        "name": data.get("admin_name") or data.get("approved_by") or data.get("mt5_updated_by") or "admin",
+        "username": data.get("admin_username") or data.get("approved_by") or data.get("mt5_updated_by") or "admin",
+        "role": data.get("admin_role") or "admin",
+    }
+
+
+def _audit_safe(module, action, details="", staff=None):
+    try:
+        audit_log(staff or {"name": "system", "username": "system", "role": "system"}, module, action, details)
+    except Exception as e:
+        print("AUDIT LOG ERROR:", str(e))
+
+
+def _safe_fetch(table, column, value, limit=50):
+    try:
+        if value is None or str(value).strip() == "":
+            return []
+        res = supabase.table(table).select("*").eq(column, value).limit(limit).execute()
+        return getattr(res, "data", []) or []
+    except Exception as e:
+        print(f"SAFE FETCH FAILED {table}.{column}:", e)
+        return []
+
+
+def _is_truthy(value):
+    return value is True or str(value or "").strip().lower() in {"true", "1", "yes", "y"}
+
+
+def _is_funded_trader(row):
+    status = str(row.get("status") or "").strip().lower()
+    phase = str(row.get("phase") or "").strip().lower()
+    return status in {"funded", "live"} or phase in {"funded", "live"} or bool(row.get("funded_at"))
+
+
+def _has_approved_payment(rows):
+    for row in rows or []:
+        status = str(row.get("status") or "").strip().lower()
+        payment = str(row.get("payment_status") or "").strip().lower()
+        if status in {"approved", "approved_active", "paid"} or payment == "approved":
+            return True
+    return False
+
 @app.route("/update_trader_mt5", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
 def update_trader_mt5():
@@ -227,6 +280,7 @@ Server: {mt5_server}
 Reason: {data.get("mt5_reset_reason") or data.get("admin_note") or "MT5 login details updated"}"""
         )
 
+        _audit_safe("mt5", "mt5_account_update", f"Trader {trader_id} MT5 updated to {mt5_login} / {mt5_server}", _admin_from_payload(data))
         return _np_ok({"success": True, "message": "MT5 details updated and synced", "data": trader_rows})
     except Exception as e:
         return _np_fail(e, 500)
@@ -847,13 +901,19 @@ def delete_trader():
 
         found = supabase.table("traders").select("*").eq("id", trader_id).execute().data
         trader = found[0] if found else {}
+        if _is_funded_trader(trader):
+            return bad("Funded/live traders cannot be deleted in production. Deactivate or mark as test instead.", 403)
 
         email = trader.get("email")
         phone = trader.get("phone")
+        related_purchases = []
+        related_purchases += _safe_fetch("challenge_purchases", "trader_id", trader_id)
+        related_purchases += _safe_fetch("challenge_purchases", "email", email)
+        related_purchases += _safe_fetch("challenge_purchases", "phone", phone)
+        if _has_approved_payment(related_purchases):
+            return bad("Traders with approved payments cannot be deleted in production. Mark as test or exclude from revenue instead.", 403)
 
         related_tables = [
-            "challenge_purchases",
-            "payouts",
             "support_tickets",
             "monitoring_snapshots",
             "monitoring_events"
@@ -929,6 +989,7 @@ Investor Password: {upd.get("mt5_investor_password", "")}
 NairaPips Team"""
         )
 
+        _audit_safe("payments", "payment_approved", f"Trader {tid} payment approved", _admin_from_payload(d))
         return ok(result, "Payment approved")
     except Exception as e: return bad(e)
 
@@ -961,7 +1022,7 @@ def update_status():
     try:
         d=request.json or {}; tid=d.get("id")
         if not tid: return bad("Missing trader id")
-        allowed=["status","phase","balance","equity","profit","drawdown","profit_percent","drawdown_percent","engine_group","payment_status","payment_note","admin_note","trading_days_left"]
+        allowed=["status","phase","balance","equity","profit","drawdown","profit_percent","drawdown_percent","engine_group","payment_status","payment_note","admin_note","trading_days_left","lead_status","follow_up_at"]
         upd={k:d[k] for k in allowed if k in d}
         if d.get("phase")=="funded" or d.get("status")=="funded": upd["funded_at"]=now_iso()
         if not upd: return bad("Nothing to update")
@@ -991,6 +1052,7 @@ Status: {upd.get("status", trader_row.get("status", ""))}
 Phase: {upd.get("phase", trader_row.get("phase", ""))}
 Note: {upd.get("admin_note") or "Challenge pass/certificate status updated."}"""
             )
+        _audit_safe("traders", "trader_status_update", f"Trader {tid} status update: {upd}", _admin_from_payload(d))
         return ok(result)
     except Exception as e: return bad(e)
 
@@ -999,7 +1061,9 @@ def activate_trader():
     try:
         tid=(request.json or {}).get("id")
         if not tid: return bad("Missing trader id")
-        return ok(supabase.table("traders").update({"status":"active"}).eq("id",tid).execute().data)
+        result = supabase.table("traders").update({"status":"active"}).eq("id",tid).execute().data
+        _audit_safe("traders", "trader_activated", f"Trader {tid} activated", _admin_from_payload(request.json or {}))
+        return ok(result)
     except Exception as e: return bad(e)
 
 @app.route("/deactivate_trader", methods=["POST"])
@@ -1143,6 +1207,10 @@ def create_purchase():
         d=request.json or {}; plan=str(d.get("plan_name","")).strip(); proof=str(d.get("payment_proof_url","")).strip()
         if not plan: return bad("Plan name is required")
         if not proof: return bad("Payment proof is required")
+        ref_code = str(d.get("referral_code") or d.get("ref_code") or d.get("affiliate_code") or "").strip().lower()
+        own_ref_codes = [str(d.get(k) or "").strip().lower() for k in ["own_referral_code", "my_referral_code", "personal_referral_code"]]
+        if ref_code and ref_code in [x for x in own_ref_codes if x]:
+            return bad("Self-referral is not allowed.", 403)
         row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
              "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
              "payment_proof_url":proof,"payment_status":"pending","status":"pending_review","admin_note":"",
@@ -1254,6 +1322,8 @@ Please log in to your trader dashboard to view your account details and begin yo
 NairaPips Team"""
         )
 
+        _audit_safe("challenge_purchases", "challenge_purchase_approved", f"Purchase {pid} approved", _admin_from_payload(d))
+        _audit_safe("mt5", "mt5_account_assignment", f"Purchase {pid} assigned MT5 {m.get('mt5_login','')}", _admin_from_payload(d))
         return ok(approved_rows, "Challenge purchase approved and MT5 assigned")
     except Exception as e: return bad(e)
 
@@ -1389,6 +1459,7 @@ Admin Note: {note or "Approved after review."}
 NairaPips Team"""
         )
 
+        _audit_safe("payouts", "payout_approved", f"Payout {pid} approved", _admin_from_payload(d))
         return ok(result, "Payout approved")
     except Exception as e: return bad(e)
 
@@ -1439,6 +1510,7 @@ Admin Note: {note or "Payment completed."}
 NairaPips Team"""
         )
 
+        _audit_safe("payouts", "payout_paid", f"Payout {pid} marked paid", _admin_from_payload(d))
         return ok(result, "Payout marked paid")
     except Exception as e: return bad(e)
 
@@ -2437,6 +2509,72 @@ def audit_log(staff, module, action, details=''):
         }).execute()
     except Exception:
         pass
+
+
+
+@app.post('/audit_event')
+def audit_event_route():
+    try:
+        data = request.get_json(silent=True) or {}
+        _audit_safe(
+            data.get('module') or 'admin',
+            data.get('action') or 'activity',
+            data.get('details') or data.get('record') or '',
+            _admin_from_payload(data)
+        )
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/mark_record_test')
+def mark_record_test():
+    try:
+        data = request.get_json(silent=True) or {}
+        table = str(data.get('table') or '').strip()
+        record_id = data.get('id')
+        if table not in SAFE_FLAG_TABLES:
+            return bad('Unsupported table for test/revenue flagging')
+        if not record_id:
+            return bad('Record id is required')
+
+        payload = {'updated_at': now_iso()}
+        if 'mark_as_test' in data:
+            payload['mark_as_test'] = bool(data.get('mark_as_test'))
+        if 'excluded_from_revenue' in data:
+            payload['excluded_from_revenue'] = bool(data.get('excluded_from_revenue'))
+        if len(payload) == 1:
+            return bad('Nothing to update')
+
+        try:
+            res = supabase.table(table).update(payload).eq('id', record_id).execute()
+        except Exception as e:
+            print('SAFE FLAG UPDATE FAILED:', table, record_id, e)
+            return jsonify({'success': False, 'fallback': 'local', 'error': str(e)}), 200
+
+        _audit_safe(table, 'mark_test_or_revenue_flag', f"{table}:{record_id} {payload}", _admin_from_payload(data))
+        return ok(getattr(res, 'data', []) or [], 'Record flag updated')
+    except Exception as e:
+        return bad(e)
+
+@app.post('/delete_payout')
+def delete_payout_protected():
+    return bad('Payout records cannot be deleted in production. Mark as test or exclude from revenue instead.', 403)
+
+@app.post('/delete_payment')
+def delete_payment_protected():
+    return bad('Approved payment records cannot be deleted in production. Mark as test or exclude from revenue instead.', 403)
+
+@app.post('/delete_challenge_purchase')
+def delete_challenge_purchase_protected():
+    try:
+        data = request.get_json(silent=True) or {}
+        pid = data.get('id')
+        purchase = get_purchase_by_id(pid) if pid else {}
+        if _has_approved_payment([purchase]):
+            return bad('Approved challenge purchases cannot be deleted in production. Mark as test or exclude from revenue instead.', 403)
+        return bad('Challenge purchase deletion is disabled in production. Mark as test or exclude from revenue instead.', 403)
+    except Exception as e:
+        return bad(e)
 
 # ===== NAIRAPIPS PAYMENT ACCOUNTS ROUTES =====
 # Paste above: if __name__ == "__main__":
