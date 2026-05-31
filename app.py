@@ -137,9 +137,9 @@ def _admin_from_payload(data):
     }
 
 
-def _audit_safe(module, action, details="", staff=None):
+def _audit_safe(module, action, details="", staff=None, record_affected=""):
     try:
-        audit_log(staff or {"name": "system", "username": "system", "role": "system"}, module, action, details)
+        audit_log(staff or {"name": "system", "username": "system", "role": "system"}, module, action, details, record_affected)
     except Exception as e:
         print("AUDIT LOG ERROR:", str(e))
 
@@ -2496,31 +2496,140 @@ def audit_logs():
     except Exception as e:
         return jsonify([])
 
-def audit_log(staff, module, action, details=''):
+def audit_log(staff, module, action, details='', record_affected='', created_at=None):
     try:
-        supabase.table('admin_audit_logs').insert({
+        row = {
             'staff_id': str(staff.get('id','')),
             'staff_name': staff.get('name'),
             'username': staff.get('username'),
             'role': staff.get('role'),
             'module': module,
             'action': action,
-            'details': details
-        }).execute()
-    except Exception:
-        pass
+            'details': details,
+            'record_affected': record_affected,
+            'created_at': created_at or now_iso()
+        }
+        try:
+            supabase.table('admin_audit_logs').insert(row).execute()
+        except Exception:
+            row.pop('record_affected', None)
+            row.pop('created_at', None)
+            supabase.table('admin_audit_logs').insert(row).execute()
+    except Exception as e:
+        print('AUDIT LOG ERROR:', str(e))
 
 
+
+
+
+def _business_setting_defaults():
+    return {
+        "revenue_launch_date": "",
+        "production_mode": "test"
+    }
+
+
+def _load_business_settings():
+    settings = _business_setting_defaults()
+    try:
+        res = supabase.table('business_settings').select('*').execute()
+        rows = getattr(res, 'data', []) or []
+        for row in rows:
+            key = row.get('key') or row.get('setting_key') or row.get('name')
+            if not key:
+                continue
+            value = row.get('value')
+            if value is None:
+                value = row.get('setting_value')
+            if value is None:
+                value = row.get('data')
+            settings[str(key)] = value if value is not None else ""
+    except Exception as e:
+        print('BUSINESS SETTINGS LOAD ERROR:', str(e))
+    return settings
+
+
+def _save_business_setting(key, value, admin=None):
+    row = {
+        'key': key,
+        'value': str(value or ''),
+        'updated_at': now_iso(),
+        'updated_by': (admin or {}).get('name') or (admin or {}).get('username') or 'admin'
+    }
+    try:
+        supabase.table('business_settings').upsert(row, on_conflict='key').execute()
+        return True, None
+    except Exception as e:
+        print('BUSINESS SETTINGS SAVE ERROR:', str(e))
+        try:
+            supabase.table('business_settings').update({
+                'value': row['value'],
+                'updated_at': row['updated_at'],
+                'updated_by': row['updated_by']
+            }).eq('key', key).execute()
+            return True, None
+        except Exception as e2:
+            print('BUSINESS SETTINGS UPDATE ERROR:', str(e2))
+            return False, str(e2)
+
+@app.get('/business_settings')
+def get_business_settings():
+    return jsonify({'success': True, 'data': _load_business_settings()})
+
+@app.post('/business_settings')
+def update_business_settings():
+    data = request.get_json(silent=True) or {}
+    admin = _admin_from_payload(data)
+    allowed = {'revenue_launch_date', 'production_mode'}
+    saved = {}
+    for key in allowed:
+        if key in data:
+            ok_saved, err = _save_business_setting(key, data.get(key), admin)
+            if not ok_saved:
+                return jsonify({'success': False, 'error': err or f'Could not save {key}'}), 500
+            saved[key] = data.get(key) or ''
+    if 'launch_date' in data and 'revenue_launch_date' not in saved:
+        ok_saved, err = _save_business_setting('revenue_launch_date', data.get('launch_date'), admin)
+        if not ok_saved:
+            return jsonify({'success': False, 'error': err or 'Could not save launch date'}), 500
+        saved['revenue_launch_date'] = data.get('launch_date') or ''
+    _audit_safe('business_settings', 'settings_update', f'Business settings updated: {saved}', admin, 'business_settings')
+    return jsonify({'success': True, 'data': _load_business_settings()})
+
+@app.get('/revenue_launch_date')
+def get_revenue_launch_date():
+    settings = _load_business_settings()
+    return jsonify({'success': True, 'data': {
+        'revenue_launch_date': settings.get('revenue_launch_date') or '',
+        'production_mode': settings.get('production_mode') or 'test'
+    }})
+
+@app.post('/revenue_launch_date')
+def update_revenue_launch_date():
+    data = request.get_json(silent=True) or {}
+    admin = _admin_from_payload(data)
+    value = data.get('revenue_launch_date') if 'revenue_launch_date' in data else data.get('launch_date', '')
+    ok_saved, err = _save_business_setting('revenue_launch_date', value or '', admin)
+    if not ok_saved:
+        return jsonify({'success': False, 'error': err or 'Could not save revenue launch date'}), 500
+    if 'production_mode' in data:
+        ok_mode, err_mode = _save_business_setting('production_mode', data.get('production_mode') or 'test', admin)
+        if not ok_mode:
+            return jsonify({'success': False, 'error': err_mode or 'Could not save production mode'}), 500
+    _audit_safe('revenue', 'launch_date_set', f'Revenue launch date set to {value or "cleared"}', admin, 'business_launch_date')
+    return get_revenue_launch_date()
 
 @app.post('/audit_event')
 def audit_event_route():
     try:
         data = request.get_json(silent=True) or {}
-        _audit_safe(
+        audit_log(
+            _admin_from_payload(data),
             data.get('module') or 'admin',
             data.get('action') or 'activity',
             data.get('details') or data.get('record') or '',
-            _admin_from_payload(data)
+            data.get('record_affected') or data.get('record_id') or '',
+            data.get('created_at') or now_iso()
         )
         return jsonify({'success': True})
     except Exception as e:
