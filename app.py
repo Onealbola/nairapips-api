@@ -2529,48 +2529,129 @@ def _business_setting_defaults():
     }
 
 
+def _coerce_business_settings_from_row(row):
+    settings = {}
+    if not isinstance(row, dict):
+        return settings
+
+    # Direct-column schema support: id/main row with launch_date + production_mode columns.
+    for date_key in ["revenue_launch_date", "launch_date", "business_launch_date"]:
+        if row.get(date_key) not in [None, ""]:
+            settings["revenue_launch_date"] = row.get(date_key)
+            break
+    if row.get("production_mode") not in [None, ""]:
+        settings["production_mode"] = row.get("production_mode")
+
+    # Key/value schema support: key/value, setting_key/setting_value, name/data.
+    key = row.get("key") or row.get("setting_key") or row.get("name")
+    if key:
+        value = row.get("value")
+        if value is None:
+            value = row.get("setting_value")
+        if value is None:
+            value = row.get("data")
+        if value is None:
+            value = row.get("setting_data")
+        key = str(key)
+        if key == "launch_date":
+            key = "revenue_launch_date"
+        settings[key] = value if value is not None else ""
+
+    return settings
+
+
 def _load_business_settings():
     settings = _business_setting_defaults()
     try:
         res = supabase.table('business_settings').select('*').execute()
         rows = getattr(res, 'data', []) or []
         for row in rows:
-            key = row.get('key') or row.get('setting_key') or row.get('name')
-            if not key:
-                continue
-            value = row.get('value')
-            if value is None:
-                value = row.get('setting_value')
-            if value is None:
-                value = row.get('data')
-            settings[str(key)] = value if value is not None else ""
+            settings.update(_coerce_business_settings_from_row(row))
     except Exception as e:
         print('BUSINESS SETTINGS LOAD ERROR:', str(e))
+    if settings.get("production_mode") not in ["test", "live"]:
+        settings["production_mode"] = "test"
+    settings["revenue_launch_date"] = str(settings.get("revenue_launch_date") or settings.get("launch_date") or "")
     return settings
 
 
-def _save_business_setting(key, value, admin=None):
-    row = {
-        'key': key,
-        'value': str(value or ''),
-        'updated_at': now_iso(),
-        'updated_by': (admin or {}).get('name') or (admin or {}).get('username') or 'admin'
-    }
+def _try_business_settings_write(row, on_conflict=None, update_column=None, update_value=None):
     try:
-        supabase.table('business_settings').upsert(row, on_conflict='key').execute()
+        table = supabase.table('business_settings')
+        if update_column:
+            table.update(row).eq(update_column, update_value).execute()
+        elif on_conflict:
+            table.upsert(row, on_conflict=on_conflict).execute()
+        else:
+            table.insert(row).execute()
         return True, None
     except Exception as e:
-        print('BUSINESS SETTINGS SAVE ERROR:', str(e))
-        try:
-            supabase.table('business_settings').update({
-                'value': row['value'],
-                'updated_at': row['updated_at'],
-                'updated_by': row['updated_by']
-            }).eq('key', key).execute()
+        return False, str(e)
+
+
+def _save_business_settings(settings, admin=None):
+    current = _load_business_settings()
+    current.update(settings or {})
+    launch = str(current.get('revenue_launch_date') or current.get('launch_date') or '')
+    mode = 'live' if str(current.get('production_mode') or '').lower() == 'live' else 'test'
+    who = (admin or {}).get('name') or (admin or {}).get('username') or 'admin'
+    now = now_iso()
+
+    attempts = [
+        # Direct-column schemas.
+        ({'id': 'main', 'revenue_launch_date': launch, 'launch_date': launch, 'production_mode': mode, 'updated_at': now, 'updated_by': who}, 'id', None, None),
+        ({'id': 'main', 'revenue_launch_date': launch, 'production_mode': mode, 'updated_at': now, 'updated_by': who}, 'id', None, None),
+        ({'id': 'main', 'launch_date': launch, 'production_mode': mode, 'updated_at': now, 'updated_by': who}, 'id', None, None),
+        ({'id': 'main', 'revenue_launch_date': launch, 'launch_date': launch, 'production_mode': mode}, 'id', None, None),
+        ({'id': 'main', 'revenue_launch_date': launch, 'production_mode': mode}, 'id', None, None),
+        ({'id': 'main', 'launch_date': launch, 'production_mode': mode}, 'id', None, None),
+        ({'revenue_launch_date': launch, 'launch_date': launch, 'production_mode': mode, 'updated_at': now, 'updated_by': who}, None, 'id', 'main'),
+        ({'revenue_launch_date': launch, 'production_mode': mode, 'updated_at': now, 'updated_by': who}, None, 'id', 'main'),
+        ({'launch_date': launch, 'production_mode': mode, 'updated_at': now, 'updated_by': who}, None, 'id', 'main'),
+        ({'revenue_launch_date': launch, 'launch_date': launch, 'production_mode': mode}, None, 'id', 'main'),
+        ({'revenue_launch_date': launch, 'production_mode': mode}, None, 'id', 'main'),
+        ({'launch_date': launch, 'production_mode': mode}, None, 'id', 'main'),
+    ]
+
+    errors = []
+    for row, conflict, update_column, update_value in attempts:
+        ok_saved, err = _try_business_settings_write(row, conflict, update_column, update_value)
+        if ok_saved:
             return True, None
-        except Exception as e2:
-            print('BUSINESS SETTINGS UPDATE ERROR:', str(e2))
-            return False, str(e2)
+        errors.append(err)
+
+    # Key/value schemas. Save both settings independently; this supports tables with key/value rows.
+    kv_attempts = []
+    for key, value in [('revenue_launch_date', launch), ('production_mode', mode)]:
+        kv_attempts.extend([
+            ({'key': key, 'value': value, 'updated_at': now, 'updated_by': who}, 'key', None, None),
+            ({'key': key, 'value': value}, 'key', None, None),
+            ({'setting_key': key, 'setting_value': value, 'updated_at': now, 'updated_by': who}, 'setting_key', None, None),
+            ({'setting_key': key, 'setting_value': value}, 'setting_key', None, None),
+            ({'name': key, 'value': value, 'updated_at': now, 'updated_by': who}, 'name', None, None),
+            ({'name': key, 'value': value}, 'name', None, None),
+            ({'key': key, 'value': value}, None, 'key', key),
+            ({'setting_key': key, 'setting_value': value}, None, 'setting_key', key),
+            ({'name': key, 'value': value}, None, 'name', key),
+        ])
+
+    saved_any = False
+    for row, conflict, update_column, update_value in kv_attempts:
+        ok_saved, err = _try_business_settings_write(row, conflict, update_column, update_value)
+        if ok_saved:
+            saved_any = True
+        else:
+            errors.append(err)
+
+    if saved_any:
+        return True, None
+    return False, ' | '.join([e for e in errors if e][-5:]) or 'Business settings table schema is unsupported'
+
+
+def _save_business_setting(key, value, admin=None):
+    if key == 'launch_date':
+        key = 'revenue_launch_date'
+    return _save_business_settings({key: value}, admin)
 
 @app.get('/business_settings')
 def get_business_settings():
@@ -2580,20 +2661,19 @@ def get_business_settings():
 def update_business_settings():
     data = request.get_json(silent=True) or {}
     admin = _admin_from_payload(data)
-    allowed = {'revenue_launch_date', 'production_mode'}
-    saved = {}
-    for key in allowed:
-        if key in data:
-            ok_saved, err = _save_business_setting(key, data.get(key), admin)
-            if not ok_saved:
-                return jsonify({'success': False, 'error': err or f'Could not save {key}'}), 500
-            saved[key] = data.get(key) or ''
-    if 'launch_date' in data and 'revenue_launch_date' not in saved:
-        ok_saved, err = _save_business_setting('revenue_launch_date', data.get('launch_date'), admin)
-        if not ok_saved:
-            return jsonify({'success': False, 'error': err or 'Could not save launch date'}), 500
-        saved['revenue_launch_date'] = data.get('launch_date') or ''
-    _audit_safe('business_settings', 'settings_update', f'Business settings updated: {saved}', admin, 'business_settings')
+    updates = {}
+    if 'revenue_launch_date' in data:
+        updates['revenue_launch_date'] = data.get('revenue_launch_date') or ''
+    if 'launch_date' in data:
+        updates['revenue_launch_date'] = data.get('launch_date') or ''
+    if 'production_mode' in data:
+        updates['production_mode'] = 'live' if str(data.get('production_mode')).lower() == 'live' else 'test'
+    if not updates:
+        return jsonify({'success': True, 'data': _load_business_settings()})
+    ok_saved, err = _save_business_settings(updates, admin)
+    if not ok_saved:
+        return jsonify({'success': False, 'error': err or 'Could not save business settings'}), 500
+    _audit_safe('business_settings', 'settings_update', f'Business settings updated: {updates}', admin, 'business_settings')
     return jsonify({'success': True, 'data': _load_business_settings()})
 
 @app.get('/revenue_launch_date')
@@ -2601,6 +2681,7 @@ def get_revenue_launch_date():
     settings = _load_business_settings()
     return jsonify({'success': True, 'data': {
         'revenue_launch_date': settings.get('revenue_launch_date') or '',
+        'launch_date': settings.get('revenue_launch_date') or '',
         'production_mode': settings.get('production_mode') or 'test'
     }})
 
@@ -2608,15 +2689,15 @@ def get_revenue_launch_date():
 def update_revenue_launch_date():
     data = request.get_json(silent=True) or {}
     admin = _admin_from_payload(data)
-    value = data.get('revenue_launch_date') if 'revenue_launch_date' in data else data.get('launch_date', '')
-    ok_saved, err = _save_business_setting('revenue_launch_date', value or '', admin)
+    updates = {
+        'revenue_launch_date': data.get('revenue_launch_date') if 'revenue_launch_date' in data else data.get('launch_date', '')
+    }
+    if 'production_mode' in data:
+        updates['production_mode'] = 'live' if str(data.get('production_mode')).lower() == 'live' else 'test'
+    ok_saved, err = _save_business_settings(updates, admin)
     if not ok_saved:
         return jsonify({'success': False, 'error': err or 'Could not save revenue launch date'}), 500
-    if 'production_mode' in data:
-        ok_mode, err_mode = _save_business_setting('production_mode', data.get('production_mode') or 'test', admin)
-        if not ok_mode:
-            return jsonify({'success': False, 'error': err_mode or 'Could not save production mode'}), 500
-    _audit_safe('revenue', 'launch_date_set', f'Revenue launch date set to {value or "cleared"}', admin, 'business_launch_date')
+    _audit_safe('revenue', 'launch_date_set', f'Revenue launch date set to {updates.get("revenue_launch_date") or "cleared"}', admin, 'business_launch_date')
     return get_revenue_launch_date()
 
 @app.post('/audit_event')
