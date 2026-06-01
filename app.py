@@ -3107,6 +3107,140 @@ def test_email():
     except Exception as e:
         print("BREVO EMAIL ERROR:", str(e))
         return {"success": False, "error": str(e)}
+
+
+# ================================
+# NAIRAPIPS RANGE REPORTING: SALES + PAYOUTS
+# ================================
+def _np_range_params():
+    requested_mode = str(request.args.get("mode") or "test").lower()
+    mode = "live" if requested_mode == "live" else "test"
+    from_iso = _normalize_launch_date(request.args.get("from_date") or "")
+    to_iso = _normalize_launch_date(request.args.get("to_date") or "")
+    from_dt = _revenue_date(from_iso) if from_iso else None
+    to_dt = _revenue_date(to_iso) if to_iso else None
+    if to_dt:
+        to_dt = to_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return mode, from_iso, to_iso, from_dt, to_dt
+
+def _np_in_range(dt, from_dt=None, to_dt=None):
+    if not dt:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if from_dt and dt < from_dt:
+        return False
+    if to_dt and dt > to_dt:
+        return False
+    return True
+
+def _np_report_excluded(row, mode="test"):
+    if mode != "live":
+        return False
+    return _revenue_bool(row.get("excluded_from_revenue")) or _revenue_bool(row.get("mark_as_test"))
+
+def _np_purchase_report_date(row):
+    return _revenue_date(row.get("approved_at") or row.get("assigned_at") or row.get("created_at"))
+
+def _np_payout_report_date(row):
+    status = str(row.get("status") or "").strip().lower()
+    if status == "paid":
+        return _revenue_date(row.get("paid_at") or row.get("approved_at") or row.get("requested_at") or row.get("created_at"))
+    if status == "approved":
+        return _revenue_date(row.get("approved_at") or row.get("requested_at") or row.get("created_at"))
+    return _revenue_date(row.get("requested_at") or row.get("created_at") or row.get("approved_at") or row.get("paid_at"))
+
+@app.get('/sales_summary')
+def sales_summary():
+    try:
+        mode, from_iso, to_iso, from_dt, to_dt = _np_range_params()
+        rows = supabase.table("challenge_purchases").select("*").execute().data or []
+        total_loaded = len(rows)
+        counted = []
+        excluded = 0
+        pending_amount = rejected_amount = 0
+        pending_count = rejected_count = 0
+        plan_map = {}
+        day_map = {}
+        for row in rows:
+            dt = _np_purchase_report_date(row)
+            if not _np_in_range(dt, from_dt, to_dt) or _np_report_excluded(row, mode):
+                excluded += 1
+                continue
+            payment_status = str(row.get("payment_status") or "").strip().lower()
+            status = str(row.get("status") or "").strip().lower()
+            amount = clean(row.get("fee"))
+            if payment_status == "approved" or status in ["approved", "approved_active", "active"]:
+                counted.append(row)
+                plan = row.get("plan_name") or "Unknown Plan"
+                if plan not in plan_map:
+                    plan_map[plan] = {"plan_name": plan, "count": 0, "amount": 0, "account_size": row.get("account_size") or 0}
+                plan_map[plan]["count"] += 1
+                plan_map[plan]["amount"] += amount
+                if dt:
+                    day = dt.date().isoformat()
+                    if day not in day_map:
+                        day_map[day] = {"date": day, "count": 0, "amount": 0}
+                    day_map[day]["count"] += 1
+                    day_map[day]["amount"] += amount
+            elif payment_status in ["pending", "pending_review"] or status in ["pending", "pending_review"]:
+                pending_count += 1; pending_amount += amount
+            elif payment_status == "rejected" or status == "rejected":
+                rejected_count += 1; rejected_amount += amount
+        approved_amount = sum(clean(r.get("fee")) for r in counted)
+        return jsonify({"success": True, "data": {
+            "mode_used": mode, "from_date_used": from_iso, "to_date_used": to_iso,
+            "total_sales_loaded": total_loaded, "counted_sales": len(counted), "excluded_sales": excluded,
+            "approved_sales_amount": approved_amount, "pending_sales_amount": pending_amount, "rejected_sales_amount": rejected_amount,
+            "pending_sales_count": pending_count, "rejected_sales_count": rejected_count,
+            "average_sale": (approved_amount / len(counted)) if counted else 0,
+            "plan_rows": sorted(plan_map.values(), key=lambda x: x["amount"], reverse=True),
+            "day_rows": [day_map[k] for k in sorted(day_map.keys())]
+        }})
+    except Exception as e:
+        print("SALES SUMMARY ERROR:", str(e))
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.get('/payout_summary')
+def payout_summary():
+    try:
+        mode, from_iso, to_iso, from_dt, to_dt = _np_range_params()
+        rows = supabase.table("payouts").select("*").execute().data or []
+        total_loaded = len(rows)
+        excluded = 0
+        status_counts = {"pending": 0, "approved": 0, "paid": 0, "rejected": 0}
+        status_amounts = {"pending": 0, "approved": 0, "paid": 0, "rejected": 0}
+        bank_map = {}; day_map = {}; counted_rows = 0
+        for row in rows:
+            dt = _np_payout_report_date(row)
+            if not _np_in_range(dt, from_dt, to_dt) or _np_report_excluded(row, mode):
+                excluded += 1
+                continue
+            status = str(row.get("status") or "pending").strip().lower()
+            if status not in status_counts: status = "pending"
+            amount = clean(row.get("amount"))
+            status_counts[status] += 1; status_amounts[status] += amount; counted_rows += 1
+            if status == "paid":
+                bank = row.get("bank_name") or "Unknown Bank"
+                if bank not in bank_map: bank_map[bank] = {"bank_name": bank, "count": 0, "amount": 0}
+                bank_map[bank]["count"] += 1; bank_map[bank]["amount"] += amount
+                if dt:
+                    day = dt.date().isoformat()
+                    if day not in day_map: day_map[day] = {"date": day, "count": 0, "amount": 0}
+                    day_map[day]["count"] += 1; day_map[day]["amount"] += amount
+        return jsonify({"success": True, "data": {
+            "mode_used": mode, "from_date_used": from_iso, "to_date_used": to_iso,
+            "total_payouts_loaded": total_loaded, "counted_payouts": counted_rows, "excluded_payouts": excluded,
+            "pending_count": status_counts["pending"], "approved_count": status_counts["approved"], "paid_count": status_counts["paid"], "rejected_count": status_counts["rejected"],
+            "pending_amount": status_amounts["pending"], "approved_amount": status_amounts["approved"], "paid_amount": status_amounts["paid"], "rejected_amount": status_amounts["rejected"],
+            "liability_amount": status_amounts["pending"] + status_amounts["approved"],
+            "bank_rows": sorted(bank_map.values(), key=lambda x: x["amount"], reverse=True),
+            "day_rows": [day_map[k] for k in sorted(day_map.keys())]
+        }})
+    except Exception as e:
+        print("PAYOUT SUMMARY ERROR:", str(e))
+        return jsonify({"success": False, "error": str(e)}), 500
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
