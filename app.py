@@ -401,6 +401,9 @@ def get_payout_by_id(pid):
     rows = supabase.table("payouts").select("*").eq("id", pid).limit(1).execute().data or []
     return rows[0] if rows else {}
 
+def payout_status(row):
+    return str((row or {}).get("status") or "pending").strip().lower()
+
 def get_purchase_by_id(pid):
     rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
     return rows[0] if rows else {}
@@ -1026,7 +1029,12 @@ def update_status():
         upd={k:d[k] for k in allowed if k in d}
         if d.get("phase")=="funded" or d.get("status")=="funded": upd["funded_at"]=now_iso()
         if not upd: return bad("Nothing to update")
-        result = supabase.table("traders").update(upd).eq("id",tid).execute().data
+        try:
+            result = supabase.table("traders").update(upd).eq("id",tid).execute().data
+        except Exception as update_error:
+            if "lead_status" in upd or "follow_up_at" in upd:
+                return bad("Lead status columns are missing. Run the Step 2 launch SQL for traders.lead_status and traders.follow_up_at.", 500)
+            raise update_error
         trader_row = result[0] if result else get_trader_by_id(tid)
         status = str(upd.get("status") or "").lower()
         phase = str(upd.get("phase") or "").lower()
@@ -1275,7 +1283,12 @@ def approve_purchase():
         else:
             mres=supabase.table("mt5_pool").select("*").eq("status","available").eq("account_size",p.get("account_size") or 0).limit(1).execute()
         if not mres.data: return bad("No available MT5 account found for this plan/account size")
-        m=mres.data[0]; t=now_iso()
+        m=mres.data[0]
+        if str(m.get("status") or "").strip().lower() != "available":
+            return bad("Selected MT5 account is not available")
+        if clean(m.get("account_size")) != clean(p.get("account_size")):
+            return bad("Selected MT5 account size does not match purchase account size")
+        t=now_iso()
         master_password=m.get("mt5_master_password","")
         investor_password=m.get("mt5_investor_password","")
         supabase.table("challenge_purchases").update({"payment_status":"approved","status":"approved_active","assigned_mt5_id":m.get("id"),
@@ -1365,7 +1378,10 @@ def create_mt5():
         d=request.json or {}
         required=["mt5_login","mt5_server","mt5_master_password","mt5_investor_password"]
         if any(not str(d.get(x,"")).strip() for x in required): return bad("All MT5 details are required")
-        row={"plan_name":d.get("plan_name",""),"account_size":clean(d.get("account_size")),"mt5_login":str(d.get("mt5_login","")).strip(),
+        mt5_login=str(d.get("mt5_login","")).strip()
+        existing=supabase.table("mt5_pool").select("id,status").eq("mt5_login",mt5_login).limit(1).execute().data or []
+        if existing: return bad("MT5 login already exists in pool",409)
+        row={"plan_name":d.get("plan_name",""),"account_size":clean(d.get("account_size")),"mt5_login":mt5_login,
              "mt5_server":str(d.get("mt5_server","")).strip(),"mt5_master_password":str(d.get("mt5_master_password","")).strip(),
              "mt5_investor_password":str(d.get("mt5_investor_password","")).strip(),"status":d.get("status","available"),
              "admin_note":d.get("admin_note",""),"created_at":now_iso(),"updated_at":now_iso()}
@@ -1389,6 +1405,10 @@ def delete_mt5():
     try:
         mid=(request.json or {}).get("id")
         if not mid: return bad("Missing MT5 account id")
+        found=supabase.table("mt5_pool").select("*").eq("id",mid).limit(1).execute().data or []
+        if not found: return bad("MT5 account not found",404)
+        if str(found[0].get("status") or "").strip().lower()=="assigned":
+            return bad("Assigned MT5 accounts cannot be deleted",403)
         return ok(supabase.table("mt5_pool").delete().eq("id",mid).execute().data, "MT5 account deleted")
     except Exception as e: return bad(e)
 
@@ -1443,6 +1463,9 @@ def approve_payout():
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing payout id")
         payout = get_payout_by_id(pid)
+        if not payout: return bad("Payout not found",404)
+        if payout_status(payout) != "pending":
+            return bad("Only pending payouts can be approved",409)
         note = d.get("admin_note","")
         result = supabase.table("payouts").update({"status":"approved","approved_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
 
@@ -1469,6 +1492,9 @@ def reject_payout():
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing payout id")
         payout = get_payout_by_id(pid)
+        if not payout: return bad("Payout not found",404)
+        if payout_status(payout) != "pending":
+            return bad("Only pending payouts can be rejected",409)
         note = d.get("admin_note","")
         result = supabase.table("payouts").update({"status":"rejected","rejected_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
 
@@ -1494,6 +1520,9 @@ def mark_paid():
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing payout id")
         payout = get_payout_by_id(pid)
+        if not payout: return bad("Payout not found",404)
+        if payout_status(payout) != "approved":
+            return bad("Only approved payouts can be marked paid",409)
         note = d.get("admin_note","")
         result = supabase.table("payouts").update({"status":"paid","paid_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
 
