@@ -2792,9 +2792,19 @@ def _normalize_launch_date(value):
 def revenue_summary():
     try:
         settings = _load_business_settings()
-        mode = "live" if str(settings.get("production_mode") or "").lower() == "live" else "test"
+
+        requested_mode = str(request.args.get("mode") or settings.get("production_mode") or "test").lower()
+        mode = "live" if requested_mode == "live" else "test"
+
+        from_iso = _normalize_launch_date(request.args.get("from_date") or "")
+        to_iso = _normalize_launch_date(request.args.get("to_date") or "")
         launch_iso = _normalize_launch_date(settings.get("revenue_launch_date") or settings.get("launch_date") or "")
-        launch_dt = _revenue_date(launch_iso)
+
+        from_dt = _revenue_date(from_iso) if from_iso else None
+        to_dt = _revenue_date(to_iso) if to_iso else None
+        if to_dt:
+            # Inclusive end date: records on the selected To Date must count.
+            to_dt = to_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
 
         purchase_rows = supabase.table("challenge_purchases").select("*").execute().data or []
         payout_rows = supabase.table("payouts").select("*").execute().data or []
@@ -2804,23 +2814,36 @@ def revenue_summary():
         except Exception:
             trader_rows = []
 
-        def after_launch(dt):
-            if not launch_dt:
-                return True
-            return bool(dt and dt >= launch_dt)
+        def in_selected_range(dt):
+            if not dt:
+                return False
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if from_dt and dt < from_dt:
+                return False
+            if to_dt and dt > to_dt:
+                return False
+            return True
 
         def live_excluded(row):
             if mode != "live":
                 return False
             return _revenue_bool(row.get("excluded_from_revenue")) or _revenue_bool(row.get("mark_as_test"))
 
+        def purchase_date(row):
+            return _revenue_date(row.get("approved_at") or row.get("assigned_at") or row.get("created_at"))
+
+        def payout_date(row):
+            return _revenue_date(row.get("paid_at") or row.get("approved_at") or row.get("requested_at") or row.get("created_at"))
+
         counted_purchases = []
         excluded_purchases = 0
         for row in purchase_rows:
-            status = str(row.get("payment_status") or row.get("status") or "").strip().lower()
-            approved = status in ["approved", "approved_active", "active"]
-            dt = _revenue_date(row.get("approved_at") or row.get("created_at"))
-            if not approved or live_excluded(row) or not after_launch(dt):
+            payment_status = str(row.get("payment_status") or "").strip().lower()
+            status = str(row.get("status") or "").strip().lower()
+            approved = payment_status == "approved" or status in ["approved", "approved_active", "active"]
+            dt = purchase_date(row)
+            if not approved or live_excluded(row) or not in_selected_range(dt):
                 excluded_purchases += 1
                 continue
             counted_purchases.append((row, dt))
@@ -2829,9 +2852,10 @@ def revenue_summary():
         excluded_payouts = 0
         for row in payout_rows:
             status = str(row.get("status") or "").strip().lower()
-            included = status in ["paid", "approved"]
-            dt = _revenue_date(row.get("paid_at") or row.get("approved_at") or row.get("requested_at") or row.get("created_at"))
-            if not included or live_excluded(row) or not after_launch(dt):
+            # Money that has actually left the business should be PAID only.
+            included = status == "paid"
+            dt = payout_date(row)
+            if not included or live_excluded(row) or not in_selected_range(dt):
                 excluded_payouts += 1
                 continue
             counted_payouts.append((row, dt))
@@ -2846,6 +2870,9 @@ def revenue_summary():
             "weekly_net": 0,
             "monthly_net": 0,
             "yearly_net": 0,
+            "range_sales": 0,
+            "range_payouts": 0,
+            "range_net": 0,
             "gross_revenue": 0,
             "net_revenue": 0,
             "approved_payouts": 0,
@@ -2860,6 +2887,9 @@ def revenue_summary():
             "total_purchases_loaded": len(purchase_rows),
             "total_payouts_loaded": len(payout_rows),
             "launch_date_used": launch_iso,
+            "from_date_used": from_iso,
+            "to_date_used": to_iso,
+            "date_filter_used": {"from_date": from_iso, "to_date": to_iso},
             "production_mode_used": mode,
             "active_traders": len([t for t in trader_rows if str(t.get("status") or "").lower() == "active"]),
             "funded_traders": len([t for t in trader_rows if str(t.get("status") or "").lower() in ["funded", "live"] or str(t.get("phase") or "").lower() in ["funded", "live"]]),
@@ -2874,6 +2904,7 @@ def revenue_summary():
             amount = clean(row.get("fee"))
             flags = _revenue_period_flags(dt)
             summary["gross_revenue"] += amount
+            summary["range_sales"] += amount
             if flags["week"]: summary["weekly_sales"] += amount
             if flags["month"]: summary["monthly_sales"] += amount
             if flags["year"]: summary["yearly_sales"] += amount
@@ -2894,30 +2925,34 @@ def revenue_summary():
         for row, dt in counted_payouts:
             amount = clean(row.get("amount"))
             flags = _revenue_period_flags(dt)
-            status = str(row.get("status") or "").lower()
-            if status == "paid":
-                summary["paid_payouts"] += amount
-            if status == "approved":
-                summary["approved_payouts"] += amount
+            summary["paid_payouts"] += amount
+            summary["range_payouts"] += amount
             if flags["week"]: summary["weekly_payouts"] += amount
             if flags["month"]: summary["monthly_payouts"] += amount
             if flags["year"]: summary["yearly_payouts"] += amount
 
+        for row in payout_rows:
+            status = str(row.get("status") or "").lower()
+            if status == "approved" and not live_excluded(row):
+                summary["approved_payouts"] += clean(row.get("amount"))
+            if status == "pending" and not live_excluded(row):
+                summary["pending_payouts"] += clean(row.get("amount"))
+
         for row in purchase_rows:
             status = str(row.get("payment_status") or row.get("status") or "").lower()
+            dt = purchase_date(row)
+            if not in_selected_range(dt):
+                continue
             if status in ["pending", "pending_review"]:
                 summary["pending_sales"] += clean(row.get("fee"))
             if status == "rejected":
                 summary["rejected_sales"] += clean(row.get("fee"))
 
-        for row in payout_rows:
-            if str(row.get("status") or "").lower() == "pending":
-                summary["pending_payouts"] += clean(row.get("amount"))
-
         summary["weekly_net"] = summary["weekly_sales"] - summary["weekly_payouts"]
         summary["monthly_net"] = summary["monthly_sales"] - summary["monthly_payouts"]
         summary["yearly_net"] = summary["yearly_sales"] - summary["yearly_payouts"]
-        summary["net_revenue"] = summary["gross_revenue"] - summary["paid_payouts"] - summary["approved_payouts"]
+        summary["range_net"] = summary["range_sales"] - summary["range_payouts"]
+        summary["net_revenue"] = summary["range_net"]
         if trader_rows:
             summary["conversion_rate"] = f"{(summary['counted_purchases'] / len(trader_rows) * 100):.1f}%"
         summary["plan_rows"] = sorted(plan_map.values(), key=lambda x: x["fee"], reverse=True)
