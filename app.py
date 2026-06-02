@@ -1223,6 +1223,7 @@ def create_purchase():
              "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
              "payment_proof_url":proof,"payment_status":"pending","status":"pending_review","admin_note":"",
              "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
+        row.update(_affiliate_purchase_fields(d, row.get("fee")))
         created = supabase.table("challenge_purchases").insert(row).execute().data
 
         send_email_safe(
@@ -1314,6 +1315,7 @@ def approve_purchase():
             td.update({"account_reference":ref(),"profit":0,"drawdown":0,"profit_percent":0,"drawdown_percent":0})
             supabase.table("traders").insert(td).execute()
         approved_rows = supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute().data
+        _affiliate_create_commission_from_purchase(approved_rows[0] if approved_rows else p, d)
 
         send_email_safe(
             p.get("email"),
@@ -3240,6 +3242,363 @@ def payout_summary():
     except Exception as e:
         print("PAYOUT SUMMARY ERROR:", str(e))
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ================================
+# NAIRAPIPS AFFILIATE & PARTNER MANAGER - PRODUCTION READY
+# ================================
+def _aff_code(value):
+    return re.sub(r"[^A-Z0-9_-]", "", str(value or "").strip().upper())[:40]
+
+def _aff_status_active(row):
+    status = str((row or {}).get("status") or "active").strip().lower()
+    return status in {"active", "live", "enabled"}
+
+def _aff_parse_date(value):
+    try:
+        if not value:
+            return None
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        try:
+            return datetime.fromisoformat(str(value)[:10] + "T00:00:00+00:00")
+        except Exception:
+            return None
+
+def _aff_today_utc():
+    return datetime.now(timezone.utc)
+
+def _aff_code_valid_window(row):
+    now = _aff_today_utc()
+    start = _aff_parse_date((row or {}).get("start_date"))
+    end = _aff_parse_date((row or {}).get("end_date"))
+    if start and now < start:
+        return False, "Code is not active yet"
+    if end and now > end.replace(hour=23, minute=59, second=59):
+        return False, "Code has expired"
+    limit = int(clean((row or {}).get("usage_limit")) or 0)
+    uses = int(clean((row or {}).get("total_uses")) or 0)
+    if limit > 0 and uses >= limit:
+        return False, "Code usage limit reached"
+    return True, "Code is valid"
+
+def _aff_get_code(code):
+    code = _aff_code(code)
+    if not code:
+        return None
+    try:
+        rows = supabase.table("affiliate_codes").select("*").eq("code", code).limit(1).execute().data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        print("AFFILIATE CODE FETCH ERROR:", str(e))
+        return None
+
+def _aff_get_partner_by_code(code):
+    code = _aff_code(code)
+    if not code:
+        return None
+    try:
+        rows = supabase.table("affiliate_partners").select("*").eq("code", code).limit(1).execute().data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        print("AFFILIATE PARTNER FETCH ERROR:", str(e))
+        return None
+
+def _affiliate_purchase_fields(d, base_fee):
+    code = _aff_code(d.get("affiliate_code") or d.get("referral_code") or d.get("ref_code") or d.get("partner_code") or d.get("promo_code"))
+    base_fee = clean(base_fee)
+    fields = {
+        "original_fee": base_fee,
+        "discount_percent": 0,
+        "discount_amount": 0,
+        "commission_percent": 0,
+        "commission_amount": 0,
+    }
+    if not code:
+        return fields
+    code_row = _aff_get_code(code)
+    partner = _aff_get_partner_by_code(code)
+    source = code_row or partner
+    if not source:
+        fields.update({"affiliate_code": code, "referral_code": code, "promo_code": code, "affiliate_status": "unknown_code"})
+        return fields
+    ok_window, reason = _aff_code_valid_window(source)
+    if not _aff_status_active(source) or not ok_window:
+        fields.update({"affiliate_code": code, "referral_code": code, "promo_code": code, "affiliate_status": reason})
+        return fields
+    discount_pct = clean(source.get("discount_percent"))
+    commission_pct = clean(source.get("commission_percent"))
+    discount_amount = round(base_fee * discount_pct / 100, 2) if discount_pct > 0 else 0
+    final_fee = max(0, base_fee - discount_amount)
+    commission_amount = round(final_fee * commission_pct / 100, 2) if commission_pct > 0 else 0
+    fields.update({
+        "affiliate_code": code,
+        "referral_code": code,
+        "partner_code": code,
+        "promo_code": code if str(source.get("code_type") or source.get("partner_type") or "").lower() in {"promo", "flash", "flash_sale", "discount"} else d.get("promo_code"),
+        "affiliate_owner": source.get("owner_name") or source.get("name") or source.get("partner_name") or "",
+        "campaign_type": source.get("code_type") or source.get("partner_type") or "affiliate",
+        "discount_percent": discount_pct,
+        "discount_amount": discount_amount,
+        "commission_percent": commission_pct,
+        "commission_amount": commission_amount,
+        "fee": final_fee,
+        "affiliate_status": "valid",
+    })
+    return fields
+
+def _affiliate_create_commission_from_purchase(purchase, admin_payload=None):
+    try:
+        p = purchase or {}
+        code = _aff_code(p.get("affiliate_code") or p.get("referral_code") or p.get("ref_code") or p.get("partner_code"))
+        if not code:
+            return None
+        source = _aff_get_code(code) or _aff_get_partner_by_code(code)
+        if not source:
+            return None
+        commission_pct = clean(p.get("commission_percent") or source.get("commission_percent"))
+        sale_amount = clean(p.get("fee"))
+        if commission_pct <= 0 or sale_amount <= 0:
+            return None
+        commission_amount = clean(p.get("commission_amount")) or round(sale_amount * commission_pct / 100, 2)
+        existing = supabase.table("affiliate_commissions").select("id").eq("purchase_id", p.get("id")).limit(1).execute().data or []
+        if existing:
+            return existing[0]
+        row = {
+            "partner_code": code,
+            "partner_name": source.get("owner_name") or source.get("name") or source.get("partner_name") or "",
+            "purchase_id": p.get("id"),
+            "customer_name": p.get("trader_name") or p.get("name") or "",
+            "customer_email": p.get("email") or "",
+            "sale_amount": sale_amount,
+            "commission_percent": commission_pct,
+            "commission_amount": commission_amount,
+            "status": "pending",
+            "created_at": now_iso(),
+        }
+        created = supabase.table("affiliate_commissions").insert(row).execute().data
+        try:
+            supabase.table("affiliate_codes").update({"total_uses": int(clean(source.get("total_uses")) or 0) + 1, "updated_at": now_iso()}).eq("code", code).execute()
+        except Exception:
+            pass
+        _audit_safe("affiliates", "commission_created", f"Affiliate commission created for code {code}", _admin_from_payload(admin_payload or {}))
+        return created[0] if created else row
+    except Exception as e:
+        print("AFFILIATE COMMISSION CREATE ERROR:", str(e))
+        return None
+
+@app.route("/affiliate_partners", methods=["GET"])
+def affiliate_partners():
+    try:
+        return jsonify(supabase.table("affiliate_partners").select("*").order("created_at", desc=True).execute().data or [])
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/create_affiliate_partner", methods=["POST"])
+def create_affiliate_partner():
+    try:
+        d = request.json or {}
+        name = str(d.get("name") or d.get("partner_name") or "").strip()
+        code = _aff_code(d.get("code") or name)
+        if not name: return bad("Partner name is required")
+        if not code: return bad("Affiliate code is required")
+        existing = supabase.table("affiliate_partners").select("id").eq("code", code).limit(1).execute().data or []
+        if existing: return bad("Affiliate partner code already exists", 409)
+        row = {
+            "name": name,
+            "email": d.get("email") or "",
+            "phone": d.get("phone") or "",
+            "company": d.get("company") or "",
+            "partner_type": d.get("partner_type") or "affiliate",
+            "code": code,
+            "affiliate_link": d.get("affiliate_link") or f"https://nairapips.com/?ref={code}",
+            "commission_percent": clean(d.get("commission_percent") or 20),
+            "discount_percent": clean(d.get("discount_percent") or 0),
+            "status": d.get("status") or "active",
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        created = supabase.table("affiliate_partners").insert(row).execute().data
+        _audit_safe("affiliates", "partner_created", f"Affiliate partner created: {code}", _admin_from_payload(d))
+        return ok(created, "Affiliate partner created")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/update_affiliate_partner", methods=["POST"])
+def update_affiliate_partner():
+    try:
+        d = request.json or {}; pid = d.get("id")
+        if not pid: return bad("Missing partner id")
+        upd = {"updated_at": now_iso()}
+        for k in ["name", "email", "phone", "company", "partner_type", "status", "affiliate_link"]:
+            if k in d: upd[k] = d[k]
+        if "code" in d: upd["code"] = _aff_code(d.get("code"))
+        for k in ["commission_percent", "discount_percent"]:
+            if k in d: upd[k] = clean(d.get(k))
+        result = supabase.table("affiliate_partners").update(upd).eq("id", pid).execute().data
+        return ok(result, "Affiliate partner updated")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/delete_affiliate_partner", methods=["POST"])
+def delete_affiliate_partner():
+    try:
+        d = request.json or {}; pid = d.get("id")
+        if not pid: return bad("Missing partner id")
+        result = supabase.table("affiliate_partners").update({"status":"inactive", "updated_at": now_iso()}).eq("id", pid).execute().data
+        return ok(result, "Affiliate partner deactivated")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/affiliate_codes", methods=["GET"])
+def affiliate_codes():
+    try:
+        return jsonify(supabase.table("affiliate_codes").select("*").order("created_at", desc=True).execute().data or [])
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/create_affiliate_code", methods=["POST"])
+def create_affiliate_code():
+    try:
+        d = request.json or {}
+        code = _aff_code(d.get("code"))
+        if not code: return bad("Code is required")
+        existing = supabase.table("affiliate_codes").select("id").eq("code", code).limit(1).execute().data or []
+        if existing: return bad("Affiliate/promo code already exists", 409)
+        row = {
+            "code": code,
+            "owner_name": d.get("owner_name") or d.get("name") or "",
+            "code_type": d.get("code_type") or "affiliate",
+            "commission_percent": clean(d.get("commission_percent") or 0),
+            "discount_percent": clean(d.get("discount_percent") or 0),
+            "start_date": d.get("start_date") or None,
+            "end_date": d.get("end_date") or None,
+            "usage_limit": int(clean(d.get("usage_limit") or 0)),
+            "total_uses": 0,
+            "status": d.get("status") or "active",
+            "affiliate_link": d.get("affiliate_link") or f"https://nairapips.com/?ref={code}",
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        created = supabase.table("affiliate_codes").insert(row).execute().data
+        return ok(created, "Affiliate code created")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/update_affiliate_code", methods=["POST"])
+def update_affiliate_code():
+    try:
+        d = request.json or {}; cid = d.get("id")
+        if not cid: return bad("Missing code id")
+        upd = {"updated_at": now_iso()}
+        for k in ["owner_name", "code_type", "start_date", "end_date", "status", "affiliate_link"]:
+            if k in d: upd[k] = d[k] or None if k in {"start_date", "end_date"} else d[k]
+        if "code" in d: upd["code"] = _aff_code(d.get("code"))
+        for k in ["commission_percent", "discount_percent", "usage_limit", "total_uses"]:
+            if k in d: upd[k] = clean(d.get(k))
+        result = supabase.table("affiliate_codes").update(upd).eq("id", cid).execute().data
+        return ok(result, "Affiliate code updated")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/delete_affiliate_code", methods=["POST"])
+def delete_affiliate_code():
+    try:
+        d = request.json or {}; cid = d.get("id")
+        if not cid: return bad("Missing code id")
+        result = supabase.table("affiliate_codes").update({"status":"inactive", "updated_at": now_iso()}).eq("id", cid).execute().data
+        return ok(result, "Affiliate code deactivated")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/validate_affiliate_code", methods=["POST", "GET"])
+def validate_affiliate_code():
+    try:
+        code = _aff_code((request.json or {}).get("code") if request.method == "POST" else request.args.get("code"))
+        if not code: return bad("Code is required")
+        row = _aff_get_code(code) or _aff_get_partner_by_code(code)
+        if not row: return jsonify({"success": False, "valid": False, "error": "Code not found"}), 404
+        ok_window, reason = _aff_code_valid_window(row)
+        valid = _aff_status_active(row) and ok_window
+        return jsonify({"success": True, "valid": bool(valid), "message": reason if valid else reason, "data": row})
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/affiliate_commissions", methods=["GET"])
+def affiliate_commissions():
+    try:
+        return jsonify(supabase.table("affiliate_commissions").select("*").order("created_at", desc=True).execute().data or [])
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/create_affiliate_commission", methods=["POST"])
+def create_affiliate_commission():
+    try:
+        d = request.json or {}
+        sale_amount = clean(d.get("sale_amount"))
+        pct = clean(d.get("commission_percent"))
+        amount = clean(d.get("commission_amount")) or round(sale_amount * pct / 100, 2)
+        row = {
+            "partner_code": _aff_code(d.get("partner_code")),
+            "partner_name": d.get("partner_name") or "",
+            "purchase_id": d.get("purchase_id"),
+            "customer_name": d.get("customer_name") or "",
+            "customer_email": d.get("customer_email") or "",
+            "sale_amount": sale_amount,
+            "commission_percent": pct,
+            "commission_amount": amount,
+            "status": d.get("status") or "pending",
+            "created_at": now_iso(),
+        }
+        if not row["partner_code"]: return bad("Partner code is required")
+        created = supabase.table("affiliate_commissions").insert(row).execute().data
+        return ok(created, "Affiliate commission created")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/update_affiliate_commission", methods=["POST"])
+def update_affiliate_commission():
+    try:
+        d = request.json or {}; cid = d.get("id")
+        if not cid: return bad("Missing commission id")
+        status = str(d.get("status") or "").strip().lower()
+        if status not in {"pending", "approved", "paid", "rejected"}: return bad("Invalid commission status")
+        upd = {"status": status, "admin_note": d.get("admin_note") or "", "updated_at": now_iso()}
+        if status == "paid": upd["paid_at"] = now_iso()
+        result = supabase.table("affiliate_commissions").update(upd).eq("id", cid).execute().data
+        return ok(result, "Affiliate commission updated")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/affiliate_summary", methods=["GET"])
+def affiliate_summary():
+    try:
+        partners = supabase.table("affiliate_partners").select("*").execute().data or []
+        codes = supabase.table("affiliate_codes").select("*").execute().data or []
+        comms = supabase.table("affiliate_commissions").select("*").execute().data or []
+        total_sales = sum(clean(c.get("sale_amount")) for c in comms)
+        pending = sum(clean(c.get("commission_amount")) for c in comms if str(c.get("status") or "pending").lower()=="pending")
+        approved = sum(clean(c.get("commission_amount")) for c in comms if str(c.get("status") or "").lower()=="approved")
+        paid = sum(clean(c.get("commission_amount")) for c in comms if str(c.get("status") or "").lower()=="paid")
+        top = None
+        by_partner = {}
+        for c in comms:
+            code = _aff_code(c.get("partner_code")) or "UNKNOWN"
+            by_partner.setdefault(code, {"code": code, "sales": 0, "commission": 0, "count": 0})
+            by_partner[code]["sales"] += clean(c.get("sale_amount"))
+            by_partner[code]["commission"] += clean(c.get("commission_amount"))
+            by_partner[code]["count"] += 1
+        rows = sorted(by_partner.values(), key=lambda x: x["sales"], reverse=True)
+        top = rows[0] if rows else None
+        return jsonify({"success": True, "data": {
+            "total_partners": len(partners), "active_partners": len([p for p in partners if _aff_status_active(p)]),
+            "total_codes": len(codes), "active_codes": len([c for c in codes if _aff_status_active(c)]),
+            "total_sales": total_sales, "pending_commissions": pending, "approved_commissions": approved, "paid_commissions": paid,
+            "top_partner": top, "partner_rows": rows
+        }})
+    except Exception as e:
+        return bad(e, 500)
+
 
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
