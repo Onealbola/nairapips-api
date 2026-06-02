@@ -3266,15 +3266,29 @@ def _aff_status_active(row):
     return status in {"active", "live", "enabled"}
 
 def _aff_parse_date(value):
+    """Parse Supabase date/timestamp values and always return timezone-aware UTC datetime.
+    This prevents Python errors when comparing date-only values like 2026-06-02
+    with timezone-aware current time values.
+    """
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
     try:
-        if not value:
-            return None
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        # Supabase often returns either YYYY-MM-DD or ISO timestamp ending in Z.
+        if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+            dt = datetime.fromisoformat(raw + "T00:00:00+00:00")
+        else:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except Exception:
         try:
-            return datetime.fromisoformat(str(value)[:10] + "T00:00:00+00:00")
+            dt = datetime.fromisoformat(raw[:10] + "T00:00:00+00:00")
         except Exception:
             return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 def _aff_today_utc():
     return datetime.now(timezone.utc)
@@ -3285,7 +3299,9 @@ def _aff_code_valid_window(row):
     end = _aff_parse_date((row or {}).get("end_date"))
     if start and now < start:
         return False, "Code is not active yet"
-    if end and now > end.replace(hour=23, minute=59, second=59):
+    if end:
+        end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
+    if end and now > end:
         return False, "Code has expired"
     limit = int(clean((row or {}).get("usage_limit")) or 0)
     uses = int(clean((row or {}).get("total_uses")) or 0)
