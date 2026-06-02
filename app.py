@@ -1215,16 +1215,28 @@ def create_purchase():
         d=request.json or {}; plan=str(d.get("plan_name","")).strip(); proof=str(d.get("payment_proof_url","")).strip()
         if not plan: return bad("Plan name is required")
         if not proof: return bad("Payment proof is required")
-        ref_code = str(d.get("referral_code") or d.get("ref_code") or d.get("affiliate_code") or "").strip().lower()
-        own_ref_codes = [str(d.get(k) or "").strip().lower() for k in ["own_referral_code", "my_referral_code", "personal_referral_code"]]
-        if ref_code and ref_code in [x for x in own_ref_codes if x]:
-            return bad("Self-referral is not allowed.", 403)
+        original_fee = clean(d.get("fee"))
+        if original_fee <= 0: return bad("Challenge fee is required")
+
+        # Validate code before accepting proof. Invalid/expired codes must not create confused discounted purchases.
+        quote = _affiliate_quote_details(d, original_fee)
+        if quote.get("code") and not quote.get("valid"):
+            return bad(quote.get("message") or "Invalid promo/referral code", 400)
+
         row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
-             "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
+             "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":quote.get("final_fee", original_fee),
+             "original_fee":quote.get("original_fee", original_fee),"discount_percent":quote.get("discount_percent",0),"discount_amount":quote.get("discount_amount",0),
+             "final_fee":quote.get("final_fee", original_fee),"amount_due":quote.get("final_fee", original_fee),
              "payment_proof_url":proof,"payment_status":"pending","status":"pending_review","admin_note":"",
              "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
-        row.update(_affiliate_purchase_fields(d, row.get("fee")))
+        row.update(_affiliate_purchase_fields(d, original_fee))
         created = supabase.table("challenge_purchases").insert(row).execute().data
+
+        discount_line = ""
+        if clean(row.get("discount_amount")) > 0:
+            discount_line = f"\nOriginal Fee: {email_money(row.get('original_fee'))}\nDiscount: {email_money(row.get('discount_amount'))} ({row.get('discount_percent')}%)\nAmount To Pay: {email_money(row.get('fee'))}\nCode Used: {row.get('affiliate_code') or row.get('promo_code') or ''}\n"
+        else:
+            discount_line = f"\nChallenge Fee: {email_money(row.get('fee'))}\n"
 
         send_email_safe(
             row.get("email"),
@@ -1233,9 +1245,7 @@ def create_purchase():
 
 Your NairaPips payment proof has been received.
 
-Plan: {plan}
-Challenge Fee: {email_money(row.get("fee"))}
-
+Plan: {plan}{discount_line}
 Admin will review your proof and notify you after approval or rejection.
 
 NairaPips Team"""
@@ -1248,9 +1258,7 @@ NairaPips Team"""
 Your NairaPips challenge purchase has been submitted successfully.
 
 Plan: {plan}
-Account Size: {email_money(row.get("account_size"))}
-Challenge Fee: {email_money(row.get("fee"))}
-
+Account Size: {email_money(row.get("account_size"))}{discount_line}
 Admin will review your payment proof and assign your MT5 details after approval.
 
 NairaPips Team"""
@@ -1264,7 +1272,10 @@ Email: {row.get("email") or "Not provided"}
 Phone: {row.get("phone") or "Not provided"}
 Plan: {plan}
 Account Size: {email_money(row.get("account_size"))}
-Fee: {email_money(row.get("fee"))}
+Original Fee: {email_money(row.get("original_fee"))}
+Discount: {email_money(row.get("discount_amount"))}
+Final Fee: {email_money(row.get("fee"))}
+Code: {row.get("affiliate_code") or row.get("promo_code") or "None"}
 Proof URL: {proof}"""
         )
 
@@ -3304,53 +3315,153 @@ def _aff_get_partner_by_code(code):
         print("AFFILIATE PARTNER FETCH ERROR:", str(e))
         return None
 
-def _affiliate_purchase_fields(d, base_fee):
-    code = _aff_code(d.get("affiliate_code") or d.get("referral_code") or d.get("ref_code") or d.get("partner_code") or d.get("promo_code"))
+def _affiliate_quote_details(d, base_fee):
+    """Return production-safe quote details for promo / affiliate / partner codes.
+    Discount reduces customer price. Commission is calculated on the final paid fee.
+    """
     base_fee = clean(base_fee)
-    fields = {
+    raw_code = (d or {}).get("affiliate_code") or (d or {}).get("referral_code") or (d or {}).get("ref_code") or (d or {}).get("partner_code") or (d or {}).get("promo_code") or (d or {}).get("code")
+    code = _aff_code(raw_code)
+    result = {
+        "valid": False if code else True,
+        "code": code,
+        "message": "No code applied" if not code else "Code pending validation",
         "original_fee": base_fee,
         "discount_percent": 0,
         "discount_amount": 0,
+        "final_fee": base_fee,
+        "fee": base_fee,
         "commission_percent": 0,
         "commission_amount": 0,
+        "affiliate_owner": "",
+        "campaign_type": "",
+        "source": None,
     }
     if not code:
-        return fields
-    code_row = _aff_get_code(code)
-    partner = _aff_get_partner_by_code(code)
-    source = code_row or partner
+        return result
+
+    source = _aff_get_code(code) or _aff_get_partner_by_code(code)
     if not source:
-        fields.update({"affiliate_code": code, "referral_code": code, "promo_code": code, "affiliate_status": "unknown_code"})
-        return fields
+        result.update({"valid": False, "message": "Code not found"})
+        return result
+
     ok_window, reason = _aff_code_valid_window(source)
     if not _aff_status_active(source) or not ok_window:
-        fields.update({"affiliate_code": code, "referral_code": code, "promo_code": code, "affiliate_status": reason})
-        return fields
-    discount_pct = clean(source.get("discount_percent"))
-    commission_pct = clean(source.get("commission_percent"))
+        result.update({"valid": False, "message": reason or "Code is not active"})
+        return result
+
+    # Self-referral protection by email/phone when partner identity exists.
+    buyer_email = str((d or {}).get("email") or (d or {}).get("customer_email") or "").strip().lower()
+    buyer_phone = re.sub(r"\D", "", str((d or {}).get("phone") or (d or {}).get("customer_phone") or ""))
+    owner_email = str(source.get("email") or source.get("owner_email") or "").strip().lower()
+    owner_phone = re.sub(r"\D", "", str(source.get("phone") or source.get("owner_phone") or ""))
+    if buyer_email and owner_email and buyer_email == owner_email:
+        result.update({"valid": False, "message": "Self-referral is not allowed"})
+        return result
+    if buyer_phone and owner_phone and buyer_phone == owner_phone:
+        result.update({"valid": False, "message": "Self-referral is not allowed"})
+        return result
+
+    discount_pct = max(0, min(100, clean(source.get("discount_percent"))))
+    commission_pct = max(0, min(100, clean(source.get("commission_percent"))))
     discount_amount = round(base_fee * discount_pct / 100, 2) if discount_pct > 0 else 0
-    final_fee = max(0, base_fee - discount_amount)
+    final_fee = max(0, round(base_fee - discount_amount, 2))
     commission_amount = round(final_fee * commission_pct / 100, 2) if commission_pct > 0 else 0
-    fields.update({
-        "affiliate_code": code,
-        "referral_code": code,
-        "partner_code": code,
-        "promo_code": code if str(source.get("code_type") or source.get("partner_type") or "").lower() in {"promo", "flash", "flash_sale", "discount"} else d.get("promo_code"),
-        "affiliate_owner": source.get("owner_name") or source.get("name") or source.get("partner_name") or "",
-        "campaign_type": source.get("code_type") or source.get("partner_type") or "affiliate",
+    campaign_type = str(source.get("code_type") or source.get("partner_type") or "affiliate").strip().lower() or "affiliate"
+    owner = source.get("owner_name") or source.get("name") or source.get("partner_name") or ""
+
+    result.update({
+        "valid": True,
+        "message": "Code applied successfully",
         "discount_percent": discount_pct,
         "discount_amount": discount_amount,
+        "final_fee": final_fee,
+        "fee": final_fee,
         "commission_percent": commission_pct,
         "commission_amount": commission_amount,
-        "fee": final_fee,
-        "affiliate_status": "valid",
+        "affiliate_owner": owner,
+        "campaign_type": campaign_type,
+        "source": source,
     })
+    return result
+
+
+def _affiliate_purchase_fields(d, base_fee):
+    quote = _affiliate_quote_details(d, base_fee)
+    fields = {
+        "original_fee": quote.get("original_fee", clean(base_fee)),
+        "discount_percent": quote.get("discount_percent", 0),
+        "discount_amount": quote.get("discount_amount", 0),
+        "final_fee": quote.get("final_fee", clean(base_fee)),
+        "amount_due": quote.get("final_fee", clean(base_fee)),
+        "commission_percent": quote.get("commission_percent", 0),
+        "commission_amount": quote.get("commission_amount", 0),
+        "affiliate_status": "valid" if quote.get("valid") and quote.get("code") else ("none" if not quote.get("code") else quote.get("message")),
+    }
+    code = quote.get("code")
+    if code:
+        fields.update({
+            "affiliate_code": code,
+            "referral_code": code,
+            "partner_code": code,
+            "promo_code": code,
+            "affiliate_owner": quote.get("affiliate_owner") or "",
+            "campaign_type": quote.get("campaign_type") or "affiliate",
+            "fee": quote.get("final_fee", clean(base_fee)),
+        })
     return fields
+
+
+def _affiliate_record_code_usage(purchase):
+    """Increment usage only once when an approved purchase carries a valid code."""
+    try:
+        p = purchase or {}
+        if _is_truthy(p.get("affiliate_usage_recorded")):
+            return False
+        code = _aff_code(p.get("affiliate_code") or p.get("referral_code") or p.get("ref_code") or p.get("partner_code") or p.get("promo_code"))
+        if not code:
+            return False
+        source = _aff_get_code(code)
+        if source:
+            try:
+                supabase.table("affiliate_codes").update({
+                    "total_uses": int(clean(source.get("total_uses")) or 0) + 1,
+                    "updated_at": now_iso()
+                }).eq("code", code).execute()
+            except Exception as e:
+                print("AFFILIATE USAGE UPDATE ERROR:", str(e))
+        pid = p.get("id")
+        if pid:
+            try:
+                supabase.table("challenge_purchases").update({"affiliate_usage_recorded": True, "updated_at": now_iso()}).eq("id", pid).execute()
+            except Exception as e:
+                print("AFFILIATE PURCHASE USAGE FLAG ERROR:", str(e))
+        return True
+    except Exception as e:
+        print("AFFILIATE USAGE RECORD ERROR:", str(e))
+        return False
+
+@app.route("/quote_challenge_price", methods=["POST", "GET"])
+def quote_challenge_price():
+    try:
+        if request.method == "GET":
+            d = dict(request.args)
+        else:
+            d = request.json or {}
+        base_fee = clean(d.get("fee") or d.get("challenge_fee") or d.get("amount"))
+        if base_fee <= 0:
+            return bad("Challenge fee is required")
+        quote = _affiliate_quote_details(d, base_fee)
+        quote.pop("source", None)
+        return jsonify({"success": True, "data": quote, "valid": quote.get("valid"), "message": quote.get("message")})
+    except Exception as e:
+        return bad(e, 500)
 
 def _affiliate_create_commission_from_purchase(purchase, admin_payload=None):
     try:
         p = purchase or {}
-        code = _aff_code(p.get("affiliate_code") or p.get("referral_code") or p.get("ref_code") or p.get("partner_code"))
+        _affiliate_record_code_usage(p)
+        code = _aff_code(p.get("affiliate_code") or p.get("referral_code") or p.get("ref_code") or p.get("partner_code") or p.get("promo_code"))
         if not code:
             return None
         source = _aff_get_code(code) or _aff_get_partner_by_code(code)
@@ -3377,10 +3488,6 @@ def _affiliate_create_commission_from_purchase(purchase, admin_payload=None):
             "created_at": now_iso(),
         }
         created = supabase.table("affiliate_commissions").insert(row).execute().data
-        try:
-            supabase.table("affiliate_codes").update({"total_uses": int(clean(source.get("total_uses")) or 0) + 1, "updated_at": now_iso()}).eq("code", code).execute()
-        except Exception:
-            pass
         _audit_safe("affiliates", "commission_created", f"Affiliate commission created for code {code}", _admin_from_payload(admin_payload or {}))
         return created[0] if created else row
     except Exception as e:
@@ -3514,13 +3621,18 @@ def delete_affiliate_code():
 @app.route("/validate_affiliate_code", methods=["POST", "GET"])
 def validate_affiliate_code():
     try:
-        code = _aff_code((request.json or {}).get("code") if request.method == "POST" else request.args.get("code"))
+        payload = (request.json or {}) if request.method == "POST" else dict(request.args)
+        code = _aff_code(payload.get("code"))
         if not code: return bad("Code is required")
         row = _aff_get_code(code) or _aff_get_partner_by_code(code)
         if not row: return jsonify({"success": False, "valid": False, "error": "Code not found"}), 404
         ok_window, reason = _aff_code_valid_window(row)
         valid = _aff_status_active(row) and ok_window
-        return jsonify({"success": True, "valid": bool(valid), "message": reason if valid else reason, "data": row})
+        quote = None
+        if clean(payload.get("fee") or payload.get("amount") or 0) > 0:
+            quote = _affiliate_quote_details(payload, clean(payload.get("fee") or payload.get("amount")))
+            quote.pop("source", None)
+        return jsonify({"success": True, "valid": bool(valid), "message": reason if valid else reason, "data": row, "quote": quote})
     except Exception as e:
         return bad(e, 500)
 
