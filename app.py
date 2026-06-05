@@ -1523,6 +1523,30 @@ def create_payout():
     try:
         d=request.json or {}; amount=clean(d.get("amount"))
         if amount<=0: return bad("Invalid payout amount")
+
+        # Production safety: breached/locked traders must not create payout requests.
+        trader_row = None
+        tid = d.get("trader_id")
+        email = str(d.get("email") or "").strip().lower()
+        phone = str(d.get("phone") or "").strip()
+        try:
+            if tid:
+                trader_row = get_trader_by_id(tid)
+            if not trader_row and email:
+                rows = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
+                trader_row = rows[0] if rows else None
+            if not trader_row and phone:
+                rows = supabase.table("traders").select("*").eq("phone", phone).limit(1).execute().data or []
+                trader_row = rows[0] if rows else None
+        except Exception as e:
+            print("PAYOUT TRADER CHECK ERROR:", str(e))
+
+        if trader_row:
+            s = str(trader_row.get("status") or "").lower()
+            ph = str(trader_row.get("phase") or "").lower()
+            if s == "breached" or ph == "breached" or _is_truthy(trader_row.get("payout_blocked")):
+                return bad("Payout blocked: this trader account is breached/locked and is not payout eligible.", 403)
+
         row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
              "amount":amount,"bank_name":d.get("bank_name",""),"account_number":d.get("account_number",""),"account_name":d.get("account_name",""),
              "status":"pending","note":d.get("note",""),"admin_note":"","requested_at":now_iso()}
@@ -1567,6 +1591,23 @@ def approve_payout():
         if not payout: return bad("Payout not found",404)
         if payout_status(payout) != "pending":
             return bad("Only pending payouts can be approved",409)
+
+        # Final safety check before approving payout. Breached/locked traders cannot be paid.
+        trader_row = None
+        try:
+            if payout.get("trader_id"):
+                trader_row = get_trader_by_id(payout.get("trader_id"))
+            if not trader_row and payout.get("email"):
+                rows = supabase.table("traders").select("*").eq("email", payout.get("email")).limit(1).execute().data or []
+                trader_row = rows[0] if rows else None
+        except Exception as e:
+            print("APPROVE PAYOUT TRADER CHECK ERROR:", str(e))
+        if trader_row:
+            s = str(trader_row.get("status") or "").lower()
+            ph = str(trader_row.get("phase") or "").lower()
+            if s == "breached" or ph == "breached" or _is_truthy(trader_row.get("payout_blocked")):
+                return bad("Payout blocked: this trader account is breached/locked and is not payout eligible.", 403)
+
         note = d.get("admin_note","")
         result = supabase.table("payouts").update({"status":"approved","approved_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
 
@@ -1831,29 +1872,110 @@ def _should_record_snapshot_event(old_zone, zone, max_dd_used):
         return True
     return False
 
+def _safe_traders_update(trader_id, update_data):
+    """Update traders safely. If optional new columns are missing, retry with core columns."""
+    try:
+        return supabase.table("traders").update(update_data).eq("id", trader_id).execute()
+    except Exception as e:
+        print("TRADER UPDATE FULL FAILED:", e)
+        core_keys = {
+            "balance", "equity", "profit", "profit_percent", "drawdown", "drawdown_percent",
+            "highest_equity", "lowest_equity", "peak_balance", "last_equity_snapshot",
+            "max_drawdown_used", "risk_zone", "critical_mode", "monitoring_priority",
+            "last_sync_at", "status", "phase", "admin_note", "mt5_access_disabled",
+            "breach_time", "breach_equity", "breach_reason", "breach_detected_at",
+            "updated_at"
+        }
+        fallback = {k:v for k,v in update_data.items() if k in core_keys}
+        return supabase.table("traders").update(fallback).eq("id", trader_id).execute()
+
+
+def _passed_status_from_snapshot(payload):
+    status = str(payload.get("phase_pass_status") or payload.get("status") or payload.get("zone") or "").lower().strip()
+    phase_label = str(payload.get("phase_label") or "").lower().strip()
+    passed_statuses = {"phase1_passed", "phase2_passed", "passed", "funded_ready", "target_hit"}
+    if status in passed_statuses:
+        if status == "target_hit":
+            return "phase2_passed" if phase_label == "phase2" else "phase1_passed"
+        return status
+    if str(payload.get("zone") or "").lower().strip() == "passed":
+        return "phase2_passed" if phase_label == "phase2" else "phase1_passed"
+    return ""
+
+
+def _send_phase_pass_email_once(trader, pass_status, payload, old_status):
+    old_status = str(old_status or "").lower()
+    if old_status == pass_status or str(trader.get("phase_pass_status") or "").lower() == pass_status:
+        return
+    phase_name = "Phase 2" if pass_status == "phase2_passed" else "Phase 1"
+    target_equity = payload.get("target_equity") or 0
+    highest_equity = payload.get("highest_equity") or 0
+    highest_profit_percent = payload.get("highest_profit_percent") or 0
+    details = f"""Congratulations. You have successfully passed {phase_name} of the NairaPips Challenge.
+
+Highest Equity Reached: {email_money(highest_equity)}
+Target Equity: {email_money(target_equity)}
+Profit Target Achieved: {highest_profit_percent}%
+
+Your dashboard has been updated and the account has been locked for admin review / next stage processing."""
+    send_account_status_email(
+        trader,
+        f"Congratulations - You passed {phase_name}",
+        f"You have passed {phase_name}.",
+        details
+    )
+    send_admin_alert(
+        f"NairaPips {phase_name} passed",
+        f"""A trader has passed {phase_name}.
+
+Trader: {trader.get('name') or trader.get('trader_name') or 'Trader'}
+Email: {trader.get('email') or 'Not provided'}
+MT5 Login: {trader.get('mt5_login') or payload.get('mt5_login') or 'Not provided'}
+Highest Equity: {email_money(highest_equity)}
+Target Equity: {email_money(target_equity)}
+Status: {pass_status}"""
+    )
+
+
 def _apply_monitoring_snapshot(trader, payload, source="manual"):
+    # Values from MT5 engine are the source of truth when present.
     balance = _num(payload.get("balance"), _num(trader.get("balance"), _num(trader.get("account_size"))))
     equity = _num(payload.get("equity"), balance)
     account_size = _num(trader.get("account_size"), balance)
 
-    profit = equity - account_size if account_size else _num(payload.get("profit"), 0)
-    profit_percent = (profit / account_size * 100) if account_size else 0
+    profit = _num(payload.get("profit"), equity - account_size if account_size else 0)
+    profit_percent = _num(payload.get("profit_percent"), (profit / account_size * 100) if account_size else 0)
 
     previous_highest = _num(trader.get("highest_equity"), 0)
     previous_lowest = _num(trader.get("lowest_equity"), 0)
 
-    highest_equity = max(previous_highest, equity, account_size)
+    highest_equity = max(previous_highest, _num(payload.get("highest_equity"), 0), equity, account_size)
     lowest_equity = min(previous_lowest, equity) if previous_lowest > 0 else equity
 
-    peak_base = max(highest_equity, account_size)
-    equity_damage = max(0, peak_base - lowest_equity)
-    drawdown_percent = (equity_damage / peak_base * 100) if peak_base else 0
-    max_dd_used = (drawdown_percent / MAX_DRAWDOWN_LIMIT * 100) if MAX_DRAWDOWN_LIMIT else 0
+    # Prefer MT5 engine drawdown values. Fallback keeps old FXBlue/manual behaviour alive.
+    engine_dd = payload.get("drawdown_percent")
+    if engine_dd is not None:
+        drawdown_percent = _num(engine_dd, 0)
+        equity_damage = max(0, (account_size or balance) * drawdown_percent / 100)
+    else:
+        peak_base = max(highest_equity, account_size)
+        equity_damage = max(0, peak_base - lowest_equity)
+        drawdown_percent = (equity_damage / peak_base * 100) if peak_base else 0
 
-    zone = _risk_zone(max_dd_used)
-    priority = _priority_for_zone(zone)
+    max_dd_used = _num(payload.get("max_drawdown_used"), (drawdown_percent / MAX_DRAWDOWN_LIMIT * 100) if MAX_DRAWDOWN_LIMIT else 0)
+
+    incoming_zone = str(payload.get("zone") or "").lower().strip()
+    incoming_status = str(payload.get("status") or "").lower().strip()
+    passed_status = _passed_status_from_snapshot(payload)
+    breached = bool(payload.get("breached")) or incoming_status == "breached" or incoming_zone == "breached"
+
     old_zone = (trader.get("risk_zone") or "safe").lower()
     old_status = (trader.get("status") or "").lower()
+    now = _now_iso()
+
+    # Default live monitoring state.
+    zone = incoming_zone if incoming_zone in ["safe", "warning", "danger", "critical", "funded", "funded_profit_zone", "profit_protected"] else _risk_zone(max_dd_used)
+    priority = _priority_for_zone(zone)
 
     update_data = {
         "balance": balance,
@@ -1864,27 +1986,84 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
         "drawdown_percent": drawdown_percent,
         "highest_equity": highest_equity,
         "lowest_equity": lowest_equity,
-        "peak_balance": max(_num(trader.get("peak_balance"), 0), balance, account_size),
+        "peak_balance": max(_num(trader.get("peak_balance"), 0), balance, account_size, highest_equity),
         "last_equity_snapshot": equity,
         "max_drawdown_used": max_dd_used,
         "risk_zone": zone,
         "critical_mode": zone in ["danger", "critical"],
         "monitoring_priority": priority,
-        "last_sync_at": _now_iso()
+        "last_sync_at": now,
+        "updated_at": now,
+        "target_equity": _num(payload.get("target_equity"), 0),
+        "highest_profit": _num(payload.get("highest_profit"), highest_equity - account_size),
+        "highest_profit_percent": _num(payload.get("highest_profit_percent"), 0),
+        "profit_target": _num(payload.get("profit_target"), 0),
+        "phase_label": payload.get("phase_label") or trader.get("phase"),
+        "breach_equity_level": _num(payload.get("breach_equity_level"), 0),
+        "funded_profit_floor": _num(payload.get("funded_profit_floor"), 0),
+        "funded_profit_label": payload.get("funded_profit_label") or trader.get("funded_profit_label"),
     }
 
-    if zone == "breached":
+    # Critical rule order: PASS FIRST, BREACH SECOND.
+    # If highest equity has already hit the target, never let later DD overwrite it as critical/breached.
+    if passed_status:
+        zone = "passed"
+        priority = "passed"
+        update_data.update({
+            "status": passed_status,
+            "phase": passed_status,
+            "phase_pass_status": passed_status,
+            "phase_passed_at": trader.get("phase_passed_at") or now,
+            "passed_at": trader.get("passed_at") or now,
+            "risk_zone": "passed",
+            "critical_mode": False,
+            "monitoring_priority": "passed",
+            "mt5_access_disabled": True,
+            "mt5_account_active": False,
+            "payout_blocked": False,
+            "payout_eligible": False,
+            "admin_note": payload.get("reason") or f"{passed_status} by highest equity target. Account locked for admin review / next stage.",
+        })
+        if passed_status == "phase1_passed":
+            update_data["phase1_passed_at"] = trader.get("phase1_passed_at") or now
+        if passed_status == "phase2_passed":
+            update_data["phase2_passed_at"] = trader.get("phase2_passed_at") or now
+            update_data["certificate_status"] = trader.get("certificate_status") or "passed"
+            update_data["certificate_passed_at"] = trader.get("certificate_passed_at") or now
+
+    elif breached:
+        zone = "breached"
+        priority = "closed"
         update_data.update({
             "status": "breached",
-            "breach_time": trader.get("breach_time") or _now_iso(),
+            "phase": "breached",
+            "risk_zone": "breached",
+            "critical_mode": False,
+            "monitoring_priority": "closed",
+            "breach_time": trader.get("breach_time") or now,
             "breach_equity": equity,
-            "breach_reason": "Maximum drawdown violation recorded by NairaPips monitoring engine.",
-            "admin_note": "Auto-breach: maximum drawdown violation recorded by monitoring engine.",
-            "mt5_access_disabled": True if zone == "breached" else False,
-"breach_detected_at": datetime.now(timezone.utc).isoformat() if zone == "breached" else trader.get("breach_detected_at"),
+            "breach_reason": payload.get("reason") or "Maximum drawdown violation recorded by NairaPips monitoring engine.",
+            "admin_note": payload.get("reason") or "Auto-breach: maximum drawdown violation recorded by monitoring engine.",
+            "mt5_access_disabled": True,
+            "mt5_account_active": False,
+            "payout_eligible": False,
+            "payout_blocked": True,
+            "breach_detected_at": trader.get("breach_detected_at") or now,
         })
 
-    supabase.table("traders").update(update_data).eq("id", trader.get("id")).execute()
+    elif incoming_status == "profit_protected" or incoming_zone == "profit_protected":
+        zone = "profit_protected"
+        update_data.update({
+            "status": "profit_protected",
+            "risk_zone": "profit_protected",
+            "critical_mode": False,
+            "monitoring_priority": "urgent",
+            "mt5_access_disabled": True,
+            "mt5_account_active": False,
+            "admin_note": payload.get("reason") or "Funded hybrid profit protection triggered. Account locked for payout/admin review.",
+        })
+
+    _safe_traders_update(trader.get("id"), update_data)
 
     try:
         supabase.table("monitoring_snapshots").insert({
@@ -1899,45 +2078,72 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
             "drawdown": equity_damage,
             "drawdown_percent": drawdown_percent,
             "max_drawdown_used": max_dd_used,
-            "risk_zone": zone,
+            "risk_zone": update_data.get("risk_zone", zone),
             "source": source,
             "raw_data": payload
         }).execute()
     except Exception as e:
         print("monitoring snapshot insert failed:", e)
 
-    # Auto Timeline + Evidence Population
-    # Every important snapshot now becomes readable evidence for admin/trader dashboards.
-    if _should_record_snapshot_event(old_zone, zone, round(max_dd_used)):
+    if passed_status and old_status != passed_status:
+        _insert_monitoring_event(
+            trader,
+            "phase_passed",
+            "passed",
+            f"{passed_status} confirmed by highest equity target. Account locked for admin review / next stage.",
+            balance,
+            equity,
+            max_dd_used
+        )
+        _send_phase_pass_email_once(trader, passed_status, payload, old_status)
+
+    elif _should_record_snapshot_event(old_zone, update_data.get("risk_zone", zone), round(max_dd_used)):
         event_type = "monitoring_snapshot"
-        if zone != old_zone:
+        event_zone = update_data.get("risk_zone", zone)
+        if event_zone != old_zone:
             event_type = "risk_zone_change"
-        if zone == "critical":
+        if event_zone == "critical":
             event_type = "critical_mode"
-        if zone == "danger":
+        if event_zone == "danger":
             event_type = "danger_zone"
-        if zone == "breached":
+        if event_zone == "breached":
             event_type = "breach_detected"
 
         _insert_monitoring_event(
             trader,
             event_type,
-            zone,
-            _snapshot_event_message(zone, balance, equity, profit_percent, drawdown_percent, max_dd_used),
+            event_zone,
+            _snapshot_event_message(event_zone, balance, equity, profit_percent, drawdown_percent, max_dd_used),
             balance,
             equity,
             max_dd_used
         )
 
-    if zone == "breached" and old_status != "breached":
+    if update_data.get("risk_zone") == "breached" and old_status != "breached":
         _insert_monitoring_event(
             trader,
             "account_locked",
-            zone,
+            "breached",
             "Account locked permanently by NairaPips monitoring engine after maximum drawdown violation.",
             balance,
             equity,
             max_dd_used
+        )
+        send_account_status_email(
+            trader,
+            "NairaPips account breached",
+            "Your NairaPips account has been breached and locked.",
+            update_data.get("breach_reason") or "Maximum drawdown violation recorded by NairaPips monitoring engine."
+        )
+        send_admin_alert(
+            "NairaPips account breached",
+            f"""A trader account has breached and has been locked.
+
+Trader: {trader.get('name') or 'Trader'}
+Email: {trader.get('email') or 'Not provided'}
+MT5 Login: {trader.get('mt5_login') or payload.get('mt5_login') or 'Not provided'}
+Equity: {email_money(equity)}
+Max DD Used: {round(max_dd_used, 1)}%"""
         )
 
     return {
@@ -1948,10 +2154,11 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
         "profit_percent": profit_percent,
         "drawdown_percent": drawdown_percent,
         "max_drawdown_used": max_dd_used,
-        "risk_zone": zone,
-        "critical_mode": zone in ["danger", "critical"],
-        "monitoring_priority": priority,
-        "status": update_data.get("status", trader.get("status"))
+        "risk_zone": update_data.get("risk_zone", zone),
+        "critical_mode": update_data.get("critical_mode", False),
+        "monitoring_priority": update_data.get("monitoring_priority", priority),
+        "status": update_data.get("status", trader.get("status")),
+        "phase_pass_status": update_data.get("phase_pass_status", trader.get("phase_pass_status"))
     }
 
 @app.route("/register_fxblue", methods=["POST"])
@@ -2045,20 +2252,65 @@ def disable_mt5_access():
 
         trader_id = d.get("trader_id")
         mt5_login = str(d.get("mt5_login") or "")
-        reason = d.get("reason") or "This MT5 account breached NairaPips rules and is no longer payout eligible."
+        reason = d.get("reason") or "This MT5 account has been locked by NairaPips monitoring engine."
+        incoming_status = str(d.get("status") or "breached").lower().strip()
 
         if not trader_id and not mt5_login:
             return bad("trader_id or mt5_login is required")
 
-        update = {
-            "status": "breached",
-            "phase": "breached",
-            "monitoring_enabled": False,
-            "mt5_account_active": False,
-            "payout_eligible": False,
-            "admin_note": reason,
-            "updated_at": now_iso()
-        }
+        now = now_iso()
+        passed_statuses = {"phase1_passed", "phase2_passed", "passed", "funded_ready", "target_hit"}
+
+        if incoming_status in passed_statuses:
+            pass_status = "phase1_passed" if incoming_status in {"target_hit", "passed"} else incoming_status
+            update = {
+                "status": pass_status,
+                "phase": pass_status,
+                "phase_pass_status": pass_status,
+                "phase_passed_at": now,
+                "passed_at": now,
+                "risk_zone": "passed",
+                "critical_mode": False,
+                "monitoring_priority": "passed",
+                "monitoring_enabled": False,
+                "mt5_account_active": False,
+                "mt5_access_disabled": True,
+                "payout_blocked": False,
+                "payout_eligible": False,
+                "admin_note": reason,
+                "updated_at": now
+            }
+            message = "Passed MT5 account locked for admin review / next phase."
+        elif incoming_status == "profit_protected":
+            update = {
+                "status": "profit_protected",
+                "risk_zone": "profit_protected",
+                "critical_mode": False,
+                "monitoring_priority": "urgent",
+                "monitoring_enabled": False,
+                "mt5_account_active": False,
+                "mt5_access_disabled": True,
+                "admin_note": reason,
+                "updated_at": now
+            }
+            message = "Funded profit-protected MT5 account locked for payout/admin review."
+        else:
+            update = {
+                "status": "breached",
+                "phase": "breached",
+                "risk_zone": "breached",
+                "critical_mode": False,
+                "monitoring_priority": "closed",
+                "monitoring_enabled": False,
+                "mt5_account_active": False,
+                "mt5_access_disabled": True,
+                "payout_eligible": False,
+                "payout_blocked": True,
+                "breach_detected_at": now,
+                "admin_note": reason,
+                "updated_at": now
+            }
+            message = "Breached MT5 account locked. Trader profile remains active."
 
         query = supabase.table("traders").update(update)
 
@@ -2067,10 +2319,10 @@ def disable_mt5_access():
         else:
             res = query.eq("mt5_login", mt5_login).execute()
 
-        return ok(res.data, "Breached MT5 account locked. Trader profile remains active.")
-
+        return ok(res.data, message)
     except Exception as e:
         return bad(e)
+
 @app.route("/users_database", methods=["GET"])
 def users_database():
     try:
