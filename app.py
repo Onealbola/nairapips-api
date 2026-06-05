@@ -658,6 +658,86 @@ def _find_existing_trader(email="", phone=""):
 
     return None
 
+# ================================
+# NAIRAPIPS EMAIL OTP VERIFICATION
+# ================================
+
+def _otp_digits():
+    return str(random.randint(100000, 999999))
+
+def _email_verified_recent(email):
+    try:
+        email = str(email or '').strip().lower()
+        if not email:
+            return False
+        rows = supabase.table('email_verification_codes').select('*').eq('email', email).eq('verified', True).order('verified_at', desc=True).limit(1).execute().data or []
+        if not rows:
+            return False
+        verified_at = rows[0].get('verified_at')
+        if not verified_at:
+            return False
+        dt = datetime.fromisoformat(str(verified_at).replace('Z', '+00:00'))
+        return (datetime.now(timezone.utc) - dt).total_seconds() <= 60 * 60
+    except Exception as e:
+        print('EMAIL OTP CHECK ERROR:', str(e))
+        return False
+
+def _consume_email_verification(email):
+    try:
+        email = str(email or '').strip().lower()
+        supabase.table('email_verification_codes').update({'consumed_at': now_iso()}).eq('email', email).eq('verified', True).execute()
+    except Exception as e:
+        print('EMAIL OTP CONSUME ERROR:', str(e))
+
+@app.route('/send_email_otp', methods=['POST', 'OPTIONS'])
+def send_email_otp():
+    if request.method == 'OPTIONS':
+        return _np_ok({})
+    try:
+        d = request.json or {}
+        email = str(d.get('email') or '').strip().lower()
+        name = str(d.get('name') or 'Trader').strip() or 'Trader'
+        if not email or not _valid_email(email):
+            return bad('Enter a valid email address')
+        code = _otp_digits()
+        expires_at = datetime.fromtimestamp(time.time() + 10 * 60, tz=timezone.utc).isoformat()
+        row = {'email': email, 'code': code, 'verified': False, 'expires_at': expires_at, 'created_at': now_iso()}
+        try:
+            supabase.table('email_verification_codes').insert(row).execute()
+        except Exception:
+            return bad('Email verification table missing. Run the email OTP SQL first.', 500)
+        message = 'Hello ' + name + ',\n\nYour NairaPips verification code is:\n\n' + code + '\n\nThis code expires in 10 minutes.\n\nIf you did not request this code, ignore this email.\n\nNairaPips Team'
+        sent = send_email_safe(email, 'Your NairaPips verification code', message)
+        if not sent:
+            return bad('Could not send verification email. Check email service settings.', 500)
+        return ok({'email': email, 'expires_in_minutes': 10}, 'Verification code sent')
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route('/verify_email_otp', methods=['POST', 'OPTIONS'])
+def verify_email_otp():
+    if request.method == 'OPTIONS':
+        return _np_ok({})
+    try:
+        d = request.json or {}
+        email = str(d.get('email') or '').strip().lower()
+        code = str(d.get('code') or '').strip()
+        if not email or not code:
+            return bad('Email and verification code are required')
+        rows = supabase.table('email_verification_codes').select('*').eq('email', email).eq('code', code).order('created_at', desc=True).limit(1).execute().data or []
+        if not rows:
+            return bad('Invalid verification code', 400)
+        row = rows[0]
+        exp = row.get('expires_at')
+        if exp:
+            exp_dt = datetime.fromisoformat(str(exp).replace('Z', '+00:00'))
+            if datetime.now(timezone.utc) > exp_dt:
+                return bad('Verification code has expired. Request a new code.', 400)
+        supabase.table('email_verification_codes').update({'verified': True, 'verified_at': now_iso()}).eq('id', row.get('id')).execute()
+        return ok({'email': email, 'email_verified': True}, 'Email verified')
+    except Exception as e:
+        return bad(e, 500)
+
 def _safe_insert_trader(row):
     try:
         return supabase.table("traders").insert(row).execute().data
@@ -688,12 +768,16 @@ def register_trader():
 
         if not _valid_name(name):
             return bad("Please enter your real full name.")
-        if not email and not phone:
-            return bad("Email or phone is required")
+        if not email:
+            return bad("Email is required for verification")
+        if not phone:
+            return bad("Complete WhatsApp / phone number is required")
         if not _valid_email(email):
             return bad("Please enter a valid email address.")
         if not _valid_phone(phone):
-            return bad("Please enter a valid WhatsApp or phone number.")
+            return bad("Please enter a complete valid WhatsApp or phone number.")
+        if not _email_verified_recent(email):
+            return bad("Email is not verified. Please enter the verification code sent to your email before creating your account.", 403)
 
         existing = _find_existing_trader(email, phone)
         if existing:
@@ -718,6 +802,9 @@ def register_trader():
             "profit_percent": 0,
             "drawdown_percent": 0,
             "payment_status": d.get("payment_status", "none"),
+            "email_verified": True,
+            "email_verified_at": now_iso(),
+            "phone_verified": False,
             "payment_proof_url": "",
             "selected_plan": "",
             "payment_note": "",
@@ -738,6 +825,7 @@ def register_trader():
         }
 
         created = _safe_insert_trader(row)
+        _consume_email_verification(email)
         trader_row = created[0] if created else row
 
         send_email_safe(
@@ -1900,178 +1988,53 @@ def sync_fxblue_account():
     if not trader:
         return jsonify({"success": False, "error": "Trader not found"}), 404
     return jsonify({"success": True, "data": _apply_monitoring_snapshot(trader, data, "fxblue")})
-
-def _np_first_row(table, column, value):
-    try:
-        if value is None or str(value).strip() == "":
-            return None
-        rows = supabase.table(table).select("*").eq(column, value).limit(1).execute().data or []
-        return rows[0] if rows else None
-    except Exception as e:
-        print(f"NP FIRST ROW FAILED {table}.{column}:", e)
-        return None
-
-def _np_find_trader_for_sync(payload):
-    payload = payload or {}
-    for key in ["trader_id", "id"]:
-        row = _np_first_row("traders", "id", payload.get(key))
-        if row:
-            return row
-    for key in ["mt5_login", "login", "account_login"]:
-        row = _np_first_row("traders", "mt5_login", str(payload.get(key) or "").strip())
-        if row:
-            return row
-    for key in ["email"]:
-        row = _np_first_row("traders", "email", str(payload.get(key) or "").strip().lower())
-        if row:
-            return row
-    for key in ["phone"]:
-        row = _np_first_row("traders", "phone", str(payload.get(key) or "").strip())
-        if row:
-            return row
-    return None
-
-def _np_trade_ticket(trade):
-    for key in ["ticket", "position_id", "order", "deal", "id"]:
-        value = trade.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return f"AUTO-{trade.get('mt5_login') or trade.get('login') or 'UNKNOWN'}-{trade.get('symbol') or 'SYMBOL'}-{trade.get('opened_at') or trade.get('time') or now_iso()}"
-
-def _np_trade_status(trade):
-    status = str(trade.get("status") or "").strip().lower()
-    if status:
-        return status
-    if trade.get("closed_at") or trade.get("close_time"):
-        return "closed"
-    return "open"
-
-def _np_trade_type(trade):
-    value = trade.get("trade_type", trade.get("type", trade.get("side", "")))
-    if isinstance(value, (int, float)):
-        return "buy" if int(value) == 0 else "sell"
-    value = str(value or "").strip().lower()
-    if value in ["0", "buy", "long"]:
-        return "buy"
-    if value in ["1", "sell", "short"]:
-        return "sell"
-    return value or "trade"
-
-def _np_sync_trade_rows(payload):
-    payload = payload or {}
-    trades = payload.get("trades", [])
-    if not isinstance(trades, list):
-        raise ValueError("trades must be a list")
-
-    parent_trader = _np_find_trader_for_sync(payload)
-    saved = []
-    skipped = []
-
-    for trade in trades:
-        if not isinstance(trade, dict):
-            skipped.append({"reason": "trade row is not an object", "row": str(trade)[:120]})
-            continue
-
-        trader = _np_find_trader_for_sync(trade) or parent_trader or {}
-        mt5_login = str(
-            trade.get("mt5_login") or trade.get("login") or trade.get("account_login") or
-            payload.get("mt5_login") or payload.get("login") or payload.get("account_login") or
-            trader.get("mt5_login") or ""
-        ).strip()
-
-        row = {
-            "trader_id": trade.get("trader_id") or payload.get("trader_id") or trader.get("id"),
-            "trader_name": trade.get("trader_name") or trade.get("name") or payload.get("trader_name") or trader.get("name"),
-            "email": trade.get("email") or payload.get("email") or trader.get("email"),
-            "mt5_login": mt5_login,
-            "symbol": trade.get("symbol") or trade.get("instrument") or "",
-            "ticket": _np_trade_ticket(trade),
-            "trade_type": _np_trade_type(trade),
-            "volume": clean(trade.get("volume") or trade.get("lot") or trade.get("lots") or 0),
-            "open_price": clean(trade.get("open_price") or trade.get("price_open") or trade.get("entry_price") or 0),
-            "current_price": clean(trade.get("current_price") or trade.get("price_current") or trade.get("price") or 0),
-            "sl": clean(trade.get("sl") or trade.get("stop_loss") or 0),
-            "tp": clean(trade.get("tp") or trade.get("take_profit") or 0),
-            "profit": clean(trade.get("profit") or trade.get("floating_pl") or trade.get("pnl") or 0),
-            "swap": clean(trade.get("swap") or 0),
-            "commission": clean(trade.get("commission") or 0),
-            "status": _np_trade_status(trade),
-            "opened_at": trade.get("opened_at") or trade.get("open_time") or trade.get("time") or trade.get("time_setup"),
-            "closed_at": trade.get("closed_at") or trade.get("close_time"),
-            "synced_at": now_iso()
-        }
-
-        if not row["ticket"]:
-            skipped.append({"reason": "missing ticket", "row": trade})
-            continue
-
-        try:
-            existing = supabase.table("trader_trades").select("id").eq("ticket", row["ticket"]).limit(1).execute().data or []
-            if existing:
-                result = supabase.table("trader_trades").update(row).eq("ticket", row["ticket"]).execute().data
-            else:
-                result = supabase.table("trader_trades").insert(row).execute().data
-            saved.append(result)
-        except Exception as e:
-            print("TRADER TRADE SYNC INSERT/UPDATE FAILED:", e)
-            skipped.append({"reason": str(e), "ticket": row.get("ticket")})
-
-    return {"saved": saved, "skipped": skipped, "count": len(saved)}
-
-def _np_sync_monitoring_from_payload(payload):
-    payload = payload or {}
-    trader = _np_find_trader_for_sync(payload)
-    if not trader:
-        return None
-    has_account_values = any(k in payload for k in ["balance", "equity", "profit", "floating_pl", "pnl"])
-    if not has_account_values:
-        return None
-
-    if "equity" not in payload and ("floating_pl" in payload or "pnl" in payload):
-        base = clean(payload.get("balance") or trader.get("balance") or trader.get("account_size") or 0)
-        payload["equity"] = base + clean(payload.get("floating_pl") or payload.get("pnl") or 0)
-    return _apply_monitoring_snapshot(trader, payload, payload.get("source", "mt5_bridge"))
-
-@app.route("/sync_trades", methods=["POST", "OPTIONS"])
-@app.route("/mt5_sync", methods=["POST", "OPTIONS"])
-@app.route("/sync_mt5", methods=["POST", "OPTIONS"])
-@app.route("/api/mt5/sync", methods=["POST", "OPTIONS"])
-@app.route("/mt5_trade_sync", methods=["POST", "OPTIONS"])
+@app.route("/sync_trades", methods=["POST"])
 def sync_trades():
-    if request.method == "OPTIONS":
-        return _np_ok({})
     try:
-        d = request.get_json(silent=True) or {}
+        d = request.json or {}
+        trades = d.get("trades", [])
 
-        trade_result = _np_sync_trade_rows(d)
-        monitoring_result = _np_sync_monitoring_from_payload(d)
+        if not isinstance(trades, list):
+            return bad("trades must be a list")
 
-        return ok({
-            "trades": trade_result,
-            "monitoring": monitoring_result,
-            "received_at": now_iso(),
-            "message": "MT5 payload accepted. Trades and monitoring updated from posted bridge data."
-        }, "MT5 trades synced")
+        saved = []
 
-    except Exception as e:
-        print("MT5 SYNC ERROR:", repr(e))
-        return bad(e)
+        for t in trades:
+            row = {
+                "trader_id": t.get("trader_id"),
+                "trader_name": t.get("trader_name"),
+                "email": t.get("email"),
+                "mt5_login": str(t.get("mt5_login") or ""),
+                "symbol": t.get("symbol"),
+                "ticket": str(t.get("ticket") or ""),
+                "trade_type": t.get("trade_type"),
+                "volume": t.get("volume") or 0,
+                "open_price": t.get("open_price") or 0,
+                "current_price": t.get("current_price") or 0,
+                "sl": t.get("sl") or 0,
+                "tp": t.get("tp") or 0,
+                "profit": t.get("profit") or 0,
+                "swap": t.get("swap") or 0,
+                "commission": t.get("commission") or 0,
+                "status": t.get("status") or "open",
+                "opened_at": t.get("opened_at"),
+                "closed_at": t.get("closed_at"),
+                "synced_at": now_iso()
+            }
 
-@app.route("/mt5_sync_status", methods=["GET"])
-def mt5_sync_status():
-    try:
-        active_traders = supabase.table("traders").select("id,name,email,mt5_login,last_sync_at,equity,balance,risk_zone,status").neq("mt5_login", "").limit(100).execute().data or []
-        recent_trades = supabase.table("trader_trades").select("*").order("synced_at", desc=True).limit(20).execute().data or []
-        return jsonify({
-            "success": True,
-            "message": "This backend is ready to RECEIVE MT5 bridge pushes. It does not run MetaTrader terminal inside Render.",
-            "active_mt5_traders": len(active_traders),
-            "latest_trade_synced_at": recent_trades[0].get("synced_at") if recent_trades else None,
-            "latest_trade_opened_at": recent_trades[0].get("opened_at") if recent_trades else None,
-            "recent_trades_count": len(recent_trades),
-            "sample_active_traders": active_traders[:10],
-            "sample_recent_trades": recent_trades[:5]
-        })
+            existing = supabase.table("trader_trades").select("id").eq("ticket", row["ticket"]).limit(1).execute().data
+
+            if existing:
+                saved.append(
+                    supabase.table("trader_trades").update(row).eq("ticket", row["ticket"]).execute().data
+                )
+            else:
+                saved.append(
+                    supabase.table("trader_trades").insert(row).execute().data
+                )
+
+        return ok(saved, "Trades synced")
+
     except Exception as e:
         return bad(e)
 
