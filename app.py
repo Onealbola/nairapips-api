@@ -309,15 +309,58 @@ FROM_EMAIL = os.getenv("FROM_EMAIL") or "support@nairapips.com"
 ADMIN_ALERT_EMAIL = os.getenv("ADMIN_ALERT_EMAIL") or FROM_EMAIL
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 
+# ================================
+# NAIRAPIPS EMAIL LOG BANK
+# ================================
+def _email_type_from_subject(subject):
+    s = str(subject or "").lower()
+    if "phase 1" in s or "phase1" in s:
+        return "phase1_pass"
+    if "phase 2" in s or "phase2" in s:
+        return "phase2_pass"
+    if "breach" in s or "breached" in s:
+        return "breach"
+    if "otp" in s or "verification code" in s:
+        return "email_otp"
+    if "mt5" in s:
+        return "mt5_update"
+    if "payout" in s:
+        return "payout"
+    return "general"
+
+
+def _log_email_bank(to_email, subject, email_type=None, status="queued", trader_id=None, message="", provider="brevo", provider_response="", error=""):
+    """Best-effort log. If the SQL has not been run yet, email sending must not break."""
+    try:
+        row = {
+            "trader_id": trader_id,
+            "recipient_email": str(to_email or "").strip().lower(),
+            "subject": str(subject or "")[:250],
+            "email_type": email_type or _email_type_from_subject(subject),
+            "status": status,
+            "provider": provider,
+            "provider_response": str(provider_response or "")[:2000],
+            "error": str(error or "")[:2000],
+            "message_preview": str(message or "")[:1000],
+            "created_at": now_iso() if "now_iso" in globals() else datetime.now(timezone.utc).isoformat(),
+            "sent_at": (now_iso() if status == "sent" and "now_iso" in globals() else None),
+        }
+        supabase.table("email_logs").insert(row).execute()
+    except Exception as e:
+        print("EMAIL LOG BANK SKIPPED:", str(e))
+
 def text_to_html_content(message):
     return "<p>" + html.escape(str(message or "")).replace("\n", "<br>") + "</p>"
 
 def send_email_brevo(to_email, subject, html_content):
     try:
         if not to_email:
+            _log_email_bank(to_email, subject, status="failed", message=html_content, error="Missing recipient email")
             return False
         if not BREVO_API_KEY or not FROM_EMAIL:
-            print("BREVO EMAIL ERROR:", "BREVO_API_KEY or FROM_EMAIL is missing")
+            err = "BREVO_API_KEY or FROM_EMAIL is missing"
+            print("BREVO EMAIL ERROR:", err)
+            _log_email_bank(to_email, subject, status="failed", message=html_content, error=err)
             return False
 
         print("BREVO EMAIL ATTEMPT:", to_email)
@@ -334,13 +377,17 @@ def send_email_brevo(to_email, subject, html_content):
             timeout=10
         )
         if res.status_code >= 400:
-            print("BREVO EMAIL ERROR:", res.status_code, res.text[:500])
+            err = f"{res.status_code} {res.text[:500]}"
+            print("BREVO EMAIL ERROR:", err)
+            _log_email_bank(to_email, subject, status="failed", message=html_content, provider_response=res.text, error=err)
             return False
 
         print("BREVO EMAIL SENT:", to_email)
+        _log_email_bank(to_email, subject, status="sent", message=html_content, provider_response=res.text)
         return True
     except Exception as e:
         print("BREVO EMAIL ERROR:", str(e))
+        _log_email_bank(to_email, subject, status="failed", message=html_content, error=str(e))
         return False
 
 def send_email(to_email, subject, message):
@@ -1903,14 +1950,22 @@ def _passed_status_from_snapshot(payload):
     return ""
 
 
-def _send_phase_pass_email_once(trader, pass_status, payload, old_status):
+def _send_phase_pass_email_once(trader, pass_status, payload, old_status, force=False):
     old_status = str(old_status or "").lower()
-    if old_status == pass_status or str(trader.get("phase_pass_status") or "").lower() == pass_status:
-        return
+    if (not force) and (old_status == pass_status or str(trader.get("phase_pass_status") or "").lower() == pass_status):
+        _log_email_bank(
+            trader.get("email"),
+            f"Skipped duplicate {pass_status} email",
+            email_type=pass_status,
+            status="skipped",
+            trader_id=trader.get("id"),
+            message="Phase pass email was skipped because this pass status was already recorded.",
+        )
+        return False
     phase_name = "Phase 2" if pass_status == "phase2_passed" else "Phase 1"
-    target_equity = payload.get("target_equity") or 0
-    highest_equity = payload.get("highest_equity") or 0
-    highest_profit_percent = payload.get("highest_profit_percent") or 0
+    target_equity = payload.get("target_equity") or trader.get("target_equity") or 0
+    highest_equity = payload.get("highest_equity") or trader.get("highest_equity") or 0
+    highest_profit_percent = payload.get("highest_profit_percent") or trader.get("highest_profit_percent") or 0
     details = f"""Congratulations. You have successfully passed {phase_name} of the NairaPips Challenge.
 
 Highest Equity Reached: {email_money(highest_equity)}
@@ -1918,11 +1973,21 @@ Target Equity: {email_money(target_equity)}
 Profit Target Achieved: {highest_profit_percent}%
 
 Your dashboard has been updated and the account has been locked for admin review / next stage processing."""
-    send_account_status_email(
+    subject = f"Congratulations - You passed {phase_name}"
+    sent = send_account_status_email(
         trader,
-        f"Congratulations - You passed {phase_name}",
+        subject,
         f"You have passed {phase_name}.",
         details
+    )
+    _log_email_bank(
+        trader.get("email"),
+        subject,
+        email_type=pass_status,
+        status="sent" if sent else "failed",
+        trader_id=trader.get("id"),
+        message=details,
+        error="send_account_status_email returned False" if not sent else "",
     )
     send_admin_alert(
         f"NairaPips {phase_name} passed",
@@ -1935,6 +2000,7 @@ Highest Equity: {email_money(highest_equity)}
 Target Equity: {email_money(target_equity)}
 Status: {pass_status}"""
     )
+    return sent
 
 
 def _apply_monitoring_snapshot(trader, payload, source="manual"):
@@ -4064,6 +4130,53 @@ def affiliate_summary():
             "total_sales": total_sales, "pending_commissions": pending, "approved_commissions": approved, "paid_commissions": paid,
             "top_partner": top, "partner_rows": rows
         }})
+    except Exception as e:
+        return bad(e, 500)
+
+
+# ================================
+# EMAIL LOG BANK + MANUAL RESEND
+# ================================
+@app.route("/email_logs", methods=["GET"])
+def email_logs():
+    try:
+        limit = int(request.args.get("limit", 100))
+        rows = supabase.table("email_logs").select("*").order("created_at", desc=True).limit(limit).execute().data or []
+        return jsonify(rows)
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/resend_phase_pass_email", methods=["POST", "OPTIONS"])
+def resend_phase_pass_email():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        lookup = d.get("trader_id") or d.get("id") or d.get("email") or d.get("mt5_login")
+        if not lookup:
+            return bad("Send trader_id, id, email, or mt5_login", 400)
+
+        trader = None
+        if d.get("trader_id") or d.get("id"):
+            trader = get_trader_by_id(d.get("trader_id") or d.get("id"))
+        if not trader:
+            trader = _latest_trader_for_lookup(lookup)
+        if not trader:
+            return bad("Trader not found", 404)
+
+        pass_status = str(d.get("pass_status") or trader.get("phase_pass_status") or trader.get("status") or trader.get("phase") or "").lower().strip()
+        if pass_status not in ["phase1_passed", "phase2_passed"]:
+            phase_label = str(trader.get("phase_label") or trader.get("phase") or "phase1").lower()
+            pass_status = "phase2_passed" if "2" in phase_label else "phase1_passed"
+
+        payload = {
+            "target_equity": trader.get("target_equity"),
+            "highest_equity": trader.get("highest_equity"),
+            "highest_profit_percent": trader.get("highest_profit_percent"),
+            "mt5_login": trader.get("mt5_login"),
+        }
+        sent = _send_phase_pass_email_once(trader, pass_status, payload, old_status="", force=True)
+        return jsonify({"success": bool(sent), "sent": bool(sent), "pass_status": pass_status, "trader": trader})
     except Exception as e:
         return bad(e, 500)
 
