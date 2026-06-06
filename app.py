@@ -751,8 +751,9 @@ def send_email_otp():
         row = {'email': email, 'code': code, 'verified': False, 'expires_at': expires_at, 'created_at': now_iso()}
         try:
             supabase.table('email_verification_codes').insert(row).execute()
-        except Exception:
-            return bad('Email verification table missing. Run the email OTP SQL first.', 500)
+        except Exception as e:
+            print("EMAIL OTP INSERT ERROR:", str(e))
+            return bad("Email OTP save failed: " + str(e), 500)
         message = 'Hello ' + name + ',\n\nYour NairaPips verification code is:\n\n' + code + '\n\nThis code expires in 10 minutes.\n\nIf you did not request this code, ignore this email.\n\nNairaPips Team'
         sent = send_email_safe(email, 'Your NairaPips verification code', message)
         if not sent:
@@ -783,7 +784,8 @@ def verify_email_otp():
         supabase.table('email_verification_codes').update({'verified': True, 'verified_at': now_iso()}).eq('id', row.get('id')).execute()
         return ok({'email': email, 'email_verified': True}, 'Email verified')
     except Exception as e:
-        return bad(e, 500)
+        print("EMAIL OTP VERIFY ERROR:", str(e))
+        return bad("Email OTP verification failed: " + str(e), 500)
 
 def _safe_insert_trader(row):
     try:
