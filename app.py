@@ -929,7 +929,7 @@ def _eligible_for_account_backfill(trader):
 def migrate_active_trader_accounts():
     try:
         body = request.get_json(silent=True) or {}
-        confirm = request.method == "POST" and _is_truthy(body.get("confirm"))
+        confirm = _is_truthy(body.get("confirm")) or _is_truthy(request.args.get("confirm"))
         limit = int(body.get("limit") or request.args.get("limit") or 500)
         rows = supabase.table("traders").select("*").limit(limit).execute().data or []
         planned = []
