@@ -1562,6 +1562,152 @@ def delete_mt5():
         return ok(supabase.table("mt5_pool").delete().eq("id",mid).execute().data, "MT5 account deleted")
     except Exception as e: return bad(e)
 
+
+@app.route("/assign_phase_mt5", methods=["POST"])
+def assign_phase_mt5():
+    """
+    Production phase MT5 assignment.
+
+    Purpose:
+    - Assign fresh MT5 account from mt5_pool to a trader for Phase 2 or Funded/Live.
+    - Reset phase-specific tracking so old Phase 1 equity/profit cannot contaminate Phase 2.
+    - Mark MT5 pool row as assigned so it cannot be reused.
+    """
+    try:
+        d = request.json or {}
+        trader_id = d.get("trader_id") or d.get("id")
+        mt5_id = d.get("mt5_id")
+        phase = str(d.get("phase") or "phase2").lower().strip()
+        admin_name = d.get("admin_name") or d.get("approved_by") or "admin"
+
+        if not trader_id:
+            return bad("Missing trader_id")
+        if not mt5_id:
+            return bad("Choose an MT5 account from the pool")
+        if phase not in ["phase2", "funded", "live"]:
+            return bad("Phase must be phase2, funded or live")
+
+        trader_rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+        if not trader_rows:
+            return bad("Trader not found", 404)
+        trader = trader_rows[0]
+
+        pool_rows = supabase.table("mt5_pool").select("*").eq("id", mt5_id).limit(1).execute().data or []
+        if not pool_rows:
+            return bad("MT5 account not found in pool", 404)
+        mt5_acc = pool_rows[0]
+
+        if str(mt5_acc.get("status") or "available").lower().strip() != "available":
+            return bad("This MT5 account is not available. Choose another one.", 409)
+
+        login = str(mt5_acc.get("mt5_login") or "").strip()
+        server = str(mt5_acc.get("mt5_server") or "").strip()
+        master = str(mt5_acc.get("mt5_master_password") or "").strip()
+        investor = str(mt5_acc.get("mt5_investor_password") or "").strip()
+        if not login or not server or not master or not investor:
+            return bad("Selected MT5 pool account is incomplete. Login, server, master and investor passwords are required.")
+
+        account_size = clean(mt5_acc.get("account_size") or trader.get("account_size") or trader.get("balance") or 0)
+        if account_size <= 0:
+            return bad("Account size missing. Set account_size on the MT5 pool record or trader record.")
+
+        now = now_iso()
+        target_percent = 8 if phase == "phase2" else 0
+        if phase == "phase2":
+            new_phase = "phase2"
+            new_status = "phase2_active"
+            note = "Fresh Phase 2 MT5 assigned. Phase 2 tracking starts from zero."
+        else:
+            new_phase = "funded"
+            new_status = "funded_active"
+            note = "Funded/Live MT5 assigned. Funded risk monitoring starts."
+
+        trader_update = {
+            "phase": new_phase,
+            "status": new_status,
+            "mt5_login": login,
+            "mt5_server": server,
+            "mt5_master_password": master,
+            "mt5_investor_password": investor,
+            "account_size": account_size,
+            "balance": account_size,
+            "equity": account_size,
+            "profit": 0,
+            "profit_percent": 0,
+            "drawdown": 0,
+            "drawdown_percent": 0,
+            "highest_equity": account_size,
+            "lowest_equity": account_size,
+            "target_equity": account_size * (1 + (target_percent / 100)),
+            "profit_target": target_percent,
+            "phase_label": new_phase,
+            "risk_zone": "safe",
+            "critical_mode": False,
+            "monitoring_priority": "active",
+            "monitoring_enabled": True,
+            "mt5_account_active": True,
+            "mt5_access_disabled": False,
+            "payout_blocked": False,
+            "admin_note": note,
+            "approved_by": admin_name,
+            "updated_at": now,
+            "last_sync_at": now,
+        }
+        if phase == "phase2":
+            trader_update["phase2_started_at"] = now
+        else:
+            trader_update["funded_at"] = now
+
+        # Use safe updater because some deployments may not have every optional column.
+        _safe_traders_update(trader_id, trader_update)
+
+        pool_update = {
+            "status": "assigned",
+            "assigned_trader_id": trader_id,
+            "assigned_trader_name": trader.get("name") or trader.get("full_name") or "",
+            "assigned_email": trader.get("email") or "",
+            "assigned_phase": new_phase,
+            "assigned_at": now,
+            "updated_at": now,
+            "admin_note": f"Assigned to {trader.get('name') or trader_id} for {new_phase} by {admin_name}",
+        }
+        try:
+            supabase.table("mt5_pool").update(pool_update).eq("id", mt5_id).execute()
+        except Exception as pool_error:
+            print("MT5 POOL ASSIGN UPDATE FAILED:", pool_error)
+            fallback_pool = {
+                "status": "assigned",
+                "assigned_trader_name": trader.get("name") or trader.get("full_name") or "",
+                "assigned_email": trader.get("email") or "",
+                "updated_at": now,
+            }
+            supabase.table("mt5_pool").update(fallback_pool).eq("id", mt5_id).execute()
+
+        send_email_safe(
+            trader.get("email"),
+            f"NairaPips {new_phase.upper()} MT5 account assigned",
+            f"""Hello {trader.get("name") or "Trader"},
+
+Your fresh {new_phase.upper()} MT5 account has been assigned.
+
+MT5 Login: {login}
+Server: {server}
+Master Password: {master}
+Investor Password: {investor}
+
+Your {new_phase.upper()} tracking starts fresh from {email_money(account_size)}.
+
+NairaPips Team"""
+        )
+
+        _audit_safe("mt5_pool", "phase_mt5_assigned", f"{new_phase} MT5 assigned to trader {trader_id}", _admin_from_payload(d))
+
+        updated_trader = _get_trader_by_id(trader_id) or {}
+        return ok(updated_trader, f"{new_phase.upper()} MT5 assigned successfully")
+
+    except Exception as e:
+        return bad(e)
+
 @app.route("/payouts", methods=["GET"])
 def payouts():
     try: return jsonify(supabase.table("payouts").select("*").order("created_at", desc=True).execute().data)
