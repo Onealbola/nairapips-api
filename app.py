@@ -1652,6 +1652,9 @@ def assign_phase_mt5():
             "approved_by": admin_name,
             "updated_at": now,
             "last_sync_at": now,
+            "mt5_updated_at": now,
+            "assigned_at": now,
+            "assigned_phase": new_phase,
         }
         if phase == "phase2":
             trader_update["phase2_started_at"] = now
