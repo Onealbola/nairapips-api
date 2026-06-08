@@ -1563,6 +1563,193 @@ def delete_mt5():
     except Exception as e: return bad(e)
 
 
+
+
+# ================================
+# NAIRAPIPS ACCOUNT ARCHIVE SYSTEM
+# ================================
+def _archive_safe_insert(table, row):
+    """Best-effort archive insert. If the archive table/columns are not created yet, production flow must continue."""
+    try:
+        return supabase.table(table).insert(row).execute()
+    except Exception as e:
+        print(f"ARCHIVE INSERT SKIPPED {table}:", e)
+        return None
+
+
+def _archive_safe_update(table, payload, column, value):
+    """Best-effort archive marking. Missing optional columns must not break MT5 assignment."""
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return supabase.table(table).update(payload).eq(column, value).execute()
+    except Exception as e:
+        print(f"ARCHIVE UPDATE SKIPPED {table}.{column}:", e)
+        return None
+
+
+def _current_journey_key(row):
+    """
+    Return the specific challenge journey key for this account.
+
+    Important production rule:
+    One trader may run more than one challenge account at the same time.
+    Therefore archiving must be scoped to the completed account journey only,
+    never to every purchase/email/phone belonging to the trader.
+    """
+    row = row or {}
+    for key in [
+        "challenge_journey_id", "journey_id", "current_journey_id",
+        "current_purchase_id", "active_purchase_id", "purchase_id",
+        "assigned_purchase_id", "selected_purchase_id",
+        "account_reference", "mt5_login"
+    ]:
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _archive_purchase_scope(trader, archive_payload):
+    """
+    Archive only the completed account's matching purchase.
+
+    This deliberately avoids broad updates by email/phone because that would archive
+    another live challenge bought by the same trader while they are still trading
+    the current phase.
+    """
+    trader = trader or {}
+    exact_ids = []
+    for key in ["current_purchase_id", "active_purchase_id", "purchase_id", "assigned_purchase_id", "selected_purchase_id"]:
+        value = str(trader.get(key) or "").strip()
+        if value and value not in exact_ids:
+            exact_ids.append(value)
+
+    updated_any = False
+    for pid in exact_ids:
+        if _archive_safe_update("challenge_purchases", archive_payload, "id", pid):
+            updated_any = True
+
+    # Fallback scope: same trader AND same old MT5 login only. This is safe for multi-account users.
+    old_login = str(trader.get("mt5_login") or "").strip()
+    trader_id = trader.get("id")
+    if old_login and trader_id:
+        try:
+            rows = supabase.table("challenge_purchases").select("id,mt5_login,trader_id").eq("trader_id", trader_id).eq("mt5_login", old_login).execute().data or []
+            for row in rows:
+                _archive_safe_update("challenge_purchases", archive_payload, "id", row.get("id"))
+                updated_any = True
+        except Exception as e:
+            print("ARCHIVE PURCHASE MT5 SCOPE SKIPPED:", e)
+
+    # Last fallback: account_reference / journey key match, never email/phone-wide.
+    journey_key = _current_journey_key(trader)
+    if journey_key:
+        for column in ["challenge_journey_id", "journey_id", "account_reference"]:
+            try:
+                rows = supabase.table("challenge_purchases").select("id").eq(column, journey_key).execute().data or []
+                for row in rows:
+                    _archive_safe_update("challenge_purchases", archive_payload, "id", row.get("id"))
+                    updated_any = True
+            except Exception:
+                pass
+
+    if not updated_any:
+        print("ARCHIVE PURCHASE SCOPE: no exact matching purchase archived; account_archive snapshot still preserved.")
+
+
+def _phase_archive_snapshot(trader, next_phase="", reason="phase_migration", admin_name="admin"):
+    """
+    Archive the completed/old phase before assigning the next MT5 account.
+
+    Multi-account production rule:
+    - Archive the completed phase for the specific challenge journey only.
+    - Do NOT archive every purchase belonging to the same trader/email/phone.
+    - Another challenge bought by the same trader must remain active/pending.
+    """
+    if not trader:
+        return None
+    now = now_iso()
+    old_phase = str(trader.get("phase") or "").strip() or "unknown"
+    old_status = str(trader.get("status") or "").strip() or "unknown"
+    journey_key = _current_journey_key(trader)
+    source_purchase_id = str(trader.get("current_purchase_id") or trader.get("active_purchase_id") or trader.get("purchase_id") or trader.get("assigned_purchase_id") or trader.get("selected_purchase_id") or "").strip()
+    row = {
+        "trader_id": trader.get("id"),
+        "trader_name": trader.get("name") or trader.get("full_name") or trader.get("trader_name") or "Trader",
+        "email": trader.get("email") or "",
+        "phone": trader.get("phone") or "",
+        "challenge_journey_id": journey_key,
+        "journey_id": journey_key,
+        "account_reference": trader.get("account_reference") or journey_key,
+        "source_purchase_id": source_purchase_id,
+        "archived_phase": old_phase,
+        "archived_status": old_status,
+        "next_phase": next_phase,
+        "mt5_login": trader.get("mt5_login") or "",
+        "mt5_server": trader.get("mt5_server") or "",
+        "account_size": trader.get("account_size") or trader.get("balance") or 0,
+        "balance": trader.get("balance") or 0,
+        "equity": trader.get("equity") or 0,
+        "highest_equity": trader.get("highest_equity") or trader.get("equity") or trader.get("balance") or 0,
+        "lowest_equity": trader.get("lowest_equity") or trader.get("equity") or trader.get("balance") or 0,
+        "profit": trader.get("profit") or 0,
+        "profit_percent": trader.get("profit_percent") or 0,
+        "drawdown": trader.get("drawdown") or 0,
+        "drawdown_percent": trader.get("drawdown_percent") or 0,
+        "phase_pass_status": trader.get("phase_pass_status") or "",
+        "phase_passed_at": trader.get("phase_passed_at") or trader.get("passed_at") or "",
+        "phase1_passed_at": trader.get("phase1_passed_at") or "",
+        "phase2_passed_at": trader.get("phase2_passed_at") or "",
+        "risk_zone": trader.get("risk_zone") or "",
+        "archive_reason": reason,
+        "archived_by": admin_name,
+        "archived_at": now,
+        "created_at": now,
+    }
+    _archive_safe_insert("account_archives", row)
+
+    archive_payload = {
+        "account_state": "archived",
+        "archived_at": now,
+        "archive_reason": reason,
+        "challenge_journey_id": journey_key,
+        "journey_id": journey_key,
+        "updated_at": now,
+    }
+    _archive_purchase_scope(trader, archive_payload)
+    return row
+
+
+@app.route("/account_history", methods=["GET"])
+def account_history():
+    """Return archived phase/account snapshots for a trader. Best-effort if the SQL table has not been created yet."""
+    try:
+        trader_id = request.args.get("trader_id") or ""
+        email = str(request.args.get("email") or "").strip().lower()
+        phone = str(request.args.get("phone") or "").strip()
+        rows = []
+        try:
+            if trader_id:
+                rows += supabase.table("account_archives").select("*").eq("trader_id", trader_id).order("archived_at", desc=True).execute().data or []
+            if email:
+                rows += supabase.table("account_archives").select("*").eq("email", email).order("archived_at", desc=True).execute().data or []
+            if phone:
+                rows += supabase.table("account_archives").select("*").eq("phone", phone).order("archived_at", desc=True).execute().data or []
+        except Exception as archive_error:
+            print("ACCOUNT HISTORY ARCHIVE TABLE SKIPPED:", archive_error)
+
+        # De-duplicate archive rows.
+        seen, unique = set(), []
+        for r in rows:
+            key = str(r.get("id") or "") or f"{r.get('trader_id')}|{r.get('archived_phase')}|{r.get('mt5_login')}|{r.get('archived_at')}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(r)
+        return jsonify(unique)
+    except Exception as e:
+        return bad(e)
+
 @app.route("/assign_phase_mt5", methods=["POST"])
 def assign_phase_mt5():
     """
@@ -1622,6 +1809,12 @@ def assign_phase_mt5():
             new_status = "funded_active"
             note = "Funded/Live MT5 assigned. Funded risk monitoring starts."
 
+        # Archive the completed current phase BEFORE replacing it with the new MT5 account.
+        # This prevents old Phase 1/purchase state from colliding with Phase 2/Funded dashboard display.
+        _phase_archive_snapshot(trader, next_phase=new_phase, reason=f"{new_phase}_fresh_mt5_assignment", admin_name=admin_name)
+
+        current_journey_id = _current_journey_key(trader) or ref()
+
         trader_update = {
             "phase": new_phase,
             "status": new_status,
@@ -1655,6 +1848,12 @@ def assign_phase_mt5():
             "mt5_updated_at": now,
             "assigned_at": now,
             "assigned_phase": new_phase,
+            "challenge_journey_id": current_journey_id,
+            "journey_id": current_journey_id,
+            "account_state": "current_active",
+            "current_account_state": "current_active",
+            "archived_at": None,
+            "archive_reason": "",
         }
         if phase == "phase2":
             trader_update["phase2_started_at"] = now
@@ -2077,10 +2276,19 @@ def _safe_traders_update(trader_id, update_data):
     except Exception as e:
         print("TRADER UPDATE FULL FAILED:", e)
         core_keys = {
-            "balance", "equity", "profit", "profit_percent", "drawdown", "drawdown_percent",
+            # Core money / monitoring fields
+            "account_size", "balance", "equity", "profit", "profit_percent", "drawdown", "drawdown_percent",
             "highest_equity", "lowest_equity", "peak_balance", "last_equity_snapshot",
+            "target_equity", "profit_target", "phase_label",
             "max_drawdown_used", "risk_zone", "critical_mode", "monitoring_priority",
-            "last_sync_at", "status", "phase", "admin_note", "mt5_access_disabled",
+            "last_sync_at", "status", "phase", "admin_note",
+            # Critical MT5 assignment fields. Never drop these in fallback updates.
+            "mt5_login", "mt5_server", "mt5_master_password", "mt5_investor_password",
+            "mt5_password", "master_password", "investor_password", "mt5_updated_at",
+            "assigned_at", "assigned_phase", "approved_by", "phase2_started_at", "funded_at",
+            "challenge_journey_id", "journey_id", "account_reference", "current_purchase_id", "active_purchase_id",
+            "monitoring_enabled", "mt5_account_active", "mt5_access_disabled",
+            "payout_blocked", "payout_eligible",
             "breach_time", "breach_equity", "breach_reason", "breach_detected_at",
             "updated_at"
         }
