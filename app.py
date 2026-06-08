@@ -2077,9 +2077,18 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
     if passed_status:
         zone = "passed"
         priority = "passed"
+        next_phase = "phase2"
+        next_status = "phase2_waiting_mt5"
+        admin_note = payload.get("reason") or "Phase 1 passed. Assign a fresh Phase 2 MT5 account."
+
+        if passed_status == "phase2_passed":
+            next_phase = "funded_waiting"
+            next_status = "funded_waiting_mt5"
+            admin_note = payload.get("reason") or "Phase 2 passed. Assign funded/live account after admin review."
+
         update_data.update({
-            "status": passed_status,
-            "phase": passed_status,
+            "status": next_status,
+            "phase": next_phase,
             "phase_pass_status": passed_status,
             "phase_passed_at": trader.get("phase_passed_at") or now,
             "passed_at": trader.get("passed_at") or now,
@@ -2088,9 +2097,10 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
             "monitoring_priority": "passed",
             "mt5_access_disabled": True,
             "mt5_account_active": False,
+            "monitoring_enabled": False,
             "payout_blocked": False,
             "payout_eligible": False,
-            "admin_note": payload.get("reason") or f"{passed_status} by highest equity target. Account locked for admin review / next stage.",
+            "admin_note": admin_note,
         })
         if passed_status == "phase1_passed":
             update_data["phase1_passed_at"] = trader.get("phase1_passed_at") or now
@@ -2331,9 +2341,17 @@ def disable_mt5_access():
 
         if incoming_status in passed_statuses:
             pass_status = "phase1_passed" if incoming_status in {"target_hit", "passed"} else incoming_status
+            next_phase = "phase2"
+            next_status = "phase2_waiting_mt5"
+            message = "Phase 1 passed. Account locked; assign fresh Phase 2 MT5."
+            if pass_status == "phase2_passed":
+                next_phase = "funded_waiting"
+                next_status = "funded_waiting_mt5"
+                message = "Phase 2 passed. Account locked; assign funded/live account after review."
+
             update = {
-                "status": pass_status,
-                "phase": pass_status,
+                "status": next_status,
+                "phase": next_phase,
                 "phase_pass_status": pass_status,
                 "phase_passed_at": now,
                 "passed_at": now,
@@ -2348,7 +2366,10 @@ def disable_mt5_access():
                 "admin_note": reason,
                 "updated_at": now
             }
-            message = "Passed MT5 account locked for admin review / next phase."
+            if pass_status == "phase1_passed":
+                update["phase1_passed_at"] = now
+            if pass_status == "phase2_passed":
+                update["phase2_passed_at"] = now
         elif incoming_status == "profit_protected":
             update = {
                 "status": "profit_protected",
