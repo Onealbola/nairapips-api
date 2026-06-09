@@ -571,7 +571,12 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
     account_size = clean((purchase or {}).get("account_size") or mt5.get("account_size") or trader.get("account_size"))
     if clean(mt5.get("account_size")) and clean(mt5.get("account_size")) != account_size:
         raise ValueError("Selected MT5 account size does not match purchase/account size")
-    if _get_active_account(trader.get("id")):
+    purchase_id = (purchase or {}).get("id")
+    if purchase_id:
+        existing_purchase = supabase.table("trader_accounts").select("id,mt5_login").eq("purchase_id", purchase_id).eq("account_status", "assigned_active").limit(1).execute().data or []
+        if existing_purchase:
+            raise ValueError("This purchase already has an active MT5 account assigned")
+    elif _get_active_account(trader.get("id")):
         raise ValueError("Trader already has an active MT5 account. Archive/pass/breach it before assigning another.")
     existing_login = supabase.table("trader_accounts").select("id").eq("mt5_login", mt5.get("mt5_login")).eq("account_status", "assigned_active").limit(1).execute().data or []
     if existing_login:
@@ -579,7 +584,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
     now = now_iso()
     account_row = {
         "trader_id": trader.get("id"),
-        "purchase_id": (purchase or {}).get("id"),
+        "purchase_id": purchase_id,
         "mt5_pool_id": mt5.get("id"),
         "stage": stage,
         "account_status": "assigned_active",
@@ -2427,6 +2432,8 @@ def approve_purchase():
         pres=supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute()
         if not pres.data: return bad("Purchase not found",404)
         p=pres.data[0]
+        if p.get("trader_account_id") or p.get("assigned_mt5_id") or str(p.get("mt5_login") or "").strip():
+            return bad("This purchase is already approved/assigned. Refresh the purchases page.", 409)
         if mt5_id:
             mres=supabase.table("mt5_pool").select("*").eq("id",mt5_id).limit(1).execute()
         else:
