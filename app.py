@@ -777,11 +777,14 @@ def _dashboard_payload_for_trader(trader):
     if account:
         current_login = str(account.get("mt5_login") or "").strip()
         current_server = str(account.get("mt5_server") or "").strip()
+        current_assigned_at = _account_display_assigned_at(account)
         for p in purchases:
             # Purchase rows are payment history, not the active MT5 source of truth.
             # Keep the sale data, but stop old Phase 1 purchase credentials from leaking into the dashboard.
             p["current_mt5_login"] = current_login
             p["current_mt5_server"] = current_server
+            p["current_account_assigned_at"] = current_assigned_at
+            p["current_account_stage"] = account.get("stage")
             p["lifecycle_state"] = trader.get("challenge_state") or _active_state_for_stage(account.get("stage"))
             p["active_stage"] = account.get("stage")
             if str(p.get("mt5_login") or "").strip() and str(p.get("mt5_login") or "").strip() != current_login:
