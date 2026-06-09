@@ -913,25 +913,37 @@ def _dashboard_payload_for_trader(trader):
         current_login = str(account.get("mt5_login") or "").strip()
         current_server = str(account.get("mt5_server") or "").strip()
         current_assigned_at = _account_display_assigned_at(account)
+        account_by_purchase = {str(a.get("purchase_id") or ""): a for a in active_accounts if a.get("purchase_id")}
+        account_by_login = {str(a.get("mt5_login") or "").strip(): a for a in active_accounts if str(a.get("mt5_login") or "").strip()}
         for p in purchases:
-            # Purchase rows are payment history, not the active MT5 source of truth.
-            # Keep the sale data, but stop old Phase 1 purchase credentials from leaking into the dashboard.
-            p["current_mt5_login"] = current_login
-            p["current_mt5_server"] = current_server
-            p["current_account_assigned_at"] = current_assigned_at
-            p["current_account_stage"] = account.get("stage")
-            p["lifecycle_state"] = trader.get("challenge_state") or _active_state_for_stage(account.get("stage"))
-            p["active_stage"] = account.get("stage")
-            if str(p.get("mt5_login") or "").strip() and str(p.get("mt5_login") or "").strip() != current_login:
-                p["archived_mt5_login"] = p.get("mt5_login")
-                p["archived_mt5_server"] = p.get("mt5_server")
-                p["mt5_login"] = ""
-                p["mt5_server"] = ""
-                p["mt5_master_password"] = ""
-                p["mt5_password"] = ""
-                p["master_password"] = ""
-                p["mt5_investor_password"] = ""
-                p["investor_password"] = ""
+            # Purchase history must preserve the MT5 assigned to that purchase.
+            # The dashboard focus account can be risky/current, but it must never erase
+            # another purchase's own assigned MT5 credentials.
+            purchase_account = account_by_purchase.get(str(p.get("id") or ""))
+            if not purchase_account and str(p.get("mt5_login") or "").strip():
+                purchase_account = account_by_login.get(str(p.get("mt5_login") or "").strip())
+            if purchase_account:
+                p["current_mt5_login"] = purchase_account.get("mt5_login") or ""
+                p["current_mt5_server"] = purchase_account.get("mt5_server") or ""
+                p["current_account_assigned_at"] = _account_display_assigned_at(purchase_account)
+                p["current_account_stage"] = purchase_account.get("stage")
+                p["lifecycle_state"] = _active_state_for_stage(purchase_account.get("stage"))
+                p["active_stage"] = purchase_account.get("stage")
+                if not str(p.get("mt5_login") or "").strip():
+                    p["mt5_login"] = purchase_account.get("mt5_login") or ""
+                    p["mt5_server"] = purchase_account.get("mt5_server") or ""
+                    p["mt5_master_password"] = purchase_account.get("mt5_master_password") or ""
+                    p["mt5_password"] = purchase_account.get("mt5_master_password") or ""
+                    p["master_password"] = purchase_account.get("mt5_master_password") or ""
+                    p["mt5_investor_password"] = purchase_account.get("mt5_investor_password") or ""
+                    p["investor_password"] = purchase_account.get("mt5_investor_password") or ""
+            else:
+                p["current_mt5_login"] = current_login
+                p["current_mt5_server"] = current_server
+                p["current_account_assigned_at"] = current_assigned_at
+                p["current_account_stage"] = account.get("stage")
+                p["lifecycle_state"] = trader.get("challenge_state") or _active_state_for_stage(account.get("stage"))
+                p["active_stage"] = account.get("stage")
     payouts_rows = _safe_fetch("payouts", "trader_id", trader.get("id"), 100)
     events = []
     archives = []
