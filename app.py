@@ -323,7 +323,8 @@ def _active_account_from_trader_profile(trader):
     profit = clean(trader.get("profit") or (equity - start_balance if start_balance else 0))
     profit_percent = clean(trader.get("profit_percent") or ((profit / start_balance * 100) if start_balance else 0))
     dd_limit = clean(trader.get("dd_limit_percent") or trader.get("max_drawdown") or 20) or 20
-    dd_used = clean(trader.get("dd_used_percent") or trader.get("max_drawdown_used") or 0)
+    absolute_dd = clean(trader.get("drawdown_percent") or 0)
+    dd_used = _safe_dd_used(trader, absolute_dd, dd_limit)
     assigned_at = _stage_started_at_from_legacy_trader(trader, stage, trader.get("updated_at") or trader.get("created_at") or now_iso())
     return _decorate_account_for_api({
         "id": trader.get("current_account_id") if _is_uuid(trader.get("current_account_id")) else None,
@@ -340,7 +341,7 @@ def _active_account_from_trader_profile(trader):
         "current_equity": equity,
         "profit": profit,
         "profit_percent": profit_percent,
-        "absolute_drawdown_percent": clean(trader.get("drawdown_percent") or 0),
+        "absolute_drawdown_percent": absolute_dd,
         "dd_limit_percent": dd_limit,
         "dd_used_percent": dd_used,
         "target_percent": _target_for_stage(stage),
@@ -1081,6 +1082,121 @@ def account_archive(trader_id):
         return bad(e)
 
 
+@app.route("/admin/recalculate_drawdown_usage", methods=["POST", "GET"])
+def recalculate_drawdown_usage():
+    """Repair and enforce DD-limit usage from actual drawdown for active accounts."""
+    try:
+        body = request.get_json(silent=True) or {}
+        confirm = _is_truthy(body.get("confirm")) or _is_truthy(request.args.get("confirm"))
+        limit = int(body.get("limit") or request.args.get("limit") or 1000)
+        account_rows = supabase.table("trader_accounts").select("*").eq("account_status", "assigned_active").limit(limit).execute().data or []
+
+        reviewed = []
+        updated = []
+        breached_rows = []
+        skipped = []
+        now = now_iso()
+
+        for account in account_rows:
+            trader_id = account.get("trader_id")
+            trader = get_trader_by_id(trader_id) if trader_id else None
+            if not trader:
+                skipped.append({"account_id": account.get("id"), "reason": "trader not found"})
+                continue
+
+            dd_limit = _num(account.get("dd_limit_percent"), MAX_DRAWDOWN_LIMIT) or MAX_DRAWDOWN_LIMIT
+            actual_dd = _num(account.get("absolute_drawdown_percent"), _num(trader.get("drawdown_percent"), 0))
+            if actual_dd <= 0 and _num(trader.get("drawdown_percent"), 0) > 0:
+                actual_dd = _num(trader.get("drawdown_percent"), 0)
+            dd_used = _safe_dd_used(account, actual_dd, dd_limit)
+            old_dd_used = _num(account.get("dd_used_percent"), _num(trader.get("max_drawdown_used"), 0))
+            zone = _risk_zone(dd_used)
+            priority = _priority_for_zone(zone)
+            changed = round(dd_used, 4) != round(old_dd_used, 4) or round(actual_dd, 4) != round(_num(account.get("absolute_drawdown_percent"), 0), 4)
+
+            row = {
+                "trader_id": trader_id,
+                "account_id": account.get("id"),
+                "name": trader.get("name") or trader.get("trader_name"),
+                "email": trader.get("email"),
+                "mt5_login": account.get("mt5_login") or trader.get("mt5_login"),
+                "actual_drawdown_percent": actual_dd,
+                "dd_limit_percent": dd_limit,
+                "old_dd_used_percent": old_dd_used,
+                "new_dd_used_percent": dd_used,
+                "risk_zone": zone,
+                "will_update": bool(changed or dd_used >= 100),
+            }
+            reviewed.append(row)
+
+            if not confirm or not row["will_update"]:
+                continue
+
+            account_update = {
+                "absolute_drawdown_percent": actual_dd,
+                "dd_used_percent": dd_used,
+                "monitoring_enabled": dd_used < 100,
+                "updated_at": now,
+            }
+            try:
+                supabase.table("trader_accounts").update(account_update).eq("id", account.get("id")).execute()
+            except Exception as e:
+                skipped.append({"account_id": account.get("id"), "reason": f"account update failed: {e}"})
+                continue
+
+            trader_update = {
+                "drawdown_percent": actual_dd,
+                "max_drawdown_used": dd_used,
+                "risk_zone": zone,
+                "critical_mode": zone in {"danger", "critical"},
+                "monitoring_priority": priority,
+                "last_sync_at": trader.get("last_sync_at") or now,
+                "updated_at": now,
+            }
+            _safe_traders_update(trader_id, trader_update)
+
+            try:
+                _insert_monitoring_event(
+                    trader,
+                    "drawdown_usage_recalculated",
+                    zone,
+                    f"Drawdown usage recalculated from actual DD {actual_dd:.2f}% against {dd_limit:.2f}% limit. DD limit used: {dd_used:.1f}%.",
+                    _num(account.get("current_balance"), _num(trader.get("balance"), 0)),
+                    _num(account.get("current_equity"), _num(trader.get("equity"), 0)),
+                    dd_used,
+                    account.get("id"),
+                )
+            except Exception as e:
+                print("DD RECALC EVENT ERROR:", e)
+
+            if dd_used >= 100:
+                try:
+                    breached, archived = _breach_trader_account(
+                        trader_id,
+                        "Maximum drawdown breach confirmed by drawdown usage recalculation.",
+                        {"name": "monitoring_repair", "username": "monitoring_repair", "role": "system"},
+                    )
+                    breached_rows.append({"trader": breached, "archived_account": archived})
+                except Exception as e:
+                    skipped.append({"account_id": account.get("id"), "reason": f"breach action failed: {e}"})
+
+            updated.append(row)
+
+        return ok({
+            "dry_run": not confirm,
+            "reviewed_count": len(reviewed),
+            "updated_count": len(updated),
+            "breached_count": len(breached_rows),
+            "skipped_count": len(skipped),
+            "reviewed": reviewed[:200],
+            "updated": updated[:200],
+            "breached": breached_rows[:50],
+            "skipped": skipped[:100],
+        }, "Drawdown usage reviewed" if not confirm else "Drawdown usage recalculated and enforced")
+    except Exception as e:
+        return bad(e, 500)
+
+
 def _infer_existing_account_stage(trader):
     state = str((trader or {}).get("challenge_state") or "").lower()
     phase = str((trader or {}).get("phase") or "").lower()
@@ -1145,7 +1261,7 @@ def migrate_active_trader_accounts():
                 "profit_percent": clean(trader.get("profit_percent")),
                 "absolute_drawdown_percent": clean(trader.get("drawdown_percent")),
                 "dd_limit_percent": 20,
-                "dd_used_percent": clean(trader.get("max_drawdown_used")),
+                "dd_used_percent": _safe_dd_used(trader, clean(trader.get("drawdown_percent")), 20),
                 "target_percent": _target_for_stage(stage),
                 "monitoring_enabled": True,
                 "started_at": stage_started_at,
@@ -2979,6 +3095,37 @@ def _risk_zone(max_dd_used):
         return "warning"
     return "safe"
 
+def _dd_used_from_absolute_dd(absolute_dd_percent, dd_limit_percent=MAX_DRAWDOWN_LIMIT):
+    limit = _num(dd_limit_percent, MAX_DRAWDOWN_LIMIT) or MAX_DRAWDOWN_LIMIT
+    return max(0, (_num(absolute_dd_percent, 0) / limit * 100) if limit else 0)
+
+def _safe_dd_used(payload, drawdown_percent, dd_limit_percent=MAX_DRAWDOWN_LIMIT):
+    """Calculate DD-limit usage from absolute drawdown and protect against bad feed zeros."""
+    computed = _dd_used_from_absolute_dd(drawdown_percent, dd_limit_percent)
+    incoming_keys = [
+        "dd_used_percent",
+        "max_drawdown_used",
+        "max_dd_used",
+        "dd_used",
+        "drawdown_used",
+        "drawdown_used_percent",
+    ]
+    incoming_values = []
+    for key in incoming_keys:
+        raw = (payload or {}).get(key)
+        if raw in [None, ""]:
+            continue
+        try:
+            incoming_values.append(float(raw))
+        except Exception:
+            continue
+    incoming = max(incoming_values, default=0)
+    if computed > 0 and incoming <= 0:
+        return computed
+    if computed > incoming and incoming <= _num(drawdown_percent, 0):
+        return computed
+    return max(incoming, computed)
+
 def _priority_for_zone(zone):
     return {"safe":"normal","warning":"medium","danger":"high","critical":"urgent","breached":"closed"}.get(zone, "normal")
 
@@ -3158,12 +3305,13 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
         equity_damage = max(0, peak_base - lowest_equity)
         drawdown_percent = (equity_damage / peak_base * 100) if peak_base else 0
 
-    max_dd_used = _num(payload.get("max_drawdown_used"), (drawdown_percent / MAX_DRAWDOWN_LIMIT * 100) if MAX_DRAWDOWN_LIMIT else 0)
+    dd_limit_percent = _num(active_account.get("dd_limit_percent"), MAX_DRAWDOWN_LIMIT) if active_account else MAX_DRAWDOWN_LIMIT
+    max_dd_used = _safe_dd_used(payload, drawdown_percent, dd_limit_percent)
 
     incoming_zone = str(payload.get("zone") or "").lower().strip()
     incoming_status = str(payload.get("status") or "").lower().strip()
     passed_status = _passed_status_from_snapshot(payload)
-    breached = bool(payload.get("breached")) or incoming_status == "breached" or incoming_zone == "breached"
+    breached = bool(payload.get("breached")) or incoming_status == "breached" or incoming_zone == "breached" or max_dd_used >= 100
     if active_account and not breached:
         account_stage = str(active_account.get("stage") or "").lower()
         target = _target_for_stage(account_stage)
