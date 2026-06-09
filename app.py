@@ -226,6 +226,68 @@ def _normalize_phone_value(phone):
     return digits
 
 
+def _stage_for_lifecycle_state(state, phase=None):
+    state = str(state or "").strip().lower()
+    phase = str(phase or "").strip().lower()
+    if state.startswith("funded") or phase in {"funded", "live", "funded_waiting"}:
+        return "funded"
+    if state.startswith("phase2") or phase == "phase2":
+        return "phase2"
+    if state.startswith("phase1") or phase == "phase1":
+        return "phase1"
+    return "phase1"
+
+
+def _is_uuid(value):
+    return bool(re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", str(value or "").strip()))
+
+
+def _active_account_from_trader_profile(trader):
+    """Compatibility bridge for already-migrated traders whose trader_accounts row is unavailable."""
+    if not trader:
+        return None
+    state = str(trader.get("challenge_state") or trader.get("status") or "").strip().lower()
+    active_states = {"phase1_active", "phase2_active", "funded_active"}
+    if state not in active_states and str(trader.get("status") or "").strip().lower() not in {"active", "funded", "live"}:
+        return None
+    mt5_login = str(trader.get("mt5_login") or "").strip()
+    if not mt5_login:
+        return None
+    stage = _stage_for_lifecycle_state(state, trader.get("phase"))
+    account_size = clean(trader.get("account_size") or trader.get("balance") or trader.get("equity") or 0)
+    start_balance = clean(trader.get("start_balance") or account_size)
+    equity = clean(trader.get("equity") or trader.get("balance") or account_size)
+    profit = clean(trader.get("profit") or (equity - start_balance if start_balance else 0))
+    profit_percent = clean(trader.get("profit_percent") or ((profit / start_balance * 100) if start_balance else 0))
+    dd_limit = clean(trader.get("dd_limit_percent") or trader.get("max_drawdown") or 20) or 20
+    dd_used = clean(trader.get("dd_used_percent") or trader.get("max_drawdown_used") or 0)
+    return {
+        "id": trader.get("current_account_id") if _is_uuid(trader.get("current_account_id")) else None,
+        "trader_id": trader.get("id"),
+        "stage": stage,
+        "account_status": "assigned_active",
+        "mt5_login": mt5_login,
+        "mt5_server": trader.get("mt5_server") or trader.get("server") or "",
+        "mt5_master_password": trader.get("mt5_master_password") or trader.get("mt5_password") or trader.get("master_password") or "",
+        "mt5_investor_password": trader.get("mt5_investor_password") or trader.get("investor_password") or "",
+        "account_size": account_size,
+        "start_balance": start_balance or account_size,
+        "current_balance": clean(trader.get("balance") or account_size),
+        "current_equity": equity,
+        "profit": profit,
+        "profit_percent": profit_percent,
+        "absolute_drawdown_percent": clean(trader.get("drawdown_percent") or 0),
+        "dd_limit_percent": dd_limit,
+        "dd_used_percent": dd_used,
+        "target_percent": _target_for_stage(stage),
+        "monitoring_enabled": _is_truthy(trader.get("monitoring_enabled")),
+        "started_at": trader.get("assigned_at") or trader.get("challenge_started_at") or trader.get("approved_at") or trader.get("created_at"),
+        "created_at": trader.get("assigned_at") or trader.get("challenge_started_at") or trader.get("approved_at") or trader.get("created_at"),
+        "updated_at": trader.get("mt5_updated_at") or trader.get("updated_at") or trader.get("assigned_at") or trader.get("created_at"),
+        "_source": "trader_profile_bridge",
+    }
+
+
 def _sync_identity_fields(trader):
     try:
         if not trader:
@@ -241,13 +303,35 @@ def _sync_identity_fields(trader):
         print("IDENTITY SYNC ERROR:", e)
 
 
-def _get_active_account(trader_id):
+def _get_active_account(trader_id, trader=None):
     try:
-        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").order("started_at", desc=True).order("created_at", desc=True).limit(1).execute().data or []
-        return rows[0] if rows else None
+        if not trader and trader_id:
+            try:
+                trader_rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+                trader = trader_rows[0] if trader_rows else None
+            except Exception:
+                trader = None
+
+        current_account_id = (trader or {}).get("current_account_id")
+        if current_account_id:
+            rows = supabase.table("trader_accounts").select("*").eq("id", current_account_id).limit(1).execute().data or []
+            if rows:
+                status = str(rows[0].get("account_status") or "").strip().lower()
+                if status in {"assigned_active", "active", "current_active"}:
+                    return rows[0]
+
+        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").order("started_at", desc=True).order("created_at", desc=True).limit(25).execute().data or []
+        if rows:
+            preferred_stage = _stage_for_lifecycle_state((trader or {}).get("challenge_state"), (trader or {}).get("phase"))
+            for row in rows:
+                if str(row.get("stage") or "").strip().lower() == preferred_stage:
+                    return row
+            return rows[0]
+
+        return _active_account_from_trader_profile(trader)
     except Exception as e:
         print("ACTIVE ACCOUNT FETCH ERROR:", e)
-        return None
+        return _active_account_from_trader_profile(trader)
 
 
 def _get_active_account_by_login(mt5_login):
@@ -290,7 +374,7 @@ def _payout_eligibility(trader):
     if not trader:
         return False, "Trader not found", None
     state = str(trader.get("challenge_state") or "").strip().lower()
-    account = _get_active_account(trader.get("id"))
+    account = _get_active_account(trader.get("id"), trader)
     if state != "funded_active":
         return False, "Payouts require funded_active lifecycle state.", account
     if not account:
@@ -502,7 +586,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
 
 
 def _archive_active_account(trader, reason, staff=None, breached=False):
-    account = _get_active_account(trader.get("id"))
+    account = _get_active_account(trader.get("id"), trader)
     if not account:
         raise ValueError("Trader has no active account to archive")
     status = _archive_status_for_stage(account.get("stage"), breached)
@@ -542,7 +626,7 @@ def _pass_stage(trader_id, stage, staff=None, note="Stage passed"):
     trader = get_trader_by_id(trader_id)
     if not trader:
         raise ValueError("Trader not found")
-    account = _get_active_account(trader_id)
+    account = _get_active_account(trader_id, trader)
     if not account or account.get("stage") != stage:
         raise ValueError(f"Trader does not have an active {stage} account")
     target = _target_for_stage(stage)
@@ -621,7 +705,7 @@ def _dedupe_by_id(rows):
 def _dashboard_payload_for_trader(trader):
     if not trader:
         return None
-    account = _get_active_account(trader.get("id"))
+    account = _get_active_account(trader.get("id"), trader)
     purchases = _safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100)
     if trader.get("email"):
         purchases += _safe_fetch("challenge_purchases", "email", trader.get("email"), 100)
@@ -664,7 +748,7 @@ def update_trader_mt5():
         trader_row = get_trader_by_id(trader_id)
         if not trader_row:
             return _np_fail("Trader not found", 404)
-        account = _get_active_account(trader_id)
+        account = _get_active_account(trader_id, trader_row)
         if not account:
             return _np_fail("No active MT5 account found. Use lifecycle assignment to assign a fresh MT5 account.", 409)
 
@@ -847,7 +931,7 @@ def trader_current_account(lookup):
         trader = _latest_trader_for_lookup(lookup)
         if not trader:
             return bad("Trader not found", 404)
-        account = _get_active_account(trader.get("id"))
+        account = _get_active_account(trader.get("id"), trader)
         return ok({"trader": trader, "current_account": account, "challenge_state": trader.get("challenge_state") or "registered"})
     except Exception as e:
         return bad(e)
@@ -870,7 +954,7 @@ def trader_lifecycle(trader_id):
         trader = get_trader_by_id(trader_id)
         if not trader:
             return bad("Trader not found", 404)
-        active_account = _get_active_account(trader_id)
+        active_account = _get_active_account(trader_id, trader)
         accounts = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(100).execute().data or []
         events = supabase.table("lifecycle_events").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(100).execute().data or []
         archives = supabase.table("mt5_account_archives").select("*").eq("trader_id", trader_id).order("archived_at", desc=True).limit(100).execute().data or []
@@ -2946,7 +3030,7 @@ Status: {pass_status}"""
 
 def _apply_monitoring_snapshot(trader, payload, source="manual"):
     # Values from MT5 engine are the source of truth when present.
-    active_account = _get_active_account(trader.get("id"))
+    active_account = _get_active_account(trader.get("id"), trader)
     account_start = _num(active_account.get("start_balance"), _num(active_account.get("account_size"), 0)) if active_account else 0
     balance = _num(payload.get("balance"), _num(active_account.get("current_balance") if active_account else trader.get("balance"), _num(trader.get("balance"), _num(trader.get("account_size")))))
     equity = _num(payload.get("equity"), balance)
