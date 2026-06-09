@@ -709,6 +709,26 @@ def _dashboard_payload_for_trader(trader):
     purchases = _safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100)
     if trader.get("email"):
         purchases += _safe_fetch("challenge_purchases", "email", trader.get("email"), 100)
+    if account:
+        current_login = str(account.get("mt5_login") or "").strip()
+        current_server = str(account.get("mt5_server") or "").strip()
+        for p in purchases:
+            # Purchase rows are payment history, not the active MT5 source of truth.
+            # Keep the sale data, but stop old Phase 1 purchase credentials from leaking into the dashboard.
+            p["current_mt5_login"] = current_login
+            p["current_mt5_server"] = current_server
+            p["lifecycle_state"] = trader.get("challenge_state") or _active_state_for_stage(account.get("stage"))
+            p["active_stage"] = account.get("stage")
+            if str(p.get("mt5_login") or "").strip() and str(p.get("mt5_login") or "").strip() != current_login:
+                p["archived_mt5_login"] = p.get("mt5_login")
+                p["archived_mt5_server"] = p.get("mt5_server")
+                p["mt5_login"] = ""
+                p["mt5_server"] = ""
+                p["mt5_master_password"] = ""
+                p["mt5_password"] = ""
+                p["master_password"] = ""
+                p["mt5_investor_password"] = ""
+                p["investor_password"] = ""
     payouts_rows = _safe_fetch("payouts", "trader_id", trader.get("id"), 100)
     events = []
     archives = []
@@ -717,6 +737,16 @@ def _dashboard_payload_for_trader(trader):
             events = supabase.table("monitoring_events").select("*").eq("trader_account_id", account.get("id")).order("created_at", desc=True).limit(50).execute().data or []
         if not events:
             events = supabase.table("monitoring_events").select("*").eq("trader_id", trader.get("id")).order("created_at", desc=True).limit(50).execute().data or []
+        if account:
+            current_login = str(account.get("mt5_login") or "").strip()
+            account_id = str(account.get("id") or "").strip()
+            filtered = []
+            for ev in events:
+                ev_account_id = str(ev.get("trader_account_id") or "").strip()
+                ev_login = str(ev.get("mt5_login") or "").strip()
+                if (account_id and ev_account_id == account_id) or (current_login and ev_login == current_login):
+                    filtered.append(ev)
+            events = filtered
     except Exception:
         events = []
     try:
