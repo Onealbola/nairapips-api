@@ -418,11 +418,92 @@ def _get_active_account(trader_id, trader=None):
         return _active_account_from_trader_profile(trader)
 
 
-def _get_active_accounts(trader_id, trader=None):
+def _purchase_accounts_for_trader(trader, purchases=None):
+    """Create dashboard account cards from approved purchases with assigned MT5.
+    This keeps newly assigned purchases visible even if their trader_accounts row is
+    missing, archived incorrectly, or not marked assigned_active yet.
+    """
+    accounts = []
+    try:
+        rows = list(purchases or [])
+        if not rows and trader:
+            rows = _safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100)
+            if trader.get("email"):
+                rows += _safe_fetch("challenge_purchases", "email", trader.get("email"), 100)
+            if trader.get("phone"):
+                rows += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
+        for p in rows:
+            login = str(p.get("mt5_login") or p.get("current_mt5_login") or "").strip()
+            if not login:
+                continue
+            payment_status = str(p.get("payment_status") or "").strip().lower()
+            status = str(p.get("status") or "").strip().lower()
+            if payment_status != "approved" and status not in {"approved", "approved_active", "active"}:
+                continue
+            stage_text = " ".join([
+                str(p.get("lifecycle_state") or ""),
+                str(p.get("assigned_phase") or ""),
+                str(p.get("active_stage") or ""),
+                str(p.get("phase") or ""),
+                str(p.get("status") or ""),
+            ]).lower()
+            if "funded" in stage_text:
+                stage = "funded"
+            elif "phase2" in stage_text or "phase_2" in stage_text:
+                stage = "phase2"
+            else:
+                stage = "phase1"
+            account_size = clean(p.get("account_size") or p.get("challenge_size") or 0)
+            assigned_at = p.get("assigned_at") or p.get("approved_at") or p.get("updated_at") or p.get("created_at") or now_iso()
+            accounts.append(_decorate_account_for_api({
+                "id": p.get("trader_account_id") or f"purchase:{p.get('id')}",
+                "trader_id": (trader or {}).get("id") or p.get("trader_id"),
+                "purchase_id": p.get("id"),
+                "stage": stage,
+                "account_status": "assigned_active",
+                "mt5_login": login,
+                "mt5_server": p.get("mt5_server") or p.get("current_mt5_server") or "",
+                "mt5_master_password": p.get("mt5_master_password") or p.get("mt5_password") or p.get("master_password") or "",
+                "mt5_investor_password": p.get("mt5_investor_password") or p.get("investor_password") or "",
+                "account_size": account_size,
+                "start_balance": account_size,
+                "current_balance": account_size,
+                "current_equity": account_size,
+                "profit": 0,
+                "profit_percent": 0,
+                "absolute_drawdown_percent": 0,
+                "dd_limit_percent": 20,
+                "dd_used_percent": 0,
+                "target_percent": _target_for_stage(stage),
+                "monitoring_enabled": True,
+                "started_at": assigned_at,
+                "assigned_at": assigned_at,
+                "created_at": assigned_at,
+                "updated_at": p.get("updated_at") or assigned_at,
+                "_source": "challenge_purchase_assignment",
+            }))
+    except Exception as e:
+        print("PURCHASE ACCOUNT BRIDGE ERROR:", e)
+    return accounts
+
+
+def _get_active_accounts(trader_id, trader=None, purchases=None):
     """Return every active challenge account for this trader, with the current/risky account first."""
     try:
         rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
         decorated = [_decorate_account_for_api(row) for row in rows]
+        purchase_accounts = _purchase_accounts_for_trader(trader, purchases)
+        by_login = {}
+        for row in purchase_accounts + decorated:
+            login = str(row.get("mt5_login") or "").strip()
+            key = login or str(row.get("id") or "")
+            if not key:
+                continue
+            # Real trader_accounts rows carry monitoring data and should win over a
+            # purchase bridge for the same login. Purchase bridge keeps new accounts visible.
+            if key not in by_login or row.get("_source") != "challenge_purchase_assignment":
+                by_login[key] = row
+        decorated = list(by_login.values())
         if not decorated:
             bridged = _active_account_from_trader_profile(trader)
             return [bridged] if bridged else []
@@ -821,10 +902,13 @@ def _dashboard_payload_for_trader(trader):
     if not trader:
         return None
     account = _get_active_account(trader.get("id"), trader)
-    active_accounts = _get_active_accounts(trader.get("id"), trader)
     purchases = _safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100)
     if trader.get("email"):
         purchases += _safe_fetch("challenge_purchases", "email", trader.get("email"), 100)
+    if trader.get("phone"):
+        purchases += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
+    purchases = _dedupe_by_id(purchases)
+    active_accounts = _get_active_accounts(trader.get("id"), trader, purchases)
     if account:
         current_login = str(account.get("mt5_login") or "").strip()
         current_server = str(account.get("mt5_server") or "").strip()
@@ -878,7 +962,7 @@ def _dashboard_payload_for_trader(trader):
         "active_accounts": active_accounts,
         "accounts": active_accounts,
         "challenge_state": trader.get("challenge_state") or "registered",
-        "purchases": _dedupe_by_id(purchases),
+        "purchases": purchases,
         "payouts": payouts_rows,
         "monitoring_events": events,
         "archives": archives,
@@ -1083,7 +1167,12 @@ def trader_current_account(lookup):
         if not trader:
             return bad("Trader not found", 404)
         account = _get_active_account(trader.get("id"), trader)
-        active_accounts = _get_active_accounts(trader.get("id"), trader)
+        purchases = _safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100)
+        if trader.get("email"):
+            purchases += _safe_fetch("challenge_purchases", "email", trader.get("email"), 100)
+        if trader.get("phone"):
+            purchases += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
+        active_accounts = _get_active_accounts(trader.get("id"), trader, _dedupe_by_id(purchases))
         return ok({"trader": trader, "current_account": account, "active_accounts": active_accounts, "accounts": active_accounts, "challenge_state": trader.get("challenge_state") or "registered"})
     except Exception as e:
         return bad(e)
