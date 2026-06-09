@@ -243,7 +243,7 @@ def _sync_identity_fields(trader):
 
 def _get_active_account(trader_id):
     try:
-        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").limit(1).execute().data or []
+        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").order("started_at", desc=True).order("created_at", desc=True).limit(1).execute().data or []
         return rows[0] if rows else None
     except Exception as e:
         print("ACTIVE ACCOUNT FETCH ERROR:", e)
