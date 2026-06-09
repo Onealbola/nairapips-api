@@ -418,6 +418,32 @@ def _get_active_account(trader_id, trader=None):
         return _active_account_from_trader_profile(trader)
 
 
+def _get_active_accounts(trader_id, trader=None):
+    """Return every active challenge account for this trader, with the current/risky account first."""
+    try:
+        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
+        decorated = [_decorate_account_for_api(row) for row in rows]
+        if not decorated:
+            bridged = _active_account_from_trader_profile(trader)
+            return [bridged] if bridged else []
+
+        current = _get_active_account(trader_id, trader)
+        current_id = str((current or {}).get("id") or "")
+        current_login = str((current or {}).get("mt5_login") or "")
+
+        def account_sort(row):
+            dd_used = _safe_dd_used(row, _num(row.get("absolute_drawdown_percent"), 0), _num(row.get("dd_limit_percent"), MAX_DRAWDOWN_LIMIT) or MAX_DRAWDOWN_LIMIT)
+            is_current = 1 if (current_id and str(row.get("id") or "") == current_id) or (current_login and str(row.get("mt5_login") or "") == current_login) else 0
+            updated = _dt_score(row.get("updated_at") or row.get("started_at") or row.get("created_at"))
+            return (is_current, dd_used, updated)
+
+        return sorted(decorated, key=account_sort, reverse=True)
+    except Exception as e:
+        print("ACTIVE ACCOUNTS FETCH ERROR:", e)
+        bridged = _active_account_from_trader_profile(trader)
+        return [bridged] if bridged else []
+
+
 def _get_active_account_by_login(mt5_login):
     try:
         login = str(mt5_login or "").strip()
@@ -795,6 +821,7 @@ def _dashboard_payload_for_trader(trader):
     if not trader:
         return None
     account = _get_active_account(trader.get("id"), trader)
+    active_accounts = _get_active_accounts(trader.get("id"), trader)
     purchases = _safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100)
     if trader.get("email"):
         purchases += _safe_fetch("challenge_purchases", "email", trader.get("email"), 100)
@@ -848,6 +875,8 @@ def _dashboard_payload_for_trader(trader):
     return {
         "trader": trader,
         "current_account": account,
+        "active_accounts": active_accounts,
+        "accounts": active_accounts,
         "challenge_state": trader.get("challenge_state") or "registered",
         "purchases": _dedupe_by_id(purchases),
         "payouts": payouts_rows,
@@ -1054,7 +1083,8 @@ def trader_current_account(lookup):
         if not trader:
             return bad("Trader not found", 404)
         account = _get_active_account(trader.get("id"), trader)
-        return ok({"trader": trader, "current_account": account, "challenge_state": trader.get("challenge_state") or "registered"})
+        active_accounts = _get_active_accounts(trader.get("id"), trader)
+        return ok({"trader": trader, "current_account": account, "active_accounts": active_accounts, "accounts": active_accounts, "challenge_state": trader.get("challenge_state") or "registered"})
     except Exception as e:
         return bad(e)
 
