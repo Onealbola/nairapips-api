@@ -378,15 +378,33 @@ def _get_active_account(trader_id, trader=None):
             except Exception:
                 trader = None
 
+        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
+        if rows:
+            def account_priority(row):
+                dd_used = _safe_dd_used(row, _num(row.get("absolute_drawdown_percent"), 0), _num(row.get("dd_limit_percent"), MAX_DRAWDOWN_LIMIT) or MAX_DRAWDOWN_LIMIT)
+                stage_score = {"funded": 3, "phase2": 2, "phase1": 1}.get(str(row.get("stage") or "").lower(), 0)
+                current_bonus = 10_000 if str(row.get("id") or "") == str((trader or {}).get("current_account_id") or "") else 0
+                risk_bonus = 1_000_000 if dd_used >= 51 else 0
+                breach_bonus = 2_000_000 if dd_used >= 100 else 0
+                return breach_bonus + risk_bonus + dd_used * 100 + current_bonus + stage_score
+
+            risky = sorted(rows, key=account_priority, reverse=True)[0]
+            if account_priority(risky) >= 51 * 100 + 1_000_000:
+                return _decorate_account_for_api(risky)
+
         current_account_id = (trader or {}).get("current_account_id")
         if current_account_id:
-            rows = supabase.table("trader_accounts").select("*").eq("id", current_account_id).limit(1).execute().data or []
-            if rows:
-                status = str(rows[0].get("account_status") or "").strip().lower()
+            for row in rows:
+                if str(row.get("id") or "") == str(current_account_id):
+                    status = str(row.get("account_status") or "").strip().lower()
+                    if status in {"assigned_active", "active", "current_active"}:
+                        return _decorate_account_for_api(row)
+            direct_rows = supabase.table("trader_accounts").select("*").eq("id", current_account_id).limit(1).execute().data or []
+            if direct_rows:
+                status = str(direct_rows[0].get("account_status") or "").strip().lower()
                 if status in {"assigned_active", "active", "current_active"}:
-                    return _decorate_account_for_api(rows[0])
+                    return _decorate_account_for_api(direct_rows[0])
 
-        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").order("started_at", desc=True).order("created_at", desc=True).limit(25).execute().data or []
         if rows:
             preferred_stage = _stage_for_lifecycle_state((trader or {}).get("challenge_state"), (trader or {}).get("phase"))
             for row in rows:
@@ -3283,7 +3301,14 @@ Status: {pass_status}"""
 
 def _apply_monitoring_snapshot(trader, payload, source="manual"):
     # Values from MT5 engine are the source of truth when present.
-    active_account = _get_active_account(trader.get("id"), trader)
+    active_account = None
+    incoming_login = str((payload or {}).get("mt5_login") or (payload or {}).get("login") or (payload or {}).get("account") or "").strip()
+    if incoming_login:
+        by_login = _get_active_account_by_login(incoming_login)
+        if by_login and str(by_login.get("trader_id") or "") == str(trader.get("id") or ""):
+            active_account = _decorate_account_for_api(by_login)
+    if not active_account:
+        active_account = _get_active_account(trader.get("id"), trader)
     account_start = _num(active_account.get("start_balance"), _num(active_account.get("account_size"), 0)) if active_account else 0
     balance = _num(payload.get("balance"), _num(active_account.get("current_balance") if active_account else trader.get("balance"), _num(trader.get("balance"), _num(trader.get("account_size")))))
     equity = _num(payload.get("equity"), balance)
