@@ -242,6 +242,69 @@ def _is_uuid(value):
     return bool(re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", str(value or "").strip()))
 
 
+def _stage_started_at_from_legacy_trader(trader, stage, fallback=None):
+    """Pick the safest account-level start date during legacy migration.
+
+    Phase 1 can use challenge_started_at/approved_at. Later stages must not inherit
+    the Phase 1 approval date, otherwise Phase 2/Funded dashboards show old MT5 dates.
+    """
+    stage = str(stage or "").strip().lower()
+    fallback = fallback or now_iso()
+    if stage == "phase1":
+        return (
+            trader.get("challenge_started_at")
+            or trader.get("assigned_at")
+            or trader.get("approved_at")
+            or trader.get("mt5_updated_at")
+            or trader.get("updated_at")
+            or fallback
+        )
+    if stage == "phase2":
+        return (
+            trader.get("phase2_started_at")
+            or trader.get("assigned_at")
+            or trader.get("mt5_updated_at")
+            or trader.get("updated_at")
+            or fallback
+        )
+    if stage == "funded":
+        return (
+            trader.get("funded_started_at")
+            or trader.get("funded_at")
+            or trader.get("assigned_at")
+            or trader.get("mt5_updated_at")
+            or trader.get("updated_at")
+            or fallback
+        )
+    return fallback
+
+
+def _account_display_assigned_at(account):
+    if not account:
+        return None
+    stage = str(account.get("stage") or "").strip().lower()
+    started = account.get("started_at")
+    created = account.get("created_at")
+    updated = account.get("updated_at")
+    if stage in {"phase2", "funded"}:
+        started_score = _dt_score(started)
+        created_score = _dt_score(created)
+        # Legacy migration sometimes copied the Phase 1 start date into Phase 2/Funded.
+        # When that happens, created_at is the safer account-level assignment date.
+        if created_score and (not started_score or created_score > started_score + 3600):
+            return created
+    return started or created or updated
+
+
+def _decorate_account_for_api(account):
+    if not account:
+        return account
+    row = dict(account)
+    row["display_assigned_at"] = _account_display_assigned_at(row)
+    row["assignment_date"] = row.get("display_assigned_at")
+    return row
+
+
 def _active_account_from_trader_profile(trader):
     """Compatibility bridge for already-migrated traders whose trader_accounts row is unavailable."""
     if not trader:
@@ -261,7 +324,8 @@ def _active_account_from_trader_profile(trader):
     profit_percent = clean(trader.get("profit_percent") or ((profit / start_balance * 100) if start_balance else 0))
     dd_limit = clean(trader.get("dd_limit_percent") or trader.get("max_drawdown") or 20) or 20
     dd_used = clean(trader.get("dd_used_percent") or trader.get("max_drawdown_used") or 0)
-    return {
+    assigned_at = _stage_started_at_from_legacy_trader(trader, stage, trader.get("updated_at") or trader.get("created_at") or now_iso())
+    return _decorate_account_for_api({
         "id": trader.get("current_account_id") if _is_uuid(trader.get("current_account_id")) else None,
         "trader_id": trader.get("id"),
         "stage": stage,
@@ -281,11 +345,12 @@ def _active_account_from_trader_profile(trader):
         "dd_used_percent": dd_used,
         "target_percent": _target_for_stage(stage),
         "monitoring_enabled": _is_truthy(trader.get("monitoring_enabled")),
-        "started_at": trader.get("assigned_at") or trader.get("challenge_started_at") or trader.get("approved_at") or trader.get("created_at"),
-        "created_at": trader.get("assigned_at") or trader.get("challenge_started_at") or trader.get("approved_at") or trader.get("created_at"),
+        "started_at": assigned_at,
+        "assigned_at": assigned_at,
+        "created_at": assigned_at,
         "updated_at": trader.get("mt5_updated_at") or trader.get("updated_at") or trader.get("assigned_at") or trader.get("created_at"),
         "_source": "trader_profile_bridge",
-    }
+    })
 
 
 def _sync_identity_fields(trader):
@@ -318,15 +383,15 @@ def _get_active_account(trader_id, trader=None):
             if rows:
                 status = str(rows[0].get("account_status") or "").strip().lower()
                 if status in {"assigned_active", "active", "current_active"}:
-                    return rows[0]
+                    return _decorate_account_for_api(rows[0])
 
         rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").order("started_at", desc=True).order("created_at", desc=True).limit(25).execute().data or []
         if rows:
             preferred_stage = _stage_for_lifecycle_state((trader or {}).get("challenge_state"), (trader or {}).get("phase"))
             for row in rows:
                 if str(row.get("stage") or "").strip().lower() == preferred_stage:
-                    return row
-            return rows[0]
+                    return _decorate_account_for_api(row)
+            return _decorate_account_for_api(rows[0])
 
         return _active_account_from_trader_profile(trader)
     except Exception as e:
@@ -1060,6 +1125,7 @@ def migrate_active_trader_accounts():
             if account_size <= 0:
                 skipped.append({"id": trader.get("id"), "reason": "missing account size"})
                 continue
+            stage_started_at = _stage_started_at_from_legacy_trader(trader, stage, now)
             account_row = {
                 "trader_id": trader.get("id"),
                 "stage": stage,
@@ -1079,7 +1145,7 @@ def migrate_active_trader_accounts():
                 "dd_used_percent": clean(trader.get("max_drawdown_used")),
                 "target_percent": _target_for_stage(stage),
                 "monitoring_enabled": True,
-                "started_at": trader.get("challenge_started_at") or trader.get("approved_at") or now,
+                "started_at": stage_started_at,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -1888,7 +1954,7 @@ def login_trader():
         t = now_iso()
         supabase.table("traders").update({"last_login_at": t}).eq("id", trader["id"]).execute()
         trader["last_login_at"] = t
-        account = _get_active_account(trader.get("id"))
+        account = _get_active_account(trader.get("id"), trader)
         if account:
             trader["current_account"] = account
             trader["current_account_id"] = account.get("id")
