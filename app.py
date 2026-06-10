@@ -3433,8 +3433,16 @@ Status: {pass_status}"""
 def _apply_monitoring_snapshot(trader, payload, source="manual"):
     # Values from MT5 engine are the source of truth when present.
     active_account = None
+    incoming_account_id = str((payload or {}).get("trader_account_id") or (payload or {}).get("current_account_id") or "").strip()
+    if incoming_account_id:
+        try:
+            rows = supabase.table("trader_accounts").select("*").eq("id", incoming_account_id).limit(1).execute().data or []
+            if rows and str(rows[0].get("trader_id") or "") == str(trader.get("id") or ""):
+                active_account = _decorate_account_for_api(rows[0])
+        except Exception as e:
+            print("ACTIVE ACCOUNT BY ID FETCH ERROR:", e)
     incoming_login = str((payload or {}).get("mt5_login") or (payload or {}).get("login") or (payload or {}).get("account") or "").strip()
-    if incoming_login:
+    if incoming_login and not active_account:
         by_login = _get_active_account_by_login(incoming_login)
         if by_login and str(by_login.get("trader_id") or "") == str(trader.get("id") or ""):
             active_account = _decorate_account_for_api(by_login)
