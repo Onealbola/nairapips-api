@@ -308,12 +308,23 @@ def _decorate_account_for_api(account):
     row["absolute_drawdown_percent"] = absolute_dd
     row["dd_limit_percent"] = dd_limit
     row["dd_used_percent"] = dd_used
-    status_blob = " ".join([
-        str(row.get("account_status") or ""),
-        str(row.get("status") or ""),
-        str(row.get("risk_zone") or ""),
-        str(row.get("phase_pass_status") or ""),
+    account_status = str(row.get("account_status") or "").strip().lower()
+    event_blob = " ".join([
+        str((row.get("latest_monitoring_event") or {}).get("event_type") or ""),
+        str((row.get("latest_monitoring_event") or {}).get("risk_zone") or ""),
     ]).lower()
+    status_blob = " ".join([
+        account_status,
+        str(row.get("status") or ""),
+        str(row.get("phase_pass_status") or ""),
+        event_blob,
+    ]).lower()
+    explicit_pass = (
+        "phase_passed" in event_blob
+        or "phase1_passed" in status_blob
+        or "phase2_passed" in status_blob
+        or "archived_phase" in account_status
+    )
     if "breach" in status_blob or "locked" in status_blob or dd_used >= 100:
         zone = "breached"
     elif dd_used >= 91:
@@ -322,7 +333,7 @@ def _decorate_account_for_api(account):
         zone = "danger"
     elif dd_used >= 51:
         zone = "warning"
-    elif "passed" in status_blob or "archived_phase" in status_blob:
+    elif explicit_pass:
         zone = "passed"
     else:
         zone = str(row.get("risk_zone") or "safe").strip().lower() or "safe"
