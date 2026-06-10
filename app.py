@@ -565,6 +565,7 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
     """Attach the latest account-level snapshot so the dashboard never falls back to stale trader/purchase data."""
     try:
         rows = supabase.table("monitoring_snapshots").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(300).execute().data or []
+        events = supabase.table("monitoring_events").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(300).execute().data or []
         by_account_id = {}
         by_login = {}
         for snap in rows:
@@ -574,11 +575,32 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
                 by_account_id[account_id] = snap
             if login and login not in by_login:
                 by_login[login] = snap
+        event_by_account_id = {}
+        event_by_login = {}
+        risk_event_by_account_id = {}
+        risk_event_by_login = {}
+        for ev in events:
+            account_id = str(ev.get("trader_account_id") or "").strip()
+            login = str(ev.get("mt5_login") or "").strip()
+            used = clean(ev.get("max_drawdown_used") or 0)
+            if account_id and account_id not in event_by_account_id:
+                event_by_account_id[account_id] = ev
+            if login and login not in event_by_login:
+                event_by_login[login] = ev
+            if used >= 51:
+                if account_id and (account_id not in risk_event_by_account_id or used > clean(risk_event_by_account_id[account_id].get("max_drawdown_used") or 0)):
+                    risk_event_by_account_id[account_id] = ev
+                if login and (login not in risk_event_by_login or used > clean(risk_event_by_login[login].get("max_drawdown_used") or 0)):
+                    risk_event_by_login[login] = ev
 
         enriched = []
         for account in accounts or []:
             row = dict(account or {})
-            snap = by_account_id.get(str(row.get("id") or "").strip()) or by_login.get(str(row.get("mt5_login") or "").strip())
+            account_id = str(row.get("id") or "").strip()
+            login = str(row.get("mt5_login") or "").strip()
+            snap = by_account_id.get(account_id) or by_login.get(login)
+            ev = event_by_account_id.get(account_id) or event_by_login.get(login)
+            risk_ev = risk_event_by_account_id.get(account_id) or risk_event_by_login.get(login)
             if snap:
                 row["latest_monitoring_snapshot"] = snap
                 row["current_balance"] = clean(snap.get("balance") or row.get("current_balance") or row.get("account_size"))
@@ -592,6 +614,24 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
                 row["risk_zone"] = snap.get("risk_zone") or row.get("risk_zone")
                 row["last_sync_at"] = snap.get("created_at") or row.get("last_sync_at") or row.get("updated_at")
                 row["updated_at"] = row.get("updated_at") or snap.get("created_at")
+            if ev:
+                row["latest_monitoring_event"] = ev
+                row["last_event_at"] = ev.get("created_at") or row.get("last_event_at")
+            # Some deployments logged the real danger/critical state as monitoring_events
+            # while leaving trader_accounts at 0.00%. Never hide that evidence.
+            if risk_ev and clean(risk_ev.get("max_drawdown_used") or 0) > clean(row.get("dd_used_percent") or row.get("max_drawdown_used") or 0):
+                used = clean(risk_ev.get("max_drawdown_used") or 0)
+                limit = clean(row.get("dd_limit_percent") or MAX_DRAWDOWN_LIMIT) or MAX_DRAWDOWN_LIMIT
+                row["latest_monitoring_event"] = risk_ev
+                row["event_risk_lock"] = True
+                row["dd_used_percent"] = used
+                row["max_drawdown_used"] = used
+                row["absolute_drawdown_percent"] = round((used / 100) * limit, 4)
+                row["drawdown_percent"] = row["absolute_drawdown_percent"]
+                row["current_balance"] = clean(risk_ev.get("balance") or row.get("current_balance") or row.get("account_size"))
+                row["current_equity"] = clean(risk_ev.get("equity") or row.get("current_equity") or row.get("current_balance") or row.get("account_size"))
+                row["risk_zone"] = risk_ev.get("risk_zone") or row.get("risk_zone") or _risk_zone(used)
+                row["last_sync_at"] = risk_ev.get("created_at") or row.get("last_sync_at") or row.get("updated_at")
             enriched.append(_decorate_account_for_api(row))
         return enriched
     except Exception as e:
