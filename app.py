@@ -309,21 +309,24 @@ def _decorate_account_for_api(account):
     row["dd_limit_percent"] = dd_limit
     row["dd_used_percent"] = dd_used
     account_status = str(row.get("account_status") or "").strip().lower()
-    event_blob = " ".join([
-        str((row.get("latest_monitoring_event") or {}).get("event_type") or ""),
-        str((row.get("latest_monitoring_event") or {}).get("risk_zone") or ""),
-    ]).lower()
+    account_id = str(row.get("id") or row.get("trader_account_id") or "").strip()
+    latest_event = row.get("latest_monitoring_event") or {}
+    event_account_id = str(latest_event.get("trader_account_id") or "").strip()
+    event_type = str(latest_event.get("event_type") or "").strip().lower()
+    event_zone = str(latest_event.get("risk_zone") or "").strip().lower()
+    phase_pass_status = str(row.get("phase_pass_status") or "").strip().lower()
+    event_matches_account = bool(account_id and event_account_id and account_id == event_account_id)
     status_blob = " ".join([
         account_status,
         str(row.get("status") or ""),
-        str(row.get("phase_pass_status") or ""),
-        event_blob,
+        phase_pass_status,
+        event_type,
+        event_zone,
     ]).lower()
     explicit_pass = (
-        "phase_passed" in event_blob
-        or "phase1_passed" in status_blob
-        or "phase2_passed" in status_blob
-        or "archived_phase" in account_status
+        "archived_phase" in account_status
+        or phase_pass_status in {"phase1_passed", "phase2_passed"}
+        or (event_matches_account and ("phase_passed" in event_type or event_zone == "passed"))
     )
     if "breach" in status_blob or "locked" in status_blob or dd_used >= 100:
         zone = "breached"
@@ -337,8 +340,10 @@ def _decorate_account_for_api(account):
         zone = "passed"
     else:
         zone = str(row.get("risk_zone") or "safe").strip().lower() or "safe"
+        if zone == "passed":
+            zone = "safe"
     row["display_risk_zone"] = zone
-    row["risk_zone"] = zone if zone != "passed" else row.get("risk_zone") or "passed"
+    row["risk_zone"] = zone
     return row
 
 
@@ -570,9 +575,10 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
         for snap in rows:
             account_id = str(snap.get("trader_account_id") or "").strip()
             login = str(snap.get("mt5_login") or "").strip()
+            snap_zone = str(snap.get("risk_zone") or "").strip().lower()
             if account_id and account_id not in by_account_id:
                 by_account_id[account_id] = snap
-            if login and login not in by_login:
+            if login and not account_id and snap_zone != "passed" and login not in by_login:
                 by_login[login] = snap
         event_by_account_id = {}
         event_by_login = {}
@@ -581,15 +587,18 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
         for ev in events:
             account_id = str(ev.get("trader_account_id") or "").strip()
             login = str(ev.get("mt5_login") or "").strip()
+            ev_type = str(ev.get("event_type") or "").strip().lower()
+            ev_zone = str(ev.get("risk_zone") or "").strip().lower()
+            pass_like = "phase_passed" in ev_type or ev_zone == "passed"
             used = clean(ev.get("max_drawdown_used") or 0)
             if account_id and account_id not in event_by_account_id:
                 event_by_account_id[account_id] = ev
-            if login and login not in event_by_login:
+            if login and not account_id and not pass_like and login not in event_by_login:
                 event_by_login[login] = ev
             if used >= 51:
                 if account_id and (account_id not in risk_event_by_account_id or used > clean(risk_event_by_account_id[account_id].get("max_drawdown_used") or 0)):
                     risk_event_by_account_id[account_id] = ev
-                if login and (login not in risk_event_by_login or used > clean(risk_event_by_login[login].get("max_drawdown_used") or 0)):
+                if login and not account_id and not pass_like and (login not in risk_event_by_login or used > clean(risk_event_by_login[login].get("max_drawdown_used") or 0)):
                     risk_event_by_login[login] = ev
 
         enriched = []
