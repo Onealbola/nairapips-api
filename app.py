@@ -1071,24 +1071,21 @@ def _dashboard_payload_for_trader(trader):
                 p["active_stage"] = account.get("stage")
     payouts_rows = _safe_fetch("payouts", "trader_id", trader.get("id"), 100)
     events = []
+    snapshots = []
     archives = []
     try:
-        if account:
-            events = supabase.table("monitoring_events").select("*").eq("trader_account_id", account.get("id")).order("created_at", desc=True).limit(50).execute().data or []
-        if not events:
-            events = supabase.table("monitoring_events").select("*").eq("trader_id", trader.get("id")).order("created_at", desc=True).limit(50).execute().data or []
-        if account:
-            current_login = str(account.get("mt5_login") or "").strip()
-            account_id = str(account.get("id") or "").strip()
-            filtered = []
-            for ev in events:
-                ev_account_id = str(ev.get("trader_account_id") or "").strip()
-                ev_login = str(ev.get("mt5_login") or "").strip()
-                if (account_id and ev_account_id == account_id) or (current_login and ev_login == current_login):
-                    filtered.append(ev)
-            events = filtered
+        # Global account evidence contract:
+        # return the full trader-level monitoring ledger so the dashboard can
+        # match every card by trader_account_id first and mt5_login second.
+        # Filtering this to one current account caused other accounts to show
+        # stale 0.00% / SAFE values.
+        events = supabase.table("monitoring_events").select("*").eq("trader_id", trader.get("id")).order("created_at", desc=True).limit(300).execute().data or []
     except Exception:
         events = []
+    try:
+        snapshots = supabase.table("monitoring_snapshots").select("*").eq("trader_id", trader.get("id")).order("created_at", desc=True).limit(300).execute().data or []
+    except Exception:
+        snapshots = []
     try:
         archives = supabase.table("mt5_account_archives").select("*").eq("trader_id", trader.get("id")).order("archived_at", desc=True).limit(50).execute().data or []
     except Exception:
@@ -1102,6 +1099,7 @@ def _dashboard_payload_for_trader(trader):
         "purchases": purchases,
         "payouts": payouts_rows,
         "monitoring_events": events,
+        "monitoring_snapshots": snapshots,
         "archives": archives,
     }
 
