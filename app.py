@@ -302,6 +302,32 @@ def _decorate_account_for_api(account):
     row = dict(account)
     row["display_assigned_at"] = _account_display_assigned_at(row)
     row["assignment_date"] = row.get("display_assigned_at")
+    absolute_dd = _num(row.get("absolute_drawdown_percent"), _num(row.get("drawdown_percent"), 0))
+    dd_limit = _num(row.get("dd_limit_percent"), MAX_DRAWDOWN_LIMIT) or MAX_DRAWDOWN_LIMIT
+    dd_used = _safe_dd_used(row, absolute_dd, dd_limit)
+    row["absolute_drawdown_percent"] = absolute_dd
+    row["dd_limit_percent"] = dd_limit
+    row["dd_used_percent"] = dd_used
+    status_blob = " ".join([
+        str(row.get("account_status") or ""),
+        str(row.get("status") or ""),
+        str(row.get("risk_zone") or ""),
+        str(row.get("phase_pass_status") or ""),
+    ]).lower()
+    if "breach" in status_blob or "locked" in status_blob or dd_used >= 100:
+        zone = "breached"
+    elif dd_used >= 91:
+        zone = "critical"
+    elif dd_used >= 66:
+        zone = "danger"
+    elif dd_used >= 51:
+        zone = "warning"
+    elif "passed" in status_blob or "archived_phase" in status_blob:
+        zone = "passed"
+    else:
+        zone = str(row.get("risk_zone") or "safe").strip().lower() or "safe"
+    row["display_risk_zone"] = zone
+    row["risk_zone"] = zone if zone != "passed" else row.get("risk_zone") or "passed"
     return row
 
 
@@ -488,9 +514,19 @@ def _purchase_accounts_for_trader(trader, purchases=None):
 
 
 def _get_active_accounts(trader_id, trader=None, purchases=None):
-    """Return every active challenge account for this trader, with the current/risky account first."""
+    """Return visible challenge accounts for this trader, with the current/risky account first."""
     try:
-        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
+        raw_rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(100).execute().data or []
+        visible_statuses = {
+            "assigned_active", "active", "current_active",
+            "archived_phase1", "archived_phase2", "archived_funded",
+            "breached_archived", "breached", "locked", "closed"
+        }
+        rows = []
+        for row in raw_rows:
+            status = str(row.get("account_status") or "").strip().lower()
+            if status in visible_statuses or str(row.get("mt5_login") or "").strip():
+                rows.append(row)
         decorated = [_decorate_account_for_api(row) for row in rows]
         purchase_accounts = _purchase_accounts_for_trader(trader, purchases)
         by_login = {}
@@ -523,6 +559,44 @@ def _get_active_accounts(trader_id, trader=None, purchases=None):
         print("ACTIVE ACCOUNTS FETCH ERROR:", e)
         bridged = _active_account_from_trader_profile(trader)
         return [bridged] if bridged else []
+
+
+def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
+    """Attach the latest account-level snapshot so the dashboard never falls back to stale trader/purchase data."""
+    try:
+        rows = supabase.table("monitoring_snapshots").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(300).execute().data or []
+        by_account_id = {}
+        by_login = {}
+        for snap in rows:
+            account_id = str(snap.get("trader_account_id") or "").strip()
+            login = str(snap.get("mt5_login") or "").strip()
+            if account_id and account_id not in by_account_id:
+                by_account_id[account_id] = snap
+            if login and login not in by_login:
+                by_login[login] = snap
+
+        enriched = []
+        for account in accounts or []:
+            row = dict(account or {})
+            snap = by_account_id.get(str(row.get("id") or "").strip()) or by_login.get(str(row.get("mt5_login") or "").strip())
+            if snap:
+                row["latest_monitoring_snapshot"] = snap
+                row["current_balance"] = clean(snap.get("balance") or row.get("current_balance") or row.get("account_size"))
+                row["current_equity"] = clean(snap.get("equity") or row.get("current_equity") or row.get("current_balance") or row.get("account_size"))
+                row["profit"] = clean(snap.get("profit") or row.get("profit"))
+                row["profit_percent"] = clean(snap.get("profit_percent") or row.get("profit_percent"))
+                row["absolute_drawdown_percent"] = clean(snap.get("drawdown_percent") or row.get("absolute_drawdown_percent"))
+                row["drawdown_percent"] = row["absolute_drawdown_percent"]
+                row["max_drawdown_used"] = clean(snap.get("max_drawdown_used") or row.get("max_drawdown_used") or row.get("dd_used_percent"))
+                row["dd_used_percent"] = row["max_drawdown_used"]
+                row["risk_zone"] = snap.get("risk_zone") or row.get("risk_zone")
+                row["last_sync_at"] = snap.get("created_at") or row.get("last_sync_at") or row.get("updated_at")
+                row["updated_at"] = row.get("updated_at") or snap.get("created_at")
+            enriched.append(_decorate_account_for_api(row))
+        return enriched
+    except Exception as e:
+        print("ACCOUNT MONITORING ENRICH ERROR:", e)
+        return accounts or []
 
 
 def _get_active_account_by_login(mt5_login):
@@ -909,6 +983,17 @@ def _dashboard_payload_for_trader(trader):
         purchases += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
     purchases = _dedupe_by_id(purchases)
     active_accounts = _get_active_accounts(trader.get("id"), trader, purchases)
+    active_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), active_accounts)
+    if account:
+        enriched_current = None
+        account_id = str(account.get("id") or "").strip()
+        account_login = str(account.get("mt5_login") or "").strip()
+        for candidate in active_accounts:
+            if (account_id and str(candidate.get("id") or "").strip() == account_id) or (account_login and str(candidate.get("mt5_login") or "").strip() == account_login):
+                enriched_current = candidate
+                break
+        if enriched_current:
+            account = enriched_current
     if account:
         current_login = str(account.get("mt5_login") or "").strip()
         current_server = str(account.get("mt5_server") or "").strip()
