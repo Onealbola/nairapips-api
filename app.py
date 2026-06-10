@@ -314,8 +314,28 @@ def _decorate_account_for_api(account):
     event_account_id = str(latest_event.get("trader_account_id") or "").strip()
     event_type = str(latest_event.get("event_type") or "").strip().lower()
     event_zone = str(latest_event.get("risk_zone") or "").strip().lower()
+    event_text = " ".join([
+        event_type,
+        event_zone,
+        str(latest_event.get("message") or ""),
+        str(latest_event.get("pass_status") or ""),
+        str(latest_event.get("phase_pass_status") or ""),
+    ]).lower()
+    stage = str(row.get("stage") or row.get("phase") or "").strip().lower()
     phase_pass_status = str(row.get("phase_pass_status") or "").strip().lower()
     event_matches_account = bool(account_id and event_account_id and account_id == event_account_id)
+    legacy_event_matches_account = bool(row.get("_legacy_event_matches_account"))
+    legacy_snapshot_matches_account = bool(row.get("_legacy_snapshot_matches_account"))
+    event_pass_belongs_to_stage = False
+    if "phase2_passed" in event_text or "phase 2" in event_text:
+        event_pass_belongs_to_stage = stage == "phase2"
+    elif "phase1_passed" in event_text or "phase 1" in event_text:
+        event_pass_belongs_to_stage = stage == "phase1"
+    elif "phase_passed" in event_type or event_zone == "passed":
+        # Generic legacy pass evidence is trusted only when the account row itself
+        # has already been archived/passed. This prevents Phase 1 pass events from
+        # incorrectly passing a newer Phase 2 account.
+        event_pass_belongs_to_stage = "archived_phase" in account_status or phase_pass_status in {"phase1_passed", "phase2_passed"}
     status_blob = " ".join([
         account_status,
         str(row.get("status") or ""),
@@ -326,7 +346,7 @@ def _decorate_account_for_api(account):
     explicit_pass = (
         "archived_phase" in account_status
         or phase_pass_status in {"phase1_passed", "phase2_passed"}
-        or (event_matches_account and ("phase_passed" in event_type or event_zone == "passed"))
+        or ((event_matches_account or legacy_event_matches_account or legacy_snapshot_matches_account) and event_pass_belongs_to_stage)
     )
     if "breach" in status_blob or "locked" in status_blob or dd_used >= 100:
         zone = "breached"
@@ -570,46 +590,78 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
     try:
         rows = supabase.table("monitoring_snapshots").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(300).execute().data or []
         events = supabase.table("monitoring_events").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(300).execute().data or []
+
+        def record_score(record):
+            return _dt_score((record or {}).get("created_at") or (record or {}).get("synced_at") or (record or {}).get("updated_at") or (record or {}).get("last_sync_at"))
+
+        def account_start_score(account):
+            return _dt_score(_account_display_assigned_at(account) or (account or {}).get("started_at") or (account or {}).get("created_at") or (account or {}).get("assigned_at"))
+
+        def account_end_score(account):
+            status = str((account or {}).get("account_status") or "").strip().lower()
+            if status in {"assigned_active", "active", "current_active"}:
+                return 0
+            return _dt_score((account or {}).get("archived_at") or (account or {}).get("passed_at") or (account or {}).get("updated_at"))
+
+        def record_belongs_to_account_by_time(record, account):
+            rec = record_score(record)
+            start = account_start_score(account)
+            end = account_end_score(account)
+            if not rec or not start:
+                return False
+            # One-day tolerance covers timezone/migration records without allowing
+            # an old login event to jump to a different challenge window.
+            if rec < start - 86400:
+                return False
+            if end and rec > end + 86400:
+                return False
+            return True
+
         by_account_id = {}
-        by_login = {}
         for snap in rows:
             account_id = str(snap.get("trader_account_id") or "").strip()
-            login = str(snap.get("mt5_login") or "").strip()
-            snap_zone = str(snap.get("risk_zone") or "").strip().lower()
             if account_id and account_id not in by_account_id:
                 by_account_id[account_id] = snap
-            if login and not account_id and snap_zone != "passed" and login not in by_login:
-                by_login[login] = snap
         event_by_account_id = {}
-        event_by_login = {}
         risk_event_by_account_id = {}
-        risk_event_by_login = {}
         for ev in events:
             account_id = str(ev.get("trader_account_id") or "").strip()
-            login = str(ev.get("mt5_login") or "").strip()
-            ev_type = str(ev.get("event_type") or "").strip().lower()
-            ev_zone = str(ev.get("risk_zone") or "").strip().lower()
-            pass_like = "phase_passed" in ev_type or ev_zone == "passed"
             used = clean(ev.get("max_drawdown_used") or 0)
             if account_id and account_id not in event_by_account_id:
                 event_by_account_id[account_id] = ev
-            if login and not account_id and not pass_like and login not in event_by_login:
-                event_by_login[login] = ev
             if used >= 51:
                 if account_id and (account_id not in risk_event_by_account_id or used > clean(risk_event_by_account_id[account_id].get("max_drawdown_used") or 0)):
                     risk_event_by_account_id[account_id] = ev
-                if login and not account_id and not pass_like and (login not in risk_event_by_login or used > clean(risk_event_by_login[login].get("max_drawdown_used") or 0)):
-                    risk_event_by_login[login] = ev
 
         enriched = []
         for account in accounts or []:
             row = dict(account or {})
             account_id = str(row.get("id") or "").strip()
             login = str(row.get("mt5_login") or "").strip()
-            snap = by_account_id.get(account_id) or by_login.get(login)
-            ev = event_by_account_id.get(account_id) or event_by_login.get(login)
-            risk_ev = risk_event_by_account_id.get(account_id) or risk_event_by_login.get(login)
+            legacy_snaps = [
+                snap for snap in rows
+                if login
+                and str(snap.get("mt5_login") or "").strip() == login
+                and not str(snap.get("trader_account_id") or "").strip()
+                and record_belongs_to_account_by_time(snap, row)
+            ]
+            legacy_events = [
+                ev for ev in events
+                if login
+                and str(ev.get("mt5_login") or "").strip() == login
+                and not str(ev.get("trader_account_id") or "").strip()
+                and record_belongs_to_account_by_time(ev, row)
+            ]
+            legacy_snaps.sort(key=record_score, reverse=True)
+            legacy_events.sort(key=record_score, reverse=True)
+            legacy_risk_events = [ev for ev in legacy_events if clean(ev.get("max_drawdown_used") or 0) >= 51]
+            legacy_risk_events.sort(key=lambda ev: (clean(ev.get("max_drawdown_used") or 0), record_score(ev)), reverse=True)
+            snap = by_account_id.get(account_id) or (legacy_snaps[0] if legacy_snaps else None)
+            ev = event_by_account_id.get(account_id) or (legacy_events[0] if legacy_events else None)
+            risk_ev = risk_event_by_account_id.get(account_id) or (legacy_risk_events[0] if legacy_risk_events else None)
             if snap:
+                if not str(snap.get("trader_account_id") or "").strip():
+                    row["_legacy_snapshot_matches_account"] = True
                 row["latest_monitoring_snapshot"] = snap
                 row["current_balance"] = clean(snap.get("balance") or row.get("current_balance") or row.get("account_size"))
                 row["current_equity"] = clean(snap.get("equity") or row.get("current_equity") or row.get("current_balance") or row.get("account_size"))
@@ -623,6 +675,8 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
                 row["last_sync_at"] = snap.get("created_at") or row.get("last_sync_at") or row.get("updated_at")
                 row["updated_at"] = row.get("updated_at") or snap.get("created_at")
             if ev:
+                if not str(ev.get("trader_account_id") or "").strip():
+                    row["_legacy_event_matches_account"] = True
                 row["latest_monitoring_event"] = ev
                 row["last_event_at"] = ev.get("created_at") or row.get("last_event_at")
             # Some deployments logged the real danger/critical state as monitoring_events
