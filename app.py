@@ -553,17 +553,53 @@ def _get_active_accounts(trader_id, trader=None, purchases=None):
                 rows.append(row)
         decorated = [_decorate_account_for_api(row) for row in rows]
         purchase_accounts = _purchase_accounts_for_trader(trader, purchases)
-        by_login = {}
-        for row in purchase_accounts + decorated:
+
+        real_purchase_ids = {
+            str(row.get("purchase_id") or "").strip()
+            for row in decorated
+            if str(row.get("purchase_id") or "").strip()
+        }
+        real_logins = {
+            str(row.get("mt5_login") or "").strip()
+            for row in decorated
+            if str(row.get("mt5_login") or "").strip()
+        }
+
+        combined = []
+        seen = set()
+
+        def account_key(row):
+            row_id = str(row.get("id") or "").strip()
+            purchase_id = str(row.get("purchase_id") or "").strip()
             login = str(row.get("mt5_login") or "").strip()
-            key = login or str(row.get("id") or "")
-            if not key:
-                continue
-            # Real trader_accounts rows carry monitoring data and should win over a
-            # purchase bridge for the same login. Purchase bridge keeps new accounts visible.
-            if key not in by_login or row.get("_source") != "challenge_purchase_assignment":
-                by_login[key] = row
-        decorated = list(by_login.values())
+            if row_id and not row_id.startswith("purchase:"):
+                return "account:" + row_id
+            if purchase_id:
+                return "purchase:" + purchase_id
+            if login:
+                return "login:" + login
+            return ""
+
+        def add_account(row):
+            if not row:
+                return
+            row_id = str(row.get("id") or "").strip()
+            purchase_id = str(row.get("purchase_id") or "").strip()
+            login = str(row.get("mt5_login") or "").strip()
+            is_purchase_bridge = row.get("_source") == "challenge_purchase_assignment" or row_id.startswith("purchase:")
+            if is_purchase_bridge and ((purchase_id and purchase_id in real_purchase_ids) or (login and login in real_logins)):
+                return
+            key = account_key(row)
+            if not key or key in seen:
+                return
+            seen.add(key)
+            combined.append(row)
+
+        for row in decorated:
+            add_account(row)
+        for row in purchase_accounts:
+            add_account(row)
+        decorated = combined
         if not decorated:
             bridged = _active_account_from_trader_profile(trader)
             return [bridged] if bridged else []
@@ -574,7 +610,9 @@ def _get_active_accounts(trader_id, trader=None, purchases=None):
 
         def account_sort(row):
             dd_used = _safe_dd_used(row, _num(row.get("absolute_drawdown_percent"), 0), _num(row.get("dd_limit_percent"), MAX_DRAWDOWN_LIMIT) or MAX_DRAWDOWN_LIMIT)
-            is_current = 1 if (current_id and str(row.get("id") or "") == current_id) or (current_login and str(row.get("mt5_login") or "") == current_login) else 0
+            row_id = str(row.get("id") or "")
+            row_login = str(row.get("mt5_login") or "")
+            is_current = 1 if (current_id and row_id == current_id) or (not current_id and current_login and row_login == current_login) else 0
             updated = _dt_score(row.get("updated_at") or row.get("started_at") or row.get("created_at"))
             return (is_current, dd_used, updated)
 
@@ -1247,10 +1285,16 @@ def _dashboard_payload_for_trader(trader):
         enriched_current = None
         account_id = str(account.get("id") or "").strip()
         account_login = str(account.get("mt5_login") or "").strip()
-        for candidate in active_accounts:
-            if (account_id and str(candidate.get("id") or "").strip() == account_id) or (account_login and str(candidate.get("mt5_login") or "").strip() == account_login):
-                enriched_current = candidate
-                break
+        if account_id:
+            for candidate in active_accounts:
+                if str(candidate.get("id") or "").strip() == account_id:
+                    enriched_current = candidate
+                    break
+        elif account_login:
+            for candidate in active_accounts:
+                if str(candidate.get("mt5_login") or "").strip() == account_login:
+                    enriched_current = candidate
+                    break
         if enriched_current:
             account = enriched_current
     if account:
