@@ -3,8 +3,9 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timezone
-import os, random, uuid, re, time
+import os, random, uuid, re, time, hmac, hashlib, base64
 import html
 import requests
 app = Flask(__name__)
@@ -1634,6 +1635,9 @@ def trader_dashboard_payload(lookup):
         trader = _latest_trader_for_lookup(lookup)
         if not trader:
             return bad("Trader not found", 404)
+        token = _request_trader_auth_token()
+        if not _verify_trader_auth_token(token, trader.get("id")):
+            return bad("Login password is required to load trader dashboard", 401)
         return ok(_dashboard_payload_for_trader(trader), "Trader dashboard loaded")
     except Exception as e:
         return bad(e)
@@ -2227,6 +2231,58 @@ def _valid_phone(phone):
     digits = _phone_digits(phone)
     return 7 <= len(digits) <= 15
 
+def _valid_trader_password(password):
+    value = str(password or "")
+    return 6 <= len(value) <= 128
+
+def _hash_trader_password(password):
+    return generate_password_hash(str(password or ""), method="pbkdf2:sha256", salt_length=16)
+
+def _check_trader_password(trader, password):
+    raw = str(password or "")
+    if not raw or not trader:
+        return False
+    password_hash = str(trader.get("password_hash") or "").strip()
+    if password_hash:
+        try:
+            return check_password_hash(password_hash, raw)
+        except Exception:
+            return False
+    legacy_password = str(trader.get("password") or "").strip()
+    return bool(legacy_password and legacy_password == raw)
+
+TRADER_AUTH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
+
+def _trader_auth_secret():
+    return str(os.getenv("TRADER_AUTH_SECRET") or SUPABASE_KEY or "nairapips-trader-auth").encode()
+
+def _make_trader_auth_token(trader_id):
+    trader_id = str(trader_id or "").strip()
+    ts = str(int(time.time()))
+    body = f"{trader_id}:{ts}"
+    sig = hmac.new(_trader_auth_secret(), body.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{body}:{sig}".encode()).decode()
+
+def _verify_trader_auth_token(token, trader_id):
+    try:
+        raw = base64.urlsafe_b64decode(str(token or "").encode()).decode()
+        tid, ts, sig = raw.split(":", 2)
+        if str(tid) != str(trader_id):
+            return False
+        body = f"{tid}:{ts}"
+        expected = hmac.new(_trader_auth_secret(), body.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return False
+        return (time.time() - int(ts)) <= TRADER_AUTH_TOKEN_TTL_SECONDS
+    except Exception:
+        return False
+
+def _request_trader_auth_token():
+    header = request.headers.get("Authorization") or ""
+    if header.lower().startswith("bearer "):
+        return header.split(" ", 1)[1].strip()
+    return request.headers.get("X-Trader-Auth") or request.args.get("auth_token") or ""
+
 def _phone_variants(phone):
     raw = str(phone or "").strip()
     digits = _phone_digits(raw)
@@ -2370,6 +2426,58 @@ def verify_email_otp():
         print("EMAIL OTP VERIFY ERROR:", str(e))
         return bad("Email OTP verification failed: " + str(e), 500)
 
+@app.route('/set_trader_password', methods=['POST', 'OPTIONS'])
+def set_trader_password():
+    if request.method == 'OPTIONS':
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        email = str(d.get('email') or '').strip().lower()
+        phone = _clean_phone(d.get('phone') or '')
+        code = str(d.get('code') or '').strip()
+        password = str(d.get('password') or '')
+        confirm = str(d.get('confirm_password') or d.get('password_confirm') or '')
+
+        if not email and not phone:
+            return bad('Email or phone is required')
+        if email and not _valid_email(email):
+            return bad('Enter a valid email address')
+        if not _valid_trader_password(password):
+            return bad('Password must be at least 6 characters and not more than 128 characters')
+        if confirm and confirm != password:
+            return bad('Passwords do not match')
+
+        if email:
+            if code:
+                rows = supabase.table('email_verification_codes').select('*').eq('email', email).eq('code', code).order('created_at', desc=True).limit(1).execute().data or []
+                if not rows:
+                    return bad('Invalid verification code', 400)
+                row = rows[0]
+                exp = row.get('expires_at')
+                if exp:
+                    exp_dt = datetime.fromisoformat(str(exp).replace('Z', '+00:00'))
+                    if datetime.now(timezone.utc) > exp_dt:
+                        return bad('Verification code has expired. Request a new code.', 400)
+                supabase.table('email_verification_codes').update({'verified': True, 'verified_at': now_iso()}).eq('id', row.get('id')).execute()
+            elif not _email_verified_recent(email):
+                return bad('Email verification is required before setting password', 403)
+
+        trader = _find_existing_trader(email, phone)
+        if not trader:
+            return bad('Trader not found', 404)
+
+        payload = {
+            'password_hash': _hash_trader_password(password),
+            'password_set_at': now_iso(),
+            'password_reset_required': False,
+            'updated_at': now_iso()
+        }
+        updated = supabase.table('traders').update(payload).eq('id', trader.get('id')).execute().data or []
+        _audit_safe('traders', 'trader_password_set', f"Trader password set/reset for {trader.get('id')}", {'name': 'trader', 'username': email or phone, 'role': 'trader'})
+        return ok(updated[0] if updated else get_trader_by_id(trader.get('id')), 'Password saved')
+    except Exception as e:
+        return bad(e, 500)
+
 def _safe_insert_trader(row):
     try:
         return supabase.table("traders").insert(row).execute().data
@@ -2397,6 +2505,8 @@ def register_trader():
         name = str(d.get("name", "")).strip()
         email = str(d.get("email", "")).strip().lower()
         phone = _clean_phone(d.get("phone", ""))
+        password = str(d.get("password") or "")
+        confirm_password = str(d.get("confirm_password") or d.get("password_confirm") or "")
 
         if not _valid_name(name):
             return bad("Please enter your real full name.")
@@ -2408,6 +2518,10 @@ def register_trader():
             return bad("Please enter a valid email address.")
         if not _valid_phone(phone):
             return bad("Please enter a complete valid WhatsApp or phone number.")
+        if not _valid_trader_password(password):
+            return bad("Password must be at least 6 characters and not more than 128 characters.")
+        if confirm_password and confirm_password != password:
+            return bad("Passwords do not match.")
         if not _email_verified_recent(email):
             return bad("Email is not verified. Please enter the verification code sent to your email before creating your account.", 403)
 
@@ -2454,6 +2568,9 @@ def register_trader():
             "registration_user_agent": user_agent[:250],
             "ip_address": ip_address,
             "registration_ip": ip_address,
+            "password_hash": _hash_trader_password(password),
+            "password_set_at": now_iso(),
+            "password_reset_required": False,
         }
 
         created = _safe_insert_trader(row)
@@ -2656,15 +2773,24 @@ def delete_trader():
 @app.route("/login_trader", methods=["POST"])
 def login_trader():
     try:
-        lookup = str((request.json or {}).get("lookup", "")).strip().lower()
+        data = request.json or {}
+        lookup = str(data.get("lookup", "")).strip().lower()
+        password = str(data.get("password") or "")
         if not lookup:
             return bad("Missing lookup")
+        if not password:
+            return bad("Password is required", 401)
         trader = _latest_trader_for_lookup(lookup)
         if not trader:
-            return bad("Trader not found", 404)
+            return bad("Invalid email/phone or password", 401)
+        if not (trader.get("password_hash") or trader.get("password")):
+            return bad("Password not set. Please verify your email and create a password.", 403)
+        if not _check_trader_password(trader, password):
+            return bad("Invalid email/phone or password", 401)
         t = now_iso()
         supabase.table("traders").update({"last_login_at": t}).eq("id", trader["id"]).execute()
         trader["last_login_at"] = t
+        trader["auth_token"] = _make_trader_auth_token(trader.get("id"))
         account = _get_active_account(trader.get("id"), trader)
         if account:
             trader["current_account"] = account
