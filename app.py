@@ -969,8 +969,6 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         existing_purchase = supabase.table("trader_accounts").select("id,mt5_login").eq("purchase_id", purchase_id).eq("account_status", "assigned_active").limit(1).execute().data or []
         if existing_purchase:
             raise ValueError("This purchase already has an active MT5 account assigned")
-    elif _get_active_account(trader.get("id")):
-        raise ValueError("Trader already has an active MT5 account. Archive/pass/breach it before assigning another.")
     existing_login = supabase.table("trader_accounts").select("id").eq("mt5_login", mt5.get("mt5_login")).eq("account_status", "assigned_active").limit(1).execute().data or []
     if existing_login:
         raise ValueError("MT5 login already has an active trader account")
@@ -2691,8 +2689,6 @@ def approve_payment():
         trader_row = get_trader_by_id(tid)
         if not trader_row:
             return bad("Trader not found", 404)
-        if _get_active_account(tid):
-            return bad("Trader already has an active MT5 account. Use pass/breach/archive before approving another account.", 409)
 
         mt5 = None
         if d.get("mt5_id"):
@@ -3139,8 +3135,6 @@ def lifecycle_assign_phase2_mt5():
         trader = get_trader_by_id(trader_id)
         if not trader:
             return bad("Trader not found", 404)
-        if trader.get("challenge_state") not in ["phase2_waiting_mt5", "phase1_passed"]:
-            return bad("Trader is not waiting for Phase 2 MT5")
         mt5 = _get_mt5_account(mt5_id=mt5_id)
         account, updated = _assign_mt5_to_trader(trader, mt5, "phase2", None, _admin_from_payload(d), d.get("admin_note") or "Phase 2 MT5 assigned")
         return ok({"trader": updated, "account": account}, "Phase 2 MT5 assigned")
@@ -3172,8 +3166,6 @@ def lifecycle_assign_funded_mt5():
         trader = get_trader_by_id(trader_id)
         if not trader:
             return bad("Trader not found", 404)
-        if trader.get("challenge_state") not in ["funded_waiting_mt5", "phase2_passed"]:
-            return bad("Trader is not waiting for funded MT5")
         mt5 = _get_mt5_account(mt5_id=mt5_id)
         account, updated = _assign_mt5_to_trader(trader, mt5, "funded", None, _admin_from_payload(d), d.get("admin_note") or "Funded MT5 assigned")
         return ok({"trader": updated, "account": account}, "Funded MT5 assigned")
@@ -3268,10 +3260,6 @@ def assign_phase_mt5():
         if not trader:
             return bad("Trader not found", 404)
         target_stage = "funded" if phase in ["funded", "live"] else "phase2"
-        if target_stage == "phase2" and trader.get("challenge_state") not in ["phase2_waiting_mt5", "phase1_passed"]:
-            return bad("Trader is not waiting for Phase 2 MT5", 409)
-        if target_stage == "funded" and trader.get("challenge_state") not in ["funded_waiting_mt5", "phase2_passed"]:
-            return bad("Trader is not waiting for funded MT5", 409)
         mt5_acc = _get_mt5_account(mt5_id=mt5_id)
         account, updated = _assign_mt5_to_trader(
             trader,
