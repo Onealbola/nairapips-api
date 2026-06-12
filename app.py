@@ -1624,6 +1624,23 @@ def trader_current_account(lookup):
         if trader.get("phone"):
             purchases += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
         active_accounts = _get_active_accounts(trader.get("id"), trader, _dedupe_by_id(purchases))
+        active_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), active_accounts)
+        if account:
+            account_id = str(account.get("id") or "").strip()
+            account_login = str(account.get("mt5_login") or "").strip()
+            enriched_current = None
+            if account_id:
+                for candidate in active_accounts:
+                    if str(candidate.get("id") or "").strip() == account_id:
+                        enriched_current = candidate
+                        break
+            if not enriched_current and account_login:
+                for candidate in active_accounts:
+                    if str(candidate.get("mt5_login") or "").strip() == account_login:
+                        enriched_current = candidate
+                        break
+            if enriched_current:
+                account = enriched_current
         return ok({"trader": trader, "current_account": account, "active_accounts": active_accounts, "accounts": active_accounts, "challenge_state": trader.get("challenge_state") or "registered"})
     except Exception as e:
         return bad(e)
