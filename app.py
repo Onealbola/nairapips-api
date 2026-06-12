@@ -5,7 +5,7 @@ from supabase import create_client
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timezone
-import os, random, uuid, re, time, hmac, hashlib, base64
+import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string
 import html
 import requests
 app = Flask(__name__)
@@ -2255,6 +2255,13 @@ def _valid_trader_password(password):
 def _hash_trader_password(password):
     return generate_password_hash(str(password or ""), method="pbkdf2:sha256", salt_length=16)
 
+def _generate_temp_trader_password(length=10):
+    alphabet = string.ascii_letters + string.digits
+    while True:
+        value = "".join(secrets.choice(alphabet) for _ in range(length))
+        if any(c.islower() for c in value) and any(c.isupper() for c in value) and any(c.isdigit() for c in value):
+            return value
+
 def _check_trader_password(trader, password):
     raw = str(password or "")
     if not raw or not trader:
@@ -2492,6 +2499,46 @@ def set_trader_password():
         updated = supabase.table('traders').update(payload).eq('id', trader.get('id')).execute().data or []
         _audit_safe('traders', 'trader_password_set', f"Trader password set/reset for {trader.get('id')}", {'name': 'trader', 'username': email or phone, 'role': 'trader'})
         return ok(updated[0] if updated else get_trader_by_id(trader.get('id')), 'Password saved')
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route('/admin_reset_trader_password', methods=['POST', 'OPTIONS'])
+def admin_reset_trader_password():
+    if request.method == 'OPTIONS':
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        trader_id = str(d.get('id') or d.get('trader_id') or '').strip()
+        email = str(d.get('email') or '').strip().lower()
+        phone = _clean_phone(d.get('phone') or '')
+
+        trader = get_trader_by_id(trader_id) if trader_id else _find_existing_trader(email, phone)
+        if not trader:
+            return bad('Trader not found', 404)
+
+        temp_password = str(d.get('password') or '').strip() or _generate_temp_trader_password()
+        if not _valid_trader_password(temp_password):
+            return bad('Temporary password must be between 6 and 128 characters')
+
+        payload = {
+            'password_hash': _hash_trader_password(temp_password),
+            'password_set_at': now_iso(),
+            'password_reset_required': False,
+            'updated_at': now_iso()
+        }
+        updated = supabase.table('traders').update(payload).eq('id', trader.get('id')).execute().data or []
+        admin = _admin_from_payload(d)
+        _audit_safe('traders', 'admin_password_reset', f"Admin reset trader password for {trader.get('id')}", admin, trader.get('id'))
+
+        row = updated[0] if updated else get_trader_by_id(trader.get('id'))
+        safe_trader = {
+            'id': row.get('id') if row else trader.get('id'),
+            'name': row.get('name') if row else trader.get('name'),
+            'email': row.get('email') if row else trader.get('email'),
+            'phone': row.get('phone') if row else trader.get('phone'),
+            'password_set_at': row.get('password_set_at') if row else payload['password_set_at'],
+        }
+        return ok({'trader': safe_trader, 'temporary_password': temp_password}, 'Temporary password generated')
     except Exception as e:
         return bad(e, 500)
 
