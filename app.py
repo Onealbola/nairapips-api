@@ -711,6 +711,18 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
                         found.append(record)
                     elif not record_account_id and record_belongs_to_account_by_time(record, account):
                         found.append(record)
+            if login:
+                try:
+                    global_login_rows = supabase.table(table).select("*").eq("mt5_login", login).order("created_at", desc=True).limit(limit).execute().data or []
+                except Exception as e:
+                    print(f"{table} global login evidence fetch failed:", e)
+                    global_login_rows = []
+                for record in global_login_rows:
+                    record_account_id = str((record or {}).get("trader_account_id") or "").strip()
+                    if record_account_id and account_id and record_account_id == account_id:
+                        found.append(record)
+                    elif not record_account_id and record_belongs_to_account_by_time(record, account):
+                        found.append(record)
             return dedupe_records(found)
 
         def strongest_risk(records):
@@ -771,6 +783,16 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
                 row["current_equity"] = clean(risk_record.get("equity") or row.get("current_equity") or row.get("current_balance") or row.get("account_size"))
                 row["risk_zone"] = risk_record.get("risk_zone") or row.get("risk_zone") or _risk_zone(used)
                 row["last_sync_at"] = risk_record.get("created_at") or row.get("last_sync_at") or row.get("updated_at")
+            start_balance = clean(row.get("start_balance") or row.get("account_size") or 0)
+            current_equity = clean(row.get("current_equity") or row.get("current_balance") or start_balance)
+            if current_equity and start_balance:
+                if not clean(row.get("profit")):
+                    row["profit"] = current_equity - start_balance
+                if not clean(row.get("profit_percent")):
+                    row["profit_percent"] = ((current_equity - start_balance) / start_balance * 100) if start_balance else 0
+                row["highest_equity"] = max(clean(row.get("highest_equity") or 0), current_equity, start_balance)
+                low = clean(row.get("lowest_equity") or 0)
+                row["lowest_equity"] = min(low, current_equity) if low > 0 else current_equity
             enriched.append(_decorate_account_for_api(row))
         return enriched
     except Exception as e:
