@@ -5,7 +5,7 @@ from supabase import create_client
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timezone
-import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string
+import os, random, uuid, re, time, hmac, hashlib, base64
 import html
 import requests
 app = Flask(__name__)
@@ -617,18 +617,7 @@ def _get_active_accounts(trader_id, trader=None, purchases=None):
             updated = _dt_score(row.get("updated_at") or row.get("started_at") or row.get("created_at"))
             return (is_current, dd_used, updated)
 
-        by_login = {}
-        no_login = []
-        for row in decorated:
-            login = str(row.get("mt5_login") or "").strip()
-            if not login:
-                no_login.append(row)
-                continue
-            existing = by_login.get(login)
-            if not existing or account_sort(row) >= account_sort(existing):
-                by_login[login] = row
-
-        return sorted(list(by_login.values()) + no_login, key=account_sort, reverse=True)
+        return sorted(decorated, key=account_sort, reverse=True)
     except Exception as e:
         print("ACTIVE ACCOUNTS FETCH ERROR:", e)
         bridged = _active_account_from_trader_profile(trader)
@@ -711,18 +700,6 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
                         found.append(record)
                     elif not record_account_id and record_belongs_to_account_by_time(record, account):
                         found.append(record)
-            if login:
-                try:
-                    global_login_rows = supabase.table(table).select("*").eq("mt5_login", login).order("created_at", desc=True).limit(limit).execute().data or []
-                except Exception as e:
-                    print(f"{table} global login evidence fetch failed:", e)
-                    global_login_rows = []
-                for record in global_login_rows:
-                    record_account_id = str((record or {}).get("trader_account_id") or "").strip()
-                    if record_account_id and account_id and record_account_id == account_id:
-                        found.append(record)
-                    elif not record_account_id and record_belongs_to_account_by_time(record, account):
-                        found.append(record)
             return dedupe_records(found)
 
         def strongest_risk(records):
@@ -783,16 +760,6 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
                 row["current_equity"] = clean(risk_record.get("equity") or row.get("current_equity") or row.get("current_balance") or row.get("account_size"))
                 row["risk_zone"] = risk_record.get("risk_zone") or row.get("risk_zone") or _risk_zone(used)
                 row["last_sync_at"] = risk_record.get("created_at") or row.get("last_sync_at") or row.get("updated_at")
-            start_balance = clean(row.get("start_balance") or row.get("account_size") or 0)
-            current_equity = clean(row.get("current_equity") or row.get("current_balance") or start_balance)
-            if current_equity and start_balance:
-                if not clean(row.get("profit")):
-                    row["profit"] = current_equity - start_balance
-                if not clean(row.get("profit_percent")):
-                    row["profit_percent"] = ((current_equity - start_balance) / start_balance * 100) if start_balance else 0
-                row["highest_equity"] = max(clean(row.get("highest_equity") or 0), current_equity, start_balance)
-                low = clean(row.get("lowest_equity") or 0)
-                row["lowest_equity"] = min(low, current_equity) if low > 0 else current_equity
             enriched.append(_decorate_account_for_api(row))
         return enriched
     except Exception as e:
@@ -1657,23 +1624,6 @@ def trader_current_account(lookup):
         if trader.get("phone"):
             purchases += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
         active_accounts = _get_active_accounts(trader.get("id"), trader, _dedupe_by_id(purchases))
-        active_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), active_accounts)
-        if account:
-            account_id = str(account.get("id") or "").strip()
-            account_login = str(account.get("mt5_login") or "").strip()
-            enriched_current = None
-            if account_id:
-                for candidate in active_accounts:
-                    if str(candidate.get("id") or "").strip() == account_id:
-                        enriched_current = candidate
-                        break
-            if not enriched_current and account_login:
-                for candidate in active_accounts:
-                    if str(candidate.get("mt5_login") or "").strip() == account_login:
-                        enriched_current = candidate
-                        break
-            if enriched_current:
-                account = enriched_current
         return ok({"trader": trader, "current_account": account, "active_accounts": active_accounts, "accounts": active_accounts, "challenge_state": trader.get("challenge_state") or "registered"})
     except Exception as e:
         return bad(e)
@@ -2288,13 +2238,6 @@ def _valid_trader_password(password):
 def _hash_trader_password(password):
     return generate_password_hash(str(password or ""), method="pbkdf2:sha256", salt_length=16)
 
-def _generate_temp_trader_password(length=10):
-    alphabet = string.ascii_letters + string.digits
-    while True:
-        value = "".join(secrets.choice(alphabet) for _ in range(length))
-        if any(c.islower() for c in value) and any(c.isupper() for c in value) and any(c.isdigit() for c in value):
-            return value
-
 def _check_trader_password(trader, password):
     raw = str(password or "")
     if not raw or not trader:
@@ -2532,46 +2475,6 @@ def set_trader_password():
         updated = supabase.table('traders').update(payload).eq('id', trader.get('id')).execute().data or []
         _audit_safe('traders', 'trader_password_set', f"Trader password set/reset for {trader.get('id')}", {'name': 'trader', 'username': email or phone, 'role': 'trader'})
         return ok(updated[0] if updated else get_trader_by_id(trader.get('id')), 'Password saved')
-    except Exception as e:
-        return bad(e, 500)
-
-@app.route('/admin_reset_trader_password', methods=['POST', 'OPTIONS'])
-def admin_reset_trader_password():
-    if request.method == 'OPTIONS':
-        return _np_ok({})
-    try:
-        d = request.get_json(silent=True) or {}
-        trader_id = str(d.get('id') or d.get('trader_id') or '').strip()
-        email = str(d.get('email') or '').strip().lower()
-        phone = _clean_phone(d.get('phone') or '')
-
-        trader = get_trader_by_id(trader_id) if trader_id else _find_existing_trader(email, phone)
-        if not trader:
-            return bad('Trader not found', 404)
-
-        temp_password = str(d.get('password') or '').strip() or _generate_temp_trader_password()
-        if not _valid_trader_password(temp_password):
-            return bad('Temporary password must be between 6 and 128 characters')
-
-        payload = {
-            'password_hash': _hash_trader_password(temp_password),
-            'password_set_at': now_iso(),
-            'password_reset_required': False,
-            'updated_at': now_iso()
-        }
-        updated = supabase.table('traders').update(payload).eq('id', trader.get('id')).execute().data or []
-        admin = _admin_from_payload(d)
-        _audit_safe('traders', 'admin_password_reset', f"Admin reset trader password for {trader.get('id')}", admin, trader.get('id'))
-
-        row = updated[0] if updated else get_trader_by_id(trader.get('id'))
-        safe_trader = {
-            'id': row.get('id') if row else trader.get('id'),
-            'name': row.get('name') if row else trader.get('name'),
-            'email': row.get('email') if row else trader.get('email'),
-            'phone': row.get('phone') if row else trader.get('phone'),
-            'password_set_at': row.get('password_set_at') if row else payload['password_set_at'],
-        }
-        return ok({'trader': safe_trader, 'temporary_password': temp_password}, 'Temporary password generated')
     except Exception as e:
         return bad(e, 500)
 
@@ -4709,12 +4612,7 @@ def get_trader_trades():
 @app.route("/monitoring_events", methods=["GET"])
 def monitoring_events():
     trader_id = request.args.get("trader_id")
-    try:
-        limit = int(request.args.get("limit", 1000))
-    except Exception:
-        limit = 1000
-    limit = max(1, min(limit, 5000))
-    query = supabase.table("monitoring_events").select("*").order("created_at", desc=True).limit(limit)
+    query = supabase.table("monitoring_events").select("*").order("created_at", desc=True).limit(100)
     if trader_id:
         query = query.eq("trader_id", trader_id)
     res = query.execute()
@@ -4723,12 +4621,7 @@ def monitoring_events():
 @app.route("/monitoring_snapshots", methods=["GET"])
 def monitoring_snapshots():
     trader_id = request.args.get("trader_id")
-    try:
-        limit = int(request.args.get("limit", 1000))
-    except Exception:
-        limit = 1000
-    limit = max(1, min(limit, 5000))
-    query = supabase.table("monitoring_snapshots").select("*").order("created_at", desc=True).limit(limit)
+    query = supabase.table("monitoring_snapshots").select("*").order("created_at", desc=True).limit(100)
     if trader_id:
         query = query.eq("trader_id", trader_id)
     res = query.execute()
