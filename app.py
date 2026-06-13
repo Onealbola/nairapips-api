@@ -1646,103 +1646,37 @@ def trader_source_get(lookup):
 
 @app.route("/trader_current_account/<path:lookup>", methods=["GET"])
 def trader_current_account(lookup):
-    """Fast global account state endpoint.
-
-    Production rule: trader_accounts is the single source of truth for live MT5
-    metrics. This endpoint is used by the MT5 engine and admin lifecycle UI, so
-    it must not perform heavy purchase/snapshot/event scans. Those led to Render
-    502/timeouts while the engine was trying to fetch active accounts.
-    """
     try:
         trader = _latest_trader_for_lookup(lookup)
         if not trader:
             return bad("Trader not found", 404)
-
-        trader_id = trader.get("id")
-        raw_accounts = []
-        try:
-            raw_accounts = (
-                supabase.table("trader_accounts")
-                .select("*")
-                .eq("trader_id", trader_id)
-                .order("updated_at", desc=True)
-                .order("started_at", desc=True)
-                .order("created_at", desc=True)
-                .limit(50)
-                .execute()
-                .data
-                or []
-            )
-        except Exception as account_fetch_error:
-            print("FAST CURRENT ACCOUNT FETCH ERROR:", account_fetch_error)
-            raw_accounts = []
-
-        visible_statuses = {
-            "assigned_active", "active", "current_active",
-            "archived_phase1", "archived_phase2", "archived_funded",
-            "breached_archived", "breached", "locked", "closed"
-        }
-        accounts = []
-        for row in raw_accounts:
-            status = str(row.get("account_status") or "").strip().lower()
-            if status in visible_statuses or str(row.get("mt5_login") or "").strip():
-                try:
-                    accounts.append(_decorate_account_for_api(row))
-                except Exception:
-                    accounts.append(row)
-
-        def active_score(row):
-            status = str((row or {}).get("account_status") or "").strip().lower()
-            stage = str((row or {}).get("stage") or "").strip().lower()
-            login = str((row or {}).get("mt5_login") or "").strip()
-            score = 0
-            if status in {"assigned_active", "active", "current_active"}:
-                score += 1_000_000_000
-            if login:
-                score += 100_000_000
-            if stage == "funded":
-                score += 3_000_000
-            elif stage == "phase2":
-                score += 2_000_000
-            elif stage == "phase1":
-                score += 1_000_000
-            score += _dt_score((row or {}).get("updated_at") or (row or {}).get("started_at") or (row or {}).get("created_at"))
-            return score
-
-        active_accounts = [
-            a for a in accounts
-            if str(a.get("account_status") or "").strip().lower() in {"assigned_active", "active", "current_active"}
-            and str(a.get("mt5_login") or "").strip()
-        ]
-        active_accounts.sort(key=active_score, reverse=True)
-
-        current_account = active_accounts[0] if active_accounts else None
-        if not current_account:
-            try:
-                current_account = _get_active_account(trader_id, trader)
-                if current_account:
-                    current_account = _decorate_account_for_api(current_account)
-            except Exception as current_error:
-                print("FAST CURRENT ACCOUNT FALLBACK ERROR:", current_error)
-                current_account = None
-
-        # Backward compatibility for legacy/current dashboards.
-        challenge_state = trader.get("challenge_state") or "registered"
-        if current_account:
-            challenge_state = _active_state_for_stage(current_account.get("stage"))
-
-        return ok({
-            "trader": trader,
-            "current_account": current_account,
-            "active_accounts": active_accounts,
-            "accounts": active_accounts,
-            "all_accounts": accounts,
-            "challenge_state": challenge_state,
-            "source_of_truth": "trader_accounts",
-        })
+        account = _get_active_account(trader.get("id"), trader)
+        purchases = _safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100)
+        if trader.get("email"):
+            purchases += _safe_fetch("challenge_purchases", "email", trader.get("email"), 100)
+        if trader.get("phone"):
+            purchases += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
+        active_accounts = _get_active_accounts(trader.get("id"), trader, _dedupe_by_id(purchases))
+        active_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), active_accounts)
+        if account:
+            account_id = str(account.get("id") or "").strip()
+            account_login = str(account.get("mt5_login") or "").strip()
+            enriched_current = None
+            if account_id:
+                for candidate in active_accounts:
+                    if str(candidate.get("id") or "").strip() == account_id:
+                        enriched_current = candidate
+                        break
+            if not enriched_current and account_login:
+                for candidate in active_accounts:
+                    if str(candidate.get("mt5_login") or "").strip() == account_login:
+                        enriched_current = candidate
+                        break
+            if enriched_current:
+                account = enriched_current
+        return ok({"trader": trader, "current_account": account, "active_accounts": active_accounts, "accounts": active_accounts, "challenge_state": trader.get("challenge_state") or "registered"})
     except Exception as e:
-        print("TRADER CURRENT ACCOUNT SAFE ERROR:", e)
-        return bad(e, 500)
+        return bad(e)
 
 
 @app.route("/trader_dashboard/<path:lookup>", methods=["GET"])
@@ -2306,161 +2240,12 @@ def get_traders_raw():
     except Exception as e:
         return bad(e)
 
-def _latest_active_account_map_for_traders(trader_ids):
-    """Return one assigned_active account per trader_id.
-
-    Business production rule:
-    - traders = identity/profile only
-    - trader_accounts = single global source of truth for live MT5 state
-
-    This helper prevents admin, dashboard and MT5 engine from reading stale
-    mt5_login/status values left on the legacy traders table.
-    """
-    account_map = {}
-    try:
-        ids = [str(x or "").strip() for x in (trader_ids or []) if str(x or "").strip()]
-        if not ids:
-            return account_map
-        try:
-            rows = (
-                supabase.table("trader_accounts")
-                .select("*")
-                .in_("trader_id", ids)
-                .eq("account_status", "assigned_active")
-                .order("updated_at", desc=True)
-                .order("started_at", desc=True)
-                .order("created_at", desc=True)
-                .execute()
-                .data
-                or []
-            )
-        except Exception as bulk_error:
-            print("GLOBAL ACCOUNT MAP BULK FETCH ERROR:", bulk_error)
-            rows = []
-            # Safe fallback for deployments where PostgREST .in_ has issues.
-            for tid in ids:
-                try:
-                    rows += (
-                        supabase.table("trader_accounts")
-                        .select("*")
-                        .eq("trader_id", tid)
-                        .eq("account_status", "assigned_active")
-                        .order("updated_at", desc=True)
-                        .order("started_at", desc=True)
-                        .order("created_at", desc=True)
-                        .limit(5)
-                        .execute()
-                        .data
-                        or []
-                    )
-                except Exception as row_error:
-                    print("GLOBAL ACCOUNT MAP ROW FETCH ERROR:", tid, row_error)
-
-        def score(row):
-            stage = str((row or {}).get("stage") or "").strip().lower()
-            val = 0
-            if str((row or {}).get("mt5_login") or "").strip():
-                val += 100_000_000
-            if stage == "funded":
-                val += 3_000_000
-            elif stage == "phase2":
-                val += 2_000_000
-            elif stage == "phase1":
-                val += 1_000_000
-            val += _dt_score((row or {}).get("updated_at") or (row or {}).get("started_at") or (row or {}).get("created_at"))
-            return val
-
-        grouped = {}
-        for row in rows:
-            tid = str(row.get("trader_id") or "").strip()
-            if not tid:
-                continue
-            grouped.setdefault(tid, []).append(row)
-        for tid, items in grouped.items():
-            account_map[tid] = _decorate_account_for_api(sorted(items, key=score, reverse=True)[0])
-    except Exception as e:
-        print("GLOBAL ACCOUNT MAP ERROR:", e)
-    return account_map
-
-
-def _mirror_trader_from_global_account(trader, account_map=None):
-    """Return a trader row whose live MT5 fields are mirrored only from trader_accounts.
-
-    If no assigned_active account exists, stale legacy MT5 credentials on traders
-    are intentionally hidden from API consumers. This stops the MT5 engine from
-    monitoring old Phase 1/old archived accounts while admin says Phase 2 is
-    waiting for a fresh MT5.
-    """
-    row = dict(trader or {})
-    tid = str(row.get("id") or "").strip()
-    account = (account_map or {}).get(tid)
-    if not account and tid:
-        try:
-            account = _get_active_account(tid, row)
-        except Exception as e:
-            print("GLOBAL MIRROR ACTIVE ACCOUNT ERROR:", tid, e)
-            account = None
-
-    if account and str(account.get("mt5_login") or "").strip():
-        stage = str(account.get("stage") or "phase1").strip().lower()
-        row["current_account"] = account
-        row["__current_account"] = account
-        row["active_accounts"] = [account]
-        row["accounts"] = [account]
-        row["challenge_state"] = _active_state_for_stage(stage)
-        row["phase"] = stage
-        row["status"] = "funded" if stage == "funded" else f"{stage}_active"
-        row["mt5_login"] = str(account.get("mt5_login") or "").strip()
-        row["mt5_server"] = str(account.get("mt5_server") or "").strip()
-        row["mt5_master_password"] = account.get("mt5_master_password") or ""
-        row["mt5_password"] = account.get("mt5_master_password") or ""
-        row["master_password"] = account.get("mt5_master_password") or ""
-        row["mt5_investor_password"] = account.get("mt5_investor_password") or ""
-        row["investor_password"] = account.get("mt5_investor_password") or ""
-        row["account_size"] = account.get("account_size") or account.get("start_balance") or row.get("account_size")
-        row["balance"] = account.get("current_balance") or account.get("start_balance") or account.get("account_size") or row.get("balance")
-        row["equity"] = account.get("current_equity") or row.get("equity")
-        row["current_equity"] = account.get("current_equity") or row.get("current_equity")
-        row["profit"] = account.get("profit") or 0
-        row["profit_percent"] = account.get("profit_percent") or 0
-        row["drawdown_percent"] = account.get("absolute_drawdown_percent") or account.get("drawdown_percent") or 0
-        row["max_drawdown_used"] = account.get("dd_used_percent") or account.get("max_drawdown_used") or 0
-        row["highest_equity"] = account.get("highest_equity") or account.get("current_equity") or account.get("account_size")
-        row["lowest_equity"] = account.get("lowest_equity") or account.get("current_equity") or account.get("account_size")
-        row["monitoring_enabled"] = account.get("monitoring_enabled") is not False
-        row["mt5_account_active"] = True
-        row["mt5_access_disabled"] = False
-        row["source_of_truth"] = "trader_accounts"
-        return row
-
-    # No live account row means no live MT5 state. Keep identity/payment fields,
-    # but hide stale credentials so every module sees the same truth.
-    row["current_account"] = None
-    row["__current_account"] = None
-    row["active_accounts"] = []
-    row["accounts"] = []
-    row["mt5_login"] = ""
-    row["mt5_server"] = ""
-    row["mt5_master_password"] = ""
-    row["mt5_password"] = ""
-    row["master_password"] = ""
-    row["mt5_investor_password"] = ""
-    row["investor_password"] = ""
-    row["monitoring_enabled"] = False
-    row["mt5_account_active"] = False
-    row["mt5_access_disabled"] = True
-    row["source_of_truth"] = "trader_accounts"
-    return row
-
-
 @app.route("/traders", methods=["GET"])
 def get_traders():
     try:
         res = supabase.table("traders").select("*").execute()
-        rows = _dedupe_traders(getattr(res, "data", []) or [])
-        account_map = _latest_active_account_map_for_traders([r.get("id") for r in rows])
-        rows = [_mirror_trader_from_global_account(r, account_map) for r in rows]
-        return jsonify(rows)
+        rows = getattr(res, "data", []) or []
+        return jsonify(_dedupe_traders(rows))
     except Exception as e:
         return bad(e)
 
@@ -4666,12 +4451,6 @@ def sync_fxblue_account():
     return jsonify({"success": True, "data": _apply_monitoring_snapshot(trader, data, "fxblue")})
 @app.route("/sync_trades", methods=["POST"])
 def sync_trades():
-    """Production-safe MT5 trade sync.
-
-    Fixes Render timeouts by removing the old per-trade SELECT loop and by
-    returning a small summary instead of a large saved payload. This preserves
-    the trader_trades table and existing dashboard/admin behaviour.
-    """
     try:
         d = request.json or {}
         trades = d.get("trades", [])
@@ -4679,41 +4458,24 @@ def sync_trades():
         if not isinstance(trades, list):
             return bad("trades must be a list")
 
-        # Hard safety limit. The engine now sends history periodically, but this
-        # protects the API if an old engine or accidental bulk payload hits Render.
-        trades = trades[:500]
-        now = now_iso()
-
-        cleaned = []
-        account_cache = {}
-        tickets = []
+        saved = []
 
         for t in trades:
-            ticket = str(t.get("ticket") or "").strip()
-            mt5_login = str(t.get("mt5_login") or "").strip()
-            if not ticket or not mt5_login:
-                continue
-
             trader_account_id = t.get("trader_account_id")
-            if not trader_account_id and mt5_login:
-                if mt5_login in account_cache:
-                    trader_account_id = account_cache[mt5_login]
-                else:
-                    try:
-                        acct_rows = supabase.table("trader_accounts").select("id").eq("mt5_login", mt5_login).eq("account_status", "assigned_active").limit(1).execute().data or []
-                        trader_account_id = acct_rows[0].get("id") if acct_rows else None
-                    except Exception:
-                        trader_account_id = None
-                    account_cache[mt5_login] = trader_account_id
-
+            if not trader_account_id and t.get("mt5_login"):
+                try:
+                    acct_rows = supabase.table("trader_accounts").select("id").eq("mt5_login", str(t.get("mt5_login") or "")).eq("account_status", "assigned_active").limit(1).execute().data or []
+                    trader_account_id = acct_rows[0].get("id") if acct_rows else None
+                except Exception:
+                    trader_account_id = None
             row = {
                 "trader_id": t.get("trader_id"),
                 "trader_account_id": trader_account_id,
                 "trader_name": t.get("trader_name"),
                 "email": t.get("email"),
-                "mt5_login": mt5_login,
+                "mt5_login": str(t.get("mt5_login") or ""),
                 "symbol": t.get("symbol"),
-                "ticket": ticket,
+                "ticket": str(t.get("ticket") or ""),
                 "trade_type": t.get("trade_type"),
                 "volume": t.get("volume") or 0,
                 "open_price": t.get("open_price") or 0,
@@ -4726,37 +4488,21 @@ def sync_trades():
                 "status": t.get("status") or "open",
                 "opened_at": t.get("opened_at"),
                 "closed_at": t.get("closed_at"),
-                "synced_at": now
+                "synced_at": now_iso()
             }
-            cleaned.append(row)
-            tickets.append(ticket)
 
-        if not cleaned:
-            return ok({"inserted": 0, "updated": 0, "received": len(trades)}, "No valid trades to sync")
+            existing = supabase.table("trader_trades").select("id").eq("ticket", row["ticket"]).limit(1).execute().data
 
-        existing_by_ticket = {}
-        try:
-            # Batch lookup instead of one SELECT per trade.
-            existing_rows = supabase.table("trader_trades").select("id,ticket").in_("ticket", tickets).execute().data or []
-            existing_by_ticket = {str(r.get("ticket")): r.get("id") for r in existing_rows if r.get("ticket")}
-        except Exception as e:
-            print("TRADE BATCH LOOKUP FAILED, falling back safely:", e)
+            if existing:
+                saved.append(
+                    supabase.table("trader_trades").update(row).eq("ticket", row["ticket"]).execute().data
+                )
+            else:
+                saved.append(
+                    supabase.table("trader_trades").insert(row).execute().data
+                )
 
-        inserted = 0
-        updated = 0
-        for row in cleaned:
-            existing_id = existing_by_ticket.get(row["ticket"])
-            try:
-                if existing_id:
-                    supabase.table("trader_trades").update(row).eq("id", existing_id).execute()
-                    updated += 1
-                else:
-                    supabase.table("trader_trades").insert(row).execute()
-                    inserted += 1
-            except Exception as e:
-                print("TRADE ROW SYNC SKIPPED:", row.get("ticket"), e)
-
-        return ok({"inserted": inserted, "updated": updated, "received": len(trades)}, "Trades synced")
+        return ok(saved, "Trades synced")
 
     except Exception as e:
         return bad(e)
