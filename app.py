@@ -2306,12 +2306,161 @@ def get_traders_raw():
     except Exception as e:
         return bad(e)
 
+def _latest_active_account_map_for_traders(trader_ids):
+    """Return one assigned_active account per trader_id.
+
+    Business production rule:
+    - traders = identity/profile only
+    - trader_accounts = single global source of truth for live MT5 state
+
+    This helper prevents admin, dashboard and MT5 engine from reading stale
+    mt5_login/status values left on the legacy traders table.
+    """
+    account_map = {}
+    try:
+        ids = [str(x or "").strip() for x in (trader_ids or []) if str(x or "").strip()]
+        if not ids:
+            return account_map
+        try:
+            rows = (
+                supabase.table("trader_accounts")
+                .select("*")
+                .in_("trader_id", ids)
+                .eq("account_status", "assigned_active")
+                .order("updated_at", desc=True)
+                .order("started_at", desc=True)
+                .order("created_at", desc=True)
+                .execute()
+                .data
+                or []
+            )
+        except Exception as bulk_error:
+            print("GLOBAL ACCOUNT MAP BULK FETCH ERROR:", bulk_error)
+            rows = []
+            # Safe fallback for deployments where PostgREST .in_ has issues.
+            for tid in ids:
+                try:
+                    rows += (
+                        supabase.table("trader_accounts")
+                        .select("*")
+                        .eq("trader_id", tid)
+                        .eq("account_status", "assigned_active")
+                        .order("updated_at", desc=True)
+                        .order("started_at", desc=True)
+                        .order("created_at", desc=True)
+                        .limit(5)
+                        .execute()
+                        .data
+                        or []
+                    )
+                except Exception as row_error:
+                    print("GLOBAL ACCOUNT MAP ROW FETCH ERROR:", tid, row_error)
+
+        def score(row):
+            stage = str((row or {}).get("stage") or "").strip().lower()
+            val = 0
+            if str((row or {}).get("mt5_login") or "").strip():
+                val += 100_000_000
+            if stage == "funded":
+                val += 3_000_000
+            elif stage == "phase2":
+                val += 2_000_000
+            elif stage == "phase1":
+                val += 1_000_000
+            val += _dt_score((row or {}).get("updated_at") or (row or {}).get("started_at") or (row or {}).get("created_at"))
+            return val
+
+        grouped = {}
+        for row in rows:
+            tid = str(row.get("trader_id") or "").strip()
+            if not tid:
+                continue
+            grouped.setdefault(tid, []).append(row)
+        for tid, items in grouped.items():
+            account_map[tid] = _decorate_account_for_api(sorted(items, key=score, reverse=True)[0])
+    except Exception as e:
+        print("GLOBAL ACCOUNT MAP ERROR:", e)
+    return account_map
+
+
+def _mirror_trader_from_global_account(trader, account_map=None):
+    """Return a trader row whose live MT5 fields are mirrored only from trader_accounts.
+
+    If no assigned_active account exists, stale legacy MT5 credentials on traders
+    are intentionally hidden from API consumers. This stops the MT5 engine from
+    monitoring old Phase 1/old archived accounts while admin says Phase 2 is
+    waiting for a fresh MT5.
+    """
+    row = dict(trader or {})
+    tid = str(row.get("id") or "").strip()
+    account = (account_map or {}).get(tid)
+    if not account and tid:
+        try:
+            account = _get_active_account(tid, row)
+        except Exception as e:
+            print("GLOBAL MIRROR ACTIVE ACCOUNT ERROR:", tid, e)
+            account = None
+
+    if account and str(account.get("mt5_login") or "").strip():
+        stage = str(account.get("stage") or "phase1").strip().lower()
+        row["current_account"] = account
+        row["__current_account"] = account
+        row["active_accounts"] = [account]
+        row["accounts"] = [account]
+        row["challenge_state"] = _active_state_for_stage(stage)
+        row["phase"] = stage
+        row["status"] = "funded" if stage == "funded" else f"{stage}_active"
+        row["mt5_login"] = str(account.get("mt5_login") or "").strip()
+        row["mt5_server"] = str(account.get("mt5_server") or "").strip()
+        row["mt5_master_password"] = account.get("mt5_master_password") or ""
+        row["mt5_password"] = account.get("mt5_master_password") or ""
+        row["master_password"] = account.get("mt5_master_password") or ""
+        row["mt5_investor_password"] = account.get("mt5_investor_password") or ""
+        row["investor_password"] = account.get("mt5_investor_password") or ""
+        row["account_size"] = account.get("account_size") or account.get("start_balance") or row.get("account_size")
+        row["balance"] = account.get("current_balance") or account.get("start_balance") or account.get("account_size") or row.get("balance")
+        row["equity"] = account.get("current_equity") or row.get("equity")
+        row["current_equity"] = account.get("current_equity") or row.get("current_equity")
+        row["profit"] = account.get("profit") or 0
+        row["profit_percent"] = account.get("profit_percent") or 0
+        row["drawdown_percent"] = account.get("absolute_drawdown_percent") or account.get("drawdown_percent") or 0
+        row["max_drawdown_used"] = account.get("dd_used_percent") or account.get("max_drawdown_used") or 0
+        row["highest_equity"] = account.get("highest_equity") or account.get("current_equity") or account.get("account_size")
+        row["lowest_equity"] = account.get("lowest_equity") or account.get("current_equity") or account.get("account_size")
+        row["monitoring_enabled"] = account.get("monitoring_enabled") is not False
+        row["mt5_account_active"] = True
+        row["mt5_access_disabled"] = False
+        row["source_of_truth"] = "trader_accounts"
+        return row
+
+    # No live account row means no live MT5 state. Keep identity/payment fields,
+    # but hide stale credentials so every module sees the same truth.
+    row["current_account"] = None
+    row["__current_account"] = None
+    row["active_accounts"] = []
+    row["accounts"] = []
+    row["mt5_login"] = ""
+    row["mt5_server"] = ""
+    row["mt5_master_password"] = ""
+    row["mt5_password"] = ""
+    row["master_password"] = ""
+    row["mt5_investor_password"] = ""
+    row["investor_password"] = ""
+    row["monitoring_enabled"] = False
+    row["mt5_account_active"] = False
+    row["mt5_access_disabled"] = True
+    row["source_of_truth"] = "trader_accounts"
+    return row
+
+
 @app.route("/traders", methods=["GET"])
 def get_traders():
     try:
         res = supabase.table("traders").select("*").execute()
-        rows = getattr(res, "data", []) or []
-        return jsonify(_dedupe_traders(rows))
+        rows = _dedupe_traders(getattr(res, "data", []) or [])
+        account_map = _latest_active_account_map_for_traders([r.get("id") for r in rows])
+        rows = [_mirror_trader_from_global_account(r, account_map) for r in rows]
+        return jsonify(rows)
     except Exception as e:
         return bad(e)
 
