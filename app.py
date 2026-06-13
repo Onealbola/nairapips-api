@@ -4709,7 +4709,12 @@ def get_trader_trades():
 @app.route("/monitoring_events", methods=["GET"])
 def monitoring_events():
     trader_id = request.args.get("trader_id")
-    query = supabase.table("monitoring_events").select("*").order("created_at", desc=True).limit(100)
+    try:
+        limit = int(request.args.get("limit", 1000))
+    except Exception:
+        limit = 1000
+    limit = max(1, min(limit, 5000))
+    query = supabase.table("monitoring_events").select("*").order("created_at", desc=True).limit(limit)
     if trader_id:
         query = query.eq("trader_id", trader_id)
     res = query.execute()
@@ -4718,7 +4723,12 @@ def monitoring_events():
 @app.route("/monitoring_snapshots", methods=["GET"])
 def monitoring_snapshots():
     trader_id = request.args.get("trader_id")
-    query = supabase.table("monitoring_snapshots").select("*").order("created_at", desc=True).limit(100)
+    try:
+        limit = int(request.args.get("limit", 1000))
+    except Exception:
+        limit = 1000
+    limit = max(1, min(limit, 5000))
+    query = supabase.table("monitoring_snapshots").select("*").order("created_at", desc=True).limit(limit)
     if trader_id:
         query = query.eq("trader_id", trader_id)
     res = query.execute()
