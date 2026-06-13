@@ -4451,6 +4451,12 @@ def sync_fxblue_account():
     return jsonify({"success": True, "data": _apply_monitoring_snapshot(trader, data, "fxblue")})
 @app.route("/sync_trades", methods=["POST"])
 def sync_trades():
+    """Production-safe MT5 trade sync.
+
+    Fixes Render timeouts by removing the old per-trade SELECT loop and by
+    returning a small summary instead of a large saved payload. This preserves
+    the trader_trades table and existing dashboard/admin behaviour.
+    """
     try:
         d = request.json or {}
         trades = d.get("trades", [])
@@ -4458,24 +4464,41 @@ def sync_trades():
         if not isinstance(trades, list):
             return bad("trades must be a list")
 
-        saved = []
+        # Hard safety limit. The engine now sends history periodically, but this
+        # protects the API if an old engine or accidental bulk payload hits Render.
+        trades = trades[:500]
+        now = now_iso()
+
+        cleaned = []
+        account_cache = {}
+        tickets = []
 
         for t in trades:
+            ticket = str(t.get("ticket") or "").strip()
+            mt5_login = str(t.get("mt5_login") or "").strip()
+            if not ticket or not mt5_login:
+                continue
+
             trader_account_id = t.get("trader_account_id")
-            if not trader_account_id and t.get("mt5_login"):
-                try:
-                    acct_rows = supabase.table("trader_accounts").select("id").eq("mt5_login", str(t.get("mt5_login") or "")).eq("account_status", "assigned_active").limit(1).execute().data or []
-                    trader_account_id = acct_rows[0].get("id") if acct_rows else None
-                except Exception:
-                    trader_account_id = None
+            if not trader_account_id and mt5_login:
+                if mt5_login in account_cache:
+                    trader_account_id = account_cache[mt5_login]
+                else:
+                    try:
+                        acct_rows = supabase.table("trader_accounts").select("id").eq("mt5_login", mt5_login).eq("account_status", "assigned_active").limit(1).execute().data or []
+                        trader_account_id = acct_rows[0].get("id") if acct_rows else None
+                    except Exception:
+                        trader_account_id = None
+                    account_cache[mt5_login] = trader_account_id
+
             row = {
                 "trader_id": t.get("trader_id"),
                 "trader_account_id": trader_account_id,
                 "trader_name": t.get("trader_name"),
                 "email": t.get("email"),
-                "mt5_login": str(t.get("mt5_login") or ""),
+                "mt5_login": mt5_login,
                 "symbol": t.get("symbol"),
-                "ticket": str(t.get("ticket") or ""),
+                "ticket": ticket,
                 "trade_type": t.get("trade_type"),
                 "volume": t.get("volume") or 0,
                 "open_price": t.get("open_price") or 0,
@@ -4488,21 +4511,37 @@ def sync_trades():
                 "status": t.get("status") or "open",
                 "opened_at": t.get("opened_at"),
                 "closed_at": t.get("closed_at"),
-                "synced_at": now_iso()
+                "synced_at": now
             }
+            cleaned.append(row)
+            tickets.append(ticket)
 
-            existing = supabase.table("trader_trades").select("id").eq("ticket", row["ticket"]).limit(1).execute().data
+        if not cleaned:
+            return ok({"inserted": 0, "updated": 0, "received": len(trades)}, "No valid trades to sync")
 
-            if existing:
-                saved.append(
-                    supabase.table("trader_trades").update(row).eq("ticket", row["ticket"]).execute().data
-                )
-            else:
-                saved.append(
-                    supabase.table("trader_trades").insert(row).execute().data
-                )
+        existing_by_ticket = {}
+        try:
+            # Batch lookup instead of one SELECT per trade.
+            existing_rows = supabase.table("trader_trades").select("id,ticket").in_("ticket", tickets).execute().data or []
+            existing_by_ticket = {str(r.get("ticket")): r.get("id") for r in existing_rows if r.get("ticket")}
+        except Exception as e:
+            print("TRADE BATCH LOOKUP FAILED, falling back safely:", e)
 
-        return ok(saved, "Trades synced")
+        inserted = 0
+        updated = 0
+        for row in cleaned:
+            existing_id = existing_by_ticket.get(row["ticket"])
+            try:
+                if existing_id:
+                    supabase.table("trader_trades").update(row).eq("id", existing_id).execute()
+                    updated += 1
+                else:
+                    supabase.table("trader_trades").insert(row).execute()
+                    inserted += 1
+            except Exception as e:
+                print("TRADE ROW SYNC SKIPPED:", row.get("ticket"), e)
+
+        return ok({"inserted": inserted, "updated": updated, "received": len(trades)}, "Trades synced")
 
     except Exception as e:
         return bad(e)
