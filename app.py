@@ -1646,37 +1646,103 @@ def trader_source_get(lookup):
 
 @app.route("/trader_current_account/<path:lookup>", methods=["GET"])
 def trader_current_account(lookup):
+    """Fast global account state endpoint.
+
+    Production rule: trader_accounts is the single source of truth for live MT5
+    metrics. This endpoint is used by the MT5 engine and admin lifecycle UI, so
+    it must not perform heavy purchase/snapshot/event scans. Those led to Render
+    502/timeouts while the engine was trying to fetch active accounts.
+    """
     try:
         trader = _latest_trader_for_lookup(lookup)
         if not trader:
             return bad("Trader not found", 404)
-        account = _get_active_account(trader.get("id"), trader)
-        purchases = _safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100)
-        if trader.get("email"):
-            purchases += _safe_fetch("challenge_purchases", "email", trader.get("email"), 100)
-        if trader.get("phone"):
-            purchases += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
-        active_accounts = _get_active_accounts(trader.get("id"), trader, _dedupe_by_id(purchases))
-        active_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), active_accounts)
-        if account:
-            account_id = str(account.get("id") or "").strip()
-            account_login = str(account.get("mt5_login") or "").strip()
-            enriched_current = None
-            if account_id:
-                for candidate in active_accounts:
-                    if str(candidate.get("id") or "").strip() == account_id:
-                        enriched_current = candidate
-                        break
-            if not enriched_current and account_login:
-                for candidate in active_accounts:
-                    if str(candidate.get("mt5_login") or "").strip() == account_login:
-                        enriched_current = candidate
-                        break
-            if enriched_current:
-                account = enriched_current
-        return ok({"trader": trader, "current_account": account, "active_accounts": active_accounts, "accounts": active_accounts, "challenge_state": trader.get("challenge_state") or "registered"})
+
+        trader_id = trader.get("id")
+        raw_accounts = []
+        try:
+            raw_accounts = (
+                supabase.table("trader_accounts")
+                .select("*")
+                .eq("trader_id", trader_id)
+                .order("updated_at", desc=True)
+                .order("started_at", desc=True)
+                .order("created_at", desc=True)
+                .limit(50)
+                .execute()
+                .data
+                or []
+            )
+        except Exception as account_fetch_error:
+            print("FAST CURRENT ACCOUNT FETCH ERROR:", account_fetch_error)
+            raw_accounts = []
+
+        visible_statuses = {
+            "assigned_active", "active", "current_active",
+            "archived_phase1", "archived_phase2", "archived_funded",
+            "breached_archived", "breached", "locked", "closed"
+        }
+        accounts = []
+        for row in raw_accounts:
+            status = str(row.get("account_status") or "").strip().lower()
+            if status in visible_statuses or str(row.get("mt5_login") or "").strip():
+                try:
+                    accounts.append(_decorate_account_for_api(row))
+                except Exception:
+                    accounts.append(row)
+
+        def active_score(row):
+            status = str((row or {}).get("account_status") or "").strip().lower()
+            stage = str((row or {}).get("stage") or "").strip().lower()
+            login = str((row or {}).get("mt5_login") or "").strip()
+            score = 0
+            if status in {"assigned_active", "active", "current_active"}:
+                score += 1_000_000_000
+            if login:
+                score += 100_000_000
+            if stage == "funded":
+                score += 3_000_000
+            elif stage == "phase2":
+                score += 2_000_000
+            elif stage == "phase1":
+                score += 1_000_000
+            score += _dt_score((row or {}).get("updated_at") or (row or {}).get("started_at") or (row or {}).get("created_at"))
+            return score
+
+        active_accounts = [
+            a for a in accounts
+            if str(a.get("account_status") or "").strip().lower() in {"assigned_active", "active", "current_active"}
+            and str(a.get("mt5_login") or "").strip()
+        ]
+        active_accounts.sort(key=active_score, reverse=True)
+
+        current_account = active_accounts[0] if active_accounts else None
+        if not current_account:
+            try:
+                current_account = _get_active_account(trader_id, trader)
+                if current_account:
+                    current_account = _decorate_account_for_api(current_account)
+            except Exception as current_error:
+                print("FAST CURRENT ACCOUNT FALLBACK ERROR:", current_error)
+                current_account = None
+
+        # Backward compatibility for legacy/current dashboards.
+        challenge_state = trader.get("challenge_state") or "registered"
+        if current_account:
+            challenge_state = _active_state_for_stage(current_account.get("stage"))
+
+        return ok({
+            "trader": trader,
+            "current_account": current_account,
+            "active_accounts": active_accounts,
+            "accounts": active_accounts,
+            "all_accounts": accounts,
+            "challenge_state": challenge_state,
+            "source_of_truth": "trader_accounts",
+        })
     except Exception as e:
-        return bad(e)
+        print("TRADER CURRENT ACCOUNT SAFE ERROR:", e)
+        return bad(e, 500)
 
 
 @app.route("/trader_dashboard/<path:lookup>", methods=["GET"])
