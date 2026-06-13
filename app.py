@@ -617,7 +617,18 @@ def _get_active_accounts(trader_id, trader=None, purchases=None):
             updated = _dt_score(row.get("updated_at") or row.get("started_at") or row.get("created_at"))
             return (is_current, dd_used, updated)
 
-        return sorted(decorated, key=account_sort, reverse=True)
+        by_login = {}
+        no_login = []
+        for row in decorated:
+            login = str(row.get("mt5_login") or "").strip()
+            if not login:
+                no_login.append(row)
+                continue
+            existing = by_login.get(login)
+            if not existing or account_sort(row) >= account_sort(existing):
+                by_login[login] = row
+
+        return sorted(list(by_login.values()) + no_login, key=account_sort, reverse=True)
     except Exception as e:
         print("ACTIVE ACCOUNTS FETCH ERROR:", e)
         bridged = _active_account_from_trader_profile(trader)
