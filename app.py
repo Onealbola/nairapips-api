@@ -4231,13 +4231,26 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
 
     incoming_zone = str(payload.get("zone") or "").lower().strip()
     incoming_status = str(payload.get("status") or "").lower().strip()
-    passed_status = _passed_status_from_snapshot(payload)
+    incoming_pass_status = _passed_status_from_snapshot(payload)
+    passed_status = ""
     breached = bool(payload.get("breached")) or incoming_status == "breached" or incoming_zone == "breached" or max_dd_used >= 100
+
+    # GLOBAL PASS SAFETY RULE:
+    # Live assigned accounts may only pass from current account metrics, never from stale
+    # trader.phase_pass_status / old monitoring events / old phase2_passed text.
     if active_account and not breached:
         account_stage = str(active_account.get("stage") or "").lower()
         target = _target_for_stage(account_stage)
-        if target is not None and profit_percent >= target and max_dd_used < 100:
+        target_equity_value = account_size * (1 + (target / 100)) if target is not None and account_size else 0
+        metric_passed = bool(target is not None and max_dd_used < 100 and account_size and highest_equity >= target_equity_value)
+        if metric_passed:
             passed_status = "phase2_passed" if account_stage == "phase2" else "phase1_passed"
+        else:
+            # Prevent stale pass flags from locking or mislabeling an active account.
+            passed_status = ""
+    elif not active_account:
+        # Legacy/manual fallback only when no account-level source exists.
+        passed_status = incoming_pass_status
 
     old_zone = ((active_account or {}).get("risk_zone") or trader.get("risk_zone") or "safe").lower()
     old_status = ((active_account or {}).get("account_status") or trader.get("status") or "").lower()
@@ -4362,6 +4375,9 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
             if passed_status:
                 account_update["phase_pass_status"] = passed_status
                 account_update["passed_at"] = account_update.get("passed_at") or now
+            elif str(active_account.get("account_status") or "").lower() == "assigned_active":
+                # Clear stale account-level pass labels while the account is still active.
+                account_update["phase_pass_status"] = None
             if breached:
                 account_update["breached_at"] = account_update.get("breached_at") or now
                 account_update["breach_reason"] = update_data.get("breach_reason")
