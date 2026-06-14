@@ -4236,6 +4236,22 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
 
     dd_limit_percent = _num(active_account.get("dd_limit_percent"), MAX_DRAWDOWN_LIMIT) if active_account else MAX_DRAWDOWN_LIMIT
     max_dd_used = _safe_dd_used(payload, drawdown_percent, dd_limit_percent)
+    dd_remaining_percent = max(0, dd_limit_percent - drawdown_percent)
+    breach_equity_level = _num(payload.get("breach_equity_level"), live_base * (1 - dd_limit_percent / 100) if live_base else 0)
+    worst_static_drawdown_percent = _num(payload.get("worst_static_drawdown_percent"), ((max(0, live_base - lowest_equity) / live_base) * 100) if live_base else 0)
+    worst_dd_used_percent = _num(payload.get("worst_dd_used_percent"), _safe_dd_used(payload, worst_static_drawdown_percent, dd_limit_percent))
+    worst_dd_remaining_percent = _num(payload.get("worst_dd_remaining_percent"), max(0, dd_limit_percent - worst_static_drawdown_percent))
+
+    # Production pass meter. Works globally for every plan size because it uses account_size and target_percent.
+    active_stage_for_meter = str((active_account or {}).get("stage") or payload.get("phase_label") or trader.get("phase") or "").lower()
+    meter_target = _target_for_stage(active_stage_for_meter)
+    if meter_target is None:
+        pass_progress_percent = 0
+        pass_remaining_percent = 0
+    else:
+        highest_profit_percent_for_meter = ((highest_equity - account_size) / account_size * 100) if account_size else 0
+        pass_progress_percent = _num(payload.get("pass_progress_percent"), max(0, (highest_profit_percent_for_meter / meter_target) * 100 if meter_target else 0))
+        pass_remaining_percent = _num(payload.get("pass_remaining_percent"), max(0, 100 - pass_progress_percent))
 
     incoming_zone = str(payload.get("zone") or "").lower().strip()
     incoming_status = str(payload.get("status") or "").lower().strip()
@@ -4279,7 +4295,7 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
         "actual_drawdown_percent": drawdown_percent,
         "current_drawdown_percent": drawdown_percent,
         "drawdown_amount": equity_damage,
-        "dd_remaining_percent": max(0, dd_limit_percent - drawdown_percent),
+        "dd_remaining_percent": dd_remaining_percent,
         "highest_equity": highest_equity,
         "lowest_equity": lowest_equity,
         "peak_balance": max(_num(trader.get("peak_balance"), 0), balance, account_size, highest_equity),
@@ -4295,7 +4311,12 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
         "highest_profit_percent": _num(payload.get("highest_profit_percent"), 0),
         "profit_target": _num(payload.get("profit_target"), 0),
         "phase_label": payload.get("phase_label") or trader.get("phase"),
-        "breach_equity_level": _num(payload.get("breach_equity_level"), 0),
+        "breach_equity_level": breach_equity_level,
+        "worst_static_drawdown_percent": worst_static_drawdown_percent,
+        "worst_dd_used_percent": worst_dd_used_percent,
+        "worst_dd_remaining_percent": worst_dd_remaining_percent,
+        "pass_progress_percent": pass_progress_percent,
+        "pass_remaining_percent": pass_remaining_percent,
         "funded_profit_floor": _num(payload.get("funded_profit_floor"), 0),
         "funded_profit_label": payload.get("funded_profit_label") or trader.get("funded_profit_label"),
     }
@@ -4383,6 +4404,13 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
                 "actual_drawdown_percent": drawdown_percent,
                 "dd_used_percent": max_dd_used,
                 "current_dd_used_percent": max_dd_used,
+                "dd_remaining_percent": dd_remaining_percent,
+                "breach_equity_level": breach_equity_level,
+                "worst_static_drawdown_percent": worst_static_drawdown_percent,
+                "worst_dd_used_percent": worst_dd_used_percent,
+                "worst_dd_remaining_percent": worst_dd_remaining_percent,
+                "pass_progress_percent": pass_progress_percent,
+                "pass_remaining_percent": pass_remaining_percent,
                 "risk_zone": update_data.get("risk_zone", zone),
                 "monitoring_enabled": not (passed_status or breached or incoming_status == "profit_protected"),
                 "updated_at": now,
@@ -4459,6 +4487,13 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
             "drawdown_amount": equity_damage,
             "max_drawdown_used": max_dd_used,
             "dd_used_percent": max_dd_used,
+            "dd_remaining_percent": dd_remaining_percent,
+            "breach_equity_level": breach_equity_level,
+            "worst_static_drawdown_percent": worst_static_drawdown_percent,
+            "worst_dd_used_percent": worst_dd_used_percent,
+            "worst_dd_remaining_percent": worst_dd_remaining_percent,
+            "pass_progress_percent": pass_progress_percent,
+            "pass_remaining_percent": pass_remaining_percent,
             "risk_zone": update_data.get("risk_zone", zone),
             "source": source,
             "raw_data": payload
