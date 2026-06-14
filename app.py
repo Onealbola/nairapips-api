@@ -1686,17 +1686,66 @@ def trader_dashboard_payload(lookup):
         if not trader:
             return bad("Trader not found", 404)
         token = _request_trader_auth_token()
-        normal_token_ok = _verify_trader_auth_token(token, trader.get("id"))
-        admin_view_ok = _verify_admin_view_token(token, trader.get("id"))
-        if not (normal_token_ok or admin_view_ok):
+        if not _verify_trader_auth_token(token, trader.get("id")):
             return bad("Login password is required to load trader dashboard", 401)
-        payload = _dashboard_payload_for_trader(trader)
-        if admin_view_ok:
-            payload["admin_view_mode"] = True
-        return ok(payload, "Trader dashboard loaded")
+        return ok(_dashboard_payload_for_trader(trader), "Trader dashboard loaded")
     except Exception as e:
         return bad(e)
 
+
+
+
+# ================================
+# ADMIN SUPPORT: VIEW TRADER DASHBOARD
+# ================================
+ADMIN_VIEW_SECRET = os.getenv("ADMIN_VIEW_SECRET", "")
+
+
+def _admin_view_secret_ok(value):
+    try:
+        configured = str(ADMIN_VIEW_SECRET or "").strip()
+        supplied = str(value or "").strip()
+        return bool(configured) and hmac.compare_digest(configured, supplied)
+    except Exception:
+        return False
+
+
+@app.route("/admin_view_trader_token", methods=["POST", "OPTIONS"])
+def admin_view_trader_token():
+    """Create a short-lived trader auth token for admin support viewing.
+
+    This does NOT reveal, reset, or use the trader's password. It simply creates
+    the same signed dashboard auth token normal login creates, after verifying
+    a private ADMIN_VIEW_SECRET configured in Render.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        data = request.get_json(silent=True) or {}
+        secret = data.get("admin_view_secret") or request.headers.get("X-Admin-View-Secret") or ""
+        if not _admin_view_secret_ok(secret):
+            return bad("Unauthorized admin view", 401)
+
+        lookup = str(data.get("lookup") or data.get("trader_id") or data.get("email") or "").strip()
+        if not lookup:
+            return bad("Trader lookup is required", 400)
+
+        trader = _latest_trader_for_lookup(lookup)
+        if not trader:
+            return bad("Trader not found", 404)
+
+        token = _make_trader_auth_token(trader.get("id"))
+        safe_lookup = trader.get("email") or trader.get("phone") or trader.get("id") or lookup
+        return ok({
+            "trader_id": trader.get("id"),
+            "lookup": safe_lookup,
+            "email": trader.get("email"),
+            "name": trader.get("name") or trader.get("full_name") or "Trader",
+            "auth_token": token,
+            "admin_view": True,
+        }, "Admin dashboard view token created")
+    except Exception as e:
+        return bad(e, 500)
 
 @app.route("/trader_lifecycle/<trader_id>", methods=["GET"])
 def trader_lifecycle(trader_id):
@@ -2344,91 +2393,6 @@ def _request_trader_auth_token():
     if header.lower().startswith("bearer "):
         return header.split(" ", 1)[1].strip()
     return request.headers.get("X-Trader-Auth") or request.args.get("auth_token") or ""
-
-
-# ================================
-# NAIRAPIPS ADMIN SUPPORT VIEW
-# Safe admin dashboard inspection without knowing trader password.
-# Creates a short-lived normal trader auth token for read/support viewing.
-# ================================
-ADMIN_VIEW_TOKEN_TTL_SECONDS = 30 * 60
-
-def _verify_admin_support_password(data):
-    username = str(data.get("admin_username") or data.get("username") or "").strip()
-    password = str(data.get("admin_password") or data.get("password") or "")
-
-    # Existing emergency super-admin login used by the current admin dashboard.
-    if username == "admin" and password == "nairapips123":
-        return {"username": "admin", "name": "Super Admin", "role": "super_admin"}
-
-    try:
-        rows = supabase.table("admin_staff_members").select("*").eq("username", username).eq("password", password).limit(1).execute().data or []
-        if rows and str(rows[0].get("status") or "active").lower() == "active":
-            staff = dict(rows[0])
-            staff.pop("password", None)
-            return staff
-    except Exception as e:
-        print("ADMIN SUPPORT PASSWORD CHECK FAILED:", e)
-    return None
-
-def _make_admin_view_token(trader_id):
-    trader_id = str(trader_id or "").strip()
-    ts = str(int(time.time()))
-    body = f"adminview:{trader_id}:{ts}"
-    sig = hmac.new(_trader_auth_secret(), body.encode(), hashlib.sha256).hexdigest()
-    return base64.urlsafe_b64encode(f"{body}:{sig}".encode()).decode()
-
-def _verify_admin_view_token(token, trader_id):
-    try:
-        raw = base64.urlsafe_b64decode(str(token or "").encode()).decode()
-        prefix, tid, ts, sig = raw.split(":", 3)
-        if prefix != "adminview" or str(tid) != str(trader_id):
-            return False
-        body = f"adminview:{tid}:{ts}"
-        expected = hmac.new(_trader_auth_secret(), body.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            return False
-        return (time.time() - int(ts)) <= ADMIN_VIEW_TOKEN_TTL_SECONDS
-    except Exception:
-        return False
-
-@app.route("/admin_view_trader_dashboard", methods=["POST", "OPTIONS"])
-def admin_view_trader_dashboard():
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        data = request.get_json(silent=True) or {}
-        staff = _verify_admin_support_password(data)
-        if not staff:
-            return bad("Admin password required to open trader dashboard", 401)
-
-        lookup = str(data.get("lookup") or data.get("email") or data.get("phone") or data.get("trader_id") or data.get("id") or "").strip()
-        if not lookup:
-            return bad("Trader lookup is required")
-
-        trader = _latest_trader_for_lookup(lookup)
-        if not trader:
-            return bad("Trader not found", 404)
-
-        token = _make_admin_view_token(trader.get("id"))
-        safe = {
-            "id": trader.get("id"),
-            "name": trader.get("name"),
-            "email": trader.get("email"),
-            "phone": trader.get("phone"),
-            "phase": trader.get("phase"),
-            "status": trader.get("status"),
-            "challenge_state": trader.get("challenge_state"),
-        }
-        _audit_safe("traders", "admin_view_trader_dashboard", f"Admin opened trader dashboard support view for {trader.get('email') or trader.get('id')}", staff, trader.get("id"))
-        return ok({
-            "trader": safe,
-            "lookup": trader.get("email") or trader.get("phone") or trader.get("id"),
-            "admin_view_token": token,
-            "expires_in_seconds": ADMIN_VIEW_TOKEN_TTL_SECONDS,
-        }, "Admin support dashboard token created")
-    except Exception as e:
-        return bad(e, 500)
 
 def _phone_variants(phone):
     raw = str(phone or "").strip()
