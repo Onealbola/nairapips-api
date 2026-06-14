@@ -4216,15 +4216,23 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
     highest_equity = max(previous_highest, _num(payload.get("highest_equity"), 0), equity, account_size)
     lowest_equity = min(previous_lowest, equity) if previous_lowest > 0 else equity
 
-    # Prefer MT5 engine drawdown values. Fallback keeps old FXBlue/manual behaviour alive.
-    engine_dd = payload.get("drawdown_percent")
+    # GLOBAL LIVE DRAWDOWN RULE:
+    # Breach danger must always be based on CURRENT equity versus the fixed
+    # challenge/account size. Highest/lowest equity are evidence only and must
+    # never hide a live account approaching breach.
+    live_base = account_size or balance
+    live_equity_damage = max(0, live_base - equity) if live_base else 0
+    live_drawdown_percent = (live_equity_damage / live_base * 100) if live_base else 0
+
+    # Prefer the engine's current drawdown if present, but recompute from live
+    # equity as a safety net so all modules show the same risk.
+    engine_dd = payload.get("current_drawdown_percent", payload.get("actual_drawdown_percent", payload.get("drawdown_percent")))
     if engine_dd is not None:
-        drawdown_percent = _num(engine_dd, 0)
-        equity_damage = max(0, (account_size or balance) * drawdown_percent / 100)
+        drawdown_percent = max(0, _num(engine_dd, live_drawdown_percent))
+        equity_damage = max(0, live_base * drawdown_percent / 100) if live_base else live_equity_damage
     else:
-        peak_base = max(highest_equity, account_size)
-        equity_damage = max(0, peak_base - lowest_equity)
-        drawdown_percent = (equity_damage / peak_base * 100) if peak_base else 0
+        drawdown_percent = live_drawdown_percent
+        equity_damage = live_equity_damage
 
     dd_limit_percent = _num(active_account.get("dd_limit_percent"), MAX_DRAWDOWN_LIMIT) if active_account else MAX_DRAWDOWN_LIMIT
     max_dd_used = _safe_dd_used(payload, drawdown_percent, dd_limit_percent)
@@ -4268,6 +4276,10 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
         "profit_percent": profit_percent,
         "drawdown": equity_damage,
         "drawdown_percent": drawdown_percent,
+        "actual_drawdown_percent": drawdown_percent,
+        "current_drawdown_percent": drawdown_percent,
+        "drawdown_amount": equity_damage,
+        "dd_remaining_percent": max(0, dd_limit_percent - drawdown_percent),
         "highest_equity": highest_equity,
         "lowest_equity": lowest_equity,
         "peak_balance": max(_num(trader.get("peak_balance"), 0), balance, account_size, highest_equity),
@@ -4367,7 +4379,10 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
                 "highest_equity": highest_equity,
                 "lowest_equity": lowest_equity,
                 "absolute_drawdown_percent": drawdown_percent,
+                "drawdown_percent": drawdown_percent,
+                "actual_drawdown_percent": drawdown_percent,
                 "dd_used_percent": max_dd_used,
+                "current_dd_used_percent": max_dd_used,
                 "risk_zone": update_data.get("risk_zone", zone),
                 "monitoring_enabled": not (passed_status or breached or incoming_status == "profit_protected"),
                 "updated_at": now,
@@ -4391,6 +4406,7 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
                     "profit": profit,
                     "profit_percent": profit_percent,
                     "absolute_drawdown_percent": drawdown_percent,
+                    "drawdown_percent": drawdown_percent,
                     "dd_used_percent": max_dd_used,
                     "monitoring_enabled": not (passed_status or breached or incoming_status == "profit_protected"),
                     "updated_at": now,
@@ -4438,7 +4454,11 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
             "profit_percent": profit_percent,
             "drawdown": equity_damage,
             "drawdown_percent": drawdown_percent,
+            "actual_drawdown_percent": drawdown_percent,
+            "current_drawdown_percent": drawdown_percent,
+            "drawdown_amount": equity_damage,
             "max_drawdown_used": max_dd_used,
+            "dd_used_percent": max_dd_used,
             "risk_zone": update_data.get("risk_zone", zone),
             "source": source,
             "raw_data": payload
@@ -4518,7 +4538,11 @@ Max DD Used: {round(max_dd_used, 1)}%"""
         "profit": profit,
         "profit_percent": profit_percent,
         "drawdown_percent": drawdown_percent,
+        "actual_drawdown_percent": drawdown_percent,
+        "current_drawdown_percent": drawdown_percent,
+        "drawdown_amount": equity_damage,
         "max_drawdown_used": max_dd_used,
+        "dd_used_percent": max_dd_used,
         "risk_zone": update_data.get("risk_zone", zone),
         "critical_mode": update_data.get("critical_mode", False),
         "monitoring_priority": update_data.get("monitoring_priority", priority),
