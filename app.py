@@ -1710,6 +1710,44 @@ def _admin_view_secret_ok(value):
         return False
 
 
+def _admin_view_request_ok(data):
+    """Authorize admin support dashboard view without asking for a separate popup secret.
+
+    Production-safe behavior:
+    - Existing ADMIN_VIEW_SECRET still works if configured.
+    - Normal master admin login works: admin / nairapips123.
+    - Staff accounts work through the existing admin_staff_members table.
+    - No trader password is revealed, reset, or required.
+    """
+    try:
+        secret = data.get("admin_view_secret") or request.headers.get("X-Admin-View-Secret") or ""
+        if _admin_view_secret_ok(secret):
+            return True
+
+        username = str(data.get("admin_username") or data.get("username") or request.headers.get("X-Admin-Username") or "").strip()
+        password = str(data.get("admin_password") or data.get("password") or request.headers.get("X-Admin-Password") or "")
+
+        # Existing source-of-truth master admin fallback used by admin.html login.
+        if username == "admin" and password == "nairapips123":
+            return True
+
+        if not username or not password:
+            return False
+
+        rows = supabase.table("admin_staff_members").select("id,username,password,status,role").eq("username", username).eq("password", password).limit(1).execute().data or []
+        if not rows:
+            return False
+
+        staff = rows[0]
+        if str(staff.get("status") or "active").strip().lower() != "active":
+            return False
+
+        return True
+    except Exception as e:
+        print("ADMIN VIEW AUTH ERROR:", e)
+        return False
+
+
 @app.route("/admin_view_trader_token", methods=["POST", "OPTIONS"])
 def admin_view_trader_token():
     """Create a short-lived trader auth token for admin support viewing.
@@ -1722,8 +1760,7 @@ def admin_view_trader_token():
         return _np_ok({})
     try:
         data = request.get_json(silent=True) or {}
-        secret = data.get("admin_view_secret") or request.headers.get("X-Admin-View-Secret") or ""
-        if not _admin_view_secret_ok(secret):
+        if not _admin_view_request_ok(data):
             return bad("Unauthorized admin view", 401)
 
         lookup = str(data.get("lookup") or data.get("trader_id") or data.get("email") or "").strip()
