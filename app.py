@@ -6560,6 +6560,273 @@ def resend_phase_pass_email():
         return bad(e, 500)
 
 
+# ================================
+# NAIRAPIPS INTELLIGENT ACCOUNT MANAGER HOTFIX
+# Independent backend brain for pass/breach/alert decisions.
+# It does not replace MT5. It converts latest account/snapshot data into immediate business status.
+# ================================
+
+def _iam_num(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return float(default)
+        return float(str(v).replace("₦", "").replace(",", "").strip())
+    except Exception:
+        return float(default)
+
+
+def _iam_stage_target(stage):
+    stage = str(stage or "").strip().lower()
+    if stage == "phase1":
+        return 10.0
+    if stage == "phase2":
+        return 8.0
+    return None
+
+
+def _iam_alert(trader, account, alert_type, title, message, severity="info"):
+    """Write one admin-visible monitoring event and email admin if available."""
+    try:
+        supabase.table("monitoring_events").insert({
+            "trader_id": trader.get("id") if trader else None,
+            "trader_account_id": account.get("id") if account else None,
+            "trader_name": (trader or {}).get("name") or (trader or {}).get("full_name") or "Trader",
+            "email": (trader or {}).get("email"),
+            "mt5_login": (account or {}).get("mt5_login") or (trader or {}).get("mt5_login"),
+            "event_type": alert_type,
+            "risk_zone": severity,
+            "message": message,
+            "balance": _iam_num((account or {}).get("account_size") or (account or {}).get("start_balance")),
+            "equity": _iam_num((account or {}).get("current_equity")),
+            "max_drawdown_used": _iam_num((account or {}).get("dd_used_percent")),
+        }).execute()
+    except Exception as e:
+        print("IAM ALERT EVENT FAILED:", e)
+    try:
+        send_admin_alert(title, message)
+    except Exception as e:
+        print("IAM ADMIN ALERT EMAIL FAILED:", e)
+
+
+def _iam_latest_snapshot_for_account(account):
+    try:
+        account_id = str((account or {}).get("id") or "").strip()
+        login = str((account or {}).get("mt5_login") or "").strip()
+        rows = []
+        if account_id:
+            rows = supabase.table("monitoring_snapshots").select("*").eq("trader_account_id", account_id).order("created_at", desc=True).limit(1).execute().data or []
+        if not rows and login:
+            rows = supabase.table("monitoring_snapshots").select("*").eq("mt5_login", login).order("created_at", desc=True).limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print("IAM LATEST SNAPSHOT FETCH FAILED:", e)
+        return {}
+
+
+def _iam_safe_account_update(account_id, payload):
+    try:
+        return supabase.table("trader_accounts").update(payload).eq("id", account_id).execute()
+    except Exception as e:
+        print("IAM ACCOUNT UPDATE FAILED:", e)
+        # Retry with only common/core columns to survive optional schema differences.
+        core = {
+            k: v for k, v in payload.items()
+            if k in {
+                "current_balance", "current_equity", "profit", "profit_percent",
+                "highest_equity", "lowest_equity", "absolute_drawdown_percent", "drawdown_percent",
+                "dd_used_percent", "risk_zone", "monitoring_enabled", "phase_pass_status",
+                "passed_at", "breached_at", "breach_reason", "account_status", "updated_at"
+            }
+        }
+        try:
+            return supabase.table("trader_accounts").update(core).eq("id", account_id).execute()
+        except Exception as e2:
+            print("IAM ACCOUNT CORE UPDATE FAILED:", e2)
+            return None
+
+
+def _iam_process_account(account, force=False):
+    """Single-account intelligence decision. Safe to run repeatedly/idempotently."""
+    if not account:
+        return {"action": "skipped", "reason": "empty account"}
+
+    status = str(account.get("account_status") or "").strip().lower()
+    if status not in {"assigned_active", "active", "current_active"} and not force:
+        return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "skipped", "reason": f"not active: {status}"}
+
+    trader = _get_trader_by_id(account.get("trader_id")) if account.get("trader_id") else None
+    snap = _iam_latest_snapshot_for_account(account)
+
+    stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
+    start_balance = _iam_num(account.get("start_balance") or account.get("account_size") or snap.get("balance") or snap.get("account_size"), 0)
+    current_equity = _iam_num(snap.get("equity"), _iam_num(account.get("current_equity") or account.get("current_balance"), start_balance))
+    if start_balance <= 0:
+        return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "skipped", "reason": "missing start balance"}
+
+    previous_high = _iam_num(account.get("highest_equity"), start_balance)
+    previous_low = _iam_num(account.get("lowest_equity"), start_balance)
+    snap_high = _iam_num(snap.get("highest_equity"), current_equity)
+    snap_low = _iam_num(snap.get("lowest_equity"), current_equity)
+    highest_equity = max(start_balance, previous_high, snap_high, current_equity)
+    lowest_equity = min(v for v in [previous_low, snap_low, current_equity, start_balance] if v > 0)
+
+    profit = current_equity - start_balance
+    profit_percent = (profit / start_balance) * 100
+    dd_limit = _iam_num(account.get("dd_limit_percent"), 20) or 20
+    current_dd = max(0, ((start_balance - current_equity) / start_balance) * 100)
+    dd_used = (current_dd / dd_limit) * 100 if dd_limit else 0
+    worst_dd = max(0, ((start_balance - lowest_equity) / start_balance) * 100)
+    worst_dd_used = (worst_dd / dd_limit) * 100 if dd_limit else 0
+    breach_level = start_balance * (1 - dd_limit / 100)
+    risk_zone = _risk_zone(dd_used)
+    target_percent = _iam_stage_target(stage)
+    target_equity = start_balance * (1 + (target_percent / 100)) if target_percent is not None else 0
+    pass_status = ""
+    if target_percent is not None and highest_equity >= target_equity and dd_used < 100:
+        pass_status = "phase2_passed" if stage == "phase2" else "phase1_passed"
+    breached = current_equity <= breach_level or dd_used >= 100
+
+    update = {
+        "current_balance": start_balance,
+        "current_equity": current_equity,
+        "profit": profit,
+        "profit_percent": profit_percent,
+        "highest_equity": highest_equity,
+        "lowest_equity": lowest_equity,
+        "absolute_drawdown_percent": current_dd,
+        "drawdown_percent": current_dd,
+        "dd_used_percent": dd_used,
+        "risk_zone": "passed" if pass_status else ("breached" if breached else risk_zone),
+        "updated_at": _now_iso(),
+    }
+    # Optional columns, safely retried away if missing.
+    update.update({
+        "actual_drawdown_percent": current_dd,
+        "current_drawdown_percent": current_dd,
+        "dd_remaining_percent": max(0, dd_limit - current_dd),
+        "breach_equity_level": breach_level,
+        "worst_static_drawdown_percent": worst_dd,
+        "worst_dd_used_percent": worst_dd_used,
+        "worst_dd_remaining_percent": max(0, dd_limit - worst_dd),
+        "target_equity": target_equity,
+        "profit_target": target_percent or 0,
+        "pass_progress_percent": (max(0, ((highest_equity - start_balance) / start_balance * 100)) / target_percent * 100) if target_percent else 0,
+    })
+    _iam_safe_account_update(account.get("id"), update)
+
+    # Hard business actions happen after evidence is saved.
+    if pass_status:
+        already = str(account.get("phase_pass_status") or "").strip().lower() == pass_status or "archived_phase" in status
+        if not already:
+            message = (
+                f"{pass_status} detected automatically by NairaPips Intelligent Account Manager. "
+                f"MT5 {account.get('mt5_login')} | Equity {current_equity:,.2f} | Target {target_equity:,.2f} | Stage {stage}."
+            )
+            try:
+                _pass_specific_account(trader, account, pass_status, {"name": "intelligent_account_manager", "username": "iam"}, message)
+            except Exception as e:
+                print("IAM AUTO PASS FAILED:", e)
+            _iam_alert(trader, account, "phase_passed", "NairaPips phase pass detected", message, "passed")
+            try:
+                _send_phase_pass_email_once(trader, pass_status, {"target_equity": target_equity, "highest_equity": highest_equity, "highest_profit_percent": ((highest_equity-start_balance)/start_balance*100), "mt5_login": account.get("mt5_login")}, old_status="", force=False)
+            except Exception as e:
+                print("IAM PASS EMAIL FAILED:", e)
+            return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "passed", "pass_status": pass_status, "equity": current_equity, "target_equity": target_equity}
+        return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "already_passed", "pass_status": pass_status}
+
+    if breached:
+        if "breach" not in status:
+            reason = f"Static drawdown breach detected. MT5 {account.get('mt5_login')} equity {current_equity:,.2f} <= breach level {breach_level:,.2f}."
+            try:
+                _breach_specific_account(trader, account, reason, {"name": "intelligent_account_manager", "username": "iam"})
+            except Exception as e:
+                print("IAM AUTO BREACH FAILED:", e)
+            _iam_alert(trader, account, "breach_detected", "NairaPips breach detected", reason, "breached")
+            return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "breached", "equity": current_equity, "breach_level": breach_level}
+        return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "already_breached"}
+
+    # Alert before damage gets out of hand, without locking.
+    if risk_zone in {"warning", "danger", "critical"}:
+        _iam_alert(
+            trader,
+            account,
+            f"risk_{risk_zone}",
+            f"NairaPips account {risk_zone.upper()}",
+            f"MT5 {account.get('mt5_login')} is {risk_zone.upper()}. Current DD used: {dd_used:.1f}% of limit. Equity: {current_equity:,.2f}. Breach level: {breach_level:,.2f}.",
+            risk_zone,
+        )
+    return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "monitored", "risk_zone": risk_zone, "equity": current_equity, "dd_used_percent": dd_used, "pass_status": "not_passed"}
+
+
+
+
+# Wrap the existing monitoring snapshot receiver so every MT5 snapshot also runs
+# the independent account intelligence decision immediately.
+_np_original_apply_monitoring_snapshot = _apply_monitoring_snapshot
+
+def _apply_monitoring_snapshot(trader, payload, source="manual"):
+    result = _np_original_apply_monitoring_snapshot(trader, payload, source)
+    try:
+        account = None
+        account_id = str((payload or {}).get("trader_account_id") or (payload or {}).get("current_account_id") or "").strip()
+        login = str((payload or {}).get("mt5_login") or (payload or {}).get("login") or "").strip()
+        if account_id:
+            rows = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+            account = rows[0] if rows else None
+        if not account and login:
+            rows = supabase.table("trader_accounts").select("*").eq("mt5_login", login).order("updated_at", desc=True).limit(1).execute().data or []
+            account = rows[0] if rows else None
+        if account:
+            iam = _iam_process_account(account, force=False)
+            if isinstance(result, dict):
+                result["intelligence"] = iam
+    except Exception as e:
+        print("IAM SNAPSHOT WRAP FAILED:", e)
+    return result
+
+@app.route("/account_intelligence_scan", methods=["POST", "GET", "OPTIONS"])
+def account_intelligence_scan():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        limit = int(request.args.get("limit", 250))
+    except Exception:
+        limit = 250
+    limit = max(1, min(limit, 1000))
+    try:
+        rows = supabase.table("trader_accounts").select("*").in_("account_status", ["assigned_active", "active", "current_active"]).order("updated_at", desc=True).limit(limit).execute().data or []
+    except Exception as e:
+        return bad(f"Could not load active accounts: {e}", 500)
+    results = []
+    for account in rows:
+        try:
+            results.append(_iam_process_account(account))
+        except Exception as e:
+            results.append({"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "error", "error": str(e)})
+    return jsonify({"success": True, "scanned": len(rows), "results": results})
+
+
+@app.route("/account_intelligence_alerts", methods=["GET", "OPTIONS"])
+def account_intelligence_alerts():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        limit = int(request.args.get("limit", 100))
+    except Exception:
+        limit = 100
+    limit = max(1, min(limit, 500))
+    types = [
+        "phase_passed", "breach_detected", "account_locked",
+        "risk_warning", "risk_danger", "risk_critical",
+        "critical_mode", "danger_zone"
+    ]
+    try:
+        rows = supabase.table("monitoring_events").select("*").in_("event_type", types).order("created_at", desc=True).limit(limit).execute().data or []
+        return jsonify({"success": True, "data": rows})
+    except Exception as e:
+        return bad(e, 500)
+
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
