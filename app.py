@@ -1645,106 +1645,99 @@ def trader_source_get(lookup):
 
 
 
-def _phase_assignment_rows_for_trader(trader, accounts):
-    """Return archived passed accounts that need the next fresh MT5 assignment.
+# ================================
+# NAIRAPIPS ADMIN PHASE ASSIGNMENT QUEUE
+# Archived passed accounts are intentionally archived for monitoring safety,
+# but they must still appear here for the next fresh MT5 assignment.
+# ================================
 
-    This fixes the production gap where a passed account is archived correctly
-    for monitoring safety, but then disappears from the admin Phase MT5
-    Assignment queue.
-    """
+def _np_number(value, default=0):
+    try:
+        if value is None:
+            return default
+        return float(str(value).replace("₦", "").replace(",", "").replace("%", "").strip() or default)
+    except Exception:
+        return default
+
+def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None):
     rows = []
-    if not trader:
-        return rows
+    traders_by_id = traders_by_id or {}
+    seen = set()
     for acc in accounts or []:
-        status = str(acc.get("account_status") or "").strip().lower()
-        pass_status = str(acc.get("phase_pass_status") or acc.get("pass_status") or "").strip().lower()
-        stage = str(acc.get("stage") or "").strip().lower()
-        risk = str(acc.get("risk_zone") or acc.get("display_risk_zone") or "").strip().lower()
-
-        phase1_passed = (
-            status == "archived_phase1"
-            and (pass_status == "phase1_passed" or risk == "passed" or stage == "phase1")
-        )
-        phase2_passed = (
-            status == "archived_phase2"
-            and (pass_status == "phase2_passed" or risk == "passed" or stage == "phase2")
-        )
-
-        if not phase1_passed and not phase2_passed:
-            continue
-
-        target_stage = "funded" if phase2_passed else "phase2"
-        rows.append({
-            "id": trader.get("id"),
-            "trader_id": trader.get("id"),
-            "trader_account_id": acc.get("id"),
-            "completed_account_id": acc.get("id"),
-            "name": trader.get("name") or trader.get("full_name") or "Trader",
-            "email": trader.get("email") or "",
-            "phone": trader.get("phone") or "",
-            "account_reference": trader.get("account_reference") or "",
-            "old_mt5_login": acc.get("mt5_login") or "",
-            "completed_mt5_login": acc.get("mt5_login") or "",
-            "completed_stage": stage or ("phase2" if phase2_passed else "phase1"),
-            "passed_stage": "phase2" if phase2_passed else "phase1",
-            "target_phase": target_stage,
-            "target_stage": target_stage,
-            "assignment_label": "Assign Funded MT5" if target_stage == "funded" else "Assign Phase 2 MT5",
-            "account_size": acc.get("account_size") or acc.get("start_balance") or trader.get("account_size") or trader.get("balance") or 0,
-            "current_equity": acc.get("current_equity") or acc.get("equity") or 0,
-            "highest_equity": acc.get("highest_equity") or 0,
-            "pass_progress_percent": acc.get("pass_progress_percent") or 0,
-            "phase_pass_status": pass_status or ("phase2_passed" if phase2_passed else "phase1_passed"),
-            "account_status": status,
-            "passed_at": acc.get("passed_at") or acc.get("phase_passed_at") or acc.get("archived_at") or acc.get("updated_at"),
-            "archived_at": acc.get("archived_at") or "",
-            "source": "trader_accounts_archived_passed"
-        })
+        try:
+            status = str(acc.get("account_status") or "").strip().lower()
+            pass_status = str(acc.get("phase_pass_status") or "").strip().lower()
+            risk = str(acc.get("risk_zone") or acc.get("display_risk_zone") or "").strip().lower()
+            stage = str(acc.get("stage") or "").strip().lower()
+            if status not in {"archived_phase1", "archived_phase2"}:
+                continue
+            phase1_passed = status == "archived_phase1" and (pass_status == "phase1_passed" or risk == "passed" or stage == "phase1")
+            phase2_passed = status == "archived_phase2" and (pass_status == "phase2_passed" or risk == "passed" or stage == "phase2")
+            if not phase1_passed and not phase2_passed:
+                continue
+            account_id = str(acc.get("id") or "").strip()
+            if account_id and account_id in seen:
+                continue
+            if account_id:
+                seen.add(account_id)
+            trader_id = str(acc.get("trader_id") or "").strip()
+            trader = traders_by_id.get(trader_id) or {}
+            target_stage = "funded" if phase2_passed else "phase2"
+            rows.append({
+                "id": trader.get("id") or trader_id,
+                "trader_id": trader.get("id") or trader_id,
+                "trader_account_id": account_id,
+                "completed_account_id": account_id,
+                "name": trader.get("name") or trader.get("full_name") or acc.get("name") or "Trader",
+                "email": trader.get("email") or acc.get("email") or "",
+                "phone": trader.get("phone") or acc.get("phone") or "",
+                "account_reference": trader.get("account_reference") or acc.get("account_reference") or "",
+                "old_mt5_login": acc.get("mt5_login") or "",
+                "completed_mt5_login": acc.get("mt5_login") or "",
+                "completed_stage": "phase2" if phase2_passed else "phase1",
+                "passed_stage": "phase2" if phase2_passed else "phase1",
+                "target_phase": target_stage,
+                "target_stage": target_stage,
+                "assignment_label": "Assign Funded MT5" if target_stage == "funded" else "Assign Phase 2 MT5",
+                "account_size": acc.get("account_size") or acc.get("start_balance") or trader.get("account_size") or trader.get("balance") or 0,
+                "current_equity": acc.get("current_equity") or acc.get("equity") or 0,
+                "highest_equity": acc.get("highest_equity") or 0,
+                "pass_progress_percent": acc.get("pass_progress_percent") or 0,
+                "phase_pass_status": pass_status or ("phase2_passed" if phase2_passed else "phase1_passed"),
+                "account_status": status,
+                "passed_at": acc.get("passed_at") or acc.get("phase_passed_at") or acc.get("archived_at") or acc.get("updated_at") or "",
+                "archived_at": acc.get("archived_at") or "",
+                "source": "trader_accounts_archived_passed"
+            })
+        except Exception as row_error:
+            print("PHASE ASSIGNMENT ROW ERROR:", row_error)
+    rows.sort(key=lambda r: str(r.get("passed_at") or r.get("archived_at") or ""), reverse=True)
     return rows
 
+def _fetch_phase_assignment_queue():
+    account_rows = supabase.table("trader_accounts").select("*").in_("account_status", ["archived_phase1", "archived_phase2"]).order("updated_at", desc=True).limit(1000).execute().data or []
+    trader_ids = list({str(a.get("trader_id") or "").strip() for a in account_rows if str(a.get("trader_id") or "").strip()})
+    traders_by_id = {}
+    if trader_ids:
+        try:
+            trader_rows = supabase.table("traders").select("*").in_("id", trader_ids).limit(1000).execute().data or []
+            traders_by_id = {str(t.get("id") or ""): t for t in trader_rows}
+        except Exception as e:
+            print("PHASE QUEUE TRADER FETCH ERROR:", e)
+    return _phase_assignment_rows_from_accounts(account_rows, traders_by_id)
 
-@app.route("/phase_assignment_queue", methods=["GET"])
+@app.route("/phase_assignment_queue", methods=["GET", "OPTIONS"])
 def phase_assignment_queue():
-    """Admin source for Phase MT5 Assignment.
-
-    Shows archived passed accounts:
-    - archived_phase1 + phase1_passed => needs Phase 2 MT5
-    - archived_phase2 + phase2_passed => needs Funded MT5
-    Active accounts are deliberately excluded.
-    """
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
     try:
-        account_rows = (
-            supabase.table("trader_accounts")
-            .select("*")
-            .in_("account_status", ["archived_phase1", "archived_phase2"])
-            .order("updated_at", desc=True)
-            .limit(500)
-            .execute()
-            .data
-            or []
-        )
-
-        trader_ids = list({str(a.get("trader_id") or "").strip() for a in account_rows if str(a.get("trader_id") or "").strip()})
-        traders_by_id = {}
-        if trader_ids:
-            try:
-                trader_rows = supabase.table("traders").select("*").in_("id", trader_ids).limit(500).execute().data or []
-                traders_by_id = {str(t.get("id")): t for t in trader_rows}
-            except Exception as e:
-                print("PHASE QUEUE TRADER FETCH ERROR:", e)
-
-        queue = []
-        for acc in account_rows:
-            trader = traders_by_id.get(str(acc.get("trader_id") or "")) or {"id": acc.get("trader_id")}
-            queue.extend(_phase_assignment_rows_for_trader(trader, [_decorate_account_for_api(acc)]))
-
+        queue = _fetch_phase_assignment_queue()
         available_mt5 = []
         try:
-            available_mt5 = supabase.table("mt5_pool").select("*").eq("status", "available").order("created_at", desc=True).limit(500).execute().data or []
+            available_mt5 = supabase.table("mt5_pool").select("*").eq("status", "available").order("created_at", desc=True).limit(1000).execute().data or []
         except Exception as e:
             print("PHASE QUEUE MT5 FETCH ERROR:", e)
-
-        return ok({
+        return _np_ok({
             "success": True,
             "rows": queue,
             "assignment_queue": queue,
@@ -1753,8 +1746,7 @@ def phase_assignment_queue():
             "message": f"{len(queue)} phase assignment record(s)"
         })
     except Exception as e:
-        return bad(e, 500)
-
+        return _np_fail(e, 500)
 
 @app.route("/trader_current_account/<path:lookup>", methods=["GET"])
 def trader_current_account(lookup):
@@ -1770,30 +1762,6 @@ def trader_current_account(lookup):
             purchases += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
         active_accounts = _get_active_accounts(trader.get("id"), trader, _dedupe_by_id(purchases))
         active_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), active_accounts)
-
-        # Production source of truth:
-        # "accounts" stays backward-compatible, but admin assignment needs the
-        # FULL account ledger, including archived_phase1/archived_phase2 rows
-        # that already passed and are waiting for a fresh MT5.
-        all_accounts = []
-        try:
-            raw_all_accounts = (
-                supabase.table("trader_accounts")
-                .select("*")
-                .eq("trader_id", trader.get("id"))
-                .order("updated_at", desc=True)
-                .order("started_at", desc=True)
-                .order("created_at", desc=True)
-                .limit(200)
-                .execute()
-                .data
-                or []
-            )
-            all_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), [_decorate_account_for_api(a) for a in raw_all_accounts])
-        except Exception as all_account_error:
-            print("TRADER ALL ACCOUNTS FETCH ERROR:", all_account_error)
-            all_accounts = list(active_accounts or [])
-
         if account:
             account_id = str(account.get("id") or "").strip()
             account_login = str(account.get("mt5_login") or "").strip()
@@ -1810,13 +1778,21 @@ def trader_current_account(lookup):
                         break
             if enriched_current:
                 account = enriched_current
+        all_accounts = []
+        try:
+            raw_all_accounts = supabase.table("trader_accounts").select("*").eq("trader_id", trader.get("id")).order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(200).execute().data or []
+            all_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), [_decorate_account_for_api(a) for a in raw_all_accounts])
+        except Exception as all_account_error:
+            print("TRADER ALL ACCOUNTS FETCH ERROR:", all_account_error)
+            all_accounts = list(active_accounts or [])
+        assignment_queue = _phase_assignment_rows_from_accounts(all_accounts, {str(trader.get("id")): trader})
         return ok({
             "trader": trader,
             "current_account": account,
             "active_accounts": active_accounts,
             "accounts": active_accounts,
             "all_accounts": all_accounts,
-            "assignment_queue": _phase_assignment_rows_for_trader(trader, all_accounts),
+            "assignment_queue": assignment_queue,
             "challenge_state": trader.get("challenge_state") or "registered"
         })
     except Exception as e:
