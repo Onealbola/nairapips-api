@@ -1748,6 +1748,108 @@ def phase_assignment_queue():
     except Exception as e:
         return _np_fail(e, 500)
 
+
+# ================================
+# NAIRAPIPS ADMIN BOOTSTRAP FEED
+# Single instant admin payload: prevents the admin UI from making 18+ slow calls.
+# ================================
+def _admin_table_rows(table, order_col="created_at", desc=True, limit=2000):
+    try:
+        q = supabase.table(table).select("*")
+        if order_col:
+            try:
+                q = q.order(order_col, desc=desc)
+            except Exception:
+                pass
+        return q.limit(limit).execute().data or []
+    except Exception as e:
+        print(f"ADMIN BOOTSTRAP TABLE ERROR {table}:", e)
+        return []
+
+
+def _admin_object_setting(route_name, table_name=None):
+    # Prefer table fetch for settings, but never allow settings to break the admin bootstrap.
+    if not table_name:
+        return {}
+    try:
+        rows = supabase.table(table_name).select("*").limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print(f"ADMIN BOOTSTRAP OBJECT ERROR {route_name}:", e)
+        return {}
+
+
+@app.route("/admin_bootstrap", methods=["GET", "OPTIONS"])
+def admin_bootstrap():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    started = time.time()
+    try:
+        traders_rows = _admin_table_rows("traders", "created_at", True, 3000)
+        payout_rows = _admin_table_rows("payouts", "created_at", True, 2000)
+        ticket_rows = _admin_table_rows("support_tickets", "created_at", True, 2000)
+        announcement_rows = _admin_table_rows("announcements", "created_at", True, 1000)
+        plan_rows = _admin_table_rows("challenge_plans", "created_at", True, 1000)
+        purchase_rows = _admin_table_rows("challenge_purchases", "created_at", True, 3000)
+        mt5_rows = _admin_table_rows("mt5_pool", "created_at", True, 3000)
+        trade_rows = _admin_table_rows("trader_trades", "created_at", True, 3000)
+        snapshot_rows = _admin_table_rows("monitoring_snapshots", "created_at", True, 3000)
+        event_rows = _admin_table_rows("monitoring_events", "created_at", True, 3000)
+        deleted_rows = _admin_table_rows("marketing_deleted_contacts", "created_at", True, 2000)
+        staff_rows = _admin_table_rows("staff_members", "created_at", True, 1000)
+        audit_rows = _admin_table_rows("audit_logs", "created_at", True, 1000)
+        affiliate_partner_rows = _admin_table_rows("affiliate_partners", "created_at", True, 1000)
+        affiliate_code_rows = _admin_table_rows("affiliate_codes", "created_at", True, 1000)
+        affiliate_commission_rows = _admin_table_rows("affiliate_commissions", "created_at", True, 2000)
+        phase_queue_rows = _fetch_phase_assignment_queue()
+        available_mt5_rows = [m for m in mt5_rows if str(m.get("status") or "available").strip().lower() == "available"]
+
+        payload = {
+            "success": True,
+            "source": "admin_bootstrap",
+            "generated_at": now_iso(),
+            "duration_ms": int((time.time() - started) * 1000),
+            "traders": traders_rows,
+            "payouts": payout_rows,
+            "tickets": ticket_rows,
+            "support_tickets": ticket_rows,
+            "announcements": announcement_rows,
+            "plans": plan_rows,
+            "challenge_plans": plan_rows,
+            "purchases": purchase_rows,
+            "challenge_purchases": purchase_rows,
+            "mt5_pool": mt5_rows,
+            "available_mt5": available_mt5_rows,
+            "trader_trades": trade_rows,
+            "trades": trade_rows,
+            "monitoring_snapshots": snapshot_rows,
+            "snapshots": snapshot_rows,
+            "monitoring_events": event_rows,
+            "events": event_rows,
+            "marketing_deleted_contacts": deleted_rows,
+            "staff_members": staff_rows,
+            "audit_logs": audit_rows,
+            "affiliate_partners": affiliate_partner_rows,
+            "affiliate_codes": affiliate_code_rows,
+            "affiliate_commissions": affiliate_commission_rows,
+            "affiliate_summary": {},
+            "referral_settings": {},
+            "business_settings": {},
+            "phase_assignment_queue": phase_queue_rows,
+            "assignment_queue": phase_queue_rows,
+            "counts": {
+                "traders": len(traders_rows),
+                "plans": len(plan_rows),
+                "purchases": len(purchase_rows),
+                "mt5_pool": len(mt5_rows),
+                "available_mt5": len(available_mt5_rows),
+                "phase_assignment_queue": len(phase_queue_rows),
+            }
+        }
+        return _np_ok(payload)
+    except Exception as e:
+        return _np_fail(e, 500)
+
 @app.route("/trader_current_account/<path:lookup>", methods=["GET"])
 def trader_current_account(lookup):
     try:
