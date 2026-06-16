@@ -5516,7 +5516,29 @@ def reset_referral_settings():
     return jsonify({'success': True, 'data': default})
 
 # ===== NAIRAPIPS STAFF RBAC ROUTES =====
-# Paste above: if __name__ == "__main__":
+# Paste above: 
+
+# ===== COMPATIBILITY ROUTES FOR ADMIN FRONTEND =====
+# Some admin.html versions still call /admin_feed while newer versions call /admin_bootstrap.
+# Keep both routes returning the same payload so old/new admin files do not collapse.
+@app.route("/admin_feed", methods=["GET", "OPTIONS"])
+def admin_feed():
+    if request.method == "OPTIONS":
+        return ok({})
+    return admin_bootstrap()
+
+@app.route("/routes", methods=["GET"])
+def list_routes():
+    try:
+        routes = []
+        for rule in app.url_map.iter_rules():
+            routes.append({"route": str(rule), "endpoint": rule.endpoint, "methods": sorted([m for m in rule.methods if m not in ("HEAD", "OPTIONS")])})
+        return ok({"routes": sorted(routes, key=lambda r: r["route"]), "version": "admin-bootstrap-feed-alias"})
+    except Exception as e:
+        return bad(str(e), 500)
+
+
+if __name__ == "__main__":
 
 @app.get('/staff_members')
 def staff_members():
@@ -6093,7 +6115,29 @@ def delete_challenge_purchase_protected():
         return bad(e)
 
 # ===== NAIRAPIPS PAYMENT ACCOUNTS ROUTES =====
-# Paste above: if __name__ == "__main__":
+# Paste above: 
+
+# ===== COMPATIBILITY ROUTES FOR ADMIN FRONTEND =====
+# Some admin.html versions still call /admin_feed while newer versions call /admin_bootstrap.
+# Keep both routes returning the same payload so old/new admin files do not collapse.
+@app.route("/admin_feed", methods=["GET", "OPTIONS"])
+def admin_feed():
+    if request.method == "OPTIONS":
+        return ok({})
+    return admin_bootstrap()
+
+@app.route("/routes", methods=["GET"])
+def list_routes():
+    try:
+        routes = []
+        for rule in app.url_map.iter_rules():
+            routes.append({"route": str(rule), "endpoint": rule.endpoint, "methods": sorted([m for m in rule.methods if m not in ("HEAD", "OPTIONS")])})
+        return ok({"routes": sorted(routes, key=lambda r: r["route"]), "version": "admin-bootstrap-feed-alias"})
+    except Exception as e:
+        return bad(str(e), 500)
+
+
+if __name__ == "__main__":
 
 @app.get('/payment_accounts')
 def payment_accounts():
@@ -7066,6 +7110,28 @@ def account_intelligence_alerts():
         return jsonify({"success": True, "data": rows})
     except Exception as e:
         return bad(e, 500)
+
+
+
+
+# ===== COMPATIBILITY ROUTES FOR ADMIN FRONTEND =====
+# Some admin.html versions still call /admin_feed while newer versions call /admin_bootstrap.
+# Keep both routes returning the same payload so old/new admin files do not collapse.
+@app.route("/admin_feed", methods=["GET", "OPTIONS"])
+def admin_feed():
+    if request.method == "OPTIONS":
+        return ok({})
+    return admin_bootstrap()
+
+@app.route("/routes", methods=["GET"])
+def list_routes():
+    try:
+        routes = []
+        for rule in app.url_map.iter_rules():
+            routes.append({"route": str(rule), "endpoint": rule.endpoint, "methods": sorted([m for m in rule.methods if m not in ("HEAD", "OPTIONS")])})
+        return ok({"routes": sorted(routes, key=lambda r: r["route"]), "version": "admin-bootstrap-feed-alias"})
+    except Exception as e:
+        return bad(str(e), 500)
 
 
 if __name__ == "__main__":
