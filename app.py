@@ -4561,6 +4561,220 @@ def resend_phase_pass_email():
         return bad(e, 500)
 
 
+# ================================
+# NAIRAPIPS MT5 ENGINE BRIDGE ENDPOINTS
+# Production-safe add-on: lets the MT5 engine talk to the stable main API
+# without touching admin/dashboard logic or existing business routes.
+# ================================
+
+def _np_bridge_clean(v):
+    return str(v or "").strip()
+
+def _np_bridge_lower(v):
+    return _np_bridge_clean(v).lower()
+
+def _np_bridge_num(v, default=0):
+    try:
+        if v is None or v == "":
+            return default
+        return float(str(v).replace("₦", "").replace(",", "").replace("%", "").strip())
+    except Exception:
+        return default
+
+def _np_bridge_valid_login(v):
+    value = _np_bridge_clean(v)
+    return bool(value and value.isdigit())
+
+def _np_bridge_stage(row):
+    phase = _np_bridge_lower(row.get("phase"))
+    status = _np_bridge_lower(row.get("status"))
+    if "funded" in phase or status in {"funded", "live"}:
+        return "funded"
+    if "phase2" in phase or "phase_2" in phase or "phase 2" in phase:
+        return "phase2"
+    return "phase1"
+
+def _np_bridge_monitorable(row):
+    login = _np_bridge_clean(row.get("mt5_login"))
+    server = _np_bridge_clean(row.get("mt5_server") or row.get("server"))
+    if not _np_bridge_valid_login(login) or not server:
+        return False
+
+    status = _np_bridge_lower(row.get("status"))
+    phase = _np_bridge_lower(row.get("phase"))
+    payment = _np_bridge_lower(row.get("payment_status"))
+
+    if status in {"breached", "locked", "profit_protected"} or phase in {"breached", "locked", "profit_protected"}:
+        return True
+    if payment == "approved" and (status in {"active", "funded", "live", "target_hit"} or phase in {"phase1", "phase2", "funded", "live"}):
+        return True
+    if _is_truthy(row.get("monitoring_enabled")):
+        return True
+    return False
+
+def _np_bridge_latest_snapshot(login="", trader_id=""):
+    try:
+        query = supabase.table("monitoring_snapshots").select("*")
+        if trader_id:
+            query = query.eq("trader_id", trader_id)
+        elif login:
+            query = query.eq("mt5_login", str(login))
+        else:
+            return {}
+        rows = query.order("created_at", desc=True).limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print("MT5 BRIDGE SNAPSHOT SKIPPED:", e)
+        return {}
+
+def _np_bridge_latest_event(login="", trader_id=""):
+    try:
+        query = supabase.table("monitoring_events").select("*")
+        if trader_id:
+            query = query.eq("trader_id", trader_id)
+        elif login:
+            query = query.eq("mt5_login", str(login))
+        else:
+            return {}
+        rows = query.order("created_at", desc=True).limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print("MT5 BRIDGE EVENT SKIPPED:", e)
+        return {}
+
+def _np_bridge_account_from_trader(row):
+    """Create the account-level object the dashboard and MT5 engine expect.
+    This works with the restored 08/06 production schema where the live account
+    still sits on the traders row, and enriches it with latest monitoring when available.
+    """
+    if not row:
+        return {}
+    login = _np_bridge_clean(row.get("mt5_login"))
+    trader_id = row.get("id")
+    snap = _np_bridge_latest_snapshot(login, trader_id)
+    event = _np_bridge_latest_event(login, trader_id)
+
+    account_size = _np_bridge_num(row.get("account_size") or row.get("balance") or snap.get("balance"), 0)
+    equity = _np_bridge_num(snap.get("equity") if snap else row.get("equity"), _np_bridge_num(row.get("equity") or row.get("balance") or account_size, account_size))
+    balance = _np_bridge_num(snap.get("balance") if snap else row.get("balance"), _np_bridge_num(row.get("balance") or account_size, account_size))
+    highest = _np_bridge_num(snap.get("highest_equity") or row.get("highest_equity") or row.get("peak_equity"), max(equity, account_size))
+    lowest = _np_bridge_num(snap.get("lowest_equity") or row.get("lowest_equity"), equity or account_size)
+    drawdown = _np_bridge_num(snap.get("drawdown_percent") or snap.get("actual_drawdown_percent") or row.get("drawdown_percent"), 0)
+    dd_used = _np_bridge_num(snap.get("dd_used_percent") or snap.get("max_drawdown_used") or row.get("max_drawdown_used"), drawdown * 5)
+    stage = _np_bridge_stage(row)
+    target = 10 if stage == "phase1" else (8 if stage == "phase2" else None)
+
+    return {
+        "id": row.get("current_account_id") or row.get("trader_account_id") or f"legacy:{row.get('id')}:{login}",
+        "trader_id": row.get("id"),
+        "trader_account_id": row.get("current_account_id") or row.get("trader_account_id") or None,
+        "current_account_id": row.get("current_account_id") or row.get("trader_account_id") or None,
+        "account_status": "assigned_active" if _np_bridge_lower(row.get("status")) not in {"breached", "locked", "profit_protected"} else _np_bridge_lower(row.get("status")),
+        "stage": stage,
+        "phase": stage,
+        "mt5_login": login,
+        "mt5_server": row.get("mt5_server") or row.get("server") or "",
+        "mt5_master_password": row.get("mt5_master_password") or row.get("mt5_password") or row.get("master_password") or "",
+        "mt5_password": row.get("mt5_password") or row.get("mt5_master_password") or row.get("master_password") or "",
+        "master_password": row.get("master_password") or row.get("mt5_master_password") or row.get("mt5_password") or "",
+        "mt5_investor_password": row.get("mt5_investor_password") or row.get("investor_password") or "",
+        "investor_password": row.get("investor_password") or row.get("mt5_investor_password") or "",
+        "account_size": account_size,
+        "start_balance": account_size,
+        "current_balance": balance,
+        "current_equity": equity,
+        "equity": equity,
+        "profit": _np_bridge_num(snap.get("profit") or row.get("profit"), max(0, highest - account_size) if account_size else 0),
+        "profit_percent": _np_bridge_num(snap.get("profit_percent") or row.get("profit_percent"), ((highest - account_size) / account_size * 100) if account_size else 0),
+        "current_profit": _np_bridge_num(snap.get("current_profit"), equity - account_size if account_size else 0),
+        "current_profit_percent": _np_bridge_num(snap.get("current_profit_percent"), ((equity - account_size) / account_size * 100) if account_size else 0),
+        "highest_equity": highest,
+        "lowest_equity": lowest,
+        "absolute_drawdown_percent": drawdown,
+        "drawdown_percent": drawdown,
+        "dd_used_percent": dd_used,
+        "max_drawdown_used": dd_used,
+        "dd_limit_percent": 20,
+        "target_percent": target,
+        "profit_target": target,
+        "phase_pass_status": snap.get("phase_pass_status") or row.get("phase_pass_status") or "",
+        "risk_zone": snap.get("zone") or snap.get("risk_zone") or row.get("risk_zone") or "safe",
+        "display_risk_zone": snap.get("zone") or snap.get("risk_zone") or row.get("risk_zone") or "safe",
+        "latest_monitoring_snapshot": snap,
+        "latest_monitoring_event": event,
+        "started_at": row.get("challenge_started_at") or row.get("approved_at") or row.get("created_at"),
+        "assigned_at": row.get("assigned_at") or row.get("mt5_updated_at") or row.get("approved_at") or row.get("created_at"),
+        "display_assigned_at": row.get("assigned_at") or row.get("mt5_updated_at") or row.get("approved_at") or row.get("created_at"),
+        "updated_at": snap.get("created_at") or snap.get("timestamp") or row.get("updated_at"),
+        "_source_of_truth": "monitoring_api",
+    }
+
+@app.route("/monitorable_accounts", methods=["GET"])
+def monitorable_accounts():
+    try:
+        rows = supabase.table("traders").select("*").execute().data or []
+        rows = _dedupe_traders(rows)
+        accounts = []
+        for row in rows:
+            if _np_bridge_monitorable(row):
+                acc = _np_bridge_account_from_trader(row)
+                merged = dict(row)
+                merged.update(acc)
+                merged["id"] = row.get("id")
+                merged["trader_id"] = row.get("id")
+                merged["current_account"] = acc
+                merged["active_accounts"] = [acc]
+                merged["source_of_truth"] = "legacy_traders_row_with_mt5_bridge"
+                merged["_source_of_truth"] = "monitoring_api"
+                accounts.append(merged)
+        return jsonify({
+            "success": True,
+            "source": "main_api_mt5_bridge",
+            "count": len(accounts),
+            "data": accounts,
+            "accounts": accounts,
+            "sample": accounts[:20],
+        })
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/trader_current_account/<path:lookup>", methods=["GET"])
+@app.route("/current_account/<path:lookup>", methods=["GET"])
+def trader_current_account_bridge(lookup):
+    try:
+        trader = _latest_trader_for_lookup(lookup)
+        if not trader:
+            return bad("Trader not found", 404)
+        account = _np_bridge_account_from_trader(trader) if _np_bridge_valid_login(trader.get("mt5_login")) else {}
+        active_accounts = [account] if account and account.get("mt5_login") else []
+        history = []
+        try:
+            history = _account_history_for_trader(trader.get("id"), trader.get("email"), trader.get("phone")) if "_account_history_for_trader" in globals() else []
+        except Exception:
+            history = []
+        return jsonify({
+            "success": True,
+            "source": "main_api_mt5_bridge",
+            "source_of_truth": "legacy_traders_row_with_archive_history",
+            "data": {
+                "trader": trader,
+                "current_account": account,
+                "account": account,
+                "active_accounts": active_accounts,
+                "accounts": active_accounts,
+                "account_history": history,
+            },
+            "trader": trader,
+            "current_account": account,
+            "account": account,
+            "active_accounts": active_accounts,
+            "accounts": active_accounts,
+            "account_history": history,
+        })
+    except Exception as e:
+        return bad(e, 500)
+
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
