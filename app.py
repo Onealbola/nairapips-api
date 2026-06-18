@@ -5506,6 +5506,206 @@ def np_reconcile_business_flow():
         return bad(e, 500)
 
 
+
+# ============================================================
+# NAIRAPIPS FINAL BUSINESS GRAPH API - production-safe additive route
+# Does not delete any existing route. Admin can use this even if /admin_bootstrap is partial.
+# ============================================================
+def _np_final_rows(table, order_col=None, desc=True, limit=None):
+    try:
+        q = supabase.table(table).select("*")
+        if order_col:
+            try:
+                q = q.order(order_col, desc=desc)
+            except Exception:
+                pass
+        if limit:
+            q = q.limit(limit)
+        return getattr(q.execute(), "data", []) or []
+    except Exception as e:
+        print("NP FINAL ROWS ERROR", table, str(e))
+        return []
+
+def _np_final_clean(v):
+    return str(v or "").strip().lower()
+
+def _np_final_digits(v):
+    return re.sub(r"\D", "", str(v or "")) if "re" in globals() else "".join(ch for ch in str(v or "") if ch.isdigit())
+
+def _np_final_keys(row):
+    row = row or {}
+    keys = []
+    tid = _np_final_clean(row.get("trader_id") or row.get("id"))
+    if tid: keys.append("id:" + tid)
+    email = _np_final_clean(row.get("email"))
+    if email: keys.append("email:" + email)
+    phone = _np_final_digits(row.get("phone"))
+    if phone: keys.append("phone:" + phone)
+    login = str(row.get("mt5_login") or "").strip()
+    if login: keys.append("mt5:" + login)
+    return keys
+
+def _np_final_time(row):
+    for k in ["updated_at","assigned_at","approved_at","created_at","mt5_updated_at","started_at","challenge_started_at"]:
+        try:
+            v = (row or {}).get(k)
+            if v:
+                return int(datetime.fromisoformat(str(v).replace("Z","+00:00")).timestamp())
+        except Exception:
+            pass
+    return 0
+
+def _np_final_latest(rows):
+    rows = list(rows or [])
+    rows.sort(key=_np_final_time, reverse=True)
+    return rows[0] if rows else None
+
+def _np_final_match(a,b):
+    A=set(_np_final_keys(a));
+    return any(k in A for k in _np_final_keys(b))
+
+def _np_final_account_active(a):
+    s = _np_final_clean((a or {}).get("account_status") or (a or {}).get("status"))
+    st = _np_final_clean((a or {}).get("stage") or (a or {}).get("phase"))
+    if any(x in s for x in ["breached","archived","disabled","locked","passed","profit_protected"]):
+        return False
+    return bool(str((a or {}).get("mt5_login") or "").strip()) and ("active" in s or "assigned" in s or s in {"funded","live"} or st in {"phase1","phase2","funded","live"})
+
+def _np_final_current_account(t, accounts):
+    cid = str((t or {}).get("current_account_id") or (t or {}).get("trader_account_id") or "").strip()
+    matches = [a for a in accounts if (cid and str(a.get("id") or "").strip() == cid) or _np_final_match(t,a)]
+    active = [a for a in matches if _np_final_account_active(a)]
+    return _np_final_latest(active) or _np_final_latest(matches)
+
+def _np_final_purchase_for(t, purchases):
+    return _np_final_latest([p for p in purchases if _np_final_match(t,p)])
+
+def _np_final_virtual_from_purchase(p):
+    return {
+        "id": "purchase:" + str(p.get("id") or ""),
+        "trader_id": p.get("trader_id") or "",
+        "name": p.get("trader_name") or p.get("name") or p.get("full_name") or "Pending Trader",
+        "full_name": p.get("trader_name") or p.get("name") or p.get("full_name") or "Pending Trader",
+        "email": p.get("email") or "",
+        "phone": p.get("phone") or "",
+        "account_reference": p.get("account_reference") or p.get("reference") or ("PURCHASE-" + str(p.get("id") or "")[:8]),
+        "selected_plan": p.get("plan_name") or p.get("selected_plan") or "",
+        "plan_name": p.get("plan_name") or p.get("selected_plan") or "",
+        "account_size": p.get("account_size") or 0,
+        "balance": p.get("account_size") or 0,
+        "equity": p.get("account_size") or 0,
+        "payment_status": p.get("payment_status") or "pending",
+        "purchase_payment_status": p.get("payment_status") or "pending",
+        "status": "approved_waiting_mt5" if "approved" in _np_final_clean(str(p.get("payment_status")) + " " + str(p.get("status"))) else "pending_review",
+        "phase": "phase1_pending_payment",
+        "mt5_login": p.get("mt5_login") or "",
+        "mt5_server": p.get("mt5_server") or "",
+        "purchase_id": p.get("id"),
+        "latest_purchase": p,
+        "created_at": p.get("created_at") or p.get("paid_at") or p.get("updated_at"),
+        "payment_proof_url": p.get("payment_proof_url") or p.get("proof_url") or "",
+        "__virtual_purchase_only": True,
+    }
+
+def _np_final_merge_trader(t, purchases, accounts):
+    out = dict(t or {})
+    p = _np_final_purchase_for(out, purchases)
+    a = _np_final_current_account(out, accounts)
+    if p:
+        out["latest_purchase"] = p
+        out["purchase_id"] = out.get("purchase_id") or p.get("id")
+        out["purchase_status"] = p.get("status")
+        out["purchase_payment_status"] = p.get("payment_status")
+        out["selected_plan"] = out.get("selected_plan") or p.get("plan_name") or p.get("selected_plan") or ""
+        out["plan_name"] = out.get("plan_name") or p.get("plan_name") or ""
+        out["account_size"] = out.get("account_size") or p.get("account_size") or out.get("balance") or 0
+        out["payment_proof_url"] = out.get("payment_proof_url") or p.get("payment_proof_url") or ""
+        ps = _np_final_clean(str(p.get("payment_status")) + " " + str(p.get("status")))
+        if "pending" in ps or "review" in ps:
+            out["payment_status"] = "pending_review"
+            if not str(out.get("mt5_login") or "").strip():
+                out["status"] = "pending_review"
+                out["phase"] = out.get("phase") or "phase1_pending_payment"
+        if "approved" in ps or "paid" in ps:
+            out["payment_status"] = "approved"
+            if not str(out.get("mt5_login") or "").strip():
+                out["status"] = out.get("status") if out.get("status") not in [None,"","new_signup","no_account"] else "approved_waiting_mt5"
+                out["phase"] = out.get("phase") if out.get("phase") not in [None,"","none"] else "phase1"
+    if a:
+        out["current_account"] = a
+        out["__current_account"] = a
+        out["current_account_id"] = a.get("id") or out.get("current_account_id")
+        out["trader_account_id"] = a.get("id") or out.get("trader_account_id")
+        for k in ["mt5_login","mt5_server","mt5_master_password","mt5_password","master_password","mt5_investor_password","investor_password","account_size","balance","equity","profit","profit_percent","drawdown_percent","risk_zone","current_balance","current_equity","highest_equity","lowest_equity","dd_used_percent"]:
+            if a.get(k) not in [None,""]:
+                out[k] = a.get(k)
+        out["phase"] = a.get("stage") or a.get("phase") or out.get("phase") or "phase1"
+        out["stage"] = out.get("phase")
+        out["status"] = a.get("account_status") or a.get("status") or out.get("status") or "active"
+        out["payment_status"] = "approved"
+    return out
+
+def _np_final_business_graph():
+    traders = _np_final_rows("traders", "created_at", True)
+    purchases = _np_final_rows("challenge_purchases", "created_at", True)
+    accounts = _np_final_rows("trader_accounts", "updated_at", True)
+    if not accounts:
+        accounts = _np_final_rows("trader_accounts", "created_at", True)
+    mt5 = _np_final_rows("mt5_pool", "created_at", True)
+    merged=[]; used=set()
+    for t in traders:
+        m=_np_final_merge_trader(t,purchases,accounts)
+        if m.get("latest_purchase",{}).get("id"): used.add(str(m["latest_purchase"]["id"]))
+        merged.append(m)
+    for p in purchases:
+        if str(p.get("id") or "") in used: continue
+        if any(_np_final_match(t,p) for t in merged): continue
+        merged.append(_np_final_merge_trader(_np_final_virtual_from_purchase(p), purchases, accounts))
+    for a in accounts:
+        if any(_np_final_match(t,a) for t in merged): continue
+        base={"id":"account:"+str(a.get("id") or ""),"trader_id":a.get("trader_id") or "","name":a.get("trader_name") or a.get("name") or "MT5 Trader","email":a.get("email") or "","phone":a.get("phone") or "","account_reference":a.get("account_reference") or a.get("id"),"status":a.get("account_status") or a.get("status"),"phase":a.get("stage") or a.get("phase"),"mt5_login":a.get("mt5_login"),"mt5_server":a.get("mt5_server"),"account_size":a.get("account_size") or a.get("balance")}
+        merged.append(_np_final_merge_trader(base,purchases,accounts))
+    assignment=[]
+    try:
+        if "_phase_assignment_queue_rows" in globals():
+            assignment = _phase_assignment_queue_rows() or []
+    except Exception as e:
+        print("NP FINAL PHASE QUEUE SKIP", e)
+    if not assignment:
+        assignment=[t for t in merged if any(x in _np_final_clean(str(t.get("status"))+" "+str(t.get("phase"))+" "+str(t.get("phase_pass_status"))+" "+str(t.get("admin_note"))) for x in ["phase2_waiting","funded_waiting","passed"])]
+    return {
+        "success": True,
+        "source_of_truth": "np_final_business_graph_v2",
+        "generated_at": now_iso() if "now_iso" in globals() else datetime.now(timezone.utc).isoformat(),
+        "traders": merged,
+        "business_traders": merged,
+        "challenge_purchases": purchases,
+        "purchases": purchases,
+        "trader_accounts": accounts,
+        "accounts": accounts,
+        "mt5_pool": mt5,
+        "mt5pool": mt5,
+        "phase_assignment_queue": assignment,
+        "assignment_queue": assignment,
+        "payouts": _np_final_rows("payouts", "created_at", True),
+        "support_tickets": _np_final_rows("support_tickets", "created_at", True),
+        "tickets": _np_final_rows("support_tickets", "created_at", True),
+        "announcements": _np_final_rows("announcements", "created_at", True),
+        "challenge_plans": _np_final_rows("challenge_plans", "account_size", False),
+        "plans": _np_final_rows("challenge_plans", "account_size", False),
+        "trader_trades": _np_final_rows("trader_trades", "synced_at", True, 2000),
+        "monitoring_snapshots": _np_final_rows("monitoring_snapshots", "created_at", True, 2000),
+        "monitoring_events": _np_final_rows("monitoring_events", "created_at", True, 2000),
+        "summary": {"traders":len(merged),"raw_traders":len(traders),"purchases":len(purchases),"trader_accounts":len(accounts),"mt5_pool":len(mt5),"assignment_queue":len(assignment)}
+    }
+
+@app.route("/np_final_business_graph", methods=["GET"])
+def np_final_business_graph_route():
+    try:
+        return jsonify(_np_final_business_graph())
+    except Exception as e:
+        return bad(e, 500)
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
