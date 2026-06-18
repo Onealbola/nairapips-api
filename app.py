@@ -5391,18 +5391,9 @@ def _np_build_business_snapshot():
             pp["current_account_id"] = pp.get("current_account_id") or cur.get("id")
         enriched_purchases.append(pp)
 
-    # Use backend queue if present; otherwise derive from rows with waiting states.
-    assignment_queue = []
-    try:
-        if "_phase_assignment_queue_rows" in globals():
-            assignment_queue = _phase_assignment_queue_rows()
-    except Exception as e:
-        print("NP BUSINESS ASSIGNMENT QUEUE SKIP:", e)
-    if not assignment_queue:
-        for t in output:
-            s = _np_status(t.get("status")); ph = _np_status(t.get("phase")); note = _np_status(t.get("admin_note"))
-            if "phase2_waiting" in s or "funded_waiting" in s or "passed" in s or "passed" in ph or "passed" in note:
-                assignment_queue.append(t)
+    # Derive fresh-assignment queue from the unified current business rows only.
+    # Do not trust stale legacy assignment queues; they can keep already-funded accounts visible.
+    assignment_queue = [t for t in output if _np_final_needs_phase_assignment(t)]
 
     return {
         "success": True,
@@ -5645,6 +5636,36 @@ def _np_final_merge_trader(t, purchases, accounts):
         out["payment_status"] = "approved"
     return out
 
+
+
+def _np_final_norm_status(row):
+    return _np_final_clean(str((row or {}).get("status") or "") + " " + str((row or {}).get("account_status") or "") + " " + str((row or {}).get("phase") or "") + " " + str((row or {}).get("stage") or "") + " " + str((row or {}).get("phase_pass_status") or "") + " " + str((row or {}).get("pass_status") or "") + " " + str((row or {}).get("admin_note") or ""))
+
+def _np_final_has_login(row):
+    return bool(str((row or {}).get("mt5_login") or (row or {}).get("login") or (row or {}).get("account_login") or "").strip())
+
+def _np_final_is_terminal_or_archived(row):
+    text = _np_final_norm_status(row)
+    return any(x in text for x in ["breached", "archived", "disabled", "locked", "profit_protected"])
+
+def _np_final_is_current_funded_live(row):
+    text = _np_final_norm_status(row).replace("_", "").replace("-", "").replace(" ", "")
+    return _np_final_has_login(row) and any(x in text for x in ["fundedactive", "liveactive", "funded", "live"])
+
+def _np_final_needs_phase_assignment(row):
+    if not row or _np_final_is_terminal_or_archived(row):
+        return False
+    text = _np_final_norm_status(row).replace("_", "").replace("-", "").replace(" ", "")
+    # A real current funded/live account with MT5 must never remain in the fresh-assignment queue.
+    if _np_final_is_current_funded_live(row):
+        return False
+    if any(x in text for x in ["phase2waiting", "awaitingphase2", "phase1passed", "fundedwaiting", "awaitingfunded", "phase2passed"]):
+        return True
+    # Phase2 without a usable current MT5 also needs fresh assignment.
+    if "phase2" in text and not _np_final_has_login(row):
+        return True
+    return False
+
 def _np_final_business_graph():
     traders = _np_final_rows("traders", "created_at", True)
     purchases = _np_final_rows("challenge_purchases", "created_at", True)
@@ -5665,14 +5686,8 @@ def _np_final_business_graph():
         if any(_np_final_match(t,a) for t in merged): continue
         base={"id":"account:"+str(a.get("id") or ""),"trader_id":a.get("trader_id") or "","name":a.get("trader_name") or a.get("name") or "MT5 Trader","email":a.get("email") or "","phone":a.get("phone") or "","account_reference":a.get("account_reference") or a.get("id"),"status":a.get("account_status") or a.get("status"),"phase":a.get("stage") or a.get("phase"),"mt5_login":a.get("mt5_login"),"mt5_server":a.get("mt5_server"),"account_size":a.get("account_size") or a.get("balance")}
         merged.append(_np_final_merge_trader(base,purchases,accounts))
-    assignment=[]
-    try:
-        if "_phase_assignment_queue_rows" in globals():
-            assignment = _phase_assignment_queue_rows() or []
-    except Exception as e:
-        print("NP FINAL PHASE QUEUE SKIP", e)
-    if not assignment:
-        assignment=[t for t in merged if any(x in _np_final_clean(str(t.get("status"))+" "+str(t.get("phase"))+" "+str(t.get("phase_pass_status"))+" "+str(t.get("admin_note"))) for x in ["phase2_waiting","funded_waiting","passed"])]
+    # Final source-of-truth assignment queue: only accounts that truly need a fresh next-stage MT5.
+    assignment=[t for t in merged if _np_final_needs_phase_assignment(t)]
     return {
         "success": True,
         "source_of_truth": "np_final_business_graph_v2",
