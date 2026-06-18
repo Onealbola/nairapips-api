@@ -5056,6 +5056,89 @@ def trader_current_account_bridge(lookup):
         return bad(e, 500)
 
 
+# ================================
+# NAIRAPIPS ADMIN SINGLE SOURCE BOOTSTRAP
+# Keeps admin modules fed from the same live backend snapshot instead of
+# mixing stale browser cache, sales-range filtered rows, and separate endpoints.
+# ================================
+@app.route("/admin_bootstrap", methods=["GET"])
+def admin_bootstrap():
+    try:
+        def rows(table, order_col="created_at", desc=True, limit=None):
+            try:
+                q = supabase.table(table).select("*")
+                if order_col:
+                    try:
+                        q = q.order(order_col, desc=desc)
+                    except Exception:
+                        pass
+                if limit:
+                    q = q.limit(limit)
+                return getattr(q.execute(), "data", []) or []
+            except Exception as e:
+                print(f"ADMIN BOOTSTRAP SKIP {table}:", e)
+                return []
+
+        def obj_safe(fn, default):
+            try:
+                return fn()
+            except Exception as e:
+                print("ADMIN BOOTSTRAP OBJECT SKIP:", e)
+                return default
+
+        traders_rows = rows("traders", "created_at", True)
+        purchases_rows = rows("challenge_purchases", "created_at", True)
+        mt5_rows = rows("mt5_pool", "created_at", True)
+        trader_accounts_rows = rows("trader_accounts", "updated_at", True)
+
+        assignment_queue = []
+        try:
+            # Reuse existing backend queue if present; otherwise keep empty.
+            # This avoids duplicating phase logic in the bootstrap route.
+            if "_phase_assignment_queue_rows" in globals():
+                assignment_queue = _phase_assignment_queue_rows()
+        except Exception as e:
+            print("ADMIN BOOTSTRAP ASSIGNMENT QUEUE SKIP:", e)
+            assignment_queue = []
+
+        payload = {
+            "success": True,
+            "source_of_truth": "admin_bootstrap_live_supabase_snapshot",
+            "generated_at": now_iso() if "now_iso" in globals() else datetime.now(timezone.utc).isoformat(),
+            "traders": _dedupe_traders(traders_rows) if "_dedupe_traders" in globals() else traders_rows,
+            "challenge_purchases": purchases_rows,
+            "purchases": purchases_rows,
+            "mt5_pool": mt5_rows,
+            "mt5pool": mt5_rows,
+            "trader_accounts": trader_accounts_rows,
+            "assignment_queue": assignment_queue,
+            "phase_assignment_queue": assignment_queue,
+            "payouts": rows("payouts", "created_at", True),
+            "support_tickets": rows("support_tickets", "created_at", True),
+            "tickets": rows("support_tickets", "created_at", True),
+            "announcements": rows("announcements", "created_at", True),
+            "challenge_plans": rows("challenge_plans", "created_at", True),
+            "plans": rows("challenge_plans", "created_at", True),
+            "trader_trades": rows("trader_trades", "synced_at", True, 2000),
+            "monitoring_snapshots": rows("monitoring_snapshots", "created_at", True, 2000),
+            "monitoring_events": rows("monitoring_events", "created_at", True, 2000),
+            "staff_members": rows("staff_members", "created_at", True),
+            "audit_logs": rows("audit_logs", "created_at", True, 500),
+            "affiliate_partners": rows("affiliate_partners", "created_at", True),
+            "affiliate_codes": rows("affiliate_codes", "created_at", True),
+            "affiliate_commissions": rows("affiliate_commissions", "created_at", True),
+            "summary": {
+                "traders": len(traders_rows),
+                "purchases": len(purchases_rows),
+                "mt5_pool": len(mt5_rows),
+                "trader_accounts": len(trader_accounts_rows),
+            }
+        }
+        return jsonify(payload)
+    except Exception as e:
+        return bad(e, 500)
+
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
