@@ -1625,76 +1625,155 @@ def _np_sync_trader_account_assignment(trader=None, purchase=None, mt5=None, sta
 @app.route("/approve_challenge_purchase", methods=["POST"])
 def approve_purchase():
     try:
-        d=request.json or {}; pid=d.get("id"); mt5_id=d.get("mt5_id")
-        if not pid: return bad("Missing purchase id")
-        pres=supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute()
-        if not pres.data: return bad("Purchase not found",404)
-        p=pres.data[0]
+        d = request.json or {}
+        pid = d.get("id") or d.get("purchase_id")
+        mt5_id = d.get("mt5_id") or d.get("assigned_mt5_id")
+        if not pid:
+            return bad("Missing purchase id")
+
+        pres = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute()
+        if not pres.data:
+            return bad("Purchase not found", 404)
+        p = pres.data[0]
+        account_size = clean(p.get("account_size") or 0)
+        if account_size <= 0:
+            return bad("Purchase account size is missing")
+
         if mt5_id:
-            mres=supabase.table("mt5_pool").select("*").eq("id",mt5_id).limit(1).execute()
+            mres = supabase.table("mt5_pool").select("*").eq("id", mt5_id).limit(1).execute()
         else:
-            mres=supabase.table("mt5_pool").select("*").eq("status","available").eq("account_size",p.get("account_size") or 0).limit(1).execute()
-        if not mres.data: return bad("No available MT5 account found for this plan/account size")
-        m=mres.data[0]
+            # Use normalized API rule: available stock for exact account size.
+            mres = supabase.table("mt5_pool").select("*").eq("status", "available").eq("account_size", account_size).limit(1).execute()
+        if not mres.data:
+            return bad("No available MT5 account found for this plan/account size")
+        m = mres.data[0]
         if str(m.get("status") or "").strip().lower() != "available":
             return bad("Selected MT5 account is not available")
-        if clean(m.get("account_size")) != clean(p.get("account_size")):
+        if clean(m.get("account_size")) != account_size:
             return bad("Selected MT5 account size does not match purchase account size")
-        t=now_iso()
-        master_password=m.get("mt5_master_password","")
-        investor_password=m.get("mt5_investor_password","")
-        supabase.table("challenge_purchases").update({"payment_status":"approved","status":"approved_active","assigned_mt5_id":m.get("id"),
-            "mt5_login":m.get("mt5_login",""),"mt5_server":m.get("mt5_server",""),
-            "mt5_master_password":master_password,"mt5_password":master_password,"master_password":master_password,
-            "mt5_investor_password":investor_password,"investor_password":investor_password,
-            "approved_at":t,"assigned_at":t,"updated_at":t,
-            "admin_note":d.get("admin_note","Challenge approved and MT5 assigned")}).eq("id",pid).execute()
-        supabase.table("mt5_pool").update({"status":"assigned","assigned_trader_id":p.get("trader_id"),"assigned_trader_name":p.get("trader_name",""),
-            "assigned_email":p.get("email",""),"assigned_at":t,"updated_at":t,"admin_note":"Assigned through challenge purchase approval"}).eq("id",m.get("id")).execute()
-        lookup=supabase.table("traders").select("*").or_(f"email.eq.{p.get('email','')},phone.eq.{p.get('phone','')}").limit(1).execute()
-        td={"name":p.get("trader_name",""),"phone":p.get("phone",""),"email":p.get("email",""),
-            "mt5_login":m.get("mt5_login",""),"mt5_server":m.get("mt5_server",""),"mt5_master_password":master_password,
-            "mt5_password":master_password,"master_password":master_password,
-            "mt5_investor_password":investor_password,"investor_password":investor_password,
-            "mt5_updated_at":t,"updated_at":t,"account_size":p.get("account_size") or 0,
-            "balance":p.get("account_size") or 0,"equity":p.get("account_size") or 0,"phase":"phase1","status":"active",
-            "payment_status":"approved","payment_proof_url":p.get("payment_proof_url",""),"selected_plan":p.get("plan_name",""),
-            "approved_at":t,"challenge_started_at":t,"approved_by":d.get("approved_by","admin"),"admin_note":d.get("admin_note",""),"trading_days_left":30}
+
+        now = now_iso()
+        master_password = m.get("mt5_master_password") or m.get("mt5_password") or m.get("master_password") or ""
+        investor_password = m.get("mt5_investor_password") or m.get("investor_password") or ""
+
+        # Find or create the trader FIRST. Every downstream table must use this same trader_id.
         trader_row = None
-        if lookup.data:
-            updated_traders = supabase.table("traders").update(td).eq("id",lookup.data[0]["id"]).execute().data or []
-            trader_row = updated_traders[0] if updated_traders else get_trader_by_id(lookup.data[0]["id"])
+        tid = p.get("trader_id") or d.get("trader_id")
+        if tid:
+            trader_row = get_trader_by_id(tid)
+        if not trader_row and str(p.get("email") or "").strip():
+            rows = supabase.table("traders").select("*").eq("email", str(p.get("email") or "").strip().lower()).limit(1).execute().data or []
+            trader_row = rows[0] if rows else None
+        if not trader_row and str(p.get("phone") or "").strip():
+            rows = supabase.table("traders").select("*").eq("phone", str(p.get("phone") or "").strip()).limit(1).execute().data or []
+            trader_row = rows[0] if rows else None
+
+        trader_payload = {
+            "name": p.get("trader_name") or p.get("name") or (trader_row or {}).get("name") or "Trader",
+            "phone": p.get("phone") or (trader_row or {}).get("phone") or "",
+            "email": str(p.get("email") or (trader_row or {}).get("email") or "").strip().lower(),
+            "mt5_login": m.get("mt5_login") or "",
+            "mt5_server": m.get("mt5_server") or "",
+            "mt5_master_password": master_password,
+            "mt5_password": master_password,
+            "master_password": master_password,
+            "mt5_investor_password": investor_password,
+            "investor_password": investor_password,
+            "mt5_updated_at": now,
+            "updated_at": now,
+            "account_size": account_size,
+            "balance": account_size,
+            "equity": account_size,
+            "phase": "phase1",
+            "stage": "phase1",
+            "status": "active",
+            "payment_status": "approved",
+            "payment_proof_url": p.get("payment_proof_url") or "",
+            "selected_plan": p.get("plan_name") or "",
+            "approved_at": now,
+            "challenge_started_at": now,
+            "approved_by": d.get("approved_by") or "admin",
+            "admin_note": d.get("admin_note") or "Challenge approved and Phase 1 MT5 assigned",
+            "trading_days_left": 30,
+            "monitoring_enabled": True,
+            "mt5_access_disabled": False,
+        }
+
+        if trader_row and trader_row.get("id"):
+            updated = _np_safe_table_update("traders", trader_payload, "id", trader_row.get("id"))
+            trader_rows = getattr(updated, "data", None) if updated is not None else None
+            trader_row = (trader_rows or [None])[0] or get_trader_by_id(trader_row.get("id")) or dict(trader_row, **trader_payload)
         else:
-            td.update({"account_reference":ref(),"profit":0,"drawdown":0,"profit_percent":0,"drawdown_percent":0})
-            created_traders = supabase.table("traders").insert(td).execute().data or []
-            trader_row = created_traders[0] if created_traders else td
+            trader_payload.update({
+                "account_reference": p.get("account_reference") or ref(),
+                "profit": 0, "drawdown": 0, "profit_percent": 0, "drawdown_percent": 0,
+                "created_at": now,
+            })
+            created = supabase.table("traders").insert(trader_payload).execute().data or []
+            trader_row = created[0] if created else trader_payload
 
-        # Critical production sync: every approved MT5 assignment must create/update trader_accounts.
-        # This is what Monitoring API, VPS, Admin and Trader Dashboard use as the live account source.
+        trader_id = trader_row.get("id") or p.get("trader_id")
+        if not trader_id:
+            return bad("Trader could not be created/located for this purchase", 500)
+
+        # Create/update trader_accounts. This is the live business account source.
+        account_row = _np_sync_trader_account_assignment(
+            trader=trader_row,
+            purchase=dict(p, trader_id=trader_id),
+            mt5=m,
+            stage="phase1",
+            admin_name=d.get("approved_by") or "admin",
+            note=d.get("admin_note") or "Challenge approved and Phase 1 MT5 assigned"
+        ) or {}
+        account_id = account_row.get("id")
+
+        purchase_payload = {
+            "trader_id": trader_id,
+            "payment_status": "approved",
+            "status": "approved_active",
+            "assigned_mt5_id": m.get("id"),
+            "mt5_login": m.get("mt5_login") or "",
+            "mt5_server": m.get("mt5_server") or "",
+            "mt5_master_password": master_password,
+            "mt5_password": master_password,
+            "master_password": master_password,
+            "mt5_investor_password": investor_password,
+            "investor_password": investor_password,
+            "approved_at": now,
+            "assigned_at": now,
+            "updated_at": now,
+            "admin_note": d.get("admin_note") or "Challenge approved and MT5 assigned",
+        }
+        if account_id:
+            purchase_payload.update({"current_account_id": account_id, "trader_account_id": account_id})
+        supabase.table("challenge_purchases").update(purchase_payload).eq("id", pid).execute()
+
+        pool_payload = {
+            "status": "assigned",
+            "assigned_trader_id": trader_id,
+            "assigned_trader_name": trader_row.get("name") or p.get("trader_name") or "",
+            "assigned_email": trader_row.get("email") or p.get("email") or "",
+            "assigned_at": now,
+            "updated_at": now,
+            "admin_note": "Assigned through unified challenge approval engine",
+        }
+        supabase.table("mt5_pool").update(pool_payload).eq("id", m.get("id")).execute()
+
+        approved_rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
         try:
-            _np_sync_trader_account_assignment(
-                trader=trader_row or {},
-                purchase=p,
-                mt5=m,
-                stage="phase1",
-                admin_name=d.get("approved_by") or "admin",
-                note=d.get("admin_note") or "Challenge approved and Phase 1 MT5 assigned"
-            )
-        except Exception as sync_error:
-            print("APPROVE PURCHASE TRADER_ACCOUNT_SYNC ERROR:", sync_error)
-
-        approved_rows = supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute().data
-        _affiliate_create_commission_from_purchase(approved_rows[0] if approved_rows else p, d)
+            _affiliate_create_commission_from_purchase(approved_rows[0] if approved_rows else p, d)
+        except Exception as aff_e:
+            print("AFFILIATE COMMISSION SKIPPED:", aff_e)
 
         send_email_safe(
             p.get("email"),
             "NairaPips challenge approved - MT5 details",
-            f"""Hello {p.get("trader_name") or "Trader"},
+            f"""Hello {p.get("trader_name") or trader_row.get("name") or "Trader"},
 
 Your NairaPips challenge has been approved and your MT5 account has been assigned.
 
 Plan: {p.get("plan_name", "Challenge")}
-Account Size: {email_money(p.get("account_size"))}
+Account Size: {email_money(account_size)}
 
 MT5 Login: {m.get("mt5_login", "")}
 Server: {m.get("mt5_server", "")}
@@ -1706,10 +1785,11 @@ Please log in to your trader dashboard to view your account details and begin yo
 NairaPips Team"""
         )
 
-        _audit_safe("challenge_purchases", "challenge_purchase_approved", f"Purchase {pid} approved", _admin_from_payload(d))
-        _audit_safe("mt5", "mt5_account_assignment", f"Purchase {pid} assigned MT5 {m.get('mt5_login','')}", _admin_from_payload(d))
+        _audit_safe("challenge_purchases", "unified_challenge_purchase_approved", f"Purchase {pid} approved; trader={trader_id}; account={account_id}; mt5={m.get('mt5_login','')}", _admin_from_payload(d))
         return ok(approved_rows, "Challenge purchase approved and MT5 assigned")
-    except Exception as e: return bad(e)
+    except Exception as e:
+        return bad(e)
+
 
 @app.route("/reject_challenge_purchase", methods=["POST"])
 def reject_purchase():
@@ -5056,6 +5136,313 @@ def trader_current_account_bridge(lookup):
         return bad(e, 500)
 
 
+
+
+# ============================================================
+# NAIRAPIPS FORENSIC BUSINESS SOURCE-OF-TRUTH ENGINE
+# One operational object joins: traders + challenge_purchases + trader_accounts + mt5_pool.
+# Admin/Trader Dashboard/Monitoring must read the same state, not separate guesses.
+# ============================================================
+def _np_norm_key(v):
+    return str(v or "").strip().lower()
+
+
+def _np_status(v):
+    return str(v or "").strip().lower()
+
+
+def _np_fetch_all(table, order_col="created_at", desc=True, limit=None):
+    try:
+        q = supabase.table(table).select("*")
+        if order_col:
+            try:
+                q = q.order(order_col, desc=desc)
+            except Exception:
+                pass
+        if limit:
+            q = q.limit(limit)
+        return getattr(q.execute(), "data", []) or []
+    except Exception as e:
+        print(f"NP BUSINESS FETCH SKIP {table}:", e)
+        return []
+
+
+def _np_match_keys(row):
+    keys = []
+    for k in ["id", "trader_id", "email", "phone"]:
+        v = _np_norm_key((row or {}).get(k))
+        if v:
+            keys.append(v)
+    return keys
+
+
+def _np_latest_row(rows):
+    if not rows:
+        return None
+    try:
+        return sorted(rows, key=_row_score, reverse=True)[0]
+    except Exception:
+        def score(r):
+            for k in ["updated_at", "assigned_at", "approved_at", "created_at"]:
+                try:
+                    v = r.get(k)
+                    if v:
+                        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    pass
+            return 0
+        return sorted(rows, key=score, reverse=True)[0]
+
+
+def _np_account_active(row):
+    s = _np_status((row or {}).get("account_status") or (row or {}).get("status"))
+    if s in {"breached", "archived", "breached_archived", "disabled", "locked", "passed", "profit_protected"}:
+        return False
+    return bool(str((row or {}).get("mt5_login") or "").strip())
+
+
+def _np_account_score(row):
+    s = _np_status((row or {}).get("account_status") or (row or {}).get("status"))
+    stage = _np_status((row or {}).get("stage") or (row or {}).get("phase"))
+    score = 0
+    if _np_account_active(row): score += 100000000000
+    if s in {"assigned_active", "phase1_active", "phase2_active", "funded_active", "active"}: score += 90000000000
+    if stage in {"funded", "live"}: score += 3000000000
+    if stage == "phase2": score += 2000000000
+    if stage == "phase1": score += 1000000000
+    for k in ["updated_at", "assigned_at", "started_at", "created_at"]:
+        d = _dt_score(row.get(k)) if "_dt_score" in globals() else 0
+        if d:
+            score += d
+            break
+    return score
+
+
+def _np_current_account_for_trader(trader, accounts):
+    if not trader:
+        return None
+    tid = _np_norm_key(trader.get("id"))
+    email = _np_norm_key(trader.get("email"))
+    phone = _np_norm_key(trader.get("phone"))
+    login = _np_norm_key(trader.get("mt5_login"))
+    candidates = []
+    for a in accounts or []:
+        if tid and _np_norm_key(a.get("trader_id")) == tid:
+            candidates.append(a); continue
+        if login and _np_norm_key(a.get("mt5_login")) == login:
+            candidates.append(a); continue
+        if email and _np_norm_key(a.get("email")) == email:
+            candidates.append(a); continue
+        if phone and _np_norm_key(a.get("phone")) == phone:
+            candidates.append(a); continue
+    if not candidates:
+        return None
+    return sorted(candidates, key=_np_account_score, reverse=True)[0]
+
+
+def _np_enrich_trader(trader, purchases=None, accounts=None):
+    t = dict(trader or {})
+    purchases = purchases or []
+    accounts = accounts or []
+    cur = _np_current_account_for_trader(t, accounts)
+    latest_purchase = _np_latest_row(purchases)
+
+    if latest_purchase:
+        t["latest_purchase"] = latest_purchase
+        t["purchase_id"] = latest_purchase.get("id")
+        t["plan_name"] = latest_purchase.get("plan_name") or t.get("plan_name") or t.get("selected_plan")
+        t["selected_plan"] = t.get("selected_plan") or latest_purchase.get("plan_name") or ""
+        t["purchase_status"] = latest_purchase.get("status")
+        t["purchase_payment_status"] = latest_purchase.get("payment_status")
+        if not clean(t.get("account_size") or 0):
+            t["account_size"] = latest_purchase.get("account_size") or 0
+        if not t.get("payment_proof_url"):
+            t["payment_proof_url"] = latest_purchase.get("payment_proof_url") or ""
+        if _np_status(latest_purchase.get("payment_status")) in {"pending", "pending_review"} or _np_status(latest_purchase.get("status")) == "pending_review":
+            if not str(t.get("mt5_login") or "").strip():
+                t["status"] = t.get("status") or "payment_pending"
+                t["phase"] = t.get("phase") or "no_account"
+                t["payment_status"] = "pending"
+
+    if cur:
+        t["current_account"] = cur
+        t["__current_account"] = cur
+        t["current_account_id"] = cur.get("id") or t.get("current_account_id")
+        t["trader_account_id"] = cur.get("id") or t.get("trader_account_id")
+        for src, dst in [
+            ("mt5_login", "mt5_login"), ("mt5_server", "mt5_server"),
+            ("mt5_master_password", "mt5_master_password"), ("mt5_password", "mt5_password"), ("master_password", "master_password"),
+            ("mt5_investor_password", "mt5_investor_password"), ("investor_password", "investor_password"),
+            ("account_size", "account_size"), ("balance", "balance"), ("equity", "equity"),
+            ("profit", "profit"), ("profit_percent", "profit_percent"), ("drawdown_percent", "drawdown_percent"),
+            ("risk_zone", "risk_zone"), ("monitoring_enabled", "monitoring_enabled"), ("mt5_access_disabled", "mt5_access_disabled")
+        ]:
+            if cur.get(src) not in [None, ""]:
+                t[dst] = cur.get(src)
+        stage = cur.get("stage") or cur.get("phase") or t.get("phase") or "phase1"
+        status = cur.get("account_status") or cur.get("status") or t.get("status") or "active"
+        t["phase"] = stage
+        t["stage"] = stage
+        t["status"] = "active" if _np_status(stage) == "phase1" else status
+        t["payment_status"] = "approved"
+    return t
+
+
+def _np_build_business_snapshot():
+    traders_rows = _np_fetch_all("traders", "created_at", True)
+    purchases_rows = _np_fetch_all("challenge_purchases", "created_at", True)
+    mt5_rows = _np_fetch_all("mt5_pool", "created_at", True)
+    account_rows = _np_fetch_all("trader_accounts", "updated_at", True)
+
+    # Normalize MT5 pool visibility without altering DB here.
+    for m in mt5_rows:
+        try:
+            if "_mt5_pool_status" in globals():
+                m["status"] = _mt5_pool_status(m.get("status"))
+        except Exception:
+            pass
+
+    trader_by_key = {}
+    for t in traders_rows:
+        for key in _np_match_keys(t):
+            trader_by_key.setdefault(key, []).append(t)
+
+    purchases_by_trader_key = {}
+    for p in purchases_rows:
+        for key in _np_match_keys(p):
+            purchases_by_trader_key.setdefault(key, []).append(p)
+
+    accounts_by_trader_key = {}
+    for a in account_rows:
+        for key in _np_match_keys(a):
+            accounts_by_trader_key.setdefault(key, []).append(a)
+
+    output = []
+    seen = set()
+    for t in traders_rows:
+        keys = _np_match_keys(t)
+        all_p = []
+        all_a = []
+        for k in keys:
+            all_p.extend(purchases_by_trader_key.get(k, []))
+            all_a.extend(accounts_by_trader_key.get(k, []))
+        enriched = _np_enrich_trader(t, list({str(x.get('id')): x for x in all_p if x.get('id')}.values()) or all_p, list({str(x.get('id')): x for x in all_a if x.get('id')}.values()) or all_a)
+        seen.add(str(t.get("id")))
+        output.append(enriched)
+
+    # Show purchase-only customers in admin while awaiting approval.
+    for p in purchases_rows:
+        matched = False
+        for key in _np_match_keys(p):
+            if key in trader_by_key:
+                matched = True
+                break
+        if matched:
+            continue
+        virtual = {
+            "id": f"purchase:{p.get('id')}",
+            "trader_id": p.get("trader_id"),
+            "name": p.get("trader_name") or p.get("name") or "Pending Trader",
+            "email": p.get("email") or "",
+            "phone": p.get("phone") or "",
+            "account_reference": p.get("account_reference") or p.get("reference") or f"PURCHASE-{p.get('id')}",
+            "account_size": p.get("account_size") or 0,
+            "balance": p.get("account_size") or 0,
+            "equity": p.get("account_size") or 0,
+            "selected_plan": p.get("plan_name") or "",
+            "plan_name": p.get("plan_name") or "",
+            "status": "payment_pending" if _np_status(p.get("payment_status")) in {"pending", ""} else p.get("status") or "pending_review",
+            "phase": "no_account",
+            "payment_status": p.get("payment_status") or "pending",
+            "purchase_status": p.get("status") or "pending_review",
+            "purchase_id": p.get("id"),
+            "latest_purchase": p,
+            "created_at": p.get("created_at"),
+            "payment_proof_url": p.get("payment_proof_url") or "",
+            "__virtual_purchase_only": True,
+        }
+        output.append(virtual)
+
+    # Make purchases self-contained for Challenge Purchases module.
+    enriched_purchases = []
+    for p in purchases_rows:
+        pp = dict(p)
+        linked = None
+        for key in _np_match_keys(p):
+            rows = trader_by_key.get(key) or []
+            if rows:
+                linked = _np_latest_row(rows)
+                break
+        if linked:
+            pp["linked_trader"] = linked
+            pp["trader_id"] = pp.get("trader_id") or linked.get("id")
+            pp["trader_current_status"] = linked.get("status")
+            pp["trader_current_phase"] = linked.get("phase")
+            pp["trader_account_reference"] = linked.get("account_reference")
+        # attach current account if already assigned
+        if pp.get("trader_id"):
+            accs = [a for a in account_rows if _np_norm_key(a.get("trader_id")) == _np_norm_key(pp.get("trader_id"))]
+        else:
+            accs = [a for a in account_rows if _np_norm_key(a.get("mt5_login")) and _np_norm_key(a.get("mt5_login")) == _np_norm_key(pp.get("mt5_login"))]
+        cur = sorted(accs, key=_np_account_score, reverse=True)[0] if accs else None
+        if cur:
+            pp["current_account"] = cur
+            pp["trader_account_id"] = pp.get("trader_account_id") or cur.get("id")
+            pp["current_account_id"] = pp.get("current_account_id") or cur.get("id")
+        enriched_purchases.append(pp)
+
+    # Use backend queue if present; otherwise derive from rows with waiting states.
+    assignment_queue = []
+    try:
+        if "_phase_assignment_queue_rows" in globals():
+            assignment_queue = _phase_assignment_queue_rows()
+    except Exception as e:
+        print("NP BUSINESS ASSIGNMENT QUEUE SKIP:", e)
+    if not assignment_queue:
+        for t in output:
+            s = _np_status(t.get("status")); ph = _np_status(t.get("phase")); note = _np_status(t.get("admin_note"))
+            if "phase2_waiting" in s or "funded_waiting" in s or "passed" in s or "passed" in ph or "passed" in note:
+                assignment_queue.append(t)
+
+    return {
+        "success": True,
+        "source_of_truth": "np_business_source_of_truth_v1",
+        "generated_at": now_iso() if "now_iso" in globals() else datetime.now(timezone.utc).isoformat(),
+        "traders": _dedupe_traders(output) if "_dedupe_traders" in globals() else output,
+        "business_traders": output,
+        "challenge_purchases": enriched_purchases,
+        "purchases": enriched_purchases,
+        "mt5_pool": mt5_rows,
+        "mt5pool": mt5_rows,
+        "trader_accounts": account_rows,
+        "accounts": account_rows,
+        "assignment_queue": assignment_queue,
+        "phase_assignment_queue": assignment_queue,
+        "payouts": _np_fetch_all("payouts", "created_at", True),
+        "support_tickets": _np_fetch_all("support_tickets", "created_at", True),
+        "tickets": _np_fetch_all("support_tickets", "created_at", True),
+        "announcements": _np_fetch_all("announcements", "created_at", True),
+        "challenge_plans": _np_fetch_all("challenge_plans", "account_size", False),
+        "plans": _np_fetch_all("challenge_plans", "account_size", False),
+        "trader_trades": _np_fetch_all("trader_trades", "synced_at", True, 2000),
+        "monitoring_snapshots": _np_fetch_all("monitoring_snapshots", "created_at", True, 2000),
+        "monitoring_events": _np_fetch_all("monitoring_events", "created_at", True, 2000),
+        "staff_members": _np_fetch_all("staff_members", "created_at", True),
+        "audit_logs": _np_fetch_all("audit_logs", "created_at", True, 500),
+        "affiliate_partners": _np_fetch_all("affiliate_partners", "created_at", True),
+        "affiliate_codes": _np_fetch_all("affiliate_codes", "created_at", True),
+        "affiliate_commissions": _np_fetch_all("affiliate_commissions", "created_at", True),
+        "summary": {"traders": len(traders_rows), "purchases": len(purchases_rows), "mt5_pool": len(mt5_rows), "trader_accounts": len(account_rows), "business_traders": len(output)}
+    }
+
+
+@app.route("/np_business_snapshot", methods=["GET"])
+def np_business_snapshot():
+    try:
+        return jsonify(_np_build_business_snapshot())
+    except Exception as e:
+        return bad(e, 500)
+
 # ================================
 # NAIRAPIPS ADMIN SINGLE SOURCE BOOTSTRAP
 # Keeps admin modules fed from the same live backend snapshot instead of
@@ -5064,77 +5451,57 @@ def trader_current_account_bridge(lookup):
 @app.route("/admin_bootstrap", methods=["GET"])
 def admin_bootstrap():
     try:
-        def rows(table, order_col="created_at", desc=True, limit=None):
-            try:
-                q = supabase.table(table).select("*")
-                if order_col:
-                    try:
-                        q = q.order(order_col, desc=desc)
-                    except Exception:
-                        pass
-                if limit:
-                    q = q.limit(limit)
-                return getattr(q.execute(), "data", []) or []
-            except Exception as e:
-                print(f"ADMIN BOOTSTRAP SKIP {table}:", e)
-                return []
+        return jsonify(_np_build_business_snapshot())
+    except Exception as e:
+        return bad(e, 500)
 
-        def obj_safe(fn, default):
-            try:
-                return fn()
-            except Exception as e:
-                print("ADMIN BOOTSTRAP OBJECT SKIP:", e)
-                return default
 
-        traders_rows = rows("traders", "created_at", True)
-        purchases_rows = rows("challenge_purchases", "created_at", True)
-        mt5_rows = rows("mt5_pool", "created_at", True)
-        trader_accounts_rows = rows("trader_accounts", "updated_at", True)
-
-        assignment_queue = []
-        try:
-            # Reuse existing backend queue if present; otherwise keep empty.
-            # This avoids duplicating phase logic in the bootstrap route.
-            if "_phase_assignment_queue_rows" in globals():
-                assignment_queue = _phase_assignment_queue_rows()
-        except Exception as e:
-            print("ADMIN BOOTSTRAP ASSIGNMENT QUEUE SKIP:", e)
-            assignment_queue = []
-
-        payload = {
-            "success": True,
-            "source_of_truth": "admin_bootstrap_live_supabase_snapshot",
-            "generated_at": now_iso() if "now_iso" in globals() else datetime.now(timezone.utc).isoformat(),
-            "traders": _dedupe_traders(traders_rows) if "_dedupe_traders" in globals() else traders_rows,
-            "challenge_purchases": purchases_rows,
-            "purchases": purchases_rows,
-            "mt5_pool": mt5_rows,
-            "mt5pool": mt5_rows,
-            "trader_accounts": trader_accounts_rows,
-            "assignment_queue": assignment_queue,
-            "phase_assignment_queue": assignment_queue,
-            "payouts": rows("payouts", "created_at", True),
-            "support_tickets": rows("support_tickets", "created_at", True),
-            "tickets": rows("support_tickets", "created_at", True),
-            "announcements": rows("announcements", "created_at", True),
-            "challenge_plans": rows("challenge_plans", "created_at", True),
-            "plans": rows("challenge_plans", "created_at", True),
-            "trader_trades": rows("trader_trades", "synced_at", True, 2000),
-            "monitoring_snapshots": rows("monitoring_snapshots", "created_at", True, 2000),
-            "monitoring_events": rows("monitoring_events", "created_at", True, 2000),
-            "staff_members": rows("staff_members", "created_at", True),
-            "audit_logs": rows("audit_logs", "created_at", True, 500),
-            "affiliate_partners": rows("affiliate_partners", "created_at", True),
-            "affiliate_codes": rows("affiliate_codes", "created_at", True),
-            "affiliate_commissions": rows("affiliate_commissions", "created_at", True),
-            "summary": {
-                "traders": len(traders_rows),
-                "purchases": len(purchases_rows),
-                "mt5_pool": len(mt5_rows),
-                "trader_accounts": len(trader_accounts_rows),
-            }
-        }
-        return jsonify(payload)
+@app.route("/np_reconcile_business_flow", methods=["POST", "GET", "OPTIONS"])
+def np_reconcile_business_flow():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        now = now_iso() if "now_iso" in globals() else datetime.now(timezone.utc).isoformat()
+        purchases = _np_fetch_all("challenge_purchases", "created_at", True)
+        fixed = []
+        for p in purchases:
+            email = str(p.get("email") or "").strip().lower()
+            phone = str(p.get("phone") or "").strip()
+            if not email and not phone:
+                continue
+            trader = None
+            if p.get("trader_id"):
+                trader = get_trader_by_id(p.get("trader_id"))
+            if not trader and email:
+                rows = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
+                trader = rows[0] if rows else None
+            if not trader and phone:
+                rows = supabase.table("traders").select("*").eq("phone", phone).limit(1).execute().data or []
+                trader = rows[0] if rows else None
+            if not trader:
+                continue
+            updates_purchase = {}
+            if not p.get("trader_id"):
+                updates_purchase["trader_id"] = trader.get("id")
+            pay = _np_status(p.get("payment_status"))
+            status = _np_status(p.get("status"))
+            if pay in {"pending", ""} or status == "pending_review":
+                trader_updates = {
+                    "payment_status": "pending",
+                    "status": "payment_pending",
+                    "phase": trader.get("phase") or "no_account",
+                    "selected_plan": p.get("plan_name") or trader.get("selected_plan") or "",
+                    "account_size": p.get("account_size") or trader.get("account_size") or 0,
+                    "payment_proof_url": p.get("payment_proof_url") or trader.get("payment_proof_url") or "",
+                    "updated_at": now,
+                }
+                _np_safe_table_update("traders", trader_updates, "id", trader.get("id"))
+            if updates_purchase:
+                updates_purchase["updated_at"] = now
+                _np_safe_table_update("challenge_purchases", updates_purchase, "id", p.get("id"))
+            if updates_purchase or pay in {"pending", ""} or status == "pending_review":
+                fixed.append({"purchase_id": p.get("id"), "trader_id": trader.get("id"), "email": email, "payment_status": pay or "pending"})
+        return ok({"fixed": fixed, "count": len(fixed)}, "Business flow reconciled")
     except Exception as e:
         return bad(e, 500)
 
