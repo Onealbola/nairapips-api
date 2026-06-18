@@ -788,13 +788,28 @@ def verify_email_otp():
         return bad("Email OTP verification failed: " + str(e), 500)
 
 def _safe_insert_trader(row):
-    try:
-        return supabase.table("traders").insert(row).execute().data
-    except Exception as e:
-        optional = ["source", "user_agent", "ip_address", "registration_source", "registration_user_agent", "registration_ip"]
-        safe_row = {k: v for k, v in row.items() if k not in optional}
-        print("REGISTRATION OPTIONAL TRACKING SKIPPED:", str(e))
-        return supabase.table("traders").insert(safe_row).execute().data
+    attempts = []
+    attempts.append(dict(row))
+    # If one password column is missing in Supabase, try common variants safely.
+    only_password = dict(row)
+    only_password.pop("login_password", None)
+    attempts.append(only_password)
+    only_login_password = dict(row)
+    only_login_password.pop("password", None)
+    attempts.append(only_login_password)
+    optional = ["source", "user_agent", "ip_address", "registration_source", "registration_user_agent", "registration_ip"]
+    safe_row = {k: v for k, v in row.items() if k not in optional}
+    attempts.append(safe_row)
+    safe_no_pwd = {k: v for k, v in safe_row.items() if k not in ["password", "login_password"]}
+    attempts.append(safe_no_pwd)
+    last_error = None
+    for candidate in attempts:
+        try:
+            return supabase.table("traders").insert(candidate).execute().data
+        except Exception as e:
+            last_error = e
+            print("REGISTRATION INSERT RETRY:", str(e))
+    raise last_error
 
 @app.route("/register_trader", methods=["POST", "OPTIONS"])
 def register_trader():
@@ -814,6 +829,8 @@ def register_trader():
         name = str(d.get("name", "")).strip()
         email = str(d.get("email", "")).strip().lower()
         phone = _clean_phone(d.get("phone", ""))
+        password = str(d.get("password") or d.get("login_password") or d.get("trader_password") or "").strip()
+        confirm_password = str(d.get("confirm_password") or password).strip()
 
         if not _valid_name(name):
             return bad("Please enter your real full name.")
@@ -825,17 +842,30 @@ def register_trader():
             return bad("Please enter a valid email address.")
         if not _valid_phone(phone):
             return bad("Please enter a complete valid WhatsApp or phone number.")
+        if not password or len(password) < 6:
+            return bad("Create a login password with at least 6 characters.")
+        if password != confirm_password:
+            return bad("Password confirmation does not match.")
         if not _email_verified_recent(email):
             return bad("Email is not verified. Please enter the verification code sent to your email before creating your account.", 403)
 
         existing = _find_existing_trader(email, phone)
         if existing:
+            try:
+                if password and not str(existing.get("password") or existing.get("login_password") or "").strip():
+                    supabase.table("traders").update({"password": password, "login_password": password, "updated_at": now_iso()}).eq("id", existing.get("id")).execute()
+                    existing["password"] = password
+                    existing["login_password"] = password
+            except Exception as e:
+                print("EXISTING TRADER PASSWORD SAVE SKIPPED:", str(e))
             return ok(existing, "Trader already exists")
 
         row = {
             "name": name,
             "phone": phone,
             "email": email,
+            "password": password,
+            "login_password": password,
             "mt5_login": "",
             "mt5_server": "",
             "mt5_master_password": "",
@@ -1083,15 +1113,62 @@ def delete_trader():
 
     except Exception as e:
         return bad(e)
+
+@app.route("/set_trader_password", methods=["POST", "OPTIONS"])
+def set_trader_password():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = request.json or {}
+        email = str(d.get("email") or d.get("lookup") or "").strip().lower()
+        code = str(d.get("code") or "").strip()
+        password = str(d.get("password") or d.get("login_password") or "").strip()
+        confirm = str(d.get("confirm_password") or password).strip()
+        if not email or not password:
+            return bad("Email and new password are required")
+        if len(password) < 6:
+            return bad("Password must be at least 6 characters")
+        if password != confirm:
+            return bad("Password confirmation does not match")
+        # Verify code when provided; allow already-verified recent OTP too.
+        if code:
+            rows = supabase.table('email_verification_codes').select('*').eq('email', email).eq('code', code).order('created_at', desc=True).limit(1).execute().data or []
+            if not rows:
+                return bad('Invalid verification code', 400)
+            try:
+                supabase.table('email_verification_codes').update({'verified': True, 'verified_at': now_iso()}).eq('id', rows[0].get('id')).execute()
+            except Exception:
+                pass
+        elif not _email_verified_recent(email):
+            return bad("Email is not verified. Send and verify the email code first.", 403)
+        trader = _latest_trader_for_lookup(email)
+        if not trader:
+            return bad("Trader not found", 404)
+        payload = {"password": password, "login_password": password, "updated_at": now_iso()}
+        try:
+            result = supabase.table("traders").update(payload).eq("id", trader.get("id")).execute().data
+        except Exception as e:
+            print("PASSWORD ALIAS SAVE RETRY:", str(e))
+            result = supabase.table("traders").update({"password": password, "updated_at": now_iso()}).eq("id", trader.get("id")).execute().data
+        out = result[0] if result else trader
+        out["password"] = password
+        return ok(out, "Trader password saved")
+    except Exception as e:
+        return bad(e, 500)
+
 @app.route("/login_trader", methods=["POST"])
 def login_trader():
     try:
         lookup = str((request.json or {}).get("lookup", "")).strip().lower()
         if not lookup:
             return bad("Missing lookup")
+        password = str((request.json or {}).get("password", "")).strip()
         trader = _latest_trader_for_lookup(lookup)
         if not trader:
             return bad("Trader not found", 404)
+        saved_password = str(trader.get("password") or trader.get("login_password") or trader.get("trader_password") or "").strip()
+        if saved_password and password != saved_password:
+            return bad("Invalid email/phone or password", 401)
         t = now_iso()
         supabase.table("traders").update({"last_login_at": t}).eq("id", trader["id"]).execute()
         trader["last_login_at"] = t
