@@ -5828,6 +5828,43 @@ def _np_ac_row(kind, source, trader=None, purchase=None, account=None, target=No
         "last_sync_at": _np_ac_s(source.get("updated_at") or source.get("created_at") or purchase.get("created_at") or trader.get("updated_at") or trader.get("created_at")),
     }
 
+def _np_ac_job_identity(row):
+    row = row or {}
+    email = _np_ac_l(row.get("email"))
+    phone = ''.join(ch for ch in _np_ac_s(row.get("phone")) if ch.isdigit())
+    trader_id = _np_ac_l(row.get("trader_id") or row.get("id"))
+    return email or phone or trader_id
+
+
+def _np_ac_ref(row):
+    return _np_ac_l((row or {}).get("account_reference") or (row or {}).get("reference") or (row or {}).get("ref"))
+
+
+def _np_ac_job_key(kind, row, target="phase1"):
+    row = row or {}
+    ident = _np_ac_job_identity(row)
+    ref = _np_ac_ref(row)
+    size = str(int(round(_np_ac_num(row.get("account_size") or row.get("balance") or row.get("start_balance"), 0))))
+    plan = _np_ac_l(row.get("plan_name") or row.get("selected_plan") or row.get("plan") or row.get("account_plan"))
+    # If account_reference exists, it is the business challenge identity. This prevents
+    # the same purchase/trader from appearing twice when the row exists in several tables.
+    if ref:
+        return f"{target}:{ref}"
+    return f"{target}:{ident}:{size}:{plan}"
+
+
+def _np_ac_row_time(row):
+    return max(_dt_score((row or {}).get(k)) for k in ["assigned_at", "approved_at", "paid_at", "updated_at", "created_at", "requested_at"])
+
+
+def _np_ac_put_job(jobs, key, row):
+    if not key:
+        key = row.get("id") or row.get("purchase_id") or row.get("trader_account_id") or str(len(jobs)+1)
+    old = jobs.get(key)
+    if not old or _np_ac_row_time(row) >= _np_ac_row_time(old):
+        jobs[key] = row
+
+
 def _np_assignment_center_payload():
     traders=_np_ac_fetch("traders", "created_at", True)
     purchases=_np_ac_fetch("challenge_purchases", "created_at", True)
@@ -5835,9 +5872,14 @@ def _np_assignment_center_payload():
     if not accounts:
         accounts=_np_ac_fetch("trader_accounts", "created_at", True)
     mt5=_np_ac_fetch("mt5_pool", "created_at", True)
-    rows=[]; seen=set()
 
-    # Purchases are the operating order queue: pending/approved purchases with no assigned MT5 must appear for assignment.
+    jobs = {}
+    protected_identities = set()
+    protected_refs = set()
+
+    # 1) Purchase queue: a live order with no MT5 is a Phase 1 assignment job.
+    # Dedupe by business identity (account_reference when available, otherwise trader+size+plan),
+    # not by database row id. This kills duplicate purchase/trader ghost rows.
     for p in purchases:
         if _np_ac_terminal(p):
             continue
@@ -5849,11 +5891,15 @@ def _np_assignment_center_payload():
             continue
         t=_np_ac_best_trader(p, traders)
         row=_np_ac_row("purchase", p, trader=t, purchase=p, target="phase1")
-        key="purchase:" + row.get("purchase_id", row.get("id",""))
-        if key not in seen:
-            seen.add(key); rows.append(row)
+        # Preserve the newest purchase id for the actual Approve + Assign action.
+        row["purchase_id"] = _np_ac_s(p.get("id"))
+        key=_np_ac_job_key("purchase", {**p, **row}, "phase1")
+        _np_ac_put_job(jobs, key, row)
+        if _np_ac_job_identity(row): protected_identities.add(_np_ac_job_identity(row))
+        if _np_ac_ref(row): protected_refs.add(_np_ac_ref(row))
 
-    # Account lifecycle queue: passed phase/waiting next MT5 accounts.
+    # 2) Account lifecycle queue: only accounts that have passed and are genuinely waiting
+    # for next-stage MT5. Current funded/live with MT5 is never shown here.
     for a in accounts:
         if _np_ac_terminal(a) or _np_ac_funded_live_with_mt5(a):
             continue
@@ -5864,13 +5910,17 @@ def _np_assignment_center_payload():
         t=_np_ac_best_trader(a, traders)
         target=_np_ac_target_from_row(a, "phase2")
         row=_np_ac_row("account", a, trader=t, account=a, target=target)
-        key="account:" + (row.get("trader_account_id") or row.get("id") or row.get("trader_id")) + ":" + target
-        if key not in seen:
-            seen.add(key); rows.append(row)
+        key="account:" + (_np_ac_s(a.get("id")) or _np_ac_job_key("account", {**a, **row}, target)) + ":" + target
+        _np_ac_put_job(jobs, key, row)
+        if _np_ac_job_identity(row): protected_identities.add(_np_ac_job_identity(row))
+        if _np_ac_ref(row): protected_refs.add(_np_ac_ref(row))
 
-    # Legacy approved trader row with missing MT5: still show so admin can repair quickly.
+    # 3) Legacy repair row: only when no purchase/account job already exists for that trader/ref.
+    # This prevents Source: trader ghost rows from duplicating real purchase rows.
     for t in traders:
         if _np_ac_terminal(t) or _np_ac_funded_live_with_mt5(t):
+            continue
+        if _np_ac_job_identity(t) in protected_identities or _np_ac_ref(t) in protected_refs:
             continue
         b=_np_ac_status_blob(t)
         approved = "approved" in b or "active" in b
@@ -5879,15 +5929,21 @@ def _np_assignment_center_payload():
         if _np_ac_valid_login(t.get("mt5_login")):
             continue
         target=_np_ac_target_from_row(t, "phase1")
-        row=_np_ac_row("trader", t, trader=t, target=target)
-        key="trader:" + (row.get("trader_id") or row.get("email") or row.get("phone")) + ":" + target
-        if key not in seen:
-            seen.add(key); rows.append(row)
+        row=_np_ac_row("trader_repair", t, trader=t, target=target)
+        key="repair:" + _np_ac_job_key("trader", {**t, **row}, target)
+        _np_ac_put_job(jobs, key, row)
 
-    rows.sort(key=lambda r: (0 if r.get("target_phase")=="phase1" else 1 if r.get("target_phase")=="phase2" else 2, r.get("last_sync_at") or ""), reverse=True)
+    rows=list(jobs.values())
+    # Final absolute dedupe: one visible job per business challenge/stage.
+    final={}
+    for r in rows:
+        key=_np_ac_job_key("final", r, r.get("target_phase") or "phase1")
+        _np_ac_put_job(final, key, r)
+    rows=list(final.values())
+    rows.sort(key=lambda r: (0 if r.get("target_phase")=="phase1" else 1 if r.get("target_phase")=="phase2" else 2, _np_ac_row_time(r)), reverse=True)
     return {
         "success": True,
-        "source_of_truth": "np_assignment_center_v1",
+        "source_of_truth": "np_assignment_center_v2_deduped_business_jobs",
         "generated_at": now_iso() if "now_iso" in globals() else datetime.now(timezone.utc).isoformat(),
         "assignment_queue": rows,
         "phase_assignment_queue": rows,
