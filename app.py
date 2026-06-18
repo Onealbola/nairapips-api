@@ -1419,6 +1419,209 @@ Proof URL: {proof}"""
         return ok(created, "Challenge purchase submitted")
     except Exception as e: return bad(e)
 
+
+
+# ================================
+# NAIRAPIPS MT5 ACCOUNT ROW SYNC
+# ================================
+def _np_nonempty(v):
+    return str(v or "").strip()
+
+
+def _np_safe_table_update(table, payload, column, value):
+    """Best-effort Supabase update. If optional columns are missing, retry with core fields only."""
+    if value is None or str(value).strip() == "":
+        return []
+    payload = {k: v for k, v in (payload or {}).items() if v is not None}
+    try:
+        return supabase.table(table).update(payload).eq(column, value).execute().data or []
+    except Exception as e:
+        print(f"SAFE UPDATE OPTIONAL FAILED {table}.{column}:", e)
+        core_keys = {
+            "trader_id", "mt5_login", "mt5_server", "account_size", "balance", "equity",
+            "stage", "phase", "account_status", "status", "payment_status",
+            "mt5_master_password", "mt5_password", "master_password",
+            "mt5_investor_password", "investor_password", "updated_at"
+        }
+        core = {k: v for k, v in payload.items() if k in core_keys}
+        try:
+            return supabase.table(table).update(core).eq(column, value).execute().data or []
+        except Exception as e2:
+            print(f"SAFE UPDATE CORE FAILED {table}.{column}:", e2)
+            return []
+
+
+def _np_safe_table_insert(table, payload):
+    """Best-effort Supabase insert. If optional columns are missing, retry with core fields only."""
+    payload = {k: v for k, v in (payload or {}).items() if v is not None}
+    try:
+        return supabase.table(table).insert(payload).execute().data or []
+    except Exception as e:
+        print(f"SAFE INSERT OPTIONAL FAILED {table}:", e)
+        core_keys = {
+            "trader_id", "mt5_login", "mt5_server", "account_size", "balance", "equity",
+            "stage", "phase", "account_status", "status", "payment_status",
+            "mt5_master_password", "mt5_password", "master_password",
+            "mt5_investor_password", "investor_password", "created_at", "updated_at"
+        }
+        core = {k: v for k, v in payload.items() if k in core_keys}
+        try:
+            return supabase.table(table).insert(core).execute().data or []
+        except Exception as e2:
+            print(f"SAFE INSERT CORE FAILED {table}:", e2)
+            return []
+
+
+def _np_stage_status_for_assignment(stage):
+    stage = str(stage or "phase1").strip().lower().replace(" ", "")
+    if stage in {"funded", "live", "funded/live"}:
+        return "funded", "funded_active", 0
+    if stage in {"phase2", "phase_2"}:
+        return "phase2", "phase2_active", 8
+    return "phase1", "assigned_active", 10
+
+
+def _np_find_account_row(login="", trader_id=""):
+    login = _np_nonempty(login)
+    trader_id = _np_nonempty(trader_id)
+    try:
+        if login:
+            rows = supabase.table("trader_accounts").select("*").eq("mt5_login", login).order("updated_at", desc=True).limit(5).execute().data or []
+            if rows:
+                return rows[0]
+        if trader_id:
+            rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").order("updated_at", desc=True).limit(5).execute().data or []
+            if rows:
+                return rows[0]
+    except Exception as e:
+        print("ACCOUNT ROW LOOKUP FAILED:", e)
+    return None
+
+
+def _np_sync_trader_account_assignment(trader=None, purchase=None, mt5=None, stage="phase1", admin_name="admin", note="MT5 assigned"):
+    """Create/update trader_accounts whenever an MT5 is assigned.
+
+    This is the production source-of-truth bridge: Admin, Trader Dashboard,
+    Monitoring API and VPS all need a trader_accounts row for every live MT5.
+    """
+    trader = trader or {}
+    purchase = purchase or {}
+    mt5 = mt5 or {}
+    now = now_iso()
+
+    trader_id = _np_nonempty(trader.get("id") or purchase.get("trader_id"))
+    login = _np_nonempty(mt5.get("mt5_login") or purchase.get("mt5_login") or trader.get("mt5_login"))
+    server = _np_nonempty(mt5.get("mt5_server") or purchase.get("mt5_server") or trader.get("mt5_server"))
+    master = _np_nonempty(mt5.get("mt5_master_password") or mt5.get("mt5_password") or mt5.get("master_password") or purchase.get("mt5_master_password") or purchase.get("mt5_password") or purchase.get("master_password") or trader.get("mt5_master_password") or trader.get("mt5_password") or trader.get("master_password"))
+    investor = _np_nonempty(mt5.get("mt5_investor_password") or mt5.get("investor_password") or purchase.get("mt5_investor_password") or purchase.get("investor_password") or trader.get("mt5_investor_password") or trader.get("investor_password"))
+    account_size = clean(mt5.get("account_size") or purchase.get("account_size") or trader.get("account_size") or trader.get("balance") or 0)
+
+    if not trader_id or not login or not server:
+        print("TRADER_ACCOUNT_SYNC_SKIPPED missing core", {"trader_id": trader_id, "login": login, "server": server})
+        return None
+
+    stage, account_status, target = _np_stage_status_for_assignment(stage or purchase.get("phase") or trader.get("phase"))
+    existing = _np_find_account_row(login=login, trader_id=trader_id)
+
+    payload = {
+        "trader_id": trader_id,
+        "account_reference": trader.get("account_reference") or purchase.get("account_reference") or ref(),
+        "account_size": account_size,
+        "start_balance": account_size,
+        "balance": account_size,
+        "current_balance": account_size,
+        "equity": account_size,
+        "current_equity": account_size,
+        "highest_equity": account_size,
+        "lowest_equity": account_size,
+        "profit": 0,
+        "profit_percent": 0,
+        "current_profit": 0,
+        "current_profit_percent": 0,
+        "drawdown_percent": 0,
+        "absolute_drawdown_percent": 0,
+        "dd_used_percent": 0,
+        "max_drawdown_used": 0,
+        "risk_zone": "safe",
+        "stage": stage,
+        "phase": stage,
+        "account_status": account_status,
+        "status": "active",
+        "payment_status": "approved",
+        "monitoring_enabled": True,
+        "mt5_access_disabled": False,
+        "mt5_account_active": True,
+        "mt5_login": login,
+        "mt5_server": server,
+        "server": server,
+        "mt5_master_password": master,
+        "mt5_password": master,
+        "master_password": master,
+        "mt5_investor_password": investor,
+        "investor_password": investor,
+        "target_percent": target,
+        "profit_target": target,
+        "assigned_at": now,
+        "started_at": now,
+        "updated_at": now,
+        "admin_note": note,
+        "approved_by": admin_name,
+    }
+
+    if existing and existing.get("id"):
+        rows = _np_safe_table_update("trader_accounts", payload, "id", existing.get("id"))
+        account_row = rows[0] if rows else dict(existing, **payload)
+    else:
+        payload["created_at"] = now
+        rows = _np_safe_table_insert("trader_accounts", payload)
+        account_row = rows[0] if rows else payload
+
+    account_id = account_row.get("id")
+    trader_update = {
+        "mt5_login": login,
+        "mt5_server": server,
+        "mt5_master_password": master,
+        "mt5_password": master,
+        "master_password": master,
+        "mt5_investor_password": investor,
+        "investor_password": investor,
+        "account_size": account_size,
+        "balance": account_size,
+        "equity": account_size,
+        "phase": stage,
+        "status": "active" if stage == "phase1" else account_status,
+        "payment_status": "approved",
+        "monitoring_enabled": True,
+        "mt5_access_disabled": False,
+        "mt5_updated_at": now,
+        "updated_at": now,
+    }
+    if account_id:
+        trader_update.update({"current_account_id": account_id, "trader_account_id": account_id})
+    _np_safe_table_update("traders", trader_update, "id", trader_id)
+
+    if purchase.get("id"):
+        purchase_update = {
+            "trader_id": trader_id,
+            "mt5_login": login,
+            "mt5_server": server,
+            "mt5_master_password": master,
+            "mt5_password": master,
+            "master_password": master,
+            "mt5_investor_password": investor,
+            "investor_password": investor,
+            "payment_status": "approved",
+            "status": "approved_active",
+            "assigned_at": now,
+            "updated_at": now,
+        }
+        if account_id:
+            purchase_update.update({"current_account_id": account_id, "trader_account_id": account_id})
+        _np_safe_table_update("challenge_purchases", purchase_update, "id", purchase.get("id"))
+
+    print("TRADER_ACCOUNT_SYNC_OK", {"trader_id": trader_id, "mt5_login": login, "stage": stage, "account_id": account_id})
+    return account_row
+
 @app.route("/approve_challenge_purchase", methods=["POST"])
 def approve_purchase():
     try:
@@ -1457,11 +1660,29 @@ def approve_purchase():
             "balance":p.get("account_size") or 0,"equity":p.get("account_size") or 0,"phase":"phase1","status":"active",
             "payment_status":"approved","payment_proof_url":p.get("payment_proof_url",""),"selected_plan":p.get("plan_name",""),
             "approved_at":t,"challenge_started_at":t,"approved_by":d.get("approved_by","admin"),"admin_note":d.get("admin_note",""),"trading_days_left":30}
+        trader_row = None
         if lookup.data:
-            supabase.table("traders").update(td).eq("id",lookup.data[0]["id"]).execute()
+            updated_traders = supabase.table("traders").update(td).eq("id",lookup.data[0]["id"]).execute().data or []
+            trader_row = updated_traders[0] if updated_traders else get_trader_by_id(lookup.data[0]["id"])
         else:
             td.update({"account_reference":ref(),"profit":0,"drawdown":0,"profit_percent":0,"drawdown_percent":0})
-            supabase.table("traders").insert(td).execute()
+            created_traders = supabase.table("traders").insert(td).execute().data or []
+            trader_row = created_traders[0] if created_traders else td
+
+        # Critical production sync: every approved MT5 assignment must create/update trader_accounts.
+        # This is what Monitoring API, VPS, Admin and Trader Dashboard use as the live account source.
+        try:
+            _np_sync_trader_account_assignment(
+                trader=trader_row or {},
+                purchase=p,
+                mt5=m,
+                stage="phase1",
+                admin_name=d.get("approved_by") or "admin",
+                note=d.get("admin_note") or "Challenge approved and Phase 1 MT5 assigned"
+            )
+        except Exception as sync_error:
+            print("APPROVE PURCHASE TRADER_ACCOUNT_SYNC ERROR:", sync_error)
+
         approved_rows = supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute().data
         _affiliate_create_commission_from_purchase(approved_rows[0] if approved_rows else p, d)
 
@@ -1517,10 +1738,52 @@ NairaPips Team"""
         return ok(result, "Challenge purchase rejected")
     except Exception as e: return bad(e)
 
+# ================================
+# MT5 POOL VAULT STATUS NORMALIZATION
+# ================================
+MT5_POOL_AVAILABLE_STATUSES = {"", "available", "new", "unused", "ready", "free", "unassigned", "stock", "open"}
+MT5_POOL_ASSIGNED_STATUSES = {"assigned", "assigned_active", "in_use", "used", "allocated"}
+
+def _mt5_pool_status(value, fallback="available"):
+    raw = str(value or "").strip().lower()
+    if raw in MT5_POOL_ASSIGNED_STATUSES:
+        return "assigned"
+    if raw in MT5_POOL_AVAILABLE_STATUSES:
+        return "available"
+    if "assign" in raw or "use" in raw:
+        return "assigned"
+    return fallback
+
 @app.route("/mt5_pool", methods=["GET"])
 def mt5_pool():
-    try: return jsonify(supabase.table("mt5_pool").select("*").order("created_at", desc=True).execute().data)
+    try:
+        rows = supabase.table("mt5_pool").select("*").order("created_at", desc=True).execute().data or []
+        # Do not silently hide older records with blank/new/unused statuses.
+        # Normalize response only; stored rows can be repaired with /repair_mt5_pool_statuses.
+        for row in rows:
+            row["status"] = _mt5_pool_status(row.get("status"))
+        return jsonify(rows)
     except Exception as e: return bad(e)
+
+@app.route("/repair_mt5_pool_statuses", methods=["POST", "OPTIONS"])
+def repair_mt5_pool_statuses():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        rows = supabase.table("mt5_pool").select("*").execute().data or []
+        repaired = []
+        for row in rows:
+            mid = row.get("id")
+            old_status = str(row.get("status") or "").strip()
+            new_status = _mt5_pool_status(old_status)
+            if mid and old_status.lower() != new_status:
+                try:
+                    updated = supabase.table("mt5_pool").update({"status": new_status, "updated_at": now_iso()}).eq("id", mid).execute().data or []
+                    repaired.extend(updated or [{"id": mid, "old_status": old_status, "status": new_status}])
+                except Exception as e:
+                    print("MT5 POOL REPAIR SKIPPED:", mid, e)
+        return ok({"repaired": repaired, "count": len(repaired)}, "MT5 pool statuses repaired")
+    except Exception as e: return bad(e, 500)
 
 @app.route("/create_mt5_account", methods=["POST"])
 def create_mt5():
@@ -1531,18 +1794,11 @@ def create_mt5():
         mt5_login=str(d.get("mt5_login","")).strip()
         existing=supabase.table("mt5_pool").select("id,status").eq("mt5_login",mt5_login).limit(1).execute().data or []
         if existing: return bad("MT5 login already exists in pool",409)
-        account_size=clean(d.get("account_size"))
-        if account_size <= 0: return bad("Account size is required")
-        # Production vault rule: every newly-created MT5 pool record must enter stock room as AVAILABLE.
-        # Never trust a browser/default status here, otherwise accounts can be saved with hidden statuses
-        # and disappear from Available + Assigned views.
-        row={"plan_name":str(d.get("plan_name","")).strip(),"account_size":account_size,"mt5_login":mt5_login,
+        row={"plan_name":d.get("plan_name",""),"account_size":clean(d.get("account_size")),"mt5_login":mt5_login,
              "mt5_server":str(d.get("mt5_server","")).strip(),"mt5_master_password":str(d.get("mt5_master_password","")).strip(),
              "mt5_investor_password":str(d.get("mt5_investor_password","")).strip(),"status":"available",
-             "assigned_trader_id":None,"assigned_trader_name":"","assigned_email":"","assigned_at":None,
              "admin_note":d.get("admin_note",""),"created_at":now_iso(),"updated_at":now_iso()}
-        created=supabase.table("mt5_pool").insert(row).execute().data
-        return ok(created, "MT5 account added to available vault")
+        return ok(supabase.table("mt5_pool").insert(row).execute().data, "MT5 account added")
     except Exception as e: return bad(e)
 
 @app.route("/update_mt5_account", methods=["POST"])
@@ -1551,35 +1807,12 @@ def update_mt5():
         d=request.json or {}; mid=d.get("id")
         if not mid: return bad("Missing MT5 account id")
         upd={"updated_at":now_iso()}
-        for k in ["plan_name","mt5_login","mt5_server","mt5_master_password","mt5_investor_password","status","admin_note"]:
+        for k in ["plan_name","mt5_login","mt5_server","mt5_master_password","mt5_investor_password","admin_note"]:
             if k in d: upd[k]=d[k]
+        if "status" in d: upd["status"]=_mt5_pool_status(d.get("status"))
         if "account_size" in d: upd["account_size"]=clean(d.get("account_size"))
         return ok(supabase.table("mt5_pool").update(upd).eq("id",mid).execute().data, "MT5 account updated")
     except Exception as e: return bad(e)
-
-@app.route("/repair_mt5_pool_statuses", methods=["POST", "OPTIONS"])
-def repair_mt5_pool_statuses():
-    if request.method == "OPTIONS":
-        return _np_ok({}) if "_np_ok" in globals() else ok({})
-    try:
-        rows=supabase.table("mt5_pool").select("*").execute().data or []
-        fixed=[]
-        for m in rows:
-            raw=str(m.get("status") or "").strip().lower().replace(" ","_").replace("-","_")
-            has_assignment=bool(m.get("assigned_trader_id") or m.get("assigned_email") or m.get("assigned_at"))
-            desired=raw
-            if raw in {"", "new", "unused", "ready", "stock", "available_stock"} and not has_assignment:
-                desired="available"
-            elif raw in {"used", "in_use", "taken", "allocated"} or has_assignment:
-                desired="assigned"
-            elif raw not in {"available","assigned","inactive","expired","archived"}:
-                desired="available" if not has_assignment else "assigned"
-            if desired != raw:
-                supabase.table("mt5_pool").update({"status":desired,"updated_at":now_iso()}).eq("id",m.get("id")).execute()
-                fixed.append({"id":m.get("id"),"mt5_login":m.get("mt5_login"),"from":raw,"to":desired})
-        return ok({"fixed":fixed,"count":len(fixed)}, "MT5 pool statuses repaired")
-    except Exception as e:
-        return bad(e,500)
 
 @app.route("/delete_mt5_account", methods=["POST"])
 def delete_mt5():
@@ -1893,6 +2126,23 @@ def assign_phase_mt5():
 
         # Use safe updater because some deployments may not have every optional column.
         _safe_traders_update(trader_id, trader_update)
+
+        # Critical production sync: assign fresh phase/funded MT5 into trader_accounts too.
+        # Without this, VPS/Admin/Dashboard may not see the new account.
+        try:
+            synced_trader = dict(trader)
+            synced_trader.update(trader_update)
+            synced_trader["id"] = trader_id
+            _np_sync_trader_account_assignment(
+                trader=synced_trader,
+                purchase={},
+                mt5=mt5_acc,
+                stage=new_phase,
+                admin_name=admin_name,
+                note=note
+            )
+        except Exception as sync_error:
+            print("PHASE MT5 TRADER_ACCOUNT_SYNC ERROR:", sync_error)
 
         pool_update = {
             "status": "assigned",
