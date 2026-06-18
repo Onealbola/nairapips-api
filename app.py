@@ -1,7824 +1,5061 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NairaPips Master Command Center - Affiliate Custom Code v2</title>
-<script src="https://cdn.tailwindcss.com"></script>
 
-<style>
-body{background:#050505;color:white;font-family:Arial,sans-serif}
-.gold{color:#d4af37}.bg-gold{background:#d4af37;color:#000}
-.card{background:#111;border:1px solid rgba(212,175,55,.18)}
-.card2{background:#090909;border:1px solid rgba(255,255,255,.08)}
-.vault{background:linear-gradient(135deg,#141414,#050505);border:1px solid rgba(212,175,55,.35);box-shadow:0 0 35px rgba(212,175,55,.08)}
-.deep{background:#080808}
-.sidebar-btn{width:100%;text-align:left;padding:12px 14px;border-radius:14px;color:#ccc;font-weight:600}
-.sidebar-btn:hover,.sidebar-btn.active{background:#d4af37;color:#000;font-weight:bold}
-input,select,textarea{background:#000;border:1px solid #333;color:white;border-radius:12px;padding:12px;width:100%}
-.btn{padding:10px 15px;border-radius:12px;font-weight:bold}
-.btn-gold{background:#d4af37;color:#000}.btn-red{background:#991b1b;color:white}.btn-dark{background:#000;border:1px solid #444;color:white}.btn-green{background:#166534;color:white}
-.badge{padding:5px 10px;border-radius:999px;background:#1f1f1f;border:1px solid rgba(212,175,55,.25);color:#d4af37;font-size:12px;font-weight:bold}
-table{width:100%;min-width:1250px;border-collapse:collapse}
-th,td{padding:13px;border-bottom:1px solid rgba(255,255,255,.08);text-align:left;vertical-align:top}
-th{color:#d4af37}.tableWrap{overflow:auto}
-.loader{width:38px;height:38px;border:4px solid #333;border-top-color:#d4af37;border-radius:50%;animation:spin 1s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from supabase import create_client
+from werkzeug.utils import secure_filename
+from datetime import datetime, timezone
+import os, random, uuid, re, time
+import html
+import requests
+app = Flask(__name__)
+CORS(app)
 
-/* Payout Command Center overflow fixes */
-.kpi-amount{
-  font-size:clamp(22px,2.2vw,36px);
-  line-height:1.05;
-  white-space:normal;
-  overflow-wrap:anywhere;
-  word-break:break-word;
-  max-width:100%;
-}
-.payout-amount-main{
-  font-size:clamp(28px,3vw,48px);
-  line-height:1.02;
-  white-space:normal;
-  overflow-wrap:anywhere;
-  word-break:break-word;
-  max-width:100%;
-}
-.payout-field{
-  min-width:0;
-  overflow:hidden;
-}
-.payout-field-value{
-  font-size:clamp(16px,1.35vw,22px);
-  line-height:1.18;
-  white-space:normal;
-  overflow-wrap:anywhere;
-  word-break:break-word;
-  max-width:100%;
-}
-.payout-date-value{
-  font-size:clamp(14px,1.15vw,18px);
-  line-height:1.22;
-  white-space:normal;
-  overflow-wrap:anywhere;
-}
-.payout-bank-grid{
-  grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
-}
-.payout-date-grid{
-  grid-template-columns:repeat(auto-fit,minmax(185px,1fr));
-}
-@media(max-width:900px){
-  .payout-amount-main{font-size:34px}
-  .kpi-amount{font-size:26px}
-}
+REGISTER_RATE_WINDOW_SECONDS = 15 * 60
+REGISTER_RATE_MAX = 5
+REGISTER_RATE_BUCKET = {}
 
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-.monitor-meter{height:12px;border-radius:999px;background:#111;overflow:hidden;border:1px solid rgba(255,255,255,.08)}
-.monitor-safe{background:linear-gradient(90deg,#22c55e,#84cc16)}
-.monitor-warning{background:linear-gradient(90deg,#eab308,#f97316)}
-.monitor-danger{background:linear-gradient(90deg,#f97316,#ef4444)}
-.monitor-breached{background:linear-gradient(90deg,#991b1b,#ef4444)}
-.monitor-text{font-size:clamp(18px,1.8vw,32px);line-height:1.05;overflow-wrap:anywhere;word-break:break-word}
-.monitor-card{min-width:0;overflow:hidden}
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ================================
+# NAIRAPIPS MT5 SOURCE-OF-TRUTH CORE
+# ================================
 
-/* Monitoring Intelligence UI */
-.timeline-dot{width:14px;height:14px;border-radius:999px;background:#eab308;box-shadow:0 0 18px rgba(234,179,8,.45);flex:0 0 auto}
-.timeline-line{width:2px;background:rgba(234,179,8,.25);margin-left:6px}
-.evidence-grid{grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
-.evidence-value{font-size:clamp(20px,2vw,34px);line-height:1.05;overflow-wrap:anywhere;word-break:break-word}
-.zone-safe{color:#22c55e}.zone-warning{color:#eab308}.zone-danger{color:#fb923c}.zone-critical,.zone-breached{color:#ef4444}
+def _np_ok(data=None, status=200):
+    res = jsonify(data or {"success": True})
+    res.status_code = status
+    res.headers["Access-Control-Allow-Origin"] = "*"
+    res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return res
 
+def _np_fail(message, status=400):
+    return _np_ok({"success": False, "error": str(message)}, status)
 
-/* NairaPips premium plan + marketing CRM refinements */
-.plan-hero{background:radial-gradient(circle at top left,rgba(212,175,55,.18),transparent 35%),linear-gradient(135deg,#151515,#050505);border:1px solid rgba(212,175,55,.38);box-shadow:0 0 42px rgba(212,175,55,.08)}
-.plan-card{background:linear-gradient(160deg,#141414,#060606);border:1px solid rgba(212,175,55,.32);box-shadow:0 18px 45px rgba(0,0,0,.35);position:relative;overflow:hidden}
-.plan-card:before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 20% 0%,rgba(212,175,55,.14),transparent 28%);pointer-events:none}
-.plan-price{font-size:clamp(32px,4vw,64px);line-height:1;font-weight:900;color:#d4af37;overflow-wrap:anywhere}
-.plan-size{font-size:clamp(24px,2.5vw,44px);line-height:1.05;font-weight:900}
-.plan-pill{padding:7px 11px;border-radius:999px;background:rgba(212,175,55,.1);border:1px solid rgba(212,175,55,.28);color:#f5d76e;font-size:12px;font-weight:900;letter-spacing:.04em}
-.crm-toolbar{position:sticky;top:0;z-index:10;background:rgba(5,5,5,.88);backdrop-filter:blur(12px);border:1px solid rgba(212,175,55,.22)}
-.crm-contact-card{background:linear-gradient(145deg,#111,#050505);border:1px solid rgba(212,175,55,.20);transition:.2s ease}
-.crm-contact-card:hover{border-color:rgba(212,175,55,.55);transform:translateY(-1px)}
-.crm-check{width:auto;accent-color:#d4af37}
+def _dt_score(value):
+    try:
+        if not value:
+            return 0
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return 0
 
+def _row_score(t):
+    status = str(t.get("status") or "").strip().lower()
+    pay = str(t.get("payment_status") or "").strip().lower()
+    score = 0
 
-/* MT5 Pool Vault beauty + password visibility fixes */
-.mt5-vault-shell{display:grid;grid-template-columns:minmax(360px,430px) minmax(0,1fr);gap:24px;align-items:start}
-.mt5-panel-title{font-size:clamp(24px,2.4vw,34px);line-height:1.05}
-.mt5-password-box{background:linear-gradient(135deg,rgba(212,175,55,.08),rgba(255,255,255,.025));border:1px solid rgba(212,175,55,.26);border-radius:22px;padding:16px;overflow:hidden}
-.mt5-password-row{display:grid;grid-template-columns:minmax(0,1fr);gap:10px;margin-bottom:14px}
-.mt5-password-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-.mt5-password-actions .btn,.mt5-mini-actions .btn{padding:10px 12px;font-size:13px;white-space:nowrap;text-align:center}
-.mt5-password-input{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;letter-spacing:.4px;font-size:15px;min-height:48px;overflow:visible;text-overflow:clip}
-.mt5-mini-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
-.mt5-card{background:linear-gradient(135deg,#101010,#050505);border:1px solid rgba(212,175,55,.18);box-shadow:0 16px 40px rgba(0,0,0,.28)}
-.mt5-secret-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
-.mt5-secret{background:#060606;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:14px;min-width:0;overflow:hidden}
-.mt5-secret-value{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:13px;line-height:1.3;color:#f5f5f5;white-space:normal;overflow-wrap:anywhere;word-break:break-word;margin-top:6px}
-.mt5-info-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
-.mt5-stock-card{position:relative;overflow:hidden}
-.mt5-stock-card:before{content:"";position:absolute;inset:0;background:radial-gradient(circle at top right,rgba(212,175,55,.13),transparent 35%);pointer-events:none}
+    if pay == "approved":
+        score += 90_000_000_000
+    if status in ["active", "funded", "live"]:
+        score += 80_000_000_000
+    if str(t.get("mt5_login") or "").strip():
+        score += 70_000_000_000
+    if str(t.get("mt5_updated_at") or "").strip():
+        score += 60_000_000_000
+    if pay == "rejected" or status in ["rejected", "payment_rejected"]:
+        score -= 99_000_000_000
+    if status in ["no_account", "new_signup", "pending", "payment_pending"]:
+        score -= 50_000_000_000
 
-.mt5-assigned-card{position:relative;overflow:hidden;background:linear-gradient(135deg,#101010,#050505);border:1px solid rgba(212,175,55,.22);box-shadow:0 18px 45px rgba(0,0,0,.32)}
-.mt5-assigned-card:before{content:"";position:absolute;inset:0;background:radial-gradient(circle at top right,rgba(212,175,55,.12),transparent 38%);pointer-events:none}
-.mt5-assigned-card>*{position:relative;z-index:1}
-.mt5-assigned-head{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:start}
-.mt5-assigned-login{font-size:clamp(22px,2vw,32px);line-height:1.05;overflow-wrap:anywhere;word-break:break-word}
-.mt5-assigned-size{text-align:right;min-width:145px}
-.mt5-assigned-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px}
-.mt5-assigned-field{background:#060606;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:14px;min-width:0;overflow:hidden}
-.mt5-assigned-field b,.mt5-assigned-value{display:block;line-height:1.28;white-space:normal;overflow-wrap:anywhere;word-break:break-word;max-width:100%}
-.mt5-assigned-note{background:rgba(255,255,255,.025);border:1px solid rgba(212,175,55,.12);border-radius:18px;padding:14px;overflow-wrap:anywhere;word-break:break-word}
-.mt5-assigned-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
-@media(max-width:640px){.mt5-assigned-head{grid-template-columns:1fr}.mt5-assigned-size{text-align:left;min-width:0}.mt5-assigned-actions .btn{width:100%;text-align:center}}
-@media(max-width:1100px){.mt5-vault-shell{grid-template-columns:1fr}.mt5-password-actions,.mt5-mini-actions{grid-template-columns:1fr 1fr}.mt5-mini-actions button:last-child{grid-column:1/-1}}
-@media(max-width:640px){.mt5-secret-grid{grid-template-columns:1fr}.mt5-password-actions,.mt5-mini-actions{grid-template-columns:1fr}}
+    for key in ["mt5_updated_at", "updated_at", "approved_at", "challenge_started_at", "assigned_at", "created_at", "last_login_at"]:
+        d = _dt_score(t.get(key))
+        if d:
+            score += d
+            break
+
+    return score
+
+def _dedupe_traders(rows):
+    groups = {}
+    for row in rows or []:
+        email = str(row.get("email") or "").strip().lower()
+        phone = str(row.get("phone") or "").strip().lower()
+        key = email or phone or str(row.get("id") or "")
+        groups.setdefault(key, []).append(row)
+
+    output = []
+    for key, items in groups.items():
+        items = sorted(items, key=_row_score, reverse=True)
+        output.append(items[0])
+
+    output.sort(key=_row_score, reverse=True)
+    return output
+
+def _latest_trader_for_lookup(lookup):
+    lookup = str(lookup or "").strip().lower()
+    if not lookup:
+        return None
+
+    res = supabase.table("traders").select("*").execute()
+    rows = getattr(res, "data", []) or []
+
+    matches = []
+    for t in rows:
+        keys = [
+            str(t.get("email") or "").strip().lower(),
+            str(t.get("phone") or "").strip().lower(),
+            str(t.get("mt5_login") or "").strip().lower(),
+            str(t.get("account_reference") or "").strip().lower(),
+            str(t.get("id") or "").strip().lower(),
+        ]
+        if lookup in keys:
+            matches.append(t)
+
+    if not matches:
+        return None
+
+    return sorted(matches, key=_row_score, reverse=True)[0]
+
+def _safe_update_table(table, payload, column, value):
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return supabase.table(table).update(payload).eq(column, value).execute()
+    except Exception as e:
+        print(f"SAFE UPDATE FAILED {table}.{column}:", e)
+        return None
 
 
-
-/* MT5 bulk creation from Challenge Plan - isolated add-on */
-.mt5-plan-factory{background:radial-gradient(circle at top left,rgba(212,175,55,.18),transparent 32%),linear-gradient(135deg,#121212,#050505);border:1px solid rgba(212,175,55,.34);box-shadow:0 20px 55px rgba(0,0,0,.34),0 0 36px rgba(212,175,55,.06)}
-.mt5-plan-factory-grid{display:grid;grid-template-columns:minmax(320px,420px) minmax(0,1fr);gap:20px;align-items:start}
-.mt5-plan-preview{background:#070707;border:1px solid rgba(212,175,55,.20);border-radius:22px;padding:16px;min-height:150px}
-.mt5-plan-preview-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:10px;margin-top:14px}
-.mt5-plan-preview-item{background:#040404;border:1px solid rgba(255,255,255,.08);border-radius:15px;padding:12px;min-width:0;overflow:hidden}
-.mt5-bulk-box{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;min-height:190px;line-height:1.5;resize:vertical}
-.mt5-factory-actions{display:flex;flex-wrap:wrap;gap:10px}
-.mt5-factory-help{background:rgba(212,175,55,.06);border:1px solid rgba(212,175,55,.16);border-radius:18px;padding:14px;color:#aaa}
-@media(max-width:1100px){.mt5-plan-factory-grid{grid-template-columns:1fr}}
-
-/* Referral Marketing Module - safe visual patch */
-.referral-bar{background:linear-gradient(135deg,rgba(212,175,55,.16),rgba(12,12,12,.98));border:1px solid rgba(212,175,55,.32);box-shadow:0 14px 40px rgba(0,0,0,.28),0 0 35px rgba(212,175,55,.08)}
-.referral-chip{display:inline-flex;align-items:center;gap:7px;padding:8px 12px;border-radius:999px;background:#070707;border:1px solid rgba(212,175,55,.24);color:#d4af37;font-size:12px;font-weight:800;white-space:nowrap}
-.referral-hero{background:radial-gradient(circle at top left,rgba(212,175,55,.22),transparent 34%),linear-gradient(135deg,#15120a,#050505 65%);border:1px solid rgba(212,175,55,.38);box-shadow:0 0 45px rgba(212,175,55,.1)}
-.referral-grid{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
-.referral-input-row{display:grid;grid-template-columns:1fr auto;gap:10px}
-.referral-link-box{background:#050505;border:1px solid rgba(212,175,55,.25);border-radius:18px;padding:14px;overflow-wrap:anywhere;word-break:break-word;color:#f5e6ae}
-.referral-plan-card{background:linear-gradient(180deg,#101010,#070707);border:1px solid rgba(255,255,255,.08);box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
-@media(max-width:760px){.referral-input-row{grid-template-columns:1fr}.referral-bar .btn{width:100%}}
+# ================================
+# NAIRAPIPS PRODUCTION SAFETY CORE
+# ================================
+PROTECTED_DELETE_TABLES = {"payouts", "payments"}
+SAFE_FLAG_TABLES = {"traders", "challenge_purchases", "payouts", "payments", "referrals"}
 
 
-/* Staff RBAC Command Center */
-.permission-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
-.staff-permission-card{background:rgba(255,255,255,.035);border:1px solid rgba(212,175,55,.18);border-radius:22px;padding:16px}
-.staff-switch{display:flex;align-items:center;gap:8px;font-size:13px;color:#ddd;margin-top:8px}
-.staff-switch input{width:auto;accent-color:#d4af37}
-.staff-pill{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;border:1px solid rgba(212,175,55,.25);background:#111;color:#d4af37;font-size:12px;font-weight:800}
-.staff-danger-zone{border:1px solid rgba(239,68,68,.35);background:rgba(127,29,29,.12)}
-
-
-/* Compact MT5 Reset Button */
-.btn-mt5-reset{background:#d4af37;color:#000;margin-top:8px;display:block;width:100%;text-align:center}
-
-
-/* Lead follow-up system */
-.lead-hot{border:1px solid rgba(239,68,68,.45);background:linear-gradient(135deg,rgba(239,68,68,.13),#080808)}
-.lead-warm{border:1px solid rgba(212,175,55,.35);background:linear-gradient(135deg,rgba(212,175,55,.10),#080808)}
-.lead-action-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
-
-
-
-/* Production safety controls - black-gold preserved */
-.production-toggle{display:inline-grid;grid-template-columns:1fr 1fr;gap:4px;background:#050505;border:1px solid rgba(212,175,55,.25);border-radius:16px;padding:4px}
-.production-toggle button{border-radius:12px;padding:9px 12px;font-weight:900;color:#aaa}
-.production-toggle button.active{background:#d4af37;color:#000}
-.production-warning{border:1px solid rgba(239,68,68,.35);background:linear-gradient(135deg,rgba(127,29,29,.18),rgba(5,5,5,.96))}
-.test-badge{border-color:rgba(239,68,68,.35);color:#fb7185;background:rgba(127,29,29,.14)}
-
-
-/* NAIRAPIPS SCALE OPERATING SYSTEM */
-.np-scale-toolbar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:18px}
-.np-filter-chip{padding:10px 14px;border-radius:999px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:#d1d5db;font-weight:800;font-size:13px;cursor:pointer}
-.np-filter-chip.active{background:linear-gradient(90deg,#d4af37,#f5d061);color:#050505;border-color:transparent}
-.np-customer-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-bottom:24px}
-.np-customer-card{border-radius:22px;padding:18px;background:linear-gradient(145deg,rgba(255,255,255,.06),rgba(255,255,255,.025));border:1px solid rgba(255,255,255,.09)}
-.np-action-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
-.np-small-btn{padding:7px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.05);color:#fff;font-weight:800;font-size:12px}
-.np-drawer{position:fixed;right:0;top:0;bottom:0;width:min(560px,100%);background:#050505;border-left:1px solid rgba(212,175,55,.35);z-index:9999;transform:translateX(105%);transition:.25s ease;overflow:auto;box-shadow:-30px 0 90px rgba(0,0,0,.75)}
-.np-drawer.open{transform:translateX(0)}
-.np-drawer-head{position:sticky;top:0;background:rgba(5,5,5,.92);backdrop-filter:blur(14px);border-bottom:1px solid rgba(255,255,255,.1);padding:20px;display:flex;justify-content:space-between;gap:12px;align-items:center}
-.np-drawer-body{padding:20px}
-.np-kv{display:grid;grid-template-columns:150px 1fr;gap:10px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.07);font-size:14px}
-.np-kv span:first-child{color:#9ca3af}
-.np-pagebar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:14px 0 24px;flex-wrap:wrap}
-.np-select{background:#050505;border:1px solid rgba(255,255,255,.14);color:#fff;border-radius:12px;padding:10px 12px}
-.np-priority{display:inline-flex;padding:6px 10px;border-radius:999px;font-size:11px;font-weight:950;border:1px solid rgba(255,255,255,.12)}
-.np-priority.red{color:#f87171;background:rgba(239,68,68,.1)}
-.np-priority.green{color:#34d399;background:rgba(52,211,153,.1)}
-.np-priority.gold{color:#f5d061;background:rgba(212,175,55,.1)}
-.np-priority.blue{color:#38bdf8;background:rgba(56,189,248,.1)}
-@media(max-width:760px){.np-kv{grid-template-columns:1fr}.np-scale-toolbar input,.np-scale-toolbar select{width:100%}}
-
-</style>
-</head>
-
-<body>
-<script>
-/* NAIRAPIPS ADMIN ROUTE LOCK
-   /admin/ must always be the Master Command Center, independent of trader
-   dashboard query strings, hashes, or localStorage auth flags. */
-(function(){
-  try{
-    localStorage.removeItem("nairapipsAuthMode");
-    sessionStorage.removeItem("np_selected_account_id");
-  }catch(e){}
-  if(location.pathname.toLowerCase().includes("/dashboard")){
-    location.replace("/admin/");
-  }
-})();
-</script>
-
-<div id="loginScreen" class="min-h-screen flex items-center justify-center p-6">
-  <div class="vault p-8 rounded-3xl max-w-md w-full">
-    <h1 class="text-4xl font-black mb-2">Naira<span class="gold">Pips</span></h1>
-    <p class="text-gray-400 mb-6">Master Command Center</p>
-    <input id="adminUser" placeholder="Username" class="mb-4">
-    <input id="adminPass" type="password" placeholder="Password" class="mb-6">
-    <button onclick="adminLogin()" class="btn btn-gold w-full">Enter Command Center</button>
-    <p id="loginError" class="text-red-400 mt-4 hidden">Invalid login</p>
-  </div>
-</div>
-
-<div id="app" class="hidden min-h-screen">
-<div class="grid lg:grid-cols-[315px_1fr]">
-
-<aside class="deep border-r border-yellow-900/30 min-h-screen p-5">
-  <h1 class="text-3xl font-black mb-2">Naira<span class="gold">Pips</span></h1>
-  <p class="text-gray-500 text-sm mb-8">Capital Operating System</p>
-
-  <div class="space-y-2">
-    <button class="sidebar-btn active" data-module="overview" onclick="setModule('overview',this)">Dashboard Overview</button>
-    <button class="sidebar-btn" data-module="customerOS" onclick="setModule('customerOS',this)">Customer Command Center</button>
-    <button class="sidebar-btn" data-module="payments" onclick="setModule('payments',this)">Payments</button>
-    <button class="sidebar-btn" data-module="traders" onclick="setModule('traders',this)">Users / Traders</button>
-    <button class="sidebar-btn" data-module="traderManagement" onclick="setModule('traderManagement',this)">Traders Management</button>
-    <button class="sidebar-btn" data-module="addTrader" onclick="setModule('addTrader',this)">Add Trader</button>
-    <button class="sidebar-btn" data-module="bulkTrader" onclick="setModule('bulkTrader',this)">Bulk Add Traders</button>
-    <button class="sidebar-btn" data-module="timeline" onclick="setModule('timeline',this)">Timeline Intelligence</button>
-    <button class="sidebar-btn" data-module="plans" onclick="setModule('plans',this)">Challenge Plans</button>
-    <button class="sidebar-btn" data-module="purchases" onclick="setModule('purchases',this)">Challenge Purchases</button>
-    <button class="sidebar-btn" data-module="mt5pool" onclick="setModule('mt5pool',this)">MT5 Pool Vault</button>
-    <button class="sidebar-btn" data-module="phaseAssignment" onclick="setModule('phaseAssignment',this)">Phase MT5 Assignment</button>
-    <button class="sidebar-btn" data-module="payouts" onclick="setModule('payouts',this)">Payouts</button>
-    <button class="sidebar-btn" data-module="funded" onclick="setModule('funded',this)">Funded Traders</button>
-    <button class="sidebar-btn" data-module="revenue" onclick="setModule('revenue',this)">Revenue</button>
-    <button class="sidebar-btn" data-module="database" onclick="setModule('database',this)">Users Database</button>
-    <button class="sidebar-btn" data-module="leads" onclick="setModule('leads',this)">Lead Follow-Up</button>
-    <button class="sidebar-btn" data-module="monitoring" onclick="setModule('monitoring',this)">MT5 Monitoring</button>
-    <button class="sidebar-btn" data-module="trades" onclick="setModule('trades',this)">Trader Trades</button>
-    <button class="sidebar-btn" data-module="support" onclick="setModule('support',this)">Support Tickets</button>
-    <button class="sidebar-btn" data-module="referrals" onclick="setModule('referrals',this)">Referrals</button>
-    <button class="sidebar-btn" data-module="affiliates" onclick="setModule('affiliates',this)">Affiliate & Partner Manager</button>
-    <button class="sidebar-btn" data-module="competitions" onclick="setModule('competitions',this)">Competitions</button>
-    <button class="sidebar-btn" data-module="announcements" onclick="setModule('announcements',this)">Announcements</button>
-    <button class="sidebar-btn" data-module="staff" onclick="setModule('staff',this)">Staff</button>
-    <button class="sidebar-btn" data-module="accounts" onclick="setModule('accounts',this)">Account Management</button>
-  </div>
-</aside>
-
-<main class="p-6 lg:p-8">
-  <div class="flex flex-wrap justify-between items-center gap-4 mb-8">
-    <div>
-      <h2 id="pageTitle" class="text-4xl font-black">Dashboard Overview</h2>
-      <p class="text-gray-400">Black-gold capital command center for NairaPips operations.</p>
-    </div>
-
-    <div class="flex gap-3">
-      <input id="searchBox" oninput="render()" placeholder="Search name, email, phone, MT5, ref..." class="max-w-sm">
-      <a href="#" onclick="this.href=nairaPipsWhatsAppUrl()" target="_blank" rel="noopener" class="btn btn-dark">Chat with NairaPips</a>
-      <button onclick="loadData()" class="btn btn-gold">Refresh</button>
-    </div>
-  </div>
-
-  <div id="globalReferralBar" class="mb-6"></div>
-  <div id="content"></div>
-</main>
-
-</div>
-</div>
-
-<script>
-const API_URL = "https://nairapips-api.onrender.com";
-const WHATSAPP_NUMBER = "2348184035363";
-const WHATSAPP_MESSAGE = "Hello NairaPips, I need help from the admin dashboard.";
-
-function normalizeNairaPhoneDigits(phone){
-  let d = String(phone || "").replace(/[^0-9]/g, "");
-  if(!d) return "";
-  if(d.startsWith("00")) d = d.slice(2);
-  if(d.startsWith("234") && d.length >= 13) return d;
-  if(d.startsWith("0") && d.length >= 11) return "234" + d.slice(1);
-  if(d.length === 10 && /^[789]/.test(d)) return "234" + d;
-  return d;
-}
-
-function makeWhatsAppUrl(phone, message){
-  const n = normalizeNairaPhoneDigits(phone || WHATSAPP_NUMBER);
-  const msg = encodeURIComponent(message || WHATSAPP_MESSAGE);
-  return n ? `https://wa.me/${n}?text=${msg}` : "";
-}
-
-function nairaPipsWhatsAppUrl(){
-  return makeWhatsAppUrl(WHATSAPP_NUMBER, WHATSAPP_MESSAGE);
-}
-
-let traders = [];
-let payouts = [];
-let tickets = [];
-let announcements = [];
-let plans = [];
-let purchases = [];
-let mt5pool = [];
-let traderTrades = [];
-let monitoringSnapshots = [];
-let monitoringEvents = [];
-let marketingDeletedIdCache = [];
-let referralSettingsCache = {};
-let affiliatePartners = [];
-let affiliateCodes = [];
-let affiliateCommissions = [];
-let affiliateSummary = {};
-let businessSettingsCache = {};
-let staffMembers = [];
-let auditLogs = [];
-let currentAdmin = {username:"superadmin", role:"super_admin", name:"Super Admin", permissions:"all"};
-let staffPermissionDraft = {};
-let staffCreatePermissionDraft = {};
-let currentModule = "overview";
-let isLoading = false;
-
-async function adminLogin(){
-  const u = document.getElementById("adminUser").value.trim();
-  const p = document.getElementById("adminPass").value;
-
-  if(u === "admin" && p === "nairapips123"){
-    currentAdmin = {username:"admin", name:"Super Admin", role:"super_admin", permissions:"all"};
-    try{
-      sessionStorage.setItem("np_admin_username", u);
-      sessionStorage.setItem("np_admin_password", p);
-    }catch(e){}
-    document.getElementById("loginScreen").classList.add("hidden");
-    document.getElementById("app").classList.remove("hidden");
-    loadData();
-    return;
-  }
-
-  try{
-    const data = await postJSON(`${API_URL}/staff_login`, {username:u, password:p});
-    currentAdmin = data.staff || data.data || {username:u, role:"support", permissions:{}};
-    try{
-      sessionStorage.setItem("np_admin_username", u);
-      sessionStorage.setItem("np_admin_password", p);
-    }catch(e){}
-    document.getElementById("loginScreen").classList.add("hidden");
-    document.getElementById("app").classList.remove("hidden");
-    loadData();
-  }catch(e){
-    document.getElementById("loginError").innerText = "Invalid login or staff account not active";
-    document.getElementById("loginError").classList.remove("hidden");
-  }
-}
-
-function money(n){return "₦" + Number(n||0).toLocaleString()}
-function pct(n){return Number(n||0).toFixed(2)+"%"}
-function q(){return (document.getElementById("searchBox")?.value||"").toLowerCase()}
-
-const EXNESS_SERVERS = [
-  "Exness-MT5Trial1","Exness-MT5Trial2","Exness-MT5Trial3","Exness-MT5Trial4","Exness-MT5Trial5",
-  "Exness-MT5Trial6","Exness-MT5Trial7","Exness-MT5Trial8","Exness-MT5Trial9","Exness-MT5Trial10",
-  "Exness-MT5Trial11","Exness-MT5Trial12","Exness-MT5Trial13","Exness-MT5Trial14","Exness-MT5Trial15",
-  "Exness-MT5Trial16","Exness-MT5Trial17","Exness-MT5Trial18","Exness-MT5Trial19","Exness-MT5Trial20"
-];
-
-function serverOptions(selected=""){
-  const current = String(selected || "").trim();
-  const servers = [...EXNESS_SERVERS];
-  if(current && !servers.includes(current)) servers.unshift(current);
-  return `<option value="">Select Exness server</option>` + servers.map(s=>`<option value="${s}" ${s===current ? "selected" : ""}>${s}</option>`).join("");
-}
-
-function getPlanServer(p){
-  return p?.mt5_server || p?.default_server || p?.server || "";
-}
-
-function formatPlanServer(p){
-  return getPlanServer(p) || "Choose in MT5 Pool";
-}
-
-function formatPlanLabel(p){
-  const srv = getPlanServer(p);
-  return `${p.name || "Challenge Plan"} • ${money(p.account_size)}${srv ? " • " + srv : ""}`;
-}
-
-function formatServerValue(value){
-  return String(value || "").trim();
-}
-
-function formatServerOption(value){
-  return escapeHtml ? escapeHtml(value) : String(value || "");
-}
-
-/* NAIRAPIPS MT5 POOL STATUS NORMALIZER
-   Keeps old/broken pool rows visible. Some database rows can be saved with
-   blank/new/unused/ready status. They are unused stock, so admin must show
-   them as AVAILABLE instead of hiding them from both lists. */
-function npMt5Status(m){
-  return String((m && (m.status || m.account_status || m.mt5_status)) || "").trim().toLowerCase();
-}
-function npMt5FieldValue(m, keys){
-  for(const k of keys){
-    const v = String((m && m[k]) || "").trim();
-    if(v && !["null","none","undefined","0","false","-"].includes(v.toLowerCase())) return v;
-  }
-  return "";
-}
-function npMt5HasAssignedOwner(m){
-  // Only explicit assignment fields prove that a pool account has left stock.
-  // Do NOT classify by trader_id alone; old available rows may carry trader_id/current metadata.
-  return !!npMt5FieldValue(m, ["assigned_trader_id","assigned_to","assigned_trader_name","assigned_email","assigned_phone","assigned_at","current_account_id"]);
-}
-function npIsMt5Assigned(m){
-  const s = npMt5Status(m);
-  const flagAssigned = (m && (m.assigned === true || m.is_assigned === true || m.in_use === true));
-  return ["assigned","in_use","used","taken","allocated"].includes(s) || flagAssigned || npMt5HasAssignedOwner(m);
-}
-function npIsMt5Inactive(m){
-  const s = npMt5Status(m);
-  return ["inactive","expired","archived","deleted","disabled","locked","breached"].includes(s);
-}
-function npIsMt5Available(m){
-  // Production-safe rule: any MT5 pool row that is not assigned and not inactive is usable stock.
-  // This prevents hidden statuses like blank/new/unused/ready/available_stock from disappearing.
-  if(npIsMt5Assigned(m) || npIsMt5Inactive(m)) return false;
-  return true;
-}
-function npMt5DisplayStatus(m){
-  if(npIsMt5Assigned(m)) return "assigned";
-  if(npIsMt5Inactive(m)) return npMt5Status(m) || "inactive";
-  return "available";
-}
-
-function formatDate(value){
-  if(!value) return "Not available yet";
-  const d = new Date(value);
-  if(isNaN(d.getTime())) return "Not available yet";
-  return d.toLocaleString("en-GB",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"});
-}
-
-function renderLoading(msg="Loading data..."){
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-10 rounded-3xl flex items-center gap-5">
-    <div class="loader"></div>
-    <div>
-      <h3 class="text-2xl font-black gold">${msg}</h3>
-      <p class="text-gray-400">Loading live data from Render and Supabase.</p>
-    </div>
-  </div>`;
-}
-
-/* PRODUCTION-SAFE ADMIN API READER — CENTRAL RESTORE
-   This reader is intentionally defensive. Render routes in this project return
-   different shapes: raw arrays, {success,data}, {data:{rows}}, named arrays,
-   and occasionally slow/cold-start responses. Admin must not collapse to zero
-   just because one route is wrapped or slow. */
-function npFirstArray(payload, preferred=[]){
-  if(Array.isArray(payload)) return payload;
-  if(!payload || typeof payload !== "object") return [];
-  for(const k of preferred){
-    if(Array.isArray(payload[k])) return payload[k];
-    if(payload[k] && typeof payload[k] === "object"){
-      const nested = npFirstArray(payload[k], ["data","rows","items","results","accounts","traders","plans","purchases","mt5_pool","assignment_queue","available_mt5"]);
-      if(nested.length) return nested;
-    }
-  }
-  const generic = ["data","rows","items","results","records","traders","accounts","plans","challenge_plans","purchases","challenge_purchases","payouts","tickets","support_tickets","announcements","mt5_pool","available_mt5","assignment_queue","staff","staff_members","audit_logs","affiliate_partners","affiliate_codes","affiliate_commissions","monitoring_snapshots","snapshots","monitoring_events","events","trader_trades","trades"];
-  for(const k of generic){
-    if(Array.isArray(payload[k])) return payload[k];
-    if(payload[k] && typeof payload[k] === "object"){
-      const nested = npFirstArray(payload[k], generic);
-      if(nested.length) return nested;
-    }
-  }
-  return [];
-}
-function npApiRows(payload, url=""){
-  const u = String(url || "").toLowerCase();
-  let preferred = [];
-  if(u.includes("challenge_plans")) preferred = ["plans","challenge_plans","data","rows","items","results"];
-  else if(u.includes("challenge_purchases")) preferred = ["purchases","challenge_purchases","data","rows","items","results"];
-  else if(u.includes("phase_assignment_queue")) preferred = ["assignment_queue","data","rows","accounts","items","results"];
-  else if(u.includes("mt5_pool")) preferred = ["mt5_pool","available_mt5","accounts","data","rows","items","results"];
-  else if(u.includes("trader_trades")) preferred = ["trader_trades","trades","data","rows","items","results"];
-  else if(u.includes("monitoring_snapshots")) preferred = ["monitoring_snapshots","snapshots","data","rows","items","results"];
-  else if(u.includes("monitoring_events")) preferred = ["monitoring_events","events","data","rows","items","results"];
-  else if(u.includes("support")) preferred = ["support_tickets","tickets","data","rows","items","results"];
-  else if(u.includes("announcement")) preferred = ["announcements","data","rows","items","results"];
-  else if(u.includes("payout")) preferred = ["payouts","data","rows","items","results"];
-  else if(u.includes("staff_members")) preferred = ["staff_members","staff","data","rows","items","results"];
-  else if(u.includes("audit_logs")) preferred = ["audit_logs","logs","data","rows","items","results"];
-  else if(u.endsWith("/traders") || u.includes("/traders?")) preferred = ["traders","data","rows","items","results","accounts"];
-  return npFirstArray(payload, preferred);
-}
-function npCacheKey(url){ return "np_admin_cache_" + String(url||"").replace(/[^a-z0-9_/-]/gi,"_").slice(0,120); }
-function npReadCache(url){
-  try{ const raw = localStorage.getItem(npCacheKey(url)); return raw ? JSON.parse(raw) : null; }catch(e){ return null; }
-}
-function npWriteCache(url, rows){
-  try{ if(Array.isArray(rows) && rows.length) localStorage.setItem(npCacheKey(url), JSON.stringify(rows)); }catch(e){}
-}
-async function npFetchJson(url, timeoutMs=45000){
-  const controller = new AbortController();
-  const timer = setTimeout(()=>controller.abort(), timeoutMs);
-  try{
-    const res = await fetch(url,{cache:"no-store", signal:controller.signal});
-    const text = await res.text();
-    let data = null;
-    try{ data = text ? JSON.parse(text) : null; }catch(e){ data = null; }
-    if(!res.ok){ throw new Error(`HTTP ${res.status}`); }
-    return data;
-  }finally{ clearTimeout(timer); }
-}
-async function getJSON(url){
-  const cleanUrl = String(url || "");
-  for(let attempt=0; attempt<2; attempt++){
-    try{
-      const data = await npFetchJson(cleanUrl, attempt ? 60000 : 45000);
-      const rows = npApiRows(data, cleanUrl);
-      if(rows.length){ npWriteCache(cleanUrl, rows); return rows; }
-      // A successful empty array is respected only when there is no previous cache.
-      const cached = npReadCache(cleanUrl);
-      return Array.isArray(cached) && cached.length ? cached : [];
-    }catch(e){
-      console.warn("Admin endpoint fetch failed:", cleanUrl, e?.message || e);
-      if(attempt === 0) await new Promise(r=>setTimeout(r, 900));
-    }
-  }
-  const cached = npReadCache(cleanUrl);
-  return Array.isArray(cached) ? cached : [];
-}
-async function getObject(url, fallback={}){
-  try{
-    const data = await npFetchJson(url, 45000);
-    if(data && typeof data === "object" && !Array.isArray(data)) return data;
-  }catch(e){ console.warn("Admin object endpoint failed:", url, e?.message || e); }
-  return fallback;
-}
-async function npRunLimited(tasks, limit=3){
-  const out = new Array(tasks.length);
-  let i = 0;
-  async function worker(){
-    while(i < tasks.length){
-      const idx = i++;
-      try{ out[idx] = await tasks[idx](); }catch(e){ out[idx] = null; }
-    }
-  }
-  await Promise.all(Array.from({length:Math.min(limit,tasks.length)}, worker));
-  return out;
-}
-async function loadData(){
-  isLoading = true;
-  renderLoading("Opening Master Command Center...");
-
-  try{
-    const endpoints = [
-      () => getJSON(`${API_URL}/traders`),
-      () => getJSON(`${API_URL}/payouts`),
-      () => getJSON(`${API_URL}/support_tickets`),
-      () => getJSON(`${API_URL}/announcements`),
-      () => getJSON(`${API_URL}/challenge_plans`),
-      () => getJSON(`${API_URL}/challenge_purchases`),
-      () => getJSON(`${API_URL}/mt5_pool`),
-      () => getJSON(`${API_URL}/trader_trades`),
-      () => getJSON(`${API_URL}/monitoring_snapshots?limit=2000`),
-      () => getJSON(`${API_URL}/monitoring_events?limit=2000`),
-      () => getJSON(`${API_URL}/marketing_deleted_contacts`),
-      () => getObject(`${API_URL}/referral_settings`, {}),
-      () => getObject(`${API_URL}/business_settings`, {}),
-      () => getJSON(`${API_URL}/staff_members`),
-      () => getJSON(`${API_URL}/audit_logs`),
-      () => getJSON(`${API_URL}/affiliate_partners`),
-      () => getJSON(`${API_URL}/affiliate_codes`),
-      () => getJSON(`${API_URL}/affiliate_commissions`),
-      () => getObject(`${API_URL}/affiliate_summary`, {})
-    ];
-    const [
-      traderData,payoutData,ticketData,announcementData,planData,purchaseData,mt5Data,traderTradesData,monitoringSnapshotData,monitoringEventData,marketingDeletedData,referralSettingsData,businessSettingsData,staffData,auditData,affiliatePartnerData,affiliateCodeData,affiliateCommissionData,affiliateSummaryData
-    ] = await npRunLimited(endpoints, 3);
-
-    traders = Array.isArray(traderData) && traderData.length ? traderData : traders;
-    payouts = Array.isArray(payoutData) && payoutData.length ? payoutData : payouts;
-    tickets = Array.isArray(ticketData) && ticketData.length ? ticketData : tickets;
-    announcements = Array.isArray(announcementData) && announcementData.length ? announcementData : announcements;
-    plans = Array.isArray(planData) && planData.length ? planData : plans;
-    purchases = Array.isArray(purchaseData) && purchaseData.length ? purchaseData : purchases;
-    mt5pool = Array.isArray(mt5Data) && mt5Data.length ? mt5Data : mt5pool;
-    try{ mt5pool = mt5pool.map(m => Object.assign({}, m, {__display_status: npMt5DisplayStatus(m)})); }catch(e){}
-    traderTrades = Array.isArray(traderTradesData) && traderTradesData.length ? traderTradesData : traderTrades;
-    monitoringSnapshots = Array.isArray(monitoringSnapshotData) && monitoringSnapshotData.length ? monitoringSnapshotData : monitoringSnapshots;
-    monitoringEvents = Array.isArray(monitoringEventData) && monitoringEventData.length ? monitoringEventData : monitoringEvents;
-    marketingDeletedIdCache = Array.isArray(marketingDeletedData) ? marketingDeletedData.map(x => String(x.contact_id || x.id || x)) : marketingDeletedIdCache;
-    referralSettingsCache = referralSettingsData.data || referralSettingsData || {};
-    businessSettingsCache = businessSettingsData.data || businessSettingsData || {};
-    applyBusinessSettingsFromServer();
-    staffMembers = Array.isArray(staffData) && staffData.length ? staffData : staffMembers;
-    auditLogs = Array.isArray(auditData) && auditData.length ? auditData : auditLogs;
-    affiliatePartners = Array.isArray(affiliatePartnerData) && affiliatePartnerData.length ? affiliatePartnerData : affiliatePartners;
-    affiliateCodes = Array.isArray(affiliateCodeData) && affiliateCodeData.length ? affiliateCodeData : affiliateCodes;
-    affiliateCommissions = Array.isArray(affiliateCommissionData) && affiliateCommissionData.length ? affiliateCommissionData : affiliateCommissions;
-    affiliateSummary = affiliateSummaryData.data || affiliateSummaryData || {};
-    if(typeof npApplyLiveMetrics === "function"){
-      traders = traders.map(t => npApplyLiveMetrics(t));
+def _admin_from_payload(data):
+    return {
+        "id": data.get("admin_id") or data.get("staff_id") or "",
+        "name": data.get("admin_name") or data.get("approved_by") or data.get("mt5_updated_by") or "admin",
+        "username": data.get("admin_username") or data.get("approved_by") or data.get("mt5_updated_by") or "admin",
+        "role": data.get("admin_role") or "admin",
     }
 
-  }catch(e){
-    document.getElementById("content").innerHTML = `
-    <div class="card p-8 rounded-3xl">
-      <h3 class="text-2xl font-black text-red-400">Could not load command center</h3>
-      <p class="text-gray-400">Check API or wait for Render to wake up.</p>
-      <button onclick="loadData()" class="btn btn-gold mt-5">Try Again</button>
-    </div>`;
-    isLoading = false;
-    return;
-  }
 
-  isLoading = false;
-  applyStaffPermissions();
-  render();
-}
-
-function setModule(module,btn){
-  if(!canViewModule(module)){
-    alert("Access denied. This staff account cannot open this module.");
-    return;
-  }
-  currentModule = module;
-  document.querySelectorAll(".sidebar-btn").forEach(b=>b.classList.remove("active"));
-  if(btn) btn.classList.add("active");
-  document.getElementById("pageTitle").innerText = btn ? btn.innerText : module;
-  render();
-}
+def _audit_safe(module, action, details="", staff=None, record_affected=""):
+    try:
+        audit_log(staff or {"name": "system", "username": "system", "role": "system"}, module, action, details, record_affected)
+    except Exception as e:
+        print("AUDIT LOG ERROR:", str(e))
 
 
-const STAFF_MODULES = [
-  ["overview","Dashboard Overview"], ["customerOS","Customer Command Center"], ["payments","Payments"], ["traders","Users / Traders"], ["traderManagement","Traders Management"],
-  ["addTrader","Add Trader"], ["bulkTrader","Bulk Add Traders"], ["timeline","Timeline Intelligence"],
-  ["plans","Challenge Plans"], ["purchases","Challenge Purchases"], ["mt5pool","MT5 Pool Vault"], ["phaseAssignment","Phase MT5 Assignment"],
-  ["payouts","Payouts"], ["funded","Funded Traders"], ["revenue","Revenue"],
-  ["database","Users Database"], ["leads","Lead Follow-Up"], ["monitoring","MT5 Monitoring"], ["trades","Trader Trades"],
-  ["support","Support Tickets"], ["referrals","Referrals"], ["affiliates","Affiliate & Partner Manager"], ["competitions","Competitions"],
-  ["announcements","Announcements"], ["staff","Staff"], ["accounts","Account Management"]
-];
+def _safe_fetch(table, column, value, limit=50):
+    try:
+        if value is None or str(value).strip() == "":
+            return []
+        res = supabase.table(table).select("*").eq(column, value).limit(limit).execute()
+        return getattr(res, "data", []) or []
+    except Exception as e:
+        print(f"SAFE FETCH FAILED {table}.{column}:", e)
+        return []
 
-const STAFF_ACTIONS = ["view","create","edit","delete","approve","export","reveal_passwords"];
 
-function roleTemplate(role){
-  const all = {};
-  const grant = (mods, actions=["view"]) => mods.forEach(m => all[m] = Object.fromEntries(actions.map(a=>[a,true])));
-  if(role === "super_admin"){
-    STAFF_MODULES.forEach(([m]) => all[m] = Object.fromEntries(STAFF_ACTIONS.map(a=>[a,true])));
-  }else if(role === "admin_manager"){
-    grant(["overview","payments","traders","addTrader","bulkTrader","purchases","mt5pool","funded","support","announcements","accounts"],["view","create","edit","approve"]);
-    grant(["payouts","monitoring","trades","revenue"],["view"]);
-  }else if(role === "finance"){
-    grant(["overview","payments","payouts","purchases","revenue"],["view","approve","edit"]);
-    grant(["traders"],["view"]);
-  }else if(role === "support"){
-    grant(["overview","traders","support","announcements","database","leads"],["view","create","edit"]);
-  }else if(role === "marketing"){
-    grant(["overview","database","leads","referrals","announcements","revenue"],["view","create","edit","export"]);
-  }
-  return all;
-}
+def _is_truthy(value):
+    return value is True or str(value or "").strip().lower() in {"true", "1", "yes", "y"}
 
-function emptyPermissions(){
-  const perms = {};
-  STAFF_MODULES.forEach(([m])=>{
-    perms[m] = {};
-    STAFF_ACTIONS.forEach(a=>perms[m][a]=false);
-  });
-  return perms;
-}
 
-function fullPermissions(){
-  const perms = {};
-  STAFF_MODULES.forEach(([m])=>{
-    perms[m] = {};
-    STAFF_ACTIONS.forEach(a=>perms[m][a]=true);
-  });
-  return perms;
-}
+def _is_funded_trader(row):
+    status = str(row.get("status") or "").strip().lower()
+    phase = str(row.get("phase") or "").strip().lower()
+    return status in {"funded", "live"} or phase in {"funded", "live"} or bool(row.get("funded_at"))
 
-function normalizePermissions(p, role="support"){
-  if(p === "all") return "all";
-  if(!p || typeof p !== "object" || Array.isArray(p)) return role === "super_admin" ? fullPermissions() : emptyPermissions();
-  return p;
-}
 
-function canViewModule(module){
-  if(!currentAdmin || currentAdmin.role === "super_admin" || currentAdmin.permissions === "all") return true;
-  const perms = normalizePermissions(currentAdmin.permissions, currentAdmin.role);
-  return !!(perms[module] && perms[module].view);
-}
+def _has_approved_payment(rows):
+    for row in rows or []:
+        status = str(row.get("status") or "").strip().lower()
+        payment = str(row.get("payment_status") or "").strip().lower()
+        if status in {"approved", "approved_active", "paid"} or payment == "approved":
+            return True
+    return False
 
-function canDo(module, action="view"){
-  if(!currentAdmin || currentAdmin.role === "super_admin" || currentAdmin.permissions === "all") return true;
-  const perms = normalizePermissions(currentAdmin.permissions, currentAdmin.role);
-  return !!(perms[module] && perms[module][action]);
-}
+@app.route("/update_trader_mt5", methods=["POST", "OPTIONS"])
+@app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
+def update_trader_mt5():
+    if request.method == "OPTIONS":
+        return _np_ok({})
 
-function applyStaffPermissions(){
-  document.querySelectorAll(".sidebar-btn[data-module]").forEach(btn=>{
-    const module = btn.getAttribute("data-module");
-    btn.style.display = canViewModule(module) ? "block" : "none";
-  });
-  if(!canViewModule(currentModule)){
-    const first = document.querySelector(".sidebar-btn[data-module]:not([style*='display: none'])");
-    currentModule = first ? first.getAttribute("data-module") : "overview";
-  }
-}
+    data = request.get_json(silent=True) or {}
+    trader_id = data.get("id") or data.get("trader_id")
+    if not trader_id:
+        return _np_fail("Trader ID is required")
 
-function guarded(module, action, fn){
-  if(!canDo(module, action)){
-    alert(`Access denied. You do not have ${action} permission for this module.`);
-    return;
-  }
-  return fn();
-}
+    mt5_login = str(data.get("mt5_login") or "").strip()
+    mt5_server = str(data.get("mt5_server") or "").strip()
+    if not mt5_login:
+        return _np_fail("MT5 login is required")
+    if not mt5_server:
+        return _np_fail("MT5 server is required")
 
-function render(){
-  if(isLoading) return;
-  if(document.getElementById("globalReferralBar")){
-    document.getElementById("globalReferralBar").innerHTML = referralGlobalBar();
-  }
+    master_password = data.get("mt5_password") or data.get("master_password") or data.get("mt5_master_password") or ""
+    investor_password = data.get("mt5_investor_password") or data.get("investor_password") or ""
+    now = datetime.now(timezone.utc).isoformat()
 
-  if(currentModule==="overview") return overview();
-  if(currentModule==="customerOS") return customerOSModule();
-  if(currentModule==="payments") return paymentsModule();
-  if(currentModule==="traders") return tradersModule();
-  if(currentModule==="traderManagement") return traderManagementModule();
-  if(currentModule==="addTrader") return addTraderModule();
-  if(currentModule==="bulkTrader") return bulkTraderModule();
-  if(currentModule==="timeline") return timelineModule();
-  if(currentModule==="plans") return plansModule();
-  if(currentModule==="purchases") return purchasesModule();
-  if(currentModule==="mt5pool") return mt5PoolModule();
-  if(currentModule==="phaseAssignment") return phaseAssignmentModule();
-  if(currentModule==="monitoring") return monitoringModule();
-  if(currentModule==="payouts") return payoutsModule();
-  if(currentModule==="revenue") return revenueModule();
-  if(currentModule==="database") return databaseModule();
-  if(currentModule==="leads") return leadsModule();
-  if(currentModule==="trades") return traderTradesModule();
-  if(currentModule==="funded") return fundedModule();
-  if(currentModule==="support") return supportModule();
-  if(currentModule==="referrals") return referralsModule();
-  if(currentModule==="affiliates") return affiliatesModule();
-  if(currentModule==="competitions") return placeholder("Competitions","Trading contests and leaderboard campaigns will connect later.");
-  if(currentModule==="announcements") return announcementsModule();
-  if(currentModule==="staff") return staffModule();
-  if(currentModule==="accounts") return accountsModule();
-}
-
-function stat(label,value,extra=""){
-  return `<div class="vault p-5 rounded-2xl">
-    <p class="text-gray-400 text-sm">${label}</p>
-    <h3 class="text-3xl font-black gold">${value}</h3>
-    <p class="text-gray-500 text-xs mt-1">${extra}</p>
-  </div>`;
-}
-
-function empty(msg){
-  return `<div class="card p-8 rounded-3xl text-center text-gray-400">${msg}</div>`;
-}
-
-function filteredTraders(){
-  const s = q();
-  return traders.filter(t =>
-    (t.name||"").toLowerCase().includes(s) ||
-    (t.email||"").toLowerCase().includes(s) ||
-    (t.phone||"").toLowerCase().includes(s) ||
-    (t.mt5_login||"").toLowerCase().includes(s) ||
-    (t.account_reference||"").toLowerCase().includes(s)
-  );
-}
-
-function tradeStatusBadge(status){
-  const s = String(status||"open").toLowerCase();
-  const cls = s === "open" ? "text-green-400" : s === "closed" ? "text-gray-400" : "text-yellow-400";
-  return `<span class="badge ${cls}">${s.toUpperCase()}</span>`;
-}
-
-function tradeProfitClass(v){
-  const n = Number(v||0);
-  return n >= 0 ? "text-green-400" : "text-red-400";
-}
-
-function tradeTypeBadge(v){
-  const t = String(v||"-").toUpperCase();
-  const cls = t === "BUY" ? "text-green-400" : t === "SELL" ? "text-red-400" : "text-gray-300";
-  return `<span class="badge ${cls}">${t}</span>`;
-}
-
-async function traderTradesModule(){
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div>
-        <span class="badge">LIVE MT5 TRADE SURVEILLANCE</span>
-        <h3 class="text-4xl font-black gold mt-3">Trader Trades</h3>
-        <p class="text-gray-400 mt-2">Grouped by trader first. Click View Trades to inspect one user's activity without scattered rows.</p>
-      </div>
-      <div class="flex gap-3 items-start">
-        <button onclick="traderTradesModule()" class="btn btn-gold">Refresh Trades</button>
-        <button onclick="loadData()" class="btn btn-dark">Reload All</button>
-      </div>
-    </div>
-  </div>
-  <div class="vault p-10 rounded-3xl flex items-center gap-5">
-    <div class="loader"></div>
-    <div>
-      <h3 class="text-2xl font-black gold">Loading trader trade groups...</h3>
-      <p class="text-gray-400">Reading /trader_trades with production timeout protection. If API is slow, cached admin data will show.</p>
-    </div>
-  </div>`;
-
-  let liveFetchFailed = false;
-  try{
-    const timeout = new Promise((_, reject)=>setTimeout(()=>reject(new Error("Trade feed timeout")), 9000));
-    const live = await Promise.race([
-      getJSON(`${API_URL}/trader_trades?fresh=${Date.now()}`),
-      timeout
-    ]);
-    traderTrades = Array.isArray(live) ? live : [];
-    window.__npCachedTraderTrades = traderTrades;
-    window.__npTraderTradesLastLoadedAt = new Date().toISOString();
-  }catch(e){
-    console.warn("Trader trades feed slow/offline; using last cached admin data", e);
-    liveFetchFailed = true;
-    traderTrades = Array.isArray(window.__npCachedTraderTrades) ? window.__npCachedTraderTrades : (Array.isArray(traderTrades) ? traderTrades : []);
-  }
-
-  const allTrades = Array.isArray(traderTrades) ? traderTrades : [];
-  const s = q();
-  const groupsMap = new Map();
-
-  allTrades.forEach(t=>{
-    const email = String(t.email||"").trim().toLowerCase();
-    const login = String(t.mt5_login||"").trim();
-    const key = `${email || "no-email"}|${login || "no-login"}`;
-    if(!groupsMap.has(key)){
-      groupsMap.set(key, {
-        key,
-        trader_name: t.trader_name || t.name || "Unknown Trader",
-        email: t.email || "",
-        mt5_login: login,
-        trades: [],
-        open: 0,
-        closed: 0,
-        profit: 0,
-        volume: 0,
-        symbols: new Set(),
-        last_sync: "",
-        last_trade: ""
-      });
+    trader_update = {
+        "mt5_login": mt5_login,
+        "mt5_server": mt5_server,
+        "mt5_master_password": master_password,
+        "mt5_investor_password": investor_password,
+        "mt5_password": master_password,
+        "master_password": master_password,
+        "investor_password": investor_password,
+        "phase": data.get("phase") or "phase1",
+        "status": data.get("status") or "active",
+        "payment_status": data.get("payment_status") or "approved",
+        "approved_at": data.get("approved_at") or now,
+        "challenge_started_at": data.get("challenge_started_at") or now,
+        "mt5_updated_at": now,
+        "updated_at": now,
+        "mt5_updated_by": data.get("mt5_updated_by") or "admin",
+        "mt5_reset_reason": data.get("mt5_reset_reason") or "MT5 login details updated",
+        "admin_note": data.get("admin_note") or "MT5 login details updated",
     }
-    const g = groupsMap.get(key);
-    g.trades.push(t);
-    const status = String(t.status||"open").toLowerCase();
-    if(status === "open") g.open += 1;
-    if(status === "closed") g.closed += 1;
-    g.profit += Number(t.profit||0);
-    g.volume += Number(t.volume||0);
-    if(t.symbol) g.symbols.add(String(t.symbol));
-    const sync = t.synced_at || t.updated_at || t.created_at || "";
-    const opened = t.opened_at || "";
-    if(sync && (!g.last_sync || new Date(sync) > new Date(g.last_sync))) g.last_sync = sync;
-    if(opened && (!g.last_trade || new Date(opened) > new Date(g.last_trade))) g.last_trade = opened;
-  });
 
-  let groups = Array.from(groupsMap.values()).map(g=>({
-    ...g,
-    symbols_text: Array.from(g.symbols).slice(0,6).join(", ") || "—",
-    total: g.trades.length
-  }));
+    if not str(master_password).strip():
+        for k in ["mt5_master_password", "mt5_password", "master_password"]:
+            trader_update.pop(k, None)
+    if not str(investor_password).strip():
+        for k in ["mt5_investor_password", "investor_password"]:
+            trader_update.pop(k, None)
 
-  groups.sort((a,b)=>{
-    if((b.open||0)!==(a.open||0)) return (b.open||0)-(a.open||0);
-    return new Date(b.last_sync||0)-new Date(a.last_sync||0);
-  });
+    try:
+        result = supabase.table("traders").update(trader_update).eq("id", trader_id).execute()
+        trader_rows = getattr(result, "data", []) or []
+        if not trader_rows:
+            fetched = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute()
+            trader_rows = getattr(fetched, "data", []) or []
 
-  const filteredGroups = groups.filter(g=>{
-    const blob = [g.trader_name,g.email,g.mt5_login,g.symbols_text].join(" ").toLowerCase();
-    return !s || blob.includes(s);
-  });
+        trader_email = (trader_rows[0].get("email") if trader_rows else "") or data.get("email") or ""
+        trader_phone = (trader_rows[0].get("phone") if trader_rows else "") or data.get("phone") or ""
 
-  window.npTradeGroups = filteredGroups;
-  const restoreTradeDetailKey = window.__npOpenTradeGroupKey || "";
+        purchase_update = {
+            "mt5_login": mt5_login,
+            "mt5_server": mt5_server,
+            "mt5_master_password": master_password,
+            "mt5_investor_password": investor_password,
+            "mt5_password": master_password,
+            "master_password": master_password,
+            "investor_password": investor_password,
+            "payment_status": "approved",
+            "status": "approved",
+            "assigned_at": now,
+            "approved_at": now,
+            "updated_at": now,
+            "admin_note": data.get("admin_note") or "MT5 login details updated",
+        }
 
-  const open = allTrades.filter(t=>String(t.status||"open").toLowerCase()==="open").length;
-  const closed = allTrades.filter(t=>String(t.status||"").toLowerCase()==="closed").length;
-  const totalProfit = allTrades.reduce((a,t)=>a+Number(t.profit||0),0);
-  const totalLots = allTrades.reduce((a,t)=>a+Number(t.volume||0),0);
+        if not str(master_password).strip():
+            for k in ["mt5_master_password", "mt5_password", "master_password"]:
+                purchase_update.pop(k, None)
+        if not str(investor_password).strip():
+            for k in ["mt5_investor_password", "investor_password"]:
+                purchase_update.pop(k, None)
 
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div>
-        <span class="badge">TRADER-STRUCTURED TRADE SURVEILLANCE</span>
-        <h3 class="text-4xl font-black gold mt-3">Trader Trades</h3>
-        <p class="text-gray-400 mt-2">Production view: one row per trader/MT5 account. Open a trader to see only that user's trades.</p>
-      </div>
-      <button onclick="traderTradesModule()" class="btn btn-gold">Refresh Trades</button>
-    </div>
-  </div>
+        _safe_update_table("challenge_purchases", purchase_update, "trader_id", trader_id)
+        _safe_update_table("challenge_purchases", purchase_update, "email", trader_email)
+        _safe_update_table("challenge_purchases", purchase_update, "phone", trader_phone)
 
-  ${liveFetchFailed ? `<div class="vault p-4 rounded-2xl mb-6 border border-yellow-500/40 text-yellow-300 font-bold">Trade feed is slow right now. Showing last loaded trade data instead of keeping the module stuck on loading.</div>` : ``}
+        trader_row = trader_rows[0] if trader_rows else get_trader_by_id(trader_id)
+        send_mt5_reset_email(
+            trader_row,
+            mt5_login,
+            mt5_server,
+            master_password,
+            investor_password,
+            data.get("mt5_reset_reason") or data.get("admin_note") or "MT5 login details updated"
+        )
+        send_admin_alert(
+            "NairaPips MT5 login reset",
+            f"""A trader MT5 login/account was updated.
 
-  <div class="grid md:grid-cols-5 gap-4 mb-8">
-    ${stat("Traders With Trades",groups.length,"Grouped users / MT5 accounts")}
-    ${stat("Total Synced Trades",allTrades.length,"All trade records")}
-    ${stat("Open Trades",open,"Currently running")}
-    ${stat("Closed Records",closed,"History records")}
-    ${stat("Net Trade P/L",money(totalProfit),"Grouped total P/L")}
-  </div>
+Trader: {trader_row.get("name") if trader_row else ""}
+Email: {trader_email}
+Phone: {trader_phone}
+MT5 Login: {mt5_login}
+Server: {mt5_server}
+Reason: {data.get("mt5_reset_reason") or data.get("admin_note") or "MT5 login details updated"}"""
+        )
 
-  <div class="vault p-6 rounded-3xl">
-    <div class="flex flex-wrap justify-between items-center gap-4 mb-5">
-      <div>
-        <h3 class="text-3xl font-black gold">Trader Trade Summary</h3>
-        <p class="text-gray-400">Click View Trades beside a trader to open their individual trade history.</p>
-      </div>
-      <span class="badge">${formatDate(new Date().toISOString())}</span>
-    </div>
+        _audit_safe("mt5", "mt5_account_update", f"Trader {trader_id} MT5 updated to {mt5_login} / {mt5_server}", _admin_from_payload(data))
+        return _np_ok({"success": True, "message": "MT5 details updated and synced", "data": trader_rows})
+    except Exception as e:
+        return _np_fail(e, 500)
 
-    <div class="tableWrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Trader</th>
-            <th>Email</th>
-            <th>MT5 Login</th>
-            <th>Open</th>
-            <th>Closed</th>
-            <th>Total Trades</th>
-            <th>Symbols</th>
-            <th>Total Lots</th>
-            <th>Net P/L</th>
-            <th>Last Sync</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${filteredGroups.map((g,i)=>`
-            <tr>
-              <td><b>${g.trader_name || "Unknown Trader"}</b></td>
-              <td class="text-gray-400">${g.email || "—"}</td>
-              <td class="gold font-bold">${g.mt5_login || "—"}</td>
-              <td><span class="badge text-green-400">${g.open}</span></td>
-              <td><span class="badge text-gray-400">${g.closed}</span></td>
-              <td><b>${g.total}</b></td>
-              <td>${g.symbols_text}</td>
-              <td>${Number(g.volume||0).toFixed(2)}</td>
-              <td class="font-black ${tradeProfitClass(g.profit)}">${money(g.profit)}</td>
-              <td class="text-gray-400">${formatDate(g.last_sync)}</td>
-              <td><button onclick="viewTraderTradeGroup(${i})" class="btn btn-gold">View Trades</button></td>
-            </tr>
-          `).join("") || `<tr><td colspan="11" class="text-center text-gray-400 py-10">No trader trade groups found. Use search or keep MT5 engine running.</td></tr>`}
-        </tbody>
-      </table>
-    </div>
-  </div>`;
+@app.route("/trader_source", methods=["POST", "OPTIONS"])
+def trader_source():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    data = request.get_json(silent=True) or {}
+    lookup = data.get("lookup") or data.get("email") or data.get("phone") or data.get("id")
+    trader = _latest_trader_for_lookup(lookup)
+    if not trader:
+        return _np_fail("Trader not found", 404)
+    return _np_ok({"success": True, "data": trader, "trader": trader})
 
-  // Preserve individual trader trade view during admin refresh/re-render.
-  // Without this, background admin refresh can pull the user back to the grouped list.
-  if(restoreTradeDetailKey){
-    const restoreIndex = filteredGroups.findIndex(g => String(g.key) === String(restoreTradeDetailKey));
-    if(restoreIndex >= 0){
-      setTimeout(() => viewTraderTradeGroup(restoreIndex, true), 50);
+@app.route("/trader_source/<path:lookup>", methods=["GET"])
+def trader_source_get(lookup):
+    trader = _latest_trader_for_lookup(lookup)
+    if not trader:
+        return _np_fail("Trader not found", 404)
+    return _np_ok({"success": True, "data": trader, "trader": trader})
+
+
+
+FROM_EMAIL = os.getenv("FROM_EMAIL") or "support@nairapips.com"
+ADMIN_ALERT_EMAIL = os.getenv("ADMIN_ALERT_EMAIL") or FROM_EMAIL
+BREVO_API_KEY = os.getenv("BREVO_API_KEY")
+
+# ================================
+# NAIRAPIPS EMAIL LOG BANK
+# ================================
+def _email_type_from_subject(subject):
+    s = str(subject or "").lower()
+    if "phase 1" in s or "phase1" in s:
+        return "phase1_pass"
+    if "phase 2" in s or "phase2" in s:
+        return "phase2_pass"
+    if "breach" in s or "breached" in s:
+        return "breach"
+    if "otp" in s or "verification code" in s:
+        return "email_otp"
+    if "mt5" in s:
+        return "mt5_update"
+    if "payout" in s:
+        return "payout"
+    return "general"
+
+
+def _log_email_bank(to_email, subject, email_type=None, status="queued", trader_id=None, message="", provider="brevo", provider_response="", error=""):
+    """Best-effort log. If the SQL has not been run yet, email sending must not break."""
+    try:
+        row = {
+            "trader_id": trader_id,
+            "recipient_email": str(to_email or "").strip().lower(),
+            "subject": str(subject or "")[:250],
+            "email_type": email_type or _email_type_from_subject(subject),
+            "status": status,
+            "provider": provider,
+            "provider_response": str(provider_response or "")[:2000],
+            "error": str(error or "")[:2000],
+            "message_preview": str(message or "")[:1000],
+            "created_at": now_iso() if "now_iso" in globals() else datetime.now(timezone.utc).isoformat(),
+            "sent_at": (now_iso() if status == "sent" and "now_iso" in globals() else None),
+        }
+        supabase.table("email_logs").insert(row).execute()
+    except Exception as e:
+        print("EMAIL LOG BANK SKIPPED:", str(e))
+
+def text_to_html_content(message):
+    return "<p>" + html.escape(str(message or "")).replace("\n", "<br>") + "</p>"
+
+def send_email_brevo(to_email, subject, html_content):
+    try:
+        if not to_email:
+            _log_email_bank(to_email, subject, status="failed", message=html_content, error="Missing recipient email")
+            return False
+        if not BREVO_API_KEY or not FROM_EMAIL:
+            err = "BREVO_API_KEY or FROM_EMAIL is missing"
+            print("BREVO EMAIL ERROR:", err)
+            _log_email_bank(to_email, subject, status="failed", message=html_content, error=err)
+            return False
+
+        print("BREVO EMAIL ATTEMPT:", to_email)
+        payload = {
+            "sender": {"name": "NairaPips", "email": FROM_EMAIL},
+            "to": [{"email": to_email}],
+            "subject": subject,
+            "htmlContent": html_content
+        }
+        res = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+            timeout=10
+        )
+        if res.status_code >= 400:
+            err = f"{res.status_code} {res.text[:500]}"
+            print("BREVO EMAIL ERROR:", err)
+            _log_email_bank(to_email, subject, status="failed", message=html_content, provider_response=res.text, error=err)
+            return False
+
+        print("BREVO EMAIL SENT:", to_email)
+        _log_email_bank(to_email, subject, status="sent", message=html_content, provider_response=res.text)
+        return True
+    except Exception as e:
+        print("BREVO EMAIL ERROR:", str(e))
+        _log_email_bank(to_email, subject, status="failed", message=html_content, error=str(e))
+        return False
+
+def send_email(to_email, subject, message):
+    return send_email_brevo(to_email, subject, text_to_html_content(message))
+
+def send_email_safe(to_email, subject, message):
+    try:
+        return send_email(to_email, subject, message)
+    except Exception as e:
+        print("BREVO EMAIL ERROR:", str(e))
+        return False
+
+def send_admin_alert(subject, message):
+    return send_email_safe(ADMIN_ALERT_EMAIL, subject, message)
+
+def email_money(value):
+    try:
+        return "₦" + f"{float(value or 0):,.0f}"
+    except Exception:
+        return "₦0"
+
+def public_money(value):
+    try:
+        return "₦" + f"{float(value or 0):,.0f}"
+    except Exception:
+        return "₦0"
+
+def public_first_name(row):
+    raw = str((row or {}).get("trader_name") or (row or {}).get("name") or (row or {}).get("full_name") or "").strip()
+    if not raw:
+        return "A trader"
+    first = raw.split()[0].strip()
+    first = re.sub(r"[^A-Za-zÀ-ÿ'-]", "", first)
+    if len(first) < 2:
+        return "A trader"
+    return first
+
+def public_activity_time(row):
+    for key in ["paid_at", "approved_at", "assigned_at", "requested_at", "created_at", "updated_at"]:
+        score = _dt_score((row or {}).get(key))
+        if score:
+            return score
+    return 0
+
+def nairapips_system_activity():
+    return [
+        {"type": "system", "message": "NairaPips challenge plans are live"},
+        {"type": "system", "message": "NairaPips MT5 assignment system is active"},
+        {"type": "system", "message": "NairaPips payout review desk is active"},
+        {"type": "system", "message": "NairaPips monitoring engine is active"},
+        {"type": "system", "message": "NairaPips support desk is online"},
+    ]
+
+def trader_display_name(row):
+    return (row or {}).get("trader_name") or (row or {}).get("name") or "Trader"
+
+def get_payout_by_id(pid):
+    rows = supabase.table("payouts").select("*").eq("id", pid).limit(1).execute().data or []
+    return rows[0] if rows else {}
+
+def payout_status(row):
+    return str((row or {}).get("status") or "pending").strip().lower()
+
+def get_purchase_by_id(pid):
+    rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
+    return rows[0] if rows else {}
+
+def get_trader_by_id(tid):
+    rows = supabase.table("traders").select("*").eq("id", tid).limit(1).execute().data or []
+    return rows[0] if rows else {}
+
+def send_mt5_reset_email(trader, mt5_login="", mt5_server="", master_password="", investor_password="", reason="MT5 login details updated"):
+    if not trader:
+        return False
+    name = trader.get("name") or trader.get("trader_name") or "Trader"
+    return send_email_safe(
+        trader.get("email"),
+        "NairaPips MT5 login details updated",
+        f"""Hello {name},
+
+Your NairaPips MT5 login details have been updated/reset.
+
+MT5 Login: {mt5_login or trader.get("mt5_login", "")}
+Server: {mt5_server or trader.get("mt5_server", "")}
+Master Password: {master_password or trader.get("mt5_master_password") or trader.get("mt5_password") or trader.get("master_password") or ""}
+Investor Password: {investor_password or trader.get("mt5_investor_password") or trader.get("investor_password") or ""}
+
+Reason: {reason}
+
+If you did not request this reset, contact NairaPips support immediately.
+
+NairaPips Team"""
+    )
+
+def send_account_status_email(trader, subject, title, details=""):
+    if not trader:
+        return False
+    name = trader.get("name") or trader.get("trader_name") or "Trader"
+    return send_email_safe(
+        trader.get("email"),
+        subject,
+        f"""Hello {name},
+
+{title}
+
+{details}
+
+NairaPips Team"""
+    )
+
+def send_challenge_certificate_email(trader, details=""):
+    return send_account_status_email(
+        trader,
+        "NairaPips challenge passed - certificate earned",
+        "Congratulations. You have passed your NairaPips challenge and your certificate has been earned.",
+        details or "Your challenge pass/certificate status has been updated. Log in to your dashboard to review the latest account status."
+    )
+def now_iso(): return datetime.now(timezone.utc).isoformat()
+def ref(): return "NP-" + str(random.randint(100000,999999))
+def clean(v):
+    return float(str(v or "0").replace(",","").replace("₦","").strip() or 0)
+def month(): return datetime.now(timezone.utc).strftime("%B")
+def year(): return datetime.now(timezone.utc).strftime("%Y")
+def ok(data=None, message="ok"): return jsonify({"success": True, "message": message, "data": data})
+def bad(e, code=400): return jsonify({"success": False, "error": str(e)}), code
+
+@app.route("/")
+def home():
+    return jsonify({"status":"NairaPips API Live","database":"connected","version":"proof-upload-upgrade"})
+
+@app.route("/health")
+def health():
+    return jsonify({"health":"ok"})
+
+@app.route("/public_activity", methods=["GET"])
+def public_activity():
+    activity = []
+
+    try:
+        rows = supabase.table("payouts").select("*").order("created_at", desc=True).limit(20).execute().data or []
+        for row in rows:
+            status = str(row.get("status") or "").lower()
+            if status not in ["approved", "paid"]:
+                continue
+            amount = public_money(row.get("amount"))
+            activity.append({
+                "type": "payout",
+                "message": f"{amount} payout approved",
+                "_score": public_activity_time(row)
+            })
+    except Exception as e:
+        print("PUBLIC ACTIVITY PAYOUTS ERROR:", str(e))
+
+    try:
+        rows = supabase.table("traders").select("*").order("created_at", desc=True).limit(20).execute().data or []
+        for row in rows:
+            name = public_first_name(row)
+            message = "A trader just joined NairaPips" if name == "A trader" else f"{name} just joined NairaPips"
+            activity.append({
+                "type": "registration",
+                "message": message,
+                "_score": public_activity_time(row)
+            })
+    except Exception as e:
+        print("PUBLIC ACTIVITY TRADERS ERROR:", str(e))
+
+    try:
+        rows = supabase.table("challenge_purchases").select("*").order("created_at", desc=True).limit(20).execute().data or []
+        for row in rows:
+            status = str(row.get("status") or "").lower()
+            payment_status = str(row.get("payment_status") or "").lower()
+            if status not in ["approved", "approved_active"] and payment_status != "approved":
+                continue
+            amount = public_money(row.get("account_size"))
+            activity.append({
+                "type": "challenge",
+                "message": f"{amount} challenge approved",
+                "_score": public_activity_time(row)
+            })
+    except Exception as e:
+        print("PUBLIC ACTIVITY CHALLENGES ERROR:", str(e))
+
+    activity.sort(key=lambda item: item.get("_score", 0), reverse=True)
+    public_rows = [{k: v for k, v in item.items() if k != "_score"} for item in activity]
+    if len(public_rows) < 20:
+        public_rows.extend(nairapips_system_activity())
+    return jsonify(public_rows[:20])
+
+@app.route("/upload_payment_proof", methods=["POST"])
+def upload_payment_proof():
+    try:
+        f = request.files.get("file")
+        if not f or not f.filename:
+            return bad("No file uploaded")
+        bucket = request.form.get("bucket","payment-proofs")
+        folder = request.form.get("folder","challenge-purchases")
+        name = secure_filename(f.filename)
+        ext = name.rsplit(".",1)[-1].lower() if "." in name else "bin"
+        if ext not in {"jpg","jpeg","png","webp","pdf"}:
+            return bad("Only JPG, PNG, WEBP and PDF proof files are allowed")
+        path = f"{folder}/{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}.{ext}"
+        supabase.storage.from_(bucket).upload(path, f.read(), {"content-type": f.content_type or "application/octet-stream", "upsert": "false"})
+        url = supabase.storage.from_(bucket).get_public_url(path)
+        return jsonify({"success": True, "url": url, "path": path})
+    except Exception as e:
+        print("UPLOAD PAYMENT PROOF ERROR:", repr(e))
+        return jsonify({"success": False, "error": str(e), "hint": "Create a PUBLIC Supabase Storage bucket named payment-proofs."}), 400
+
+@app.route("/traders_raw", methods=["GET"])
+def get_traders_raw():
+    try:
+        return jsonify(supabase.table("traders").select("*").order("created_at", desc=True).execute().data)
+    except Exception as e:
+        return bad(e)
+
+@app.route("/traders", methods=["GET"])
+def get_traders():
+    try:
+        res = supabase.table("traders").select("*").execute()
+        rows = getattr(res, "data", []) or []
+        return jsonify(_dedupe_traders(rows))
+    except Exception as e:
+        return bad(e)
+
+def _request_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.headers.get("X-Real-IP") or request.remote_addr or "unknown"
+
+def _registration_rate_limited(ip):
+    now = time.time()
+    bucket = [t for t in REGISTER_RATE_BUCKET.get(ip, []) if now - t < REGISTER_RATE_WINDOW_SECONDS]
+    if len(bucket) >= REGISTER_RATE_MAX:
+        REGISTER_RATE_BUCKET[ip] = bucket
+        return True
+    bucket.append(now)
+    REGISTER_RATE_BUCKET[ip] = bucket
+    return False
+
+def _valid_email(email):
+    if not email:
+        return True
+    if len(email) > 120:
+        return False
+    return bool(re.match(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", email, re.I))
+
+def _phone_digits(phone):
+    return re.sub(r"\D", "", str(phone or ""))
+
+def _valid_phone(phone):
+    if not phone:
+        return True
+    digits = _phone_digits(phone)
+    return 7 <= len(digits) <= 15
+
+def _phone_variants(phone):
+    raw = str(phone or "").strip()
+    digits = _phone_digits(raw)
+    variants = {raw, digits}
+    if digits:
+        variants.add("+" + digits)
+    if digits.startswith("0") and len(digits) >= 10:
+        ng = "234" + digits[1:]
+        variants.update({ng, "+" + ng})
+    if digits.startswith("234") and len(digits) >= 13:
+        local = "0" + digits[3:]
+        variants.update({local, digits, "+" + digits})
+    return [v for v in variants if v]
+
+def _clean_phone(phone):
+    phone = str(phone or "").strip()
+    return re.sub(r"[^\d+]", "", phone)
+
+def _valid_name(name):
+    value = str(name or "").strip()
+    lowered = value.lower()
+    letters = re.findall(r"[a-zA-Z]", value)
+    blocked = {"test", "fake", "admin", "null", "undefined", "unknown", "n/a", "na", "none", "asdf", "qwerty"}
+    if len(value) < 2 or len(value) > 80:
+        return False
+    if len(letters) < 2:
+        return False
+    if lowered in blocked:
+        return False
+    if re.search(r"https?://|www\.|\.com|\.net|\.org", lowered):
+        return False
+    if re.fullmatch(r"([a-zA-Z])\1{2,}", value):
+        return False
+    return True
+
+def _find_existing_trader(email="", phone=""):
+    email = str(email or "").strip().lower()
+    phone = str(phone or "").strip()
+
+    if email:
+        rows = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
+        if rows:
+            return rows[0]
+        all_rows = supabase.table("traders").select("*").execute().data or []
+        for row in all_rows:
+            if str(row.get("email") or "").strip().lower() == email:
+                return row
+
+    if phone:
+        digits = _phone_digits(phone)
+        for variant in _phone_variants(phone):
+            rows = supabase.table("traders").select("*").eq("phone", variant).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+        all_rows = supabase.table("traders").select("*").execute().data or []
+        for row in all_rows:
+            if digits and _phone_digits(row.get("phone")) == digits:
+                return row
+
+    return None
+
+# ================================
+# NAIRAPIPS EMAIL OTP VERIFICATION
+# ================================
+
+def _otp_digits():
+    return str(random.randint(100000, 999999))
+
+def _email_verified_recent(email):
+    try:
+        email = str(email or '').strip().lower()
+        if not email:
+            return False
+        rows = supabase.table('email_verification_codes').select('*').eq('email', email).eq('verified', True).order('verified_at', desc=True).limit(1).execute().data or []
+        if not rows:
+            return False
+        verified_at = rows[0].get('verified_at')
+        if not verified_at:
+            return False
+        dt = datetime.fromisoformat(str(verified_at).replace('Z', '+00:00'))
+        return (datetime.now(timezone.utc) - dt).total_seconds() <= 60 * 60
+    except Exception as e:
+        print('EMAIL OTP CHECK ERROR:', str(e))
+        return False
+
+def _consume_email_verification(email):
+    try:
+        email = str(email or '').strip().lower()
+        supabase.table('email_verification_codes').update({'consumed_at': now_iso()}).eq('email', email).eq('verified', True).execute()
+    except Exception as e:
+        print('EMAIL OTP CONSUME ERROR:', str(e))
+
+@app.route('/send_email_otp', methods=['POST', 'OPTIONS'])
+def send_email_otp():
+    if request.method == 'OPTIONS':
+        return _np_ok({})
+    try:
+        d = request.json or {}
+        email = str(d.get('email') or '').strip().lower()
+        name = str(d.get('name') or 'Trader').strip() or 'Trader'
+        if not email or not _valid_email(email):
+            return bad('Enter a valid email address')
+        code = _otp_digits()
+        expires_at = datetime.fromtimestamp(time.time() + 10 * 60, tz=timezone.utc).isoformat()
+        row = {'email': email, 'code': code, 'verified': False, 'expires_at': expires_at, 'created_at': now_iso()}
+        try:
+            supabase.table('email_verification_codes').insert(row).execute()
+        except Exception as e:
+            print("EMAIL OTP INSERT ERROR:", str(e))
+            return bad("Email OTP save failed: " + str(e), 500)
+        message = 'Hello ' + name + ',\n\nYour NairaPips verification code is:\n\n' + code + '\n\nThis code expires in 10 minutes.\n\nIf you did not request this code, ignore this email.\n\nNairaPips Team'
+        sent = send_email_safe(email, 'Your NairaPips verification code', message)
+        if not sent:
+            return bad('Could not send verification email. Check email service settings.', 500)
+        return ok({'email': email, 'expires_in_minutes': 10}, 'Verification code sent')
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route('/verify_email_otp', methods=['POST', 'OPTIONS'])
+def verify_email_otp():
+    if request.method == 'OPTIONS':
+        return _np_ok({})
+    try:
+        d = request.json or {}
+        email = str(d.get('email') or '').strip().lower()
+        code = str(d.get('code') or '').strip()
+        if not email or not code:
+            return bad('Email and verification code are required')
+        rows = supabase.table('email_verification_codes').select('*').eq('email', email).eq('code', code).order('created_at', desc=True).limit(1).execute().data or []
+        if not rows:
+            return bad('Invalid verification code', 400)
+        row = rows[0]
+        exp = row.get('expires_at')
+        if exp:
+            exp_dt = datetime.fromisoformat(str(exp).replace('Z', '+00:00'))
+            if datetime.now(timezone.utc) > exp_dt:
+                return bad('Verification code has expired. Request a new code.', 400)
+        supabase.table('email_verification_codes').update({'verified': True, 'verified_at': now_iso()}).eq('id', row.get('id')).execute()
+        return ok({'email': email, 'email_verified': True}, 'Email verified')
+    except Exception as e:
+        print("EMAIL OTP VERIFY ERROR:", str(e))
+        return bad("Email OTP verification failed: " + str(e), 500)
+
+def _safe_insert_trader(row):
+    try:
+        return supabase.table("traders").insert(row).execute().data
+    except Exception as e:
+        optional = ["source", "user_agent", "ip_address", "registration_source", "registration_user_agent", "registration_ip"]
+        safe_row = {k: v for k, v in row.items() if k not in optional}
+        print("REGISTRATION OPTIONAL TRACKING SKIPPED:", str(e))
+        return supabase.table("traders").insert(safe_row).execute().data
+
+@app.route("/register_trader", methods=["POST", "OPTIONS"])
+def register_trader():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+
+    try:
+        d = request.json or {}
+        ip_address = _request_ip()
+        user_agent = request.headers.get("User-Agent", "")
+        if str(d.get("website") or d.get("company_url") or d.get("url") or "").strip():
+            print("REGISTRATION SPAM HONEYPOT:", ip_address)
+            return ok({"received": True}, "Registration received")
+        if _registration_rate_limited(ip_address):
+            return bad("Too many registration attempts. Please wait a few minutes and try again.", 429)
+
+        name = str(d.get("name", "")).strip()
+        email = str(d.get("email", "")).strip().lower()
+        phone = _clean_phone(d.get("phone", ""))
+
+        if not _valid_name(name):
+            return bad("Please enter your real full name.")
+        if not email:
+            return bad("Email is required for verification")
+        if not phone:
+            return bad("Complete WhatsApp / phone number is required")
+        if not _valid_email(email):
+            return bad("Please enter a valid email address.")
+        if not _valid_phone(phone):
+            return bad("Please enter a complete valid WhatsApp or phone number.")
+        if not _email_verified_recent(email):
+            return bad("Email is not verified. Please enter the verification code sent to your email before creating your account.", 403)
+
+        existing = _find_existing_trader(email, phone)
+        if existing:
+            return ok(existing, "Trader already exists")
+
+        row = {
+            "name": name,
+            "phone": phone,
+            "email": email,
+            "mt5_login": "",
+            "mt5_server": "",
+            "mt5_master_password": "",
+            "mt5_investor_password": "",
+            "account_size": 0,
+            "balance": 0,
+            "equity": 0,
+            "phase": "no_account",
+            "status": d.get("status", "new_signup"),
+            "engine_group": d.get("engine_group", "engine_1"),
+            "profit": 0,
+            "drawdown": 0,
+            "profit_percent": 0,
+            "drawdown_percent": 0,
+            "payment_status": d.get("payment_status", "none"),
+            "email_verified": True,
+            "email_verified_at": now_iso(),
+            "phone_verified": False,
+            "payment_proof_url": "",
+            "selected_plan": "",
+            "payment_note": "",
+            "approved_by": "",
+            "admin_note": "",
+            "account_reference": d.get("account_reference") or ref(),
+            "challenge_started_at": None,
+            "approved_at": None,
+            "funded_at": None,
+            "last_login_at": None,
+            "trading_days_left": d.get("trading_days_left", 30),
+            "source": d.get("source", "public_register"),
+            "registration_source": d.get("source", "public_register"),
+            "user_agent": user_agent[:250],
+            "registration_user_agent": user_agent[:250],
+            "ip_address": ip_address,
+            "registration_ip": ip_address,
+        }
+
+        created = _safe_insert_trader(row)
+        _consume_email_verification(email)
+        trader_row = created[0] if created else row
+
+        send_email_safe(
+            email,
+            "Welcome to NairaPips",
+            f"""Hello {name},
+
+Welcome to NairaPips. Your trader account has been created successfully.
+
+Next step: log in to your trader dashboard, choose a challenge plan, and upload your payment proof for admin approval.
+
+Reference: {trader_row.get("account_reference", "Not generated")}
+
+NairaPips Team"""
+        )
+        send_admin_alert(
+            "New NairaPips trader registration",
+            f"""A new trader registered on NairaPips.
+
+Name: {name}
+Email: {email or "Not provided"}
+Phone: {phone or "Not provided"}
+Reference: {trader_row.get("account_reference", "Not generated")}"""
+        )
+
+        return ok(trader_row, "Trader registered")
+    except Exception as e:
+        return bad(e)
+
+@app.route("/update_trader", methods=["POST", "OPTIONS"])
+def update_trader():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+
+    try:
+        d = request.json or {}
+        tid = d.get("id") or d.get("trader_id")
+        if not tid:
+            return bad("Missing trader id")
+
+        allowed = [
+            "name", "phone", "email", "status", "phase", "balance", "equity",
+            "profit", "drawdown", "profit_percent", "drawdown_percent",
+            "engine_group", "payment_status", "payment_note", "admin_note",
+            "trading_days_left", "selected_plan", "account_size",
+            "mt5_login", "mt5_server", "mt5_master_password",
+            "mt5_investor_password", "mt5_password", "master_password",
+            "investor_password", "mt5_updated_by", "mt5_reset_reason",
+            "trader_note", "mt5_notice"
+        ]
+        upd = {k: d[k] for k in allowed if k in d}
+
+        for money_key in ["account_size", "balance", "equity"]:
+            if money_key in upd:
+                upd[money_key] = clean(upd[money_key])
+
+        if any(k in upd for k in ["mt5_login", "mt5_server", "mt5_password", "master_password", "mt5_master_password"]):
+            upd["mt5_updated_at"] = now_iso()
+
+        upd["updated_at"] = now_iso()
+
+        if not upd:
+            return bad("Nothing to update")
+
+        result = supabase.table("traders").update(upd).eq("id", tid).execute().data
+        trader_row = result[0] if result else get_trader_by_id(tid)
+
+        if any(k in upd for k in ["mt5_login", "mt5_server", "mt5_password", "master_password", "mt5_master_password"]):
+            send_mt5_reset_email(
+                trader_row,
+                upd.get("mt5_login", ""),
+                upd.get("mt5_server", ""),
+                upd.get("mt5_master_password") or upd.get("mt5_password") or upd.get("master_password") or "",
+                upd.get("mt5_investor_password") or upd.get("investor_password") or "",
+                upd.get("mt5_reset_reason") or upd.get("admin_note") or "MT5 login details updated"
+            )
+
+        if str(upd.get("status", "")).lower() in ["reset", "account_reset"] or str(upd.get("phase", "")).lower() in ["reset", "account_reset"]:
+            send_account_status_email(
+                trader_row,
+                "NairaPips account reset completed",
+                "Your NairaPips trading account has been reset.",
+                upd.get("admin_note") or "You can log in to your trader dashboard to review the updated account status."
+            )
+
+        return ok(result, "Trader updated")
+    except Exception as e:
+        return bad(e)
+
+@app.route("/traders", methods=["POST"])
+def add_trader():
+    try:
+        d = request.json or {}
+        bal = clean(d.get("balance") or d.get("account_size"))
+
+        row = {
+            "name": d.get("name", ""),
+            "phone": d.get("phone", ""),
+            "email": d.get("email", ""),
+            "mt5_login": d.get("mt5_login", ""),
+            "mt5_server": d.get("mt5_server", ""),
+            "mt5_master_password": d.get("mt5_master_password", ""),
+            "mt5_investor_password": d.get("mt5_investor_password", ""),
+            "account_size": bal,
+            "balance": bal,
+            "equity": bal,
+            "phase": d.get("phase", "no_account"),
+            "status": d.get("status", "payment_pending"),
+            "engine_group": d.get("engine_group", "engine_1"),
+            "profit": 0,
+            "drawdown": 0,
+            "profit_percent": 0,
+            "drawdown_percent": 0,
+            "payment_status": d.get("payment_status", "pending"),
+            "payment_proof_url": d.get("payment_proof_url", ""),
+            "selected_plan": d.get("selected_plan", ""),
+            "payment_note": d.get("payment_note", ""),
+            "approved_by": "",
+            "admin_note": "",
+            "account_reference": d.get("account_reference") or ref(),
+            "challenge_started_at": d.get("challenge_started_at"),
+            "approved_at": d.get("approved_at"),
+            "funded_at": d.get("funded_at"),
+            "last_login_at": None,
+            "trading_days_left": d.get("trading_days_left", 30)
+        }
+
+        created = supabase.table("traders").insert(row).execute().data
+        trader_row = created[0] if created else row
+
+        send_email_safe(
+            row.get("email"),
+            "Welcome to NairaPips",
+            f"""Hello {row.get("name") or "Trader"},
+
+Your NairaPips trader account has been created successfully.
+
+Reference: {trader_row.get("account_reference", "Not generated")}
+
+NairaPips Team"""
+        )
+        send_admin_alert(
+            "New NairaPips trader registration",
+            f"""A trader account was created on NairaPips.
+
+Name: {row.get("name") or "Not provided"}
+Email: {row.get("email") or "Not provided"}
+Phone: {row.get("phone") or "Not provided"}
+Reference: {trader_row.get("account_reference", "Not generated")}"""
+        )
+
+        return ok(created, "Trader added")
+
+    except Exception as e:
+        return bad(e)
+              
+@app.route("/delete_trader", methods=["POST"])
+def delete_trader():
+    try:
+        trader_id = (request.json or {}).get("id")
+
+        if not trader_id:
+            return bad("Missing trader id")
+
+        found = supabase.table("traders").select("*").eq("id", trader_id).execute().data
+        trader = found[0] if found else {}
+        if _is_funded_trader(trader):
+            return bad("Funded/live traders cannot be deleted in production. Deactivate or mark as test instead.", 403)
+
+        email = trader.get("email")
+        phone = trader.get("phone")
+        related_purchases = []
+        related_purchases += _safe_fetch("challenge_purchases", "trader_id", trader_id)
+        related_purchases += _safe_fetch("challenge_purchases", "email", email)
+        related_purchases += _safe_fetch("challenge_purchases", "phone", phone)
+        if _has_approved_payment(related_purchases):
+            return bad("Traders with approved payments cannot be deleted in production. Mark as test or exclude from revenue instead.", 403)
+
+        related_tables = [
+            "support_tickets",
+            "monitoring_snapshots",
+            "monitoring_events"
+        ]
+
+        for table in related_tables:
+            try:
+                supabase.table(table).delete().eq("trader_id", trader_id).execute()
+            except Exception:
+                pass
+
+            if email:
+                try:
+                    supabase.table(table).delete().eq("email", email).execute()
+                except Exception:
+                    pass
+
+            if phone:
+                try:
+                    supabase.table(table).delete().eq("phone", phone).execute()
+                except Exception:
+                    pass
+
+        supabase.table("traders").delete().eq("id", trader_id).execute()
+
+        return ok([], "Trader and all related activity deleted")
+
+    except Exception as e:
+        return bad(e)
+@app.route("/login_trader", methods=["POST"])
+def login_trader():
+    try:
+        lookup = str((request.json or {}).get("lookup", "")).strip().lower()
+        if not lookup:
+            return bad("Missing lookup")
+        trader = _latest_trader_for_lookup(lookup)
+        if not trader:
+            return bad("Trader not found", 404)
+        t = now_iso()
+        supabase.table("traders").update({"last_login_at": t}).eq("id", trader["id"]).execute()
+        trader["last_login_at"] = t
+        return ok(trader, "Login successful")
+    except Exception as e:
+        return bad(e)
+
+@app.route("/approve_payment", methods=["POST"])
+def approve_payment():
+    try:
+        d=request.json or {}; tid=d.get("id")
+        if not tid: return bad("Missing trader id")
+        required=["mt5_login","mt5_server","mt5_master_password","mt5_investor_password"]
+        if any(not str(d.get(x,"")).strip() for x in required): return bad("All MT5 credentials are required")
+        upd={k:str(d.get(k,"")).strip() for k in required}
+        upd.update({"payment_status":"approved","status":"active","phase":d.get("phase","phase1"),"approved_at":now_iso(),
+                    "challenge_started_at":now_iso(),"approved_by":d.get("approved_by","admin"),"admin_note":d.get("admin_note","")})
+        if d.get("balance") or d.get("account_size"):
+            bal=clean(d.get("balance") or d.get("account_size")); upd.update({"account_size":bal,"balance":bal,"equity":bal})
+        result = supabase.table("traders").update(upd).eq("id",tid).execute().data
+        trader_row = result[0] if result else _get_trader_by_id(tid) or {}
+
+        send_email_safe(
+            trader_row.get("email"),
+            "NairaPips payment approved - MT5 details",
+            f"""Hello {trader_row.get("name") or "Trader"},
+
+Your NairaPips payment has been approved and your MT5 account has been activated.
+
+MT5 Login: {upd.get("mt5_login", "")}
+Server: {upd.get("mt5_server", "")}
+Master Password: {upd.get("mt5_master_password", "")}
+Investor Password: {upd.get("mt5_investor_password", "")}
+
+NairaPips Team"""
+        )
+
+        _audit_safe("payments", "payment_approved", f"Trader {tid} payment approved", _admin_from_payload(d))
+        return ok(result, "Payment approved")
+    except Exception as e: return bad(e)
+
+@app.route("/reject_payment", methods=["POST"])
+def reject_payment():
+    try:
+        d=request.json or {}; tid=d.get("id")
+        if not tid: return bad("Missing trader id")
+        trader_row = _get_trader_by_id(tid) or {}
+        note = d.get("admin_note","")
+        result = supabase.table("traders").update({"payment_status":"rejected","status":"payment_rejected","admin_note":note}).eq("id",tid).execute().data
+
+        send_email_safe(
+            trader_row.get("email"),
+            "NairaPips payment rejected",
+            f"""Hello {trader_row.get("name") or "Trader"},
+
+Your NairaPips payment was rejected after review.
+
+Reason / Admin Note: {note or "Please contact support for details."}
+
+NairaPips Team"""
+        )
+
+        return ok(result, "Payment rejected")
+    except Exception as e: return bad(e)
+
+@app.route("/update_status", methods=["POST"])
+def update_status():
+    try:
+        d=request.json or {}; tid=d.get("id")
+        if not tid: return bad("Missing trader id")
+        allowed=["status","phase","balance","equity","profit","drawdown","profit_percent","drawdown_percent","engine_group","payment_status","payment_note","admin_note","trading_days_left","lead_status","follow_up_at"]
+        upd={k:d[k] for k in allowed if k in d}
+        if d.get("phase")=="funded" or d.get("status")=="funded": upd["funded_at"]=now_iso()
+        if not upd: return bad("Nothing to update")
+        try:
+            result = supabase.table("traders").update(upd).eq("id",tid).execute().data
+        except Exception as update_error:
+            if "lead_status" in upd or "follow_up_at" in upd:
+                return bad("Lead status columns are missing. Run the Step 2 launch SQL for traders.lead_status and traders.follow_up_at.", 500)
+            raise update_error
+        trader_row = result[0] if result else get_trader_by_id(tid)
+        status = str(upd.get("status") or "").lower()
+        phase = str(upd.get("phase") or "").lower()
+        if status in ["reset", "account_reset"] or phase in ["reset", "account_reset"]:
+            send_account_status_email(
+                trader_row,
+                "NairaPips account reset completed",
+                "Your NairaPips trading account has been reset.",
+                upd.get("admin_note") or "You can log in to your trader dashboard to review the updated account status."
+            )
+        if status in ["funded", "passed", "phase2_passed"] or phase in ["funded", "passed", "phase2_passed"]:
+            send_challenge_certificate_email(
+                trader_row,
+                upd.get("admin_note") or f"Current status: {upd.get('status', trader_row.get('status', 'updated'))}. Current phase: {upd.get('phase', trader_row.get('phase', 'updated'))}."
+            )
+            send_admin_alert(
+                "NairaPips challenge passed certificate earned",
+                f"""A trader challenge status was marked as passed/funded.
+
+Trader: {trader_row.get("name") if trader_row else ""}
+Email: {trader_row.get("email") if trader_row else ""}
+Status: {upd.get("status", trader_row.get("status", ""))}
+Phase: {upd.get("phase", trader_row.get("phase", ""))}
+Note: {upd.get("admin_note") or "Challenge pass/certificate status updated."}"""
+            )
+        _audit_safe("traders", "trader_status_update", f"Trader {tid} status update: {upd}", _admin_from_payload(d))
+        return ok(result)
+    except Exception as e: return bad(e)
+
+@app.route("/activate_trader", methods=["POST"])
+def activate_trader():
+    try:
+        tid=(request.json or {}).get("id")
+        if not tid: return bad("Missing trader id")
+        result = supabase.table("traders").update({"status":"active"}).eq("id",tid).execute().data
+        _audit_safe("traders", "trader_activated", f"Trader {tid} activated", _admin_from_payload(request.json or {}))
+        return ok(result)
+    except Exception as e: return bad(e)
+
+@app.route("/deactivate_trader", methods=["POST"])
+def deactivate_trader():
+    try:
+        tid=(request.json or {}).get("id")
+        if not tid: return bad("Missing trader id")
+        return ok(supabase.table("traders").update({"status":"inactive"}).eq("id",tid).execute().data)
+    except Exception as e: return bad(e)
+
+@app.route("/mark_certificate_passed", methods=["POST"])
+@app.route("/pass_certificate", methods=["POST"])
+def mark_certificate_passed():
+    try:
+        d = request.json or {}
+        tid = d.get("id") or d.get("trader_id")
+        if not tid:
+            return bad("Missing trader id")
+        t = now_iso()
+        upd = {
+            "certificate_status": d.get("certificate_status") or "passed",
+            "certificate_passed_at": d.get("certificate_passed_at") or t,
+            "certificate_note": d.get("certificate_note") or d.get("admin_note") or "Certificate passed",
+            "updated_at": t
+        }
+        result = supabase.table("traders").update(upd).eq("id", tid).execute().data
+        trader_row = result[0] if result else get_trader_by_id(tid)
+        send_challenge_certificate_email(
+            trader_row,
+            upd["certificate_note"]
+        )
+        send_admin_alert(
+            "NairaPips challenge passed certificate earned",
+            f"""A trader challenge certificate was marked as earned after passing a challenge.
+
+Trader: {trader_row.get("name") if trader_row else ""}
+Email: {trader_row.get("email") if trader_row else ""}
+Note: {upd["certificate_note"]}"""
+        )
+        return ok(result, "Certificate marked passed")
+    except Exception as e:
+        return bad(e)
+
+@app.route("/update_kyc_status", methods=["POST"])
+@app.route("/kyc_passed", methods=["POST"])
+def update_kyc_status():
+    try:
+        d = request.json or {}
+        tid = d.get("id") or d.get("trader_id")
+        if not tid:
+            return bad("Missing trader id")
+        status = d.get("kyc_status") or d.get("status") or "passed"
+        t = now_iso()
+        upd = {
+            "kyc_status": status,
+            "kyc_note": d.get("kyc_note") or d.get("admin_note") or f"KYC {status}",
+            "updated_at": t
+        }
+        if str(status).lower() in ["passed", "approved", "verified"]:
+            upd["kyc_passed_at"] = d.get("kyc_passed_at") or t
+        result = supabase.table("traders").update(upd).eq("id", tid).execute().data
+        trader_row = result[0] if result else get_trader_by_id(tid)
+        if str(status).lower() in ["passed", "approved", "verified"]:
+            send_account_status_email(
+                trader_row,
+                "NairaPips KYC passed",
+                "Your NairaPips KYC verification has passed.",
+                upd["kyc_note"]
+            )
+            send_admin_alert(
+                "NairaPips KYC passed",
+                f"""A trader KYC was marked as passed.
+
+Trader: {trader_row.get("name") if trader_row else ""}
+Email: {trader_row.get("email") if trader_row else ""}
+Note: {upd["kyc_note"]}"""
+            )
+        return ok(result, "KYC status updated")
+    except Exception as e:
+        return bad(e)
+
+@app.route("/challenge_plans", methods=["GET"])
+def challenge_plans():
+    try: return jsonify(supabase.table("challenge_plans").select("*").order("account_size", desc=False).execute().data)
+    except Exception as e: return bad(e)
+
+@app.route("/plans", methods=["GET"])
+def plans_alias():
+    return challenge_plans()
+
+@app.route("/create_challenge_plan", methods=["POST"])
+def create_plan():
+    try:
+        d=request.json or {}; name=str(d.get("name","")).strip()
+        if not name: return bad("Plan name is required")
+        mt5_server = d.get("mt5_server") or d.get("default_server") or ""
+        row={"name":name,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
+             "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":float(d.get("phase2_target") or 8),
+             "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":d.get("daily_drawdown","None"),
+             "payout_split":d.get("payout_split","80%"),"description":d.get("description",""),
+             "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
+             "status":d.get("status","active"),"created_at":now_iso(),"updated_at":now_iso()}
+        return ok(supabase.table("challenge_plans").insert(row).execute().data, "Challenge plan created")
+    except Exception as e: return bad(e)
+
+@app.route("/update_challenge_plan", methods=["POST"])
+def update_plan():
+    try:
+        d=request.json or {}; pid=d.get("id")
+        if not pid: return bad("Missing plan id")
+        upd={"updated_at":now_iso()}
+        for k in ["name","daily_drawdown","payout_split","description","status","mt5_server","default_server"]:
+            if k in d: upd[k]=d[k]
+        if "mt5_server" in d and "default_server" not in d:
+            upd["default_server"] = d.get("mt5_server")
+        if "default_server" in d and "mt5_server" not in d:
+            upd["mt5_server"] = d.get("default_server")
+        for k in ["account_size","fee"]:
+            if k in d: upd[k]=clean(d[k])
+        for k in ["phase1_target","phase2_target","max_drawdown"]:
+            if k in d: upd[k]=float(d.get(k) or 0)
+        return ok(supabase.table("challenge_plans").update(upd).eq("id",pid).execute().data, "Challenge plan updated")
+    except Exception as e: return bad(e)
+
+@app.route("/delete_challenge_plan", methods=["POST"])
+def delete_plan():
+    try:
+        pid=(request.json or {}).get("id")
+        if not pid: return bad("Missing plan id")
+        return ok(supabase.table("challenge_plans").delete().eq("id",pid).execute().data, "Challenge plan deleted")
+    except Exception as e: return bad(e)
+
+@app.route("/challenge_purchases", methods=["GET"])
+def challenge_purchases():
+    try: return jsonify(supabase.table("challenge_purchases").select("*").order("created_at", desc=True).execute().data)
+    except Exception as e: return bad(e)
+
+@app.route("/create_challenge_purchase", methods=["POST"])
+def create_purchase():
+    try:
+        d=request.json or {}; plan=str(d.get("plan_name","")).strip(); proof=str(d.get("payment_proof_url","")).strip()
+        if not plan: return bad("Plan name is required")
+        if not proof: return bad("Payment proof is required")
+        original_fee = clean(d.get("fee"))
+        if original_fee <= 0: return bad("Challenge fee is required")
+
+        # Validate code before accepting proof. Invalid/expired codes must not create confused discounted purchases.
+        quote = _affiliate_quote_details(d, original_fee)
+        if quote.get("code") and not quote.get("valid"):
+            return bad(quote.get("message") or "Invalid promo/referral code", 400)
+
+        row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
+             "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":quote.get("final_fee", original_fee),
+             "original_fee":quote.get("original_fee", original_fee),"discount_percent":quote.get("discount_percent",0),"discount_amount":quote.get("discount_amount",0),
+             "final_fee":quote.get("final_fee", original_fee),"amount_due":quote.get("final_fee", original_fee),
+             "payment_proof_url":proof,"payment_status":"pending","status":"pending_review","admin_note":"",
+             "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
+        row.update(_affiliate_purchase_fields(d, original_fee))
+        created = supabase.table("challenge_purchases").insert(row).execute().data
+
+        discount_line = ""
+        if clean(row.get("discount_amount")) > 0:
+            discount_line = f"\nOriginal Fee: {email_money(row.get('original_fee'))}\nDiscount: {email_money(row.get('discount_amount'))} ({row.get('discount_percent')}%)\nAmount To Pay: {email_money(row.get('fee'))}\nCode Used: {row.get('affiliate_code') or row.get('promo_code') or ''}\n"
+        else:
+            discount_line = f"\nChallenge Fee: {email_money(row.get('fee'))}\n"
+
+        send_email_safe(
+            row.get("email"),
+            "NairaPips payment proof received",
+            f"""Hello {row.get("trader_name") or "Trader"},
+
+Your NairaPips payment proof has been received.
+
+Plan: {plan}{discount_line}
+Admin will review your proof and notify you after approval or rejection.
+
+NairaPips Team"""
+        )
+        send_email_safe(
+            row.get("email"),
+            "NairaPips challenge purchase submitted",
+            f"""Hello {row.get("trader_name") or "Trader"},
+
+Your NairaPips challenge purchase has been submitted successfully.
+
+Plan: {plan}
+Account Size: {email_money(row.get("account_size"))}{discount_line}
+Admin will review your payment proof and assign your MT5 details after approval.
+
+NairaPips Team"""
+        )
+        send_admin_alert(
+            "New NairaPips challenge purchase/payment proof",
+            f"""A new challenge purchase was submitted.
+
+Trader: {row.get("trader_name") or "Trader"}
+Email: {row.get("email") or "Not provided"}
+Phone: {row.get("phone") or "Not provided"}
+Plan: {plan}
+Account Size: {email_money(row.get("account_size"))}
+Original Fee: {email_money(row.get("original_fee"))}
+Discount: {email_money(row.get("discount_amount"))}
+Final Fee: {email_money(row.get("fee"))}
+Code: {row.get("affiliate_code") or row.get("promo_code") or "None"}
+Proof URL: {proof}"""
+        )
+
+        return ok(created, "Challenge purchase submitted")
+    except Exception as e: return bad(e)
+
+
+
+# ================================
+# NAIRAPIPS MT5 ACCOUNT ROW SYNC
+# ================================
+def _np_nonempty(v):
+    return str(v or "").strip()
+
+
+def _np_safe_table_update(table, payload, column, value):
+    """Best-effort Supabase update. If optional columns are missing, retry with core fields only."""
+    if value is None or str(value).strip() == "":
+        return []
+    payload = {k: v for k, v in (payload or {}).items() if v is not None}
+    try:
+        return supabase.table(table).update(payload).eq(column, value).execute().data or []
+    except Exception as e:
+        print(f"SAFE UPDATE OPTIONAL FAILED {table}.{column}:", e)
+        core_keys = {
+            "trader_id", "mt5_login", "mt5_server", "account_size", "balance", "equity",
+            "stage", "phase", "account_status", "status", "payment_status",
+            "mt5_master_password", "mt5_password", "master_password",
+            "mt5_investor_password", "investor_password", "updated_at"
+        }
+        core = {k: v for k, v in payload.items() if k in core_keys}
+        try:
+            return supabase.table(table).update(core).eq(column, value).execute().data or []
+        except Exception as e2:
+            print(f"SAFE UPDATE CORE FAILED {table}.{column}:", e2)
+            return []
+
+
+def _np_safe_table_insert(table, payload):
+    """Best-effort Supabase insert. If optional columns are missing, retry with core fields only."""
+    payload = {k: v for k, v in (payload or {}).items() if v is not None}
+    try:
+        return supabase.table(table).insert(payload).execute().data or []
+    except Exception as e:
+        print(f"SAFE INSERT OPTIONAL FAILED {table}:", e)
+        core_keys = {
+            "trader_id", "mt5_login", "mt5_server", "account_size", "balance", "equity",
+            "stage", "phase", "account_status", "status", "payment_status",
+            "mt5_master_password", "mt5_password", "master_password",
+            "mt5_investor_password", "investor_password", "created_at", "updated_at"
+        }
+        core = {k: v for k, v in payload.items() if k in core_keys}
+        try:
+            return supabase.table(table).insert(core).execute().data or []
+        except Exception as e2:
+            print(f"SAFE INSERT CORE FAILED {table}:", e2)
+            return []
+
+
+def _np_stage_status_for_assignment(stage):
+    stage = str(stage or "phase1").strip().lower().replace(" ", "")
+    if stage in {"funded", "live", "funded/live"}:
+        return "funded", "funded_active", 0
+    if stage in {"phase2", "phase_2"}:
+        return "phase2", "phase2_active", 8
+    return "phase1", "assigned_active", 10
+
+
+def _np_find_account_row(login="", trader_id=""):
+    login = _np_nonempty(login)
+    trader_id = _np_nonempty(trader_id)
+    try:
+        if login:
+            rows = supabase.table("trader_accounts").select("*").eq("mt5_login", login).order("updated_at", desc=True).limit(5).execute().data or []
+            if rows:
+                return rows[0]
+        if trader_id:
+            rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").order("updated_at", desc=True).limit(5).execute().data or []
+            if rows:
+                return rows[0]
+    except Exception as e:
+        print("ACCOUNT ROW LOOKUP FAILED:", e)
+    return None
+
+
+def _np_sync_trader_account_assignment(trader=None, purchase=None, mt5=None, stage="phase1", admin_name="admin", note="MT5 assigned"):
+    """Create/update trader_accounts whenever an MT5 is assigned.
+
+    This is the production source-of-truth bridge: Admin, Trader Dashboard,
+    Monitoring API and VPS all need a trader_accounts row for every live MT5.
+    """
+    trader = trader or {}
+    purchase = purchase or {}
+    mt5 = mt5 or {}
+    now = now_iso()
+
+    trader_id = _np_nonempty(trader.get("id") or purchase.get("trader_id"))
+    login = _np_nonempty(mt5.get("mt5_login") or purchase.get("mt5_login") or trader.get("mt5_login"))
+    server = _np_nonempty(mt5.get("mt5_server") or purchase.get("mt5_server") or trader.get("mt5_server"))
+    master = _np_nonempty(mt5.get("mt5_master_password") or mt5.get("mt5_password") or mt5.get("master_password") or purchase.get("mt5_master_password") or purchase.get("mt5_password") or purchase.get("master_password") or trader.get("mt5_master_password") or trader.get("mt5_password") or trader.get("master_password"))
+    investor = _np_nonempty(mt5.get("mt5_investor_password") or mt5.get("investor_password") or purchase.get("mt5_investor_password") or purchase.get("investor_password") or trader.get("mt5_investor_password") or trader.get("investor_password"))
+    account_size = clean(mt5.get("account_size") or purchase.get("account_size") or trader.get("account_size") or trader.get("balance") or 0)
+
+    if not trader_id or not login or not server:
+        print("TRADER_ACCOUNT_SYNC_SKIPPED missing core", {"trader_id": trader_id, "login": login, "server": server})
+        return None
+
+    stage, account_status, target = _np_stage_status_for_assignment(stage or purchase.get("phase") or trader.get("phase"))
+    existing = _np_find_account_row(login=login, trader_id=trader_id)
+
+    payload = {
+        "trader_id": trader_id,
+        "account_reference": trader.get("account_reference") or purchase.get("account_reference") or ref(),
+        "account_size": account_size,
+        "start_balance": account_size,
+        "balance": account_size,
+        "current_balance": account_size,
+        "equity": account_size,
+        "current_equity": account_size,
+        "highest_equity": account_size,
+        "lowest_equity": account_size,
+        "profit": 0,
+        "profit_percent": 0,
+        "current_profit": 0,
+        "current_profit_percent": 0,
+        "drawdown_percent": 0,
+        "absolute_drawdown_percent": 0,
+        "dd_used_percent": 0,
+        "max_drawdown_used": 0,
+        "risk_zone": "safe",
+        "stage": stage,
+        "phase": stage,
+        "account_status": account_status,
+        "status": "active",
+        "payment_status": "approved",
+        "monitoring_enabled": True,
+        "mt5_access_disabled": False,
+        "mt5_account_active": True,
+        "mt5_login": login,
+        "mt5_server": server,
+        "server": server,
+        "mt5_master_password": master,
+        "mt5_password": master,
+        "master_password": master,
+        "mt5_investor_password": investor,
+        "investor_password": investor,
+        "target_percent": target,
+        "profit_target": target,
+        "assigned_at": now,
+        "started_at": now,
+        "updated_at": now,
+        "admin_note": note,
+        "approved_by": admin_name,
     }
-  }
-}
 
-function viewTraderTradeGroup(index, restored=false){
-  const groups = window.npTradeGroups || [];
-  const g = groups[index];
-  if(!g){
-    alert("Trader trade group not found. Refresh Trader Trades and try again.");
-    return;
-  }
-  window.__npOpenTradeGroupKey = g.key || "";
-  const rows = [...(g.trades||[])].sort((a,b)=>new Date(b.opened_at||b.synced_at||0)-new Date(a.opened_at||a.synced_at||0));
-  const open = rows.filter(t=>String(t.status||"open").toLowerCase()==="open").length;
-  const closed = rows.filter(t=>String(t.status||"").toLowerCase()==="closed").length;
-  const profit = rows.reduce((a,t)=>a+Number(t.profit||0),0);
-  const volume = rows.reduce((a,t)=>a+Number(t.volume||0),0);
+    if existing and existing.get("id"):
+        rows = _np_safe_table_update("trader_accounts", payload, "id", existing.get("id"))
+        account_row = rows[0] if rows else dict(existing, **payload)
+    else:
+        payload["created_at"] = now
+        rows = _np_safe_table_insert("trader_accounts", payload)
+        account_row = rows[0] if rows else payload
 
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div>
-        <span class="badge">INDIVIDUAL TRADER TRADE HISTORY</span>
-        <h3 class="text-4xl font-black gold mt-3">${g.trader_name || "Trader"}</h3>
-        <p class="text-gray-400 mt-2">${g.email || ""} • MT5: <b class="gold">${g.mt5_login || "—"}</b></p>
-      </div>
-      <div class="flex flex-wrap gap-3 items-start">
-        <button onclick="window.__npOpenTradeGroupKey=''; traderTradesModule()" class="btn btn-dark">← Back To Traders</button>
-        <button onclick="traderTradesModule()" class="btn btn-gold">Refresh This Trader</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-5 gap-4 mb-8">
-    ${stat("Total Trades",rows.length,"This trader only")}
-    ${stat("Open Trades",open,"Currently running")}
-    ${stat("Closed Records",closed,"History")}
-    ${stat("Total Lots",Number(volume||0).toFixed(2),"This trader exposure")}
-    ${stat("Net P/L",money(profit),"This trader P/L")}
-  </div>
-
-  <div class="vault p-6 rounded-3xl">
-    <div class="flex flex-wrap justify-between items-center gap-4 mb-5">
-      <div>
-        <h3 class="text-3xl font-black gold">Trade Records</h3>
-        <p class="text-gray-400">Only trades belonging to this trader/MT5 account are shown here.</p>
-      </div>
-      <span class="badge">${formatDate(new Date().toISOString())}</span>
-    </div>
-
-    <div class="tableWrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Status</th>
-            <th>Ticket</th>
-            <th>Symbol</th>
-            <th>Type</th>
-            <th>Lot</th>
-            <th>Open Price</th>
-            <th>Current/Close Price</th>
-            <th>SL</th>
-            <th>TP</th>
-            <th>Profit</th>
-            <th>Opened</th>
-            <th>Closed</th>
-            <th>Synced</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${rows.map(t=>`
-            <tr>
-              <td>${tradeStatusBadge(t.status)}</td>
-              <td class="gold font-bold">${t.ticket || "—"}</td>
-              <td><b>${t.symbol||"—"}</b></td>
-              <td>${tradeTypeBadge(t.trade_type)}</td>
-              <td>${Number(t.volume||0).toFixed(2)}</td>
-              <td>${Number(t.open_price||0)}</td>
-              <td>${Number(t.current_price||0)}</td>
-              <td>${Number(t.sl||0)}</td>
-              <td>${Number(t.tp||0)}</td>
-              <td class="font-black ${tradeProfitClass(t.profit)}">${money(t.profit)}</td>
-              <td class="text-gray-400">${formatDate(t.opened_at)}</td>
-              <td class="text-gray-400">${formatDate(t.closed_at)}</td>
-              <td class="text-gray-400">${formatDate(t.synced_at || t.updated_at || t.created_at)}</td>
-            </tr>
-          `).join("") || `<tr><td colspan="13" class="text-center text-gray-400 py-10">No trade records for this trader.</td></tr>`}
-        </tbody>
-      </table>
-    </div>
-  </div>`;
-}
-
-
-function leadPhoneClean(v){
-  return normalizeNairaPhoneDigits(v);
-}
-
-function leadFirstName(t){
-  return String(t?.name || "Legend").trim().split(/\s+/)[0] || "Legend";
-}
-
-function leadWhatsAppMessage(t){
-  return `Hello ${leadFirstName(t)}, welcome to NairaPips. I noticed you created an account but have not started a challenge yet. Do you want me to guide you to pick the right account size and start today?`;
-}
-
-function leadWhatsAppUrl(t){
-  const phone = leadPhoneClean(t.phone || t.whatsapp || t.whatsapp_number || "");
-  return phone ? makeWhatsAppUrl(phone, leadWhatsAppMessage(t)) : "";
-}
-function leadMailUrl(t){
-  const subject=encodeURIComponent("Your NairaPips account is ready");
-  const body=encodeURIComponent(`Hello ${t.name||"Legend"},\n\nYour NairaPips trader dashboard is ready. The next step is to choose a challenge plan and upload proof of payment so we can activate your MT5 account.\n\nNairaPips Team`);
-  return `mailto:${t.email||""}?subject=${subject}&body=${body}`;
-}
-function isUnconvertedLead(t){
-  const s=String(t.status||"").toLowerCase(), p=String(t.payment_status||"").toLowerCase(), hasMt5=String(t.mt5_login||"").trim();
-  return !hasMt5 && (["new_signup","registered","lead"].includes(s)||["","none","no_payment","null"].includes(p)||!p);
-}
-function leadAgeHours(t){const d=new Date(t.created_at||t.joined_at||t.approved_at||Date.now()).getTime();return Math.max(0,Math.round((Date.now()-d)/36e5))}
-async function markLeadContacted(id){
-  try{await postJSON(`${API_URL}/update_trader`,{id,admin_note:"Lead contacted by admin follow-up desk"});}catch(e){}
-  alert("Marked as contacted. WhatsApp/email follow-up can continue manually.");
-  loadData();
-}
-function leadsModule(){
-  const leads=traders.filter(isUnconvertedLead).sort((a,b)=>new Date(b.created_at||0)-new Date(a.created_at||0));
-  const hot=leads.filter(t=>leadAgeHours(t)>=1).length, withPhone=leads.filter(t=>String(t.phone||"").trim()).length;
-  document.getElementById("content").innerHTML=`
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div><span class="badge">LEAD FOLLOW-UP ENGINE</span><h3 class="text-4xl font-black gold mt-3">New Signups To Chase</h3><p class="text-gray-400 mt-2">Every signup that has not bought a challenge appears here so admin can follow up immediately on WhatsApp.</p></div>
-      <button onclick="loadData()" class="btn btn-gold">Refresh Leads</button>
-    </div>
-  </div>
-  <div class="grid md:grid-cols-4 gap-4 mb-8">
-    ${stat("Unconverted Leads",leads.length,"Signed up but not paid")}
-    ${stat("With Phone",withPhone,"Can WhatsApp now")}
-    ${stat("Hot Leads",hot,"Waiting over 1 hour")}
-    ${stat("Follow-Up Rule","ASAP","Do not let leads go cold")}
-  </div>
-  <div class="grid xl:grid-cols-2 gap-5">
-  ${leads.map(t=>{
-    const wa=leadWhatsAppUrl(t), age=leadAgeHours(t);
-    return `<div class="${age>=1?'lead-hot':'lead-warm'} rounded-3xl p-5">
-      <div class="flex flex-wrap justify-between gap-3 mb-4"><div><h3 class="text-2xl font-black">${t.name||"Unnamed Lead"}</h3><p class="text-gray-400">${t.email||"No email"} • ${t.phone||"No phone"}</p></div><span class="badge">${age}h old</span></div>
-      <div class="grid md:grid-cols-3 gap-3 mb-4"><div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Status</p><b class="gold">${t.status||"new_signup"}</b></div><div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Payment</p><b class="gold">${t.payment_status||"none"}</b></div><div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Lead Stage</p><b class="gold">${leadStatusValue(t)}</b></div></div>
-      <div class="flex flex-wrap gap-2 mb-4">
-        ${["Contacted","Interested","Not Interested","Follow Up Tomorrow","Converted"].map(status=>`<button class="btn btn-dark" onclick="setLeadStatus('${t.id}','${status}')">${status}</button>`).join("")}
-      </div>
-      <div class="lead-action-grid">
-        ${wa?`<a href="${wa}" target="_blank" class="btn btn-gold text-center">Chat on WhatsApp</a>`:`<button class="btn btn-dark" disabled>No Phone</button>`}
-        ${t.email?`<a href="${leadMailUrl(t)}" class="btn btn-dark text-center">Send Email</a>`:`<button class="btn btn-dark" disabled>No Email</button>`}
-        <button onclick="markLeadContacted('${t.id}')" class="btn btn-green">Mark Contacted</button>
-      </div>
-    </div>`;
-  }).join("")||empty("No unconverted leads right now.")}
-  </div>`;
-}
-
-function overview(){
-  const oldSetModule = setModule;
-  const pendingPayments = traders.filter(t=>t.payment_status==="pending" || t.status==="payment_pending").length;
-  const active = traders.filter(t=>t.status==="active").length;
-  const funded = traders.filter(t=>t.status==="funded" || t.phase==="funded").length;
-  const pendingPayouts = payouts.filter(p=>p.status==="pending").length;
-  const openTickets = tickets.filter(t=>t.status==="open").length;
-  const pendingPurchases = purchases.filter(p=>p.status==="pending_review" || p.payment_status==="pending").length;
-  const availableMT5 = mt5pool.filter(npIsMt5Available).length;
-
-  document.getElementById("content").innerHTML = `
-  <div class="grid md:grid-cols-3 xl:grid-cols-8 gap-4 mb-8">
-    ${stat("Total Traders",traders.length,"All records")}
-    ${stat("Active Traders",active,"Currently live")}
-    ${stat("Funded / Live",funded,"Advanced accounts")}
-    ${stat("Plans",plans.length,"Challenge offers")}
-    ${stat("Pending Purchases",pendingPurchases,"Needs approval")}
-    ${stat("MT5 Available",availableMT5,"Vault stock")}
-    ${stat("Pending Payouts",pendingPayouts,"Needs action")}
-    ${stat("Open Tickets",openTickets,"Support")}
-  </div>
-
-  <div class="lead-hot rounded-3xl p-6 mb-8">
-    <div class="flex flex-wrap justify-between gap-4 items-center">
-      <div><span class="badge">FOLLOW-UP ALERT</span><h3 class="text-3xl font-black gold mt-2">New Signup Follow-Up</h3><p class="text-gray-300">Do not let registered traders go cold. Open Lead Follow-Up and chat them on WhatsApp.</p></div>
-      <button onclick="setModule('leads',document.querySelector('[data-module=leads]'))" class="btn btn-gold">Open Lead Follow-Up</button>
-    </div>
-  </div>
-  <div class="grid lg:grid-cols-3 gap-6">
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-2xl font-bold gold mb-5">Challenge Purchase Queue</h3>
-      ${purchases.filter(p=>p.status==="pending_review" || p.payment_status==="pending").slice(0,5).map(p=>`
-        <div class="border-b border-white/10 py-3">
-          <b>${p.trader_name||"Trader"}</b>
-          <p class="text-gray-400">${p.plan_name||""} • ${money(p.fee)}</p>
-          <small class="text-gray-500">${formatDate(p.created_at)}</small>
-        </div>`).join("") || `<p class="text-gray-400">No pending challenge purchase.</p>`}
-    </div>
-
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-2xl font-bold gold mb-5">MT5 Vault Pulse</h3>
-      ${stat("Available",availableMT5,"Ready for assignment")}
-      <div class="mt-4">${stat("Assigned",mt5pool.filter(npIsMt5Assigned).length,"Already given out")}</div>
-    </div>
-
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-2xl font-bold gold mb-5">Capital Alerts</h3>
-      <p class="text-gray-400">Pending Payments: <b class="gold">${pendingPayments}</b></p>
-      <p class="text-gray-400 mt-3">Pending Payouts: <b class="gold">${pendingPayouts}</b></p>
-      <p class="text-gray-400 mt-3">Support Tickets: <b class="gold">${openTickets}</b></p>
-      <p class="text-gray-400 mt-3">Active Announcements: <b class="gold">${announcements.length}</b></p>
-    </div>
-  </div>`;
-}
-
-/* PLANS */
-async function plansModule(){
-  if((!Array.isArray(plans) || plans.length===0) && !window.__npPlansDirectLoading){
-    window.__npPlansDirectLoading = true;
-    const freshPlans = await getJSON(`${API_URL}/challenge_plans?fresh=${Date.now()}`);
-    if(Array.isArray(freshPlans) && freshPlans.length) plans = freshPlans;
-    window.__npPlansDirectLoading = false;
-  }
-  const s = q();
-  const list = (plans || []).filter(p =>
-    (p.name||"").toLowerCase().includes(s) ||
-    String(p.account_size||"").includes(s) ||
-    String(p.fee||"").includes(s) ||
-    (p.description||"").toLowerCase().includes(s)
-  );
-
-  const totalPlans = plans.length;
-  const totalCapital = plans.reduce((a,p)=>a+Number(p.account_size||0),0);
-  const lowestFee = plans.length ? Math.min(...plans.map(p=>Number(p.fee||0)).filter(n=>!isNaN(n))) : 0;
-  const highestCapital = plans.length ? Math.max(...plans.map(p=>Number(p.account_size||0)).filter(n=>!isNaN(n))) : 0;
-
-  document.getElementById("content").innerHTML = `
-  <div class="plan-hero p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5 items-start">
-      <div>
-        <span class="badge">NAIRAPIPS CHALLENGE SHOP</span>
-        <h3 class="text-5xl font-black gold mt-3">Challenge Plans</h3>
-        <p class="text-gray-400 mt-3 max-w-3xl">Create, price and control the plans traders see before buying. Bigger cards, cleaner rule display, and premium black-gold presentation.</p>
-      </div>
-      <div class="grid grid-cols-2 gap-3 min-w-[280px]">
-        <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Plans Live</p><h2 class="text-3xl font-black gold">${totalPlans}</h2></div>
-        <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Top Capital</p><h2 class="text-2xl font-black gold">${money(highestCapital)}</h2></div>
-      </div>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-4 gap-4 mb-8">
-    ${stat("Total Plans", totalPlans, "Challenge offers")}
-    ${stat("Capital Display", money(totalCapital), "Combined account sizes")}
-    ${stat("Lowest Fee", money(lowestFee || 0), "Entry point")}
-    ${stat("Default Max DD", "20%", "No daily drawdown focus")}
-  </div>
-
-  <div class="grid xl:grid-cols-[440px_1fr] gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl h-fit">
-      <div class="mb-5">
-        <span class="badge">CREATE OFFER</span>
-        <h3 class="text-3xl font-black gold mt-3">New Challenge Plan</h3>
-        <p class="text-gray-400 mt-2">Use clean pricing, account size and rules. This section now looks like a real fintech plan builder.</p>
-      </div>
-
-      <label class="text-gray-400 text-sm">Plan Name</label>
-      <input id="plan_name" placeholder="e.g Starter Legend" class="mb-3">
-      <label class="text-gray-400 text-sm">Default Exness Server for this Plan</label>
-      <select id="plan_server" class="mb-3">${serverOptions("Exness-MT5Trial9")}</select>
-      <div class="grid grid-cols-2 gap-3">
-        <div><label class="text-gray-400 text-sm">Account Size</label><input id="plan_size" placeholder="500000" class="mb-3"></div>
-        <div><label class="text-gray-400 text-sm">Challenge Fee</label><input id="plan_fee" placeholder="25000" class="mb-3"></div>
-      </div>
-
-      <div class="grid grid-cols-3 gap-3 mb-3">
-        <div><label class="text-gray-400 text-sm">Phase 1</label><input id="plan_phase1" placeholder="10" value="10"></div>
-        <div><label class="text-gray-400 text-sm">Phase 2</label><input id="plan_phase2" placeholder="8" value="8"></div>
-        <div><label class="text-gray-400 text-sm">Max DD</label><input id="plan_maxdd" placeholder="20" value="20"></div>
-      </div>
-
-      <div class="grid grid-cols-2 gap-3">
-        <div><label class="text-gray-400 text-sm">Daily Drawdown</label><input id="plan_dailydd" placeholder="None" value="None" class="mb-3"></div>
-        <div><label class="text-gray-400 text-sm">Payout Split</label><input id="plan_payout" placeholder="80%" value="80%" class="mb-3"></div>
-      </div>
-      <label class="text-gray-400 text-sm">Sales Description</label>
-      <textarea id="plan_desc" rows="5" placeholder="Short powerful description for this challenge..." class="mb-4"></textarea>
-      <button onclick="createPlan()" class="btn btn-gold w-full text-lg py-4">Create Challenge Plan</button>
-    </div>
-
-    <div>
-      <div class="vault p-5 rounded-3xl mb-5 flex flex-wrap justify-between gap-4 items-center">
-        <div>
-          <h3 class="text-3xl font-black gold">Live Plan Cards</h3>
-          <p class="text-gray-400">Bigger, clearer and more premium than the old small cards.</p>
-        </div>
-        <span class="badge">${list.length} visible</span>
-      </div>
-      <div class="grid 2xl:grid-cols-2 gap-6">
-        ${list.map(planCard).join("") || empty("No challenge plans created yet.")}
-      </div>
-    </div>
-  </div>`;
-}
-
-function planCard(p){
-  const fee = Number(p.fee||0);
-  const size = Number(p.account_size||0);
-  const phase1 = p.phase1_target || 10;
-  const phase2 = p.phase2_target || 8;
-  const maxdd = p.max_drawdown || 20;
-  const payout = p.payout_split || "80%";
-  const daily = p.daily_drawdown || "None";
-  return `
-  <div class="plan-card p-7 rounded-3xl">
-    <div class="relative z-[1]">
-      <div class="flex flex-wrap justify-between gap-4 mb-6">
-        <div>
-          <span class="plan-pill">ACTIVE CHALLENGE</span>
-          <h3 class="text-4xl font-black gold mt-4">${escapeHtml(p.name||"Challenge Plan")}</h3>
-          <p class="text-gray-400 mt-3 max-w-xl">${escapeHtml(p.description||"Built for disciplined traders seeking structured capital through NairaPips.")}</p>
-        </div>
-        <div class="text-right">
-          <p class="text-gray-500 text-sm">Challenge Fee</p>
-          <div class="plan-price">${money(fee)}</div>
-        </div>
-      </div>
-
-      <div class="card2 p-5 rounded-3xl mb-5 border border-yellow-900/30">
-        <p class="text-gray-500 text-sm">Account Access</p>
-        <div class="plan-size">${money(size)}</div>
-        <p class="text-gray-400 mt-2">Capital size shown to traders for this challenge plan.</p>
-      </div>
-
-      <div class="grid md:grid-cols-3 gap-4 mb-5">
-        <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Phase 1 Target</p><b class="text-2xl gold">${phase1}%</b></div>
-        <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Phase 2 Target</p><b class="text-2xl gold">${phase2}%</b></div>
-        <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Max Drawdown</p><b class="text-2xl text-red-400">${maxdd}%</b></div>
-        <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Daily Drawdown</p><b class="text-xl">${escapeHtml(daily)}</b></div>
-        <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Payout Split</p><b class="text-xl text-green-400">${escapeHtml(payout)}</b></div>
-        <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Default Server</p><b class="text-sm gold break-words">${escapeHtml(formatPlanServer(p))}</b></div>
-        <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Updated</p><b class="text-sm">${formatDate(p.updated_at || p.created_at)}</b></div>
-      </div>
-
-      <div class="flex flex-wrap gap-3">
-        <button onclick="editPlan('${escapeQuotes(p.id)}')" class="btn btn-gold">Edit Plan</button>
-        <button onclick="deletePlan('${escapeQuotes(p.id)}')" class="btn btn-red">Delete Plan</button>
-      </div>
-    </div>
-  </div>`;
-}
-
-async function createPlan(){
-  if(!canDo("plans","create")){alert("Access denied: create plans");return;}
-  const payload = {
-    name:document.getElementById("plan_name").value,
-    account_size:document.getElementById("plan_size").value,
-    fee:document.getElementById("plan_fee").value,
-    phase1_target:document.getElementById("plan_phase1").value,
-    phase2_target:document.getElementById("plan_phase2").value,
-    max_drawdown:document.getElementById("plan_maxdd").value,
-    daily_drawdown:document.getElementById("plan_dailydd").value,
-    payout_split:document.getElementById("plan_payout").value,
-    mt5_server:document.getElementById("plan_server").value,
-    default_server:document.getElementById("plan_server").value,
-    description:document.getElementById("plan_desc").value,
-    status:"active"
-  };
-
-  const res = await fetch(`${API_URL}/create_challenge_plan`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)
-  });
-  const data = await res.json();
-  if(data.success){alert("Challenge plan created.");loadData();}
-  else alert(data.error || "Failed to create plan");
-}
-
-async function editPlan(id){
-  const p = plans.find(x=>String(x.id)===String(id));
-  if(!p) return;
-
-  const name = prompt("Plan name:", p.name || "");
-  if(name === null) return;
-  const account_size = prompt("Account size:", p.account_size || "");
-  if(account_size === null) return;
-  const fee = prompt("Challenge fee:", p.fee || "");
-  if(fee === null) return;
-  const phase1_target = prompt("Phase 1 target:", p.phase1_target || 10);
-  if(phase1_target === null) return;
-  const phase2_target = prompt("Phase 2 target:", p.phase2_target || 8);
-  if(phase2_target === null) return;
-  const max_drawdown = prompt("Max drawdown:", p.max_drawdown || 20);
-  if(max_drawdown === null) return;
-  const daily_drawdown = prompt("Daily drawdown:", p.daily_drawdown || "None");
-  if(daily_drawdown === null) return;
-  const payout_split = prompt("Payout split:", p.payout_split || "80%");
-  if(payout_split === null) return;
-  const mt5_server = prompt("Default Exness server for this plan:", getPlanServer(p) || "Exness-MT5Trial9");
-  if(mt5_server === null) return;
-  const description = prompt("Description:", p.description || "");
-  if(description === null) return;
-
-  const res = await fetch(`${API_URL}/update_challenge_plan`,{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({id,name,account_size,fee,phase1_target,phase2_target,max_drawdown,daily_drawdown,payout_split,mt5_server,default_server:mt5_server,description,status:"active"})
-  });
-
-  const data = await res.json();
-  if(data.success){alert("Plan updated.");loadData();}
-  else alert(data.error || "Update failed");
-}
-
-async function deletePlan(id){
-  if(!canDo("plans","delete")){alert("Access denied: delete plans");return;}
-  if(!confirm("Delete this challenge plan permanently?")) return;
-  const res = await fetch(`${API_URL}/delete_challenge_plan`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})
-  });
-  const data = await res.json();
-  if(data.success){alert("Plan deleted.");loadData();}
-  else alert(data.error || "Delete failed");
-}
-
-
-
-/* SALES + PAYOUT RANGE REPORTING HELPERS */
-const SALES_FILTER_KEY = "nairapips_sales_date_filter_v1";
-const PAYOUT_FILTER_KEY = "nairapips_payout_date_filter_v1";
-function reportFilters(key){
-  try{const saved=JSON.parse(localStorage.getItem(key)||"{}")||{};return {from_date:normalizeRevenueDateToIso(saved.from_date||""),to_date:normalizeRevenueDateToIso(saved.to_date||"")};}catch(e){return {from_date:"",to_date:""};}
-}
-function saveReportFilters(key,filters){localStorage.setItem(key,JSON.stringify({from_date:filters.from_date||"",to_date:filters.to_date||""}));}
-function reportRangeLabel(filters){return `${filters.from_date?formatRevenueDisplayDate(filters.from_date):"All start"} → ${filters.to_date?formatRevenueDisplayDate(filters.to_date):"All end"}`;}
-function reportDateValue(row,keys){for(const k of keys){const iso=normalizeRevenueDateToIso(row?.[k]||""); if(iso) return iso;} return "";}
-function reportInRange(row,filters,keys){const iso=reportDateValue(row,keys); if(!iso) return false; if(filters.from_date && iso<filters.from_date) return false; if(filters.to_date && iso>filters.to_date) return false; return true;}
-function setReportPreset(kind,preset){
-  const key = kind === "sales" ? SALES_FILTER_KEY : PAYOUT_FILTER_KEY;
-  const now=new Date(); let from_date=""; let to_date=todayIsoLocal();
-  const iso=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
-  if(preset==="today") from_date=to_date;
-  else if(preset==="week"){const d=new Date(now); const day=d.getDay()||7; d.setDate(d.getDate()-day+1); from_date=iso(d);}
-  else if(preset==="month") from_date=`${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-01`;
-  else if(preset==="year") from_date=`${now.getFullYear()}-01-01`;
-  else if(preset==="all"){from_date=""; to_date="";}
-  saveReportFilters(key,{from_date,to_date});
-  if(kind==="sales") purchasesModule(); else payoutsModule();
-}
-function applySalesDateFilter(){
-  const from_date=normalizeRevenueDateToIso(document.getElementById("salesFromDate")?.value||"");
-  const to_date=normalizeRevenueDateToIso(document.getElementById("salesToDate")?.value||"");
-  if(from_date && to_date && from_date>to_date){alert("Sales From Date cannot be after To Date");return;}
-  saveReportFilters(SALES_FILTER_KEY,{from_date,to_date}); purchasesModule();
-}
-function applyPayoutDateFilter(){
-  const from_date=normalizeRevenueDateToIso(document.getElementById("payoutFromDate")?.value||"");
-  const to_date=normalizeRevenueDateToIso(document.getElementById("payoutToDate")?.value||"");
-  if(from_date && to_date && from_date>to_date){alert("Payout From Date cannot be after To Date");return;}
-  saveReportFilters(PAYOUT_FILTER_KEY,{from_date,to_date}); payoutsModule();
-}
-
-/* PURCHASES */
-async function purchasesModule(){
-  const s = q();
-  const filters = reportFilters(SALES_FILTER_KEY);
-  const params = new URLSearchParams();
-  if(filters.from_date) params.set("from_date", filters.from_date);
-  if(filters.to_date) params.set("to_date", filters.to_date);
-  params.set("mode", productionMode());
-  const salesRes = await getObject(`${API_URL}/sales_summary?${params.toString()}`, {});
-  const sales = salesRes.data || salesRes || {};
-
-  const rangedPurchases = purchases.filter(p=>reportInRange(p,filters,["approved_at","assigned_at","created_at"]));
-  const list = rangedPurchases.filter(p =>
-    (p.trader_name||"").toLowerCase().includes(s) ||
-    (p.email||"").toLowerCase().includes(s) ||
-    (p.phone||"").toLowerCase().includes(s) ||
-    (p.plan_name||"").toLowerCase().includes(s) ||
-    (p.status||"").toLowerCase().includes(s) ||
-    (p.payment_status||"").toLowerCase().includes(s)
-  );
-
-  const pending = rangedPurchases.filter(p=>p.payment_status==="pending" || p.status==="pending_review");
-  const approved = rangedPurchases.filter(p=>p.payment_status==="approved" || ["approved","approved_active","active"].includes(String(p.status||"").toLowerCase()));
-  const rejected = rangedPurchases.filter(p=>p.payment_status==="rejected" || p.status==="rejected");
-  const totalFee = rangedPurchases.reduce((a,p)=>a+Number(p.fee||0),0);
-  const approvedFee = Number(sales.approved_sales_amount ?? approved.reduce((a,p)=>a+Number(p.fee||0),0));
-  const dateLabel = reportRangeLabel(filters);
-  const modeLabel = productionMode()==="live" ? "LIVE MODE" : "TEST MODE";
-
-  const stockMap = {};
-  mt5pool.filter(npIsMt5Available).forEach(m=>{
-    const key = Number(m.account_size||0);
-    stockMap[key] = (stockMap[key]||0)+1;
-  });
-
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div>
-        <span class="badge">Sales Intelligence</span>
-        <h3 class="text-4xl font-black gold mt-3">Challenge Sales Report</h3>
-        <p class="text-gray-400 mt-2">Approved challenge sales by selected date range. Backend summary controls the money figures.</p>
-      </div>
-      <div class="card2 p-5 rounded-2xl min-w-[260px]">
-        <p class="text-gray-500 text-sm">Selected Range Sales</p>
-        <h2 class="text-5xl font-black gold">${money(approvedFee)}</h2>
-        <p class="text-gray-500 text-xs mt-1">${dateLabel} • ${modeLabel}</p>
-      </div>
-    </div>
-  </div>
-
-  <div class="vault p-5 rounded-3xl mb-8 border border-yellow-900/30">
-    <div class="flex flex-wrap justify-between gap-4 items-end">
-      <div class="grid md:grid-cols-2 gap-3 flex-1 min-w-[320px]">
-        <div><label class="text-gray-400 text-sm">Sales From Date</label><input id="salesFromDate" type="date" value="${filters.from_date}"></div>
-        <div><label class="text-gray-400 text-sm">Sales To Date</label><input id="salesToDate" type="date" value="${filters.to_date}"></div>
-      </div>
-      <button type="button" onclick="applySalesDateFilter()" class="btn btn-gold">Apply Sales Filter</button>
-    </div>
-    <div class="flex flex-wrap gap-2 mt-4">
-      <button type="button" onclick="setReportPreset('sales','today')" class="btn btn-dark">Today</button>
-      <button type="button" onclick="setReportPreset('sales','week')" class="btn btn-dark">This Week</button>
-      <button type="button" onclick="setReportPreset('sales','month')" class="btn btn-dark">This Month</button>
-      <button type="button" onclick="setReportPreset('sales','year')" class="btn btn-dark">This Year</button>
-      <button type="button" onclick="setReportPreset('sales','all')" class="btn btn-dark">All Time</button>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-4 xl:grid-cols-8 gap-4 mb-8">
-    ${stat("Range Purchases",list.length,"Visible records")}
-    ${stat("Approved Sales",money(approvedFee),"Backend-counted")}
-    ${stat("Approved Count",Number(sales.counted_sales ?? approved.length),"Paid/approved purchases")}
-    ${stat("Pending Sales",money(sales.pending_sales_amount ?? 0),`${sales.pending_sales_count ?? pending.length} pending`)}
-    ${stat("Rejected Sales",money(sales.rejected_sales_amount ?? 0),`${sales.rejected_sales_count ?? rejected.length} rejected`)}
-    ${stat("Average Sale",money(sales.average_sale ?? 0),"Approved average")}
-    ${stat("Excluded",Number(sales.excluded_sales ?? 0),"Outside range/test-hidden")}
-    ${stat("Available MT5",mt5pool.filter(npIsMt5Available).length,"Ready to assign")}
-  </div>
-
-  <div class="vault p-5 rounded-3xl mb-8">
-    <h3 class="text-2xl font-black gold mb-3">Sales Debug</h3>
-    <div class="grid md:grid-cols-3 xl:grid-cols-6 gap-3 text-sm text-gray-400">
-      <div class="card2 p-3 rounded-2xl">Mode<br><b class="gold">${sales.mode_used || productionMode()}</b></div>
-      <div class="card2 p-3 rounded-2xl">From<br><b class="gold">${sales.from_date_used || "All start"}</b></div>
-      <div class="card2 p-3 rounded-2xl">To<br><b class="gold">${sales.to_date_used || "All end"}</b></div>
-      <div class="card2 p-3 rounded-2xl">Loaded<br><b class="gold">${sales.total_sales_loaded ?? purchases.length}</b></div>
-      <div class="card2 p-3 rounded-2xl">Counted<br><b class="gold">${sales.counted_sales ?? approved.length}</b></div>
-      <div class="card2 p-3 rounded-2xl">Excluded<br><b class="gold">${sales.excluded_sales ?? 0}</b></div>
-    </div>
-  </div>
-
-  <div class="vault p-6 rounded-3xl mb-8">
-    <h3 class="text-3xl font-black gold mb-4">MT5 Stock Warning Board</h3>
-    <div class="grid md:grid-cols-2 xl:grid-cols-4 gap-4">
-      ${Object.keys(stockMap).length ? Object.entries(stockMap).sort((a,b)=>Number(a[0])-Number(b[0])).map(([size,count])=>`
-        <div class="card2 p-5 rounded-2xl"><p class="text-gray-500 text-sm">Account Size</p><h3 class="text-3xl font-black gold">${money(size)}</h3><p class="text-gray-400 mt-2">Available left: <b>${count}</b></p></div>`).join("") : `<div class="card2 p-5 rounded-2xl text-red-400">No available MT5 account in vault.</div>`}
-    </div>
-  </div>
-
-  <div class="grid gap-5">
-    ${list.map(purchaseCard).join("") || empty("No challenge purchases in this selected range.")}
-  </div>`;
-}
-
-function purchaseCard(p){
-  const available = mt5pool.filter(m =>
-    npIsMt5Available(m) &&
-    Number(m.account_size||0) === Number(p.account_size||0)
-  );
-
-  const isPending = (p.payment_status==="pending" || p.status==="pending_review");
-  const isApproved = p.payment_status==="approved";
-  const isRejected = p.payment_status==="rejected";
-  const noStock = available.length === 0 && isPending;
-
-  return `
-  <div class="vault p-6 rounded-3xl ${noStock ? "danger" : ""}">
-    <div class="flex flex-wrap justify-between gap-4 mb-6">
-      <div>
-        <span class="badge">${p.payment_status||"pending"}</span>
-        <span class="badge ml-2">${p.status||"pending_review"}</span>
-        ${noStock ? `<span class="badge ml-2 text-red-400">NO MATCHING MT5 STOCK</span>` : ""}
-        <h3 class="text-3xl font-black gold mt-3">${p.plan_name||"Challenge Purchase"}</h3>
-        <p class="text-gray-400">${p.trader_name||""} • ${p.email||""} • ${p.phone||""}</p>
-      </div>
-
-      <div class="text-right">
-        <p class="text-gray-500 text-sm">Submitted</p>
-        <b>${formatDate(p.created_at)}</b>
-        <p class="text-gray-500 text-sm mt-1">${p.purchase_month||""} ${p.purchase_year||""}</p>
-      </div>
-    </div>
-
-    <div class="grid md:grid-cols-5 gap-4 mb-6">
-      <div class="card2 p-5 rounded-2xl md:col-span-2">
-        <p class="text-gray-500 text-sm">Account Size</p>
-        <h3 class="text-4xl font-black gold">${money(p.account_size)}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl">
-        <p class="text-gray-500 text-sm">Fee Paid</p>
-        <h3 class="text-2xl font-black">${money(p.fee)}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl">
-        <p class="text-gray-500 text-sm">Matching MT5 Left</p>
-        <h3 class="text-3xl font-black ${available.length ? "text-green-400" : "text-red-400"}">${available.length}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl">
-        <p class="text-gray-500 text-sm">Assigned MT5</p>
-        <h3 class="text-xl font-black">${p.mt5_login||"Not assigned"}</h3>
-      </div>
-    </div>
-
-    <div class="grid md:grid-cols-4 gap-4 mb-6">
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Approved</p><b>${formatDate(p.approved_at)}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Assigned</p><b>${formatDate(p.assigned_at)}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Rejected</p><b>${formatDate(p.rejected_at)}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">Purchase ID</p><b class="text-xs">${p.id}</b></div>
-    </div>
-
-    <div class="grid lg:grid-cols-[1fr_1fr] gap-5 mb-6">
-      <div class="card2 p-5 rounded-2xl">
-        <p class="text-gray-500 text-sm mb-2">Admin Note</p>
-        <p>${p.admin_note || "No admin note yet"}</p>
-      </div>
-
-      <div class="card2 p-5 rounded-2xl">
-        <p class="text-gray-500 text-sm mb-3">Payment Proof</p>
-        <a class="btn btn-gold inline-block" href="${p.payment_proof_url || "#"}" target="_blank">Open Receipt / Evidence</a>
-      </div>
-    </div>
-
-    ${
-      isApproved
-      ? `<div class="card2 p-5 rounded-2xl border border-green-900/40">
-          <h3 class="text-2xl font-black text-green-400 mb-2">Already Approved</h3>
-          <p class="text-gray-400">This purchase has been approved and an MT5 account has been assigned.</p>
-        </div>`
-      : isRejected
-      ? `<div class="card2 p-5 rounded-2xl border border-red-900/40">
-          <h3 class="text-2xl font-black text-red-400 mb-2">Rejected Purchase</h3>
-          <p class="text-gray-400">This purchase was rejected. Trader will see the rejection status.</p>
-        </div>`
-      : `<div class="grid md:grid-cols-[1fr_auto_auto] gap-3">
-          <select id="purchase-mt5-${p.id}">
-            <option value="">Auto assign matching MT5 from vault</option>
-            ${available.map(m=>`<option value="${m.id}">${m.mt5_login} • ${m.mt5_server} • ${money(m.account_size)}</option>`).join("")}
-          </select>
-          <button class="btn btn-green" onclick="approvePurchase('${p.id}')">Approve + Assign MT5</button>
-          <button class="btn btn-red" onclick="rejectPurchase('${p.id}')">Reject</button>
-        </div>
-        ${noStock ? `<p class="text-red-400 mt-4 font-bold">Add a ${money(p.account_size)} MT5 account to the vault before approval.</p>` : ""}`
+    account_id = account_row.get("id")
+    trader_update = {
+        "mt5_login": login,
+        "mt5_server": server,
+        "mt5_master_password": master,
+        "mt5_password": master,
+        "master_password": master,
+        "mt5_investor_password": investor,
+        "investor_password": investor,
+        "account_size": account_size,
+        "balance": account_size,
+        "equity": account_size,
+        "phase": stage,
+        "status": "active" if stage == "phase1" else account_status,
+        "payment_status": "approved",
+        "monitoring_enabled": True,
+        "mt5_access_disabled": False,
+        "mt5_updated_at": now,
+        "updated_at": now,
     }
-  </div>`;
-}
+    if account_id:
+        trader_update.update({"current_account_id": account_id, "trader_account_id": account_id})
+    _np_safe_table_update("traders", trader_update, "id", trader_id)
 
-async function approvePurchase(id){
-  const select = document.getElementById(`purchase-mt5-${id}`);
-  const mt5_id = select ? select.value : "";
-  const note = prompt("Admin approval note:", "Challenge approved. MT5 assigned from vault.") || "";
-  const res = await fetch(`${API_URL}/approve_challenge_purchase`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,mt5_id,admin_note:note,approved_by:currentAdmin?.username||"admin",admin_name:currentAdmin?.name||currentAdmin?.username||"admin",admin_username:currentAdmin?.username||"admin"})
-  });
-  const data = await res.json();
-  if(data.success){await logAdminAudit("challenge_purchases","mt5_account_assignment",`Challenge purchase ${id} approved and assigned MT5 ${mt5_id||"auto"}`,id);alert("Challenge approved and MT5 assigned.");loadData();}
-  else alert(data.error || "Approval failed");
-}
+    if purchase.get("id"):
+        purchase_update = {
+            "trader_id": trader_id,
+            "mt5_login": login,
+            "mt5_server": server,
+            "mt5_master_password": master,
+            "mt5_password": master,
+            "master_password": master,
+            "mt5_investor_password": investor,
+            "investor_password": investor,
+            "payment_status": "approved",
+            "status": "approved_active",
+            "assigned_at": now,
+            "updated_at": now,
+        }
+        if account_id:
+            purchase_update.update({"current_account_id": account_id, "trader_account_id": account_id})
+        _np_safe_table_update("challenge_purchases", purchase_update, "id", purchase.get("id"))
 
-async function rejectPurchase(id){
-  const note = prompt("Reason for rejection:", "Payment proof rejected.") || "";
-  const res = await fetch(`${API_URL}/reject_challenge_purchase`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,admin_note:note})
-  });
-  const data = await res.json();
-  if(data.success){alert("Challenge purchase rejected.");loadData();}
-  else alert(data.error || "Rejection failed");
-}
+    print("TRADER_ACCOUNT_SYNC_OK", {"trader_id": trader_id, "mt5_login": login, "stage": stage, "account_id": account_id})
+    return account_row
+
+@app.route("/approve_challenge_purchase", methods=["POST"])
+def approve_purchase():
+    try:
+        d=request.json or {}; pid=d.get("id"); mt5_id=d.get("mt5_id")
+        if not pid: return bad("Missing purchase id")
+        pres=supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute()
+        if not pres.data: return bad("Purchase not found",404)
+        p=pres.data[0]
+        if mt5_id:
+            mres=supabase.table("mt5_pool").select("*").eq("id",mt5_id).limit(1).execute()
+        else:
+            mres=supabase.table("mt5_pool").select("*").eq("status","available").eq("account_size",p.get("account_size") or 0).limit(1).execute()
+        if not mres.data: return bad("No available MT5 account found for this plan/account size")
+        m=mres.data[0]
+        if str(m.get("status") or "").strip().lower() != "available":
+            return bad("Selected MT5 account is not available")
+        if clean(m.get("account_size")) != clean(p.get("account_size")):
+            return bad("Selected MT5 account size does not match purchase account size")
+        t=now_iso()
+        master_password=m.get("mt5_master_password","")
+        investor_password=m.get("mt5_investor_password","")
+        supabase.table("challenge_purchases").update({"payment_status":"approved","status":"approved_active","assigned_mt5_id":m.get("id"),
+            "mt5_login":m.get("mt5_login",""),"mt5_server":m.get("mt5_server",""),
+            "mt5_master_password":master_password,"mt5_password":master_password,"master_password":master_password,
+            "mt5_investor_password":investor_password,"investor_password":investor_password,
+            "approved_at":t,"assigned_at":t,"updated_at":t,
+            "admin_note":d.get("admin_note","Challenge approved and MT5 assigned")}).eq("id",pid).execute()
+        supabase.table("mt5_pool").update({"status":"assigned","assigned_trader_id":p.get("trader_id"),"assigned_trader_name":p.get("trader_name",""),
+            "assigned_email":p.get("email",""),"assigned_at":t,"updated_at":t,"admin_note":"Assigned through challenge purchase approval"}).eq("id",m.get("id")).execute()
+        lookup=supabase.table("traders").select("*").or_(f"email.eq.{p.get('email','')},phone.eq.{p.get('phone','')}").limit(1).execute()
+        td={"name":p.get("trader_name",""),"phone":p.get("phone",""),"email":p.get("email",""),
+            "mt5_login":m.get("mt5_login",""),"mt5_server":m.get("mt5_server",""),"mt5_master_password":master_password,
+            "mt5_password":master_password,"master_password":master_password,
+            "mt5_investor_password":investor_password,"investor_password":investor_password,
+            "mt5_updated_at":t,"updated_at":t,"account_size":p.get("account_size") or 0,
+            "balance":p.get("account_size") or 0,"equity":p.get("account_size") or 0,"phase":"phase1","status":"active",
+            "payment_status":"approved","payment_proof_url":p.get("payment_proof_url",""),"selected_plan":p.get("plan_name",""),
+            "approved_at":t,"challenge_started_at":t,"approved_by":d.get("approved_by","admin"),"admin_note":d.get("admin_note",""),"trading_days_left":30}
+        trader_row = None
+        if lookup.data:
+            updated_traders = supabase.table("traders").update(td).eq("id",lookup.data[0]["id"]).execute().data or []
+            trader_row = updated_traders[0] if updated_traders else get_trader_by_id(lookup.data[0]["id"])
+        else:
+            td.update({"account_reference":ref(),"profit":0,"drawdown":0,"profit_percent":0,"drawdown_percent":0})
+            created_traders = supabase.table("traders").insert(td).execute().data or []
+            trader_row = created_traders[0] if created_traders else td
+
+        # Critical production sync: every approved MT5 assignment must create/update trader_accounts.
+        # This is what Monitoring API, VPS, Admin and Trader Dashboard use as the live account source.
+        try:
+            _np_sync_trader_account_assignment(
+                trader=trader_row or {},
+                purchase=p,
+                mt5=m,
+                stage="phase1",
+                admin_name=d.get("approved_by") or "admin",
+                note=d.get("admin_note") or "Challenge approved and Phase 1 MT5 assigned"
+            )
+        except Exception as sync_error:
+            print("APPROVE PURCHASE TRADER_ACCOUNT_SYNC ERROR:", sync_error)
+
+        approved_rows = supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute().data
+        _affiliate_create_commission_from_purchase(approved_rows[0] if approved_rows else p, d)
+
+        send_email_safe(
+            p.get("email"),
+            "NairaPips challenge approved - MT5 details",
+            f"""Hello {p.get("trader_name") or "Trader"},
+
+Your NairaPips challenge has been approved and your MT5 account has been assigned.
+
+Plan: {p.get("plan_name", "Challenge")}
+Account Size: {email_money(p.get("account_size"))}
+
+MT5 Login: {m.get("mt5_login", "")}
+Server: {m.get("mt5_server", "")}
+Master Password: {master_password}
+Investor Password: {investor_password}
+
+Please log in to your trader dashboard to view your account details and begin your challenge.
+
+NairaPips Team"""
+        )
+
+        _audit_safe("challenge_purchases", "challenge_purchase_approved", f"Purchase {pid} approved", _admin_from_payload(d))
+        _audit_safe("mt5", "mt5_account_assignment", f"Purchase {pid} assigned MT5 {m.get('mt5_login','')}", _admin_from_payload(d))
+        return ok(approved_rows, "Challenge purchase approved and MT5 assigned")
+    except Exception as e: return bad(e)
+
+@app.route("/reject_challenge_purchase", methods=["POST"])
+def reject_purchase():
+    try:
+        d=request.json or {}; pid=d.get("id")
+        if not pid: return bad("Missing purchase id")
+        purchase = get_purchase_by_id(pid)
+        note = d.get("admin_note","Challenge purchase rejected")
+        result = supabase.table("challenge_purchases").update({"payment_status":"rejected","status":"rejected","rejected_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+
+        send_email_safe(
+            purchase.get("email"),
+            "NairaPips challenge purchase rejected",
+            f"""Hello {purchase.get("trader_name") or "Trader"},
+
+Your NairaPips challenge purchase was rejected after review.
+
+Plan: {purchase.get("plan_name", "Challenge")}
+Reason / Admin Note: {note}
+
+Please contact NairaPips support from your dashboard if you need help.
+
+NairaPips Team"""
+        )
+
+        return ok(result, "Challenge purchase rejected")
+    except Exception as e: return bad(e)
+
+# ================================
+# MT5 POOL VAULT STATUS NORMALIZATION
+# ================================
+MT5_POOL_AVAILABLE_STATUSES = {"", "available", "new", "unused", "ready", "free", "unassigned", "stock", "open"}
+MT5_POOL_ASSIGNED_STATUSES = {"assigned", "assigned_active", "in_use", "used", "allocated"}
+
+def _mt5_pool_status(value, fallback="available"):
+    raw = str(value or "").strip().lower()
+    if raw in MT5_POOL_ASSIGNED_STATUSES:
+        return "assigned"
+    if raw in MT5_POOL_AVAILABLE_STATUSES:
+        return "available"
+    if "assign" in raw or "use" in raw:
+        return "assigned"
+    return fallback
+
+@app.route("/mt5_pool", methods=["GET"])
+def mt5_pool():
+    try:
+        rows = supabase.table("mt5_pool").select("*").order("created_at", desc=True).execute().data or []
+        # Do not silently hide older records with blank/new/unused statuses.
+        # Normalize response only; stored rows can be repaired with /repair_mt5_pool_statuses.
+        for row in rows:
+            row["status"] = _mt5_pool_status(row.get("status"))
+        return jsonify(rows)
+    except Exception as e: return bad(e)
+
+@app.route("/repair_mt5_pool_statuses", methods=["POST", "OPTIONS"])
+def repair_mt5_pool_statuses():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        rows = supabase.table("mt5_pool").select("*").execute().data or []
+        repaired = []
+        for row in rows:
+            mid = row.get("id")
+            old_status = str(row.get("status") or "").strip()
+            new_status = _mt5_pool_status(old_status)
+            if mid and old_status.lower() != new_status:
+                try:
+                    updated = supabase.table("mt5_pool").update({"status": new_status, "updated_at": now_iso()}).eq("id", mid).execute().data or []
+                    repaired.extend(updated or [{"id": mid, "old_status": old_status, "status": new_status}])
+                except Exception as e:
+                    print("MT5 POOL REPAIR SKIPPED:", mid, e)
+        return ok({"repaired": repaired, "count": len(repaired)}, "MT5 pool statuses repaired")
+    except Exception as e: return bad(e, 500)
+
+@app.route("/create_mt5_account", methods=["POST"])
+def create_mt5():
+    try:
+        d=request.json or {}
+        required=["mt5_login","mt5_server","mt5_master_password","mt5_investor_password"]
+        if any(not str(d.get(x,"")).strip() for x in required): return bad("All MT5 details are required")
+        mt5_login=str(d.get("mt5_login","")).strip()
+        existing=supabase.table("mt5_pool").select("id,status").eq("mt5_login",mt5_login).limit(1).execute().data or []
+        if existing: return bad("MT5 login already exists in pool",409)
+        row={"plan_name":d.get("plan_name",""),"account_size":clean(d.get("account_size")),"mt5_login":mt5_login,
+             "mt5_server":str(d.get("mt5_server","")).strip(),"mt5_master_password":str(d.get("mt5_master_password","")).strip(),
+             "mt5_investor_password":str(d.get("mt5_investor_password","")).strip(),"status":"available",
+             "admin_note":d.get("admin_note",""),"created_at":now_iso(),"updated_at":now_iso()}
+        return ok(supabase.table("mt5_pool").insert(row).execute().data, "MT5 account added")
+    except Exception as e: return bad(e)
+
+@app.route("/update_mt5_account", methods=["POST"])
+def update_mt5():
+    try:
+        d=request.json or {}; mid=d.get("id")
+        if not mid: return bad("Missing MT5 account id")
+        upd={"updated_at":now_iso()}
+        for k in ["plan_name","mt5_login","mt5_server","mt5_master_password","mt5_investor_password","admin_note"]:
+            if k in d: upd[k]=d[k]
+        if "status" in d: upd["status"]=_mt5_pool_status(d.get("status"))
+        if "account_size" in d: upd["account_size"]=clean(d.get("account_size"))
+        return ok(supabase.table("mt5_pool").update(upd).eq("id",mid).execute().data, "MT5 account updated")
+    except Exception as e: return bad(e)
+
+@app.route("/delete_mt5_account", methods=["POST"])
+def delete_mt5():
+    try:
+        mid=(request.json or {}).get("id")
+        if not mid: return bad("Missing MT5 account id")
+        found=supabase.table("mt5_pool").select("*").eq("id",mid).limit(1).execute().data or []
+        if not found: return bad("MT5 account not found",404)
+        if str(found[0].get("status") or "").strip().lower()=="assigned":
+            return bad("Assigned MT5 accounts cannot be deleted",403)
+        return ok(supabase.table("mt5_pool").delete().eq("id",mid).execute().data, "MT5 account deleted")
+    except Exception as e: return bad(e)
 
 
-function npAvailableMt5ForTrader(t){
-  const size = Number(t.account_size || t.balance || 0);
-  return mt5pool.filter(m=>{
-    const st = String(m.status || "available").toLowerCase();
-    const ms = Number(m.account_size || 0);
-    return st === "available" && (!size || !ms || Math.round(ms) === Math.round(size));
-  });
-}
-
-function npNeedsPhaseAssignment(t){
-  const phase = String(t.phase || "").toLowerCase();
-  const status = String(t.status || "").toLowerCase();
-  return status.includes("phase2_waiting") || phase.includes("phase1_passed") || status.includes("phase1_passed") || status.includes("funded_waiting") || phase.includes("funded_waiting");
-}
 
 
-function npNeedsPhaseAssignment(t){
-  const phase = String(t.phase || "").toLowerCase().replace(/[\s_-]/g,"");
-  const status = String(t.status || "").toLowerCase().replace(/[\s_-]/g,"");
-  const passStatus = String(t.phase_pass_status || t.pass_status || t.phase_status || "").toLowerCase().replace(/[\s_-]/g,"");
-  const login = String(t.mt5_login || "").trim();
-  const disabled = t.mt5_access_disabled === true || String(t.mt5_access_disabled || "").toLowerCase() === "true";
-  const monitorOff = t.monitoring_enabled === false || String(t.monitoring_enabled || "").toLowerCase() === "false";
-
-  if(status.includes("phase2waiting") || phase.includes("phase1passed") || status.includes("phase1passed") || passStatus.includes("phase1passed")) return true;
-  if(status.includes("fundedwaiting") || phase.includes("fundedwaiting") || phase.includes("phase2passed") || status.includes("phase2passed") || passStatus.includes("phase2passed")) return true;
-  if(phase === "phase2" && (!login || disabled || monitorOff)) return true;
-
-  return false;
-}
-
-function npAssignmentTargetPhase(t){
-  const phase = String(t.phase || "").toLowerCase().replace(/[\s_-]/g,"");
-  const status = String(t.status || "").toLowerCase().replace(/[\s_-]/g,"");
-  const passStatus = String(t.phase_pass_status || "").toLowerCase().replace(/[\s_-]/g,"");
-  if(phase.includes("phase2passed") || status.includes("phase2passed") || passStatus.includes("phase2passed") || phase.includes("fundedwaiting") || status.includes("fundedwaiting")) return "funded";
-  return "phase2";
-}
-
-function npAvailableMt5ForTrader(t){
-  const size = Number(t.account_size || t.balance || 0);
-  return mt5pool.filter(m=>{
-    const st = String(m.status || "available").toLowerCase();
-    const ms = Number(m.account_size || 0);
-    return st === "available" && (!size || !ms || Math.round(ms) === Math.round(size));
-  });
-}
+# ================================
+# NAIRAPIPS ACCOUNT ARCHIVE SYSTEM
+# ================================
+def _archive_safe_insert(table, row):
+    """Best-effort archive insert. If the archive table/columns are not created yet, production flow must continue."""
+    try:
+        return supabase.table(table).insert(row).execute()
+    except Exception as e:
+        print(f"ARCHIVE INSERT SKIPPED {table}:", e)
+        return None
 
 
-/* NAIRAPIPS MULTI-ACCOUNT ARCHIVE SYSTEM ADMIN GUARD
-   A trader with a fresh MT5 login and active Phase 2/Funded status must not remain in the waiting assignment queue.
-   Multi-account rule: assignment/archiving is scoped to the specific challenge journey, not all purchases by the same trader. */
-function npHasCurrentAssignedMt5(t){
-  return !!String(t?.mt5_login || t?.login || t?.account_login || "").trim();
-}
-function npIsArchivedAccount(t){
-  return String(t?.account_state || t?.current_account_state || "").toLowerCase().includes("archived") || !!t?.archived_at;
-}
-function npNeedsPhaseAssignment(t){
-  if(!t || npIsArchivedAccount(t)) return false;
-  const phase = String(t.phase || "").toLowerCase().replace(/[\s_-]/g,"");
-  const status = String(t.status || "").toLowerCase().replace(/[\s_-]/g,"");
-  const passStatus = String(t.phase_pass_status || t.pass_status || t.phase_status || "").toLowerCase().replace(/[\s_-]/g,"");
-  const hasMt5 = npHasCurrentAssignedMt5(t);
-  const activePhase = status.includes("phase2active") || status.includes("fundedactive") || status.includes("liveactive") || status === "active" || phase === "phase2" || phase === "funded" || phase === "live";
-  if(hasMt5 && activePhase) return false;
-  if(status.includes("phase2waiting") || phase.includes("phase1passed") || status.includes("phase1passed") || passStatus.includes("phase1passed")) return true;
-  if(status.includes("fundedwaiting") || phase.includes("fundedwaiting") || phase.includes("phase2passed") || status.includes("phase2passed") || passStatus.includes("phase2passed")) return true;
-  return false;
-}
-
-function phaseAssignmentModule(){
-  const s = q();
-  const rows = traders.filter(t=>{
-    if(!npNeedsPhaseAssignment(t)) return false;
-    if(!s) return true;
-    return npSearchBlob(t).includes(s);
-  });
-
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div>
-        <span class="badge">PRODUCTION PHASE CONTROL</span>
-        <h3 class="text-4xl font-black gold mt-3">Phase MT5 Assignment Center</h3>
-        <p class="text-gray-400 mt-2">Use this after Phase 1 pass or Phase 2 pass. Assign a fresh MT5 from the pool and reset this specific challenge journey cleanly. Other active challenges for the same trader stay separate.</p>
-      </div>
-      <button onclick="loadData()" class="btn btn-gold">Reload Live Data</button>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-4 gap-4 mb-8">
-    ${stat("Waiting Assignment", rows.length, "Needs fresh MT5")}
-    ${stat("Available MT5", mt5pool.filter(m=>String(m.status||"available").toLowerCase()==="available").length, "Pool stock")}
-    ${stat("Phase 2 Waiting", traders.filter(t=>npAssignmentTargetPhase(t)==="phase2" && npNeedsPhaseAssignment(t)).length, "After Phase 1 pass")}
-    ${stat("Funded Waiting", traders.filter(t=>npAssignmentTargetPhase(t)==="funded" && npNeedsPhaseAssignment(t)).length, "After Phase 2 pass")}
-  </div>
-
-  <div class="tableWrap"><table>
-    <tr><th>Trader</th><th>Current Stage</th><th>Account Size</th><th>Assign To</th><th>Available MT5</th><th>Action</th></tr>
-    ${rows.map(t=>{
-      const options = npAvailableMt5ForTrader(t);
-      const defaultPhase = npAssignmentTargetPhase(t);
-      return `<tr>
-        <td><b>${t.name||"Unnamed Trader"}</b><br>${t.email||""}<br>${t.phone||""}<br><span class="text-gray-500">Ref: ${t.account_reference||"—"}</span></td>
-        <td>${npStageBadge(t)}<br>${npStatusBadge2(t)}<br><span class="text-gray-500">${t.admin_note||""}</span></td>
-        <td><b>${money(t.account_size||t.balance||0)}</b><br>${t.selected_plan||t.plan_name||""}</td>
-        <td>
-          <select id="assign_phase_${t.id}" class="np-select">
-            <option value="phase2" ${defaultPhase==="phase2"?"selected":""}>Phase 2</option>
-            <option value="funded" ${defaultPhase==="funded"?"selected":""}>Funded / Live</option>
-          </select>
-        </td>
-        <td>
-          <select id="assign_mt5_${t.id}" class="np-select">
-            <option value="">Choose fresh MT5</option>
-            ${options.map(m=>`<option value="${m.id}">${m.mt5_login} • ${m.mt5_server} • ${money(m.account_size||0)}</option>`).join("")}
-          </select>
-          <div class="text-xs text-gray-500 mt-2">${options.length} matching account(s) available</div>
-        </td>
-        <td>
-          <button class="btn btn-gold" onclick="assignPhaseMt5('${t.id}')">Assign Fresh MT5</button>
-        </td>
-      </tr>`;
-    }).join("") || `<tr><td colspan="6" class="text-gray-400 p-6">No trader is waiting for Phase MT5 assignment. Existing active Phase 2/Funded accounts are excluded, and other active challenge journeys remain separate.</td></tr>`}
-  </table></div>`;
-}
-
-async function assignPhaseMt5(traderId){
-  const phase = document.getElementById(`assign_phase_${traderId}`)?.value || "phase2";
-  const mt5_id = document.getElementById(`assign_mt5_${traderId}`)?.value || "";
-  if(!mt5_id){ alert("Choose a fresh MT5 account from the pool first."); return; }
-  if(!confirm(`Assign this fresh MT5 to ${phase.toUpperCase()} and archive only the completed phase for this challenge journey? Other active accounts for this trader will not be archived.`)) return;
-
-  try{
-    await postJSON(`${API_URL}/assign_phase_mt5`, {
-      trader_id: traderId,
-      mt5_id,
-      phase,
-      admin_name: currentAdmin?.name || currentAdmin?.username || "admin"
-    });
-    alert("Fresh phase MT5 assigned successfully.");
-    loadData();
-  }catch(e){
-    alert(e.message || "Assignment failed");
-  }
-}
+def _archive_safe_update(table, payload, column, value):
+    """Best-effort archive marking. Missing optional columns must not break MT5 assignment."""
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return supabase.table(table).update(payload).eq(column, value).execute()
+    except Exception as e:
+        print(f"ARCHIVE UPDATE SKIPPED {table}.{column}:", e)
+        return None
 
 
-/* MT5 */
-function mt5PoolModule(){
-  const s = q();
+def _current_journey_key(row):
+    """
+    Return the specific challenge journey key for this account.
 
-  const available = mt5pool.filter(npIsMt5Available);
-  const assigned = mt5pool.filter(npIsMt5Assigned);
-  const inactive = mt5pool.filter(npIsMt5Inactive);
+    Important production rule:
+    One trader may run more than one challenge account at the same time.
+    Therefore archiving must be scoped to the completed account journey only,
+    never to every purchase/email/phone belonging to the trader.
+    """
+    row = row or {}
+    for key in [
+        "challenge_journey_id", "journey_id", "current_journey_id",
+        "current_purchase_id", "active_purchase_id", "purchase_id",
+        "assigned_purchase_id", "selected_purchase_id",
+        "account_reference", "mt5_login"
+    ]:
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
-  const filteredAvailable = available.filter(m =>
-    (m.mt5_login||"").toLowerCase().includes(s) ||
-    (m.mt5_server||"").toLowerCase().includes(s) ||
-    (m.plan_name||"").toLowerCase().includes(s) ||
-    String(m.account_size||"").includes(s)
-  );
 
-  const filteredAssigned = assigned.filter(m =>
-    (m.mt5_login||"").toLowerCase().includes(s) ||
-    (m.mt5_server||"").toLowerCase().includes(s) ||
-    (m.plan_name||"").toLowerCase().includes(s) ||
-    (m.assigned_trader_name||"").toLowerCase().includes(s) ||
-    (m.assigned_email||"").toLowerCase().includes(s) ||
-    String(m.account_size||"").includes(s)
-  );
+def _archive_purchase_scope(trader, archive_payload):
+    """
+    Archive only the completed account's matching purchase.
 
-  const inventoryMap = {};
-  available.forEach(m=>{
-    const size = Number(m.account_size||0);
-    const key = size || 0;
-    if(!inventoryMap[key]) inventoryMap[key] = {size, count:0, plans:{}};
-    inventoryMap[key].count++;
-    const plan = m.plan_name || "No Plan";
-    inventoryMap[key].plans[plan] = (inventoryMap[key].plans[plan] || 0) + 1;
-  });
+    This deliberately avoids broad updates by email/phone because that would archive
+    another live challenge bought by the same trader while they are still trading
+    the current phase.
+    """
+    trader = trader or {}
+    exact_ids = []
+    for key in ["current_purchase_id", "active_purchase_id", "purchase_id", "assigned_purchase_id", "selected_purchase_id"]:
+        value = str(trader.get(key) or "").strip()
+        if value and value not in exact_ids:
+            exact_ids.append(value)
 
-  const inventory = Object.values(inventoryMap).sort((a,b)=>a.size-b.size);
+    updated_any = False
+    for pid in exact_ids:
+        if _archive_safe_update("challenge_purchases", archive_payload, "id", pid):
+            updated_any = True
 
-  document.getElementById("content").innerHTML = `
-  <div class="grid md:grid-cols-4 gap-4 mb-8">
-    ${stat("Total MT5 Stored",mt5pool.length,"All vault records")}
-    ${stat("Available",available.length,"Unused accounts")}
-    ${stat("Assigned",assigned.length,"Given to traders")}
-    ${stat("Expired / Archived",inactive.length,"Old or inactive")}
-  </div>
+    # Fallback scope: same trader AND same old MT5 login only. This is safe for multi-account users.
+    old_login = str(trader.get("mt5_login") or "").strip()
+    trader_id = trader.get("id")
+    if old_login and trader_id:
+        try:
+            rows = supabase.table("challenge_purchases").select("id,mt5_login,trader_id").eq("trader_id", trader_id).eq("mt5_login", old_login).execute().data or []
+            for row in rows:
+                _archive_safe_update("challenge_purchases", archive_payload, "id", row.get("id"))
+                updated_any = True
+        except Exception as e:
+            print("ARCHIVE PURCHASE MT5 SCOPE SKIPPED:", e)
 
-  <div class="vault p-6 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-4 mb-6">
-      <div>
-        <span class="badge">Inventory Intelligence</span>
-        <h3 class="text-3xl font-black gold mt-3">Remaining MT5 Stock by Account Size</h3>
-        <p class="text-gray-400 mt-2">Only AVAILABLE accounts are counted here. Assigned accounts are removed from available stock automatically.</p>
-      </div>
-      <div class="card2 p-4 rounded-2xl">
-        <p class="text-gray-500 text-sm">Unused Accounts Left</p>
-        <h2 class="text-4xl font-black gold">${available.length}</h2>
-      </div>
-    </div>
+    # Last fallback: account_reference / journey key match, never email/phone-wide.
+    journey_key = _current_journey_key(trader)
+    if journey_key:
+        for column in ["challenge_journey_id", "journey_id", "account_reference"]:
+            try:
+                rows = supabase.table("challenge_purchases").select("id").eq(column, journey_key).execute().data or []
+                for row in rows:
+                    _archive_safe_update("challenge_purchases", archive_payload, "id", row.get("id"))
+                    updated_any = True
+            except Exception:
+                pass
 
-    <div class="grid md:grid-cols-2 xl:grid-cols-4 gap-4">
-      ${
-        inventory.map(item=>`
-          <div class="card2 mt5-stock-card p-5 rounded-2xl">
-            <p class="text-gray-500 text-sm">Account Size</p>
-            <h3 class="text-3xl font-black gold">${money(item.size)}</h3>
-            <p class="text-gray-400 mt-2">Available Left: <b>${item.count}</b></p>
-            <div class="mt-3 text-xs text-gray-500">
-              ${
-                Object.entries(item.plans).map(([plan,count])=>`
-                  <div class="flex justify-between border-b border-white/5 py-1">
-                    <span>${plan}</span>
-                    <b>${count}</b>
-                  </div>
-                `).join("")
-              }
-            </div>
-          </div>
-        `).join("") || `<div class="card2 p-5 rounded-2xl text-gray-400">No available MT5 account left in vault.</div>`
+    if not updated_any:
+        print("ARCHIVE PURCHASE SCOPE: no exact matching purchase archived; account_archive snapshot still preserved.")
+
+
+def _phase_archive_snapshot(trader, next_phase="", reason="phase_migration", admin_name="admin"):
+    """
+    Archive the completed/old phase before assigning the next MT5 account.
+
+    Multi-account production rule:
+    - Archive the completed phase for the specific challenge journey only.
+    - Do NOT archive every purchase belonging to the same trader/email/phone.
+    - Another challenge bought by the same trader must remain active/pending.
+    """
+    if not trader:
+        return None
+    now = now_iso()
+    old_phase = str(trader.get("phase") or "").strip() or "unknown"
+    old_status = str(trader.get("status") or "").strip() or "unknown"
+    journey_key = _current_journey_key(trader)
+    source_purchase_id = str(trader.get("current_purchase_id") or trader.get("active_purchase_id") or trader.get("purchase_id") or trader.get("assigned_purchase_id") or trader.get("selected_purchase_id") or "").strip()
+    row = {
+        "trader_id": trader.get("id"),
+        "trader_name": trader.get("name") or trader.get("full_name") or trader.get("trader_name") or "Trader",
+        "email": trader.get("email") or "",
+        "phone": trader.get("phone") or "",
+        "challenge_journey_id": journey_key,
+        "journey_id": journey_key,
+        "account_reference": trader.get("account_reference") or journey_key,
+        "source_purchase_id": source_purchase_id,
+        "archived_phase": old_phase,
+        "archived_status": old_status,
+        "next_phase": next_phase,
+        "mt5_login": trader.get("mt5_login") or "",
+        "mt5_server": trader.get("mt5_server") or "",
+        "account_size": trader.get("account_size") or trader.get("balance") or 0,
+        "balance": trader.get("balance") or 0,
+        "equity": trader.get("equity") or 0,
+        "highest_equity": trader.get("highest_equity") or trader.get("equity") or trader.get("balance") or 0,
+        "lowest_equity": trader.get("lowest_equity") or trader.get("equity") or trader.get("balance") or 0,
+        "profit": trader.get("profit") or 0,
+        "profit_percent": trader.get("profit_percent") or 0,
+        "drawdown": trader.get("drawdown") or 0,
+        "drawdown_percent": trader.get("drawdown_percent") or 0,
+        "phase_pass_status": trader.get("phase_pass_status") or "",
+        "phase_passed_at": trader.get("phase_passed_at") or trader.get("passed_at") or "",
+        "phase1_passed_at": trader.get("phase1_passed_at") or "",
+        "phase2_passed_at": trader.get("phase2_passed_at") or "",
+        "risk_zone": trader.get("risk_zone") or "",
+        "archive_reason": reason,
+        "archived_by": admin_name,
+        "archived_at": now,
+        "created_at": now,
+    }
+    _archive_safe_insert("account_archives", row)
+
+    archive_payload = {
+        "account_state": "archived",
+        "archived_at": now,
+        "archive_reason": reason,
+        "challenge_journey_id": journey_key,
+        "journey_id": journey_key,
+        "updated_at": now,
+    }
+    _archive_purchase_scope(trader, archive_payload)
+    return row
+
+
+@app.route("/account_history", methods=["GET"])
+def account_history():
+    """Return archived phase/account snapshots for a trader. Best-effort if the SQL table has not been created yet."""
+    try:
+        trader_id = request.args.get("trader_id") or ""
+        email = str(request.args.get("email") or "").strip().lower()
+        phone = str(request.args.get("phone") or "").strip()
+        rows = []
+        try:
+            if trader_id:
+                rows += supabase.table("account_archives").select("*").eq("trader_id", trader_id).order("archived_at", desc=True).execute().data or []
+            if email:
+                rows += supabase.table("account_archives").select("*").eq("email", email).order("archived_at", desc=True).execute().data or []
+            if phone:
+                rows += supabase.table("account_archives").select("*").eq("phone", phone).order("archived_at", desc=True).execute().data or []
+        except Exception as archive_error:
+            print("ACCOUNT HISTORY ARCHIVE TABLE SKIPPED:", archive_error)
+
+        # De-duplicate archive rows.
+        seen, unique = set(), []
+        for r in rows:
+            key = str(r.get("id") or "") or f"{r.get('trader_id')}|{r.get('archived_phase')}|{r.get('mt5_login')}|{r.get('archived_at')}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(r)
+        return jsonify(unique)
+    except Exception as e:
+        return bad(e)
+
+@app.route("/assign_phase_mt5", methods=["POST"])
+def assign_phase_mt5():
+    """
+    Production phase MT5 assignment.
+
+    Purpose:
+    - Assign fresh MT5 account from mt5_pool to a trader for Phase 2 or Funded/Live.
+    - Reset phase-specific tracking so old Phase 1 equity/profit cannot contaminate Phase 2.
+    - Mark MT5 pool row as assigned so it cannot be reused.
+    """
+    try:
+        d = request.json or {}
+        trader_id = d.get("trader_id") or d.get("id")
+        mt5_id = d.get("mt5_id")
+        phase = str(d.get("phase") or "phase2").lower().strip()
+        admin_name = d.get("admin_name") or d.get("approved_by") or "admin"
+
+        if not trader_id:
+            return bad("Missing trader_id")
+        if not mt5_id:
+            return bad("Choose an MT5 account from the pool")
+        if phase not in ["phase2", "funded", "live"]:
+            return bad("Phase must be phase2, funded or live")
+
+        trader_rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+        if not trader_rows:
+            return bad("Trader not found", 404)
+        trader = trader_rows[0]
+
+        pool_rows = supabase.table("mt5_pool").select("*").eq("id", mt5_id).limit(1).execute().data or []
+        if not pool_rows:
+            return bad("MT5 account not found in pool", 404)
+        mt5_acc = pool_rows[0]
+
+        if str(mt5_acc.get("status") or "available").lower().strip() != "available":
+            return bad("This MT5 account is not available. Choose another one.", 409)
+
+        login = str(mt5_acc.get("mt5_login") or "").strip()
+        server = str(mt5_acc.get("mt5_server") or "").strip()
+        master = str(mt5_acc.get("mt5_master_password") or "").strip()
+        investor = str(mt5_acc.get("mt5_investor_password") or "").strip()
+        if not login or not server or not master or not investor:
+            return bad("Selected MT5 pool account is incomplete. Login, server, master and investor passwords are required.")
+
+        account_size = clean(mt5_acc.get("account_size") or trader.get("account_size") or trader.get("balance") or 0)
+        if account_size <= 0:
+            return bad("Account size missing. Set account_size on the MT5 pool record or trader record.")
+
+        now = now_iso()
+        target_percent = 8 if phase == "phase2" else 0
+        if phase == "phase2":
+            new_phase = "phase2"
+            new_status = "phase2_active"
+            note = "Fresh Phase 2 MT5 assigned. Phase 2 tracking starts from zero."
+        else:
+            new_phase = "funded"
+            new_status = "funded_active"
+            note = "Funded/Live MT5 assigned. Funded risk monitoring starts."
+
+        # Archive the completed current phase BEFORE replacing it with the new MT5 account.
+        # This prevents old Phase 1/purchase state from colliding with Phase 2/Funded dashboard display.
+        _phase_archive_snapshot(trader, next_phase=new_phase, reason=f"{new_phase}_fresh_mt5_assignment", admin_name=admin_name)
+
+        current_journey_id = _current_journey_key(trader) or ref()
+
+        trader_update = {
+            "phase": new_phase,
+            "status": new_status,
+            "mt5_login": login,
+            "mt5_server": server,
+            "mt5_master_password": master,
+            "mt5_investor_password": investor,
+            "account_size": account_size,
+            "balance": account_size,
+            "equity": account_size,
+            "profit": 0,
+            "profit_percent": 0,
+            "drawdown": 0,
+            "drawdown_percent": 0,
+            "highest_equity": account_size,
+            "lowest_equity": account_size,
+            "target_equity": account_size * (1 + (target_percent / 100)),
+            "profit_target": target_percent,
+            "phase_label": new_phase,
+            "risk_zone": "safe",
+            "critical_mode": False,
+            "monitoring_priority": "active",
+            "monitoring_enabled": True,
+            "mt5_account_active": True,
+            "mt5_access_disabled": False,
+            "payout_blocked": False,
+            "admin_note": note,
+            "approved_by": admin_name,
+            "updated_at": now,
+            "last_sync_at": now,
+            "mt5_updated_at": now,
+            "assigned_at": now,
+            "assigned_phase": new_phase,
+            "challenge_journey_id": current_journey_id,
+            "journey_id": current_journey_id,
+            "account_state": "current_active",
+            "current_account_state": "current_active",
+            "archived_at": None,
+            "archive_reason": "",
+        }
+        if phase == "phase2":
+            trader_update["phase2_started_at"] = now
+        else:
+            trader_update["funded_at"] = now
+
+        # Use safe updater because some deployments may not have every optional column.
+        _safe_traders_update(trader_id, trader_update)
+
+        # Critical production sync: assign fresh phase/funded MT5 into trader_accounts too.
+        # Without this, VPS/Admin/Dashboard may not see the new account.
+        try:
+            synced_trader = dict(trader)
+            synced_trader.update(trader_update)
+            synced_trader["id"] = trader_id
+            _np_sync_trader_account_assignment(
+                trader=synced_trader,
+                purchase={},
+                mt5=mt5_acc,
+                stage=new_phase,
+                admin_name=admin_name,
+                note=note
+            )
+        except Exception as sync_error:
+            print("PHASE MT5 TRADER_ACCOUNT_SYNC ERROR:", sync_error)
+
+        pool_update = {
+            "status": "assigned",
+            "assigned_trader_id": trader_id,
+            "assigned_trader_name": trader.get("name") or trader.get("full_name") or "",
+            "assigned_email": trader.get("email") or "",
+            "assigned_phase": new_phase,
+            "assigned_at": now,
+            "updated_at": now,
+            "admin_note": f"Assigned to {trader.get('name') or trader_id} for {new_phase} by {admin_name}",
+        }
+        try:
+            supabase.table("mt5_pool").update(pool_update).eq("id", mt5_id).execute()
+        except Exception as pool_error:
+            print("MT5 POOL ASSIGN UPDATE FAILED:", pool_error)
+            fallback_pool = {
+                "status": "assigned",
+                "assigned_trader_name": trader.get("name") or trader.get("full_name") or "",
+                "assigned_email": trader.get("email") or "",
+                "updated_at": now,
+            }
+            supabase.table("mt5_pool").update(fallback_pool).eq("id", mt5_id).execute()
+
+        send_email_safe(
+            trader.get("email"),
+            f"NairaPips {new_phase.upper()} MT5 account assigned",
+            f"""Hello {trader.get("name") or "Trader"},
+
+Your fresh {new_phase.upper()} MT5 account has been assigned.
+
+MT5 Login: {login}
+Server: {server}
+Master Password: {master}
+Investor Password: {investor}
+
+Your {new_phase.upper()} tracking starts fresh from {email_money(account_size)}.
+
+NairaPips Team"""
+        )
+
+        _audit_safe("mt5_pool", "phase_mt5_assigned", f"{new_phase} MT5 assigned to trader {trader_id}", _admin_from_payload(d))
+
+        updated_trader = _get_trader_by_id(trader_id) or {}
+        return ok(updated_trader, f"{new_phase.upper()} MT5 assigned successfully")
+
+    except Exception as e:
+        return bad(e)
+
+@app.route("/payouts", methods=["GET"])
+def payouts():
+    try: return jsonify(supabase.table("payouts").select("*").order("created_at", desc=True).execute().data)
+    except Exception as e: return bad(e)
+
+@app.route("/create_payout", methods=["POST"])
+def create_payout():
+    try:
+        d=request.json or {}; amount=clean(d.get("amount"))
+        if amount<=0: return bad("Invalid payout amount")
+
+        # Production safety: breached/locked traders must not create payout requests.
+        trader_row = None
+        tid = d.get("trader_id")
+        email = str(d.get("email") or "").strip().lower()
+        phone = str(d.get("phone") or "").strip()
+        try:
+            if tid:
+                trader_row = get_trader_by_id(tid)
+            if not trader_row and email:
+                rows = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
+                trader_row = rows[0] if rows else None
+            if not trader_row and phone:
+                rows = supabase.table("traders").select("*").eq("phone", phone).limit(1).execute().data or []
+                trader_row = rows[0] if rows else None
+        except Exception as e:
+            print("PAYOUT TRADER CHECK ERROR:", str(e))
+
+        if trader_row:
+            s = str(trader_row.get("status") or "").lower()
+            ph = str(trader_row.get("phase") or "").lower()
+            if s == "breached" or ph == "breached" or _is_truthy(trader_row.get("payout_blocked")):
+                return bad("Payout blocked: this trader account is breached/locked and is not payout eligible.", 403)
+
+        row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
+             "amount":amount,"bank_name":d.get("bank_name",""),"account_number":d.get("account_number",""),"account_name":d.get("account_name",""),
+             "status":"pending","note":d.get("note",""),"admin_note":"","requested_at":now_iso()}
+        created = supabase.table("payouts").insert(row).execute().data
+
+        send_email_safe(
+            row.get("email"),
+            "NairaPips payout request received",
+            f"""Hello {row.get("trader_name") or "Trader"},
+
+Your payout request has been received.
+
+Amount: {email_money(amount)}
+Bank: {row.get("bank_name") or "Not provided"}
+Account Number: {row.get("account_number") or "Not provided"}
+
+Admin will review your account and payout request.
+
+NairaPips Team"""
+        )
+        send_admin_alert(
+            "New NairaPips payout request",
+            f"""A trader submitted a payout request.
+
+Trader: {row.get("trader_name") or "Trader"}
+Email: {row.get("email") or "Not provided"}
+Phone: {row.get("phone") or "Not provided"}
+Amount: {email_money(amount)}
+Bank: {row.get("bank_name") or "Not provided"}
+Account Number: {row.get("account_number") or "Not provided"}"""
+        )
+
+        return ok(created, "Payout request created")
+    except Exception as e: return bad(e)
+
+@app.route("/approve_payout", methods=["POST"])
+def approve_payout():
+    try:
+        d=request.json or {}; pid=d.get("id")
+        if not pid: return bad("Missing payout id")
+        payout = get_payout_by_id(pid)
+        if not payout: return bad("Payout not found",404)
+        if payout_status(payout) != "pending":
+            return bad("Only pending payouts can be approved",409)
+
+        # Final safety check before approving payout. Breached/locked traders cannot be paid.
+        trader_row = None
+        try:
+            if payout.get("trader_id"):
+                trader_row = get_trader_by_id(payout.get("trader_id"))
+            if not trader_row and payout.get("email"):
+                rows = supabase.table("traders").select("*").eq("email", payout.get("email")).limit(1).execute().data or []
+                trader_row = rows[0] if rows else None
+        except Exception as e:
+            print("APPROVE PAYOUT TRADER CHECK ERROR:", str(e))
+        if trader_row:
+            s = str(trader_row.get("status") or "").lower()
+            ph = str(trader_row.get("phase") or "").lower()
+            if s == "breached" or ph == "breached" or _is_truthy(trader_row.get("payout_blocked")):
+                return bad("Payout blocked: this trader account is breached/locked and is not payout eligible.", 403)
+
+        note = d.get("admin_note","")
+        result = supabase.table("payouts").update({"status":"approved","approved_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+
+        send_email_safe(
+            payout.get("email"),
+            "NairaPips payout approved",
+            f"""Hello {payout.get("trader_name") or "Trader"},
+
+Your payout request has been approved.
+
+Amount: {email_money(payout.get("amount"))}
+Admin Note: {note or "Approved after review."}
+
+NairaPips Team"""
+        )
+
+        _audit_safe("payouts", "payout_approved", f"Payout {pid} approved", _admin_from_payload(d))
+        return ok(result, "Payout approved")
+    except Exception as e: return bad(e)
+
+@app.route("/reject_payout", methods=["POST"])
+def reject_payout():
+    try:
+        d=request.json or {}; pid=d.get("id")
+        if not pid: return bad("Missing payout id")
+        payout = get_payout_by_id(pid)
+        if not payout: return bad("Payout not found",404)
+        if payout_status(payout) != "pending":
+            return bad("Only pending payouts can be rejected",409)
+        note = d.get("admin_note","")
+        result = supabase.table("payouts").update({"status":"rejected","rejected_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+
+        send_email_safe(
+            payout.get("email"),
+            "NairaPips payout rejected",
+            f"""Hello {payout.get("trader_name") or "Trader"},
+
+Your payout request was rejected after review.
+
+Amount: {email_money(payout.get("amount"))}
+Reason / Admin Note: {note or "Please contact support for details."}
+
+NairaPips Team"""
+        )
+
+        return ok(result, "Payout rejected")
+    except Exception as e: return bad(e)
+
+@app.route("/mark_payout_paid", methods=["POST"])
+def mark_paid():
+    try:
+        d=request.json or {}; pid=d.get("id")
+        if not pid: return bad("Missing payout id")
+        payout = get_payout_by_id(pid)
+        if not payout: return bad("Payout not found",404)
+        if payout_status(payout) != "approved":
+            return bad("Only approved payouts can be marked paid",409)
+        note = d.get("admin_note","")
+        result = supabase.table("payouts").update({"status":"paid","paid_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+
+        send_email_safe(
+            payout.get("email"),
+            "NairaPips payout marked paid",
+            f"""Hello {payout.get("trader_name") or "Trader"},
+
+Your payout has been marked as paid.
+
+Amount: {email_money(payout.get("amount"))}
+Admin Note: {note or "Payment completed."}
+
+NairaPips Team"""
+        )
+
+        _audit_safe("payouts", "payout_paid", f"Payout {pid} marked paid", _admin_from_payload(d))
+        return ok(result, "Payout marked paid")
+    except Exception as e: return bad(e)
+
+@app.route("/support_tickets", methods=["GET"])
+def support_tickets():
+    try: return jsonify(supabase.table("support_tickets").select("*").order("created_at", desc=True).execute().data)
+    except Exception as e: return bad(e)
+
+@app.route("/create_support_ticket", methods=["POST"])
+def create_ticket():
+    try:
+        d=request.json or {}; subject=str(d.get("subject","")).strip(); message=str(d.get("message","")).strip()
+        if not subject or not message: return bad("Subject and message are required")
+        row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
+             "subject":subject,"message":message,"status":"open","priority":d.get("priority","normal"),"admin_reply":"",
+             "created_at":now_iso(),"last_updated_at":now_iso()}
+        created = supabase.table("support_tickets").insert(row).execute().data
+
+        send_admin_alert(
+            "New NairaPips support ticket",
+            f"""A trader submitted a new support ticket.
+
+Trader: {row.get("trader_name") or "Trader"}
+Email: {row.get("email") or "Not provided"}
+Phone: {row.get("phone") or "Not provided"}
+Subject: {subject}
+Priority: {row.get("priority")}
+
+Message:
+{message}"""
+        )
+
+        return ok(created, "Support ticket created")
+    except Exception as e: return bad(e)
+
+@app.route("/reply_support_ticket", methods=["POST"])
+def reply_ticket():
+    try:
+        d=request.json or {}; tid=d.get("id"); reply=str(d.get("admin_reply","")).strip()
+        if not tid: return bad("Missing ticket id")
+        if not reply: return bad("Admin reply is required")
+        existing = supabase.table("support_tickets").select("*").eq("id",tid).limit(1).execute().data or []
+        ticket = existing[0] if existing else {}
+        result = supabase.table("support_tickets").update({"admin_reply":reply,"status":"replied","replied_at":now_iso(),"last_updated_at":now_iso()}).eq("id",tid).execute().data
+
+        send_email_safe(
+            ticket.get("email"),
+            "NairaPips support ticket reply",
+            f"""Hello {ticket.get("trader_name") or "Trader"},
+
+NairaPips support has replied to your ticket.
+
+Subject: {ticket.get("subject") or "Support Ticket"}
+
+Reply:
+{reply}
+
+Please log in to your trader dashboard if you need to continue the conversation.
+
+NairaPips Team"""
+        )
+
+        return ok(result, "Support ticket replied")
+    except Exception as e: return bad(e)
+
+@app.route("/close_support_ticket", methods=["POST"])
+def close_ticket():
+    try:
+        tid=(request.json or {}).get("id")
+        if not tid: return bad("Missing ticket id")
+        return ok(supabase.table("support_tickets").update({"status":"closed","closed_at":now_iso(),"last_updated_at":now_iso()}).eq("id",tid).execute().data, "Support ticket closed")
+    except Exception as e: return bad(e)
+
+@app.route("/announcements", methods=["GET"])
+def announcements():
+    try: return jsonify(supabase.table("announcements").select("*").eq("status","active").order("created_at", desc=True).execute().data)
+    except Exception as e: return bad(e)
+
+@app.route("/create_announcement", methods=["POST"])
+def create_announcement():
+    try:
+        d=request.json or {}; title=str(d.get("title","")).strip(); msg=str(d.get("message","")).strip()
+        if not title or not msg: return bad("Title and message are required")
+        row={"title":title,"message":msg,"type":d.get("type","public_notice"),"status":"active",
+             "show_on_landing":d.get("show_on_landing", True),"show_on_dashboard":d.get("show_on_dashboard", True),
+             "created_by":d.get("created_by","admin"),"created_at":now_iso()}
+        return ok(supabase.table("announcements").insert(row).execute().data, "Announcement created")
+    except Exception as e: return bad(e)
+
+@app.route("/disable_announcement", methods=["POST"])
+def disable_announcement():
+    try:
+        aid=(request.json or {}).get("id")
+        if not aid: return bad("Missing announcement id")
+        return ok(supabase.table("announcements").update({"status":"disabled"}).eq("id",aid).execute().data, "Announcement disabled")
+    except Exception as e: return bad(e)
+
+
+
+
+# ================================
+# NAIRAPIPS AUTO-PILOT MONITORING
+# FX BLUE / SNAPSHOT FOUNDATION
+# ================================
+
+MAX_DRAWDOWN_LIMIT = 20.0
+
+def _num(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+def _risk_zone(max_dd_used):
+    dd = _num(max_dd_used)
+    if dd >= 100:
+        return "breached"
+    if dd >= 91:
+        return "critical"
+    if dd >= 76:
+        return "danger"
+    if dd >= 51:
+        return "warning"
+    return "safe"
+
+def _priority_for_zone(zone):
+    return {"safe":"normal","warning":"medium","danger":"high","critical":"urgent","breached":"closed"}.get(zone, "normal")
+
+def _now_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+def _get_trader_by_id(trader_id):
+    res = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute()
+    data = getattr(res, "data", None) or []
+    return data[0] if data else None
+
+def _insert_monitoring_event(trader, event_type, zone, message, balance, equity, max_dd_used):
+    try:
+        supabase.table("monitoring_events").insert({
+            "trader_id": trader.get("id"),
+            "trader_name": trader.get("name"),
+            "email": trader.get("email"),
+            "mt5_login": trader.get("mt5_login"),
+            "event_type": event_type,
+            "risk_zone": zone,
+            "message": message,
+            "balance": balance,
+            "equity": equity,
+            "max_drawdown_used": max_dd_used
+        }).execute()
+    except Exception as e:
+        print("monitoring event insert failed:", e)
+
+
+def _snapshot_event_message(zone, balance, equity, profit_percent, drawdown_percent, max_dd_used):
+    zone = (zone or "safe").lower()
+    if zone == "breached":
+        return f"BREACH DETECTED: Maximum drawdown violation recorded. Equity: {equity:,.2f}, DD: {drawdown_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
+    if zone == "critical":
+        return f"CRITICAL MODE: Account is very close to breach. Equity: {equity:,.2f}, DD: {drawdown_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
+    if zone == "danger":
+        return f"DANGER ZONE: Drawdown pressure is high. Equity: {equity:,.2f}, DD: {drawdown_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
+    if zone == "warning":
+        return f"WARNING ZONE: Account drawdown has entered warning level. Equity: {equity:,.2f}, DD: {drawdown_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
+    return f"SAFE SNAPSHOT: Account remains within safe monitoring zone. Equity: {equity:,.2f}, Profit: {profit_percent:.2f}%, Max DD used: {max_dd_used:.1f}%."
+
+def _should_record_snapshot_event(old_zone, zone, max_dd_used):
+    """
+    Keeps timeline useful without flooding:
+    - always record zone changes
+    - always record critical/danger/breach
+    - record warning at meaningful points
+    - record safe snapshots only lightly
+    """
+    old_zone = (old_zone or "safe").lower()
+    zone = (zone or "safe").lower()
+
+    if zone != old_zone:
+        return True
+    if zone in ["breached", "critical", "danger"]:
+        return True
+    if zone == "warning" and max_dd_used >= 60:
+        return True
+    if zone == "safe" and max_dd_used in [0, 25, 50]:
+        return True
+    return False
+
+def _safe_traders_update(trader_id, update_data):
+    """Update traders safely. If optional new columns are missing, retry with core columns."""
+    try:
+        return supabase.table("traders").update(update_data).eq("id", trader_id).execute()
+    except Exception as e:
+        print("TRADER UPDATE FULL FAILED:", e)
+        core_keys = {
+            # Core money / monitoring fields
+            "account_size", "balance", "equity", "profit", "profit_percent", "drawdown", "drawdown_percent",
+            "highest_equity", "lowest_equity", "peak_balance", "last_equity_snapshot",
+            "target_equity", "profit_target", "phase_label",
+            "max_drawdown_used", "risk_zone", "critical_mode", "monitoring_priority",
+            "last_sync_at", "status", "phase", "admin_note",
+            # Critical MT5 assignment fields. Never drop these in fallback updates.
+            "mt5_login", "mt5_server", "mt5_master_password", "mt5_investor_password",
+            "mt5_password", "master_password", "investor_password", "mt5_updated_at",
+            "assigned_at", "assigned_phase", "approved_by", "phase2_started_at", "funded_at",
+            "challenge_journey_id", "journey_id", "account_reference", "current_purchase_id", "active_purchase_id",
+            "monitoring_enabled", "mt5_account_active", "mt5_access_disabled",
+            "payout_blocked", "payout_eligible",
+            "breach_time", "breach_equity", "breach_reason", "breach_detected_at",
+            "updated_at"
+        }
+        fallback = {k:v for k,v in update_data.items() if k in core_keys}
+        return supabase.table("traders").update(fallback).eq("id", trader_id).execute()
+
+
+def _passed_status_from_snapshot(payload):
+    status = str(payload.get("phase_pass_status") or payload.get("status") or payload.get("zone") or "").lower().strip()
+    phase_label = str(payload.get("phase_label") or "").lower().strip()
+    passed_statuses = {"phase1_passed", "phase2_passed", "passed", "funded_ready", "target_hit"}
+    if status in passed_statuses:
+        if status == "target_hit":
+            return "phase2_passed" if phase_label == "phase2" else "phase1_passed"
+        return status
+    if str(payload.get("zone") or "").lower().strip() == "passed":
+        return "phase2_passed" if phase_label == "phase2" else "phase1_passed"
+    return ""
+
+
+def _send_phase_pass_email_once(trader, pass_status, payload, old_status, force=False):
+    old_status = str(old_status or "").lower()
+    if (not force) and (old_status == pass_status or str(trader.get("phase_pass_status") or "").lower() == pass_status):
+        _log_email_bank(
+            trader.get("email"),
+            f"Skipped duplicate {pass_status} email",
+            email_type=pass_status,
+            status="skipped",
+            trader_id=trader.get("id"),
+            message="Phase pass email was skipped because this pass status was already recorded.",
+        )
+        return False
+    phase_name = "Phase 2" if pass_status == "phase2_passed" else "Phase 1"
+    target_equity = payload.get("target_equity") or trader.get("target_equity") or 0
+    highest_equity = payload.get("highest_equity") or trader.get("highest_equity") or 0
+    highest_profit_percent = payload.get("highest_profit_percent") or trader.get("highest_profit_percent") or 0
+    details = f"""Congratulations. You have successfully passed {phase_name} of the NairaPips Challenge.
+
+Highest Equity Reached: {email_money(highest_equity)}
+Target Equity: {email_money(target_equity)}
+Profit Target Achieved: {highest_profit_percent}%
+
+Your dashboard has been updated and the account has been locked for admin review / next stage processing."""
+    subject = f"Congratulations - You passed {phase_name}"
+    sent = send_account_status_email(
+        trader,
+        subject,
+        f"You have passed {phase_name}.",
+        details
+    )
+    _log_email_bank(
+        trader.get("email"),
+        subject,
+        email_type=pass_status,
+        status="sent" if sent else "failed",
+        trader_id=trader.get("id"),
+        message=details,
+        error="send_account_status_email returned False" if not sent else "",
+    )
+    send_admin_alert(
+        f"NairaPips {phase_name} passed",
+        f"""A trader has passed {phase_name}.
+
+Trader: {trader.get('name') or trader.get('trader_name') or 'Trader'}
+Email: {trader.get('email') or 'Not provided'}
+MT5 Login: {trader.get('mt5_login') or payload.get('mt5_login') or 'Not provided'}
+Highest Equity: {email_money(highest_equity)}
+Target Equity: {email_money(target_equity)}
+Status: {pass_status}"""
+    )
+    return sent
+
+
+def _apply_monitoring_snapshot(trader, payload, source="manual"):
+    # Values from MT5 engine are the source of truth when present.
+    balance = _num(payload.get("balance"), _num(trader.get("balance"), _num(trader.get("account_size"))))
+    equity = _num(payload.get("equity"), balance)
+    account_size = _num(trader.get("account_size"), balance)
+
+    profit = _num(payload.get("profit"), equity - account_size if account_size else 0)
+    profit_percent = _num(payload.get("profit_percent"), (profit / account_size * 100) if account_size else 0)
+
+    previous_highest = _num(trader.get("highest_equity"), 0)
+    previous_lowest = _num(trader.get("lowest_equity"), 0)
+
+    highest_equity = max(previous_highest, _num(payload.get("highest_equity"), 0), equity, account_size)
+    lowest_equity = min(previous_lowest, equity) if previous_lowest > 0 else equity
+
+    # Prefer MT5 engine drawdown values. Fallback keeps old FXBlue/manual behaviour alive.
+    engine_dd = payload.get("drawdown_percent")
+    if engine_dd is not None:
+        drawdown_percent = _num(engine_dd, 0)
+        equity_damage = max(0, (account_size or balance) * drawdown_percent / 100)
+    else:
+        peak_base = max(highest_equity, account_size)
+        equity_damage = max(0, peak_base - lowest_equity)
+        drawdown_percent = (equity_damage / peak_base * 100) if peak_base else 0
+
+    max_dd_used = _num(payload.get("max_drawdown_used"), (drawdown_percent / MAX_DRAWDOWN_LIMIT * 100) if MAX_DRAWDOWN_LIMIT else 0)
+
+    incoming_zone = str(payload.get("zone") or "").lower().strip()
+    incoming_status = str(payload.get("status") or "").lower().strip()
+    passed_status = _passed_status_from_snapshot(payload)
+    breached = bool(payload.get("breached")) or incoming_status == "breached" or incoming_zone == "breached"
+
+    old_zone = (trader.get("risk_zone") or "safe").lower()
+    old_status = (trader.get("status") or "").lower()
+    now = _now_iso()
+
+    # Default live monitoring state.
+    zone = incoming_zone if incoming_zone in ["safe", "warning", "danger", "critical", "funded", "funded_profit_zone", "profit_protected"] else _risk_zone(max_dd_used)
+    priority = _priority_for_zone(zone)
+
+    update_data = {
+        "balance": balance,
+        "equity": equity,
+        "profit": profit,
+        "profit_percent": profit_percent,
+        "drawdown": equity_damage,
+        "drawdown_percent": drawdown_percent,
+        "highest_equity": highest_equity,
+        "lowest_equity": lowest_equity,
+        "peak_balance": max(_num(trader.get("peak_balance"), 0), balance, account_size, highest_equity),
+        "last_equity_snapshot": equity,
+        "max_drawdown_used": max_dd_used,
+        "risk_zone": zone,
+        "critical_mode": zone in ["danger", "critical"],
+        "monitoring_priority": priority,
+        "last_sync_at": now,
+        "updated_at": now,
+        "target_equity": _num(payload.get("target_equity"), 0),
+        "highest_profit": _num(payload.get("highest_profit"), highest_equity - account_size),
+        "highest_profit_percent": _num(payload.get("highest_profit_percent"), 0),
+        "profit_target": _num(payload.get("profit_target"), 0),
+        "phase_label": payload.get("phase_label") or trader.get("phase"),
+        "breach_equity_level": _num(payload.get("breach_equity_level"), 0),
+        "funded_profit_floor": _num(payload.get("funded_profit_floor"), 0),
+        "funded_profit_label": payload.get("funded_profit_label") or trader.get("funded_profit_label"),
+    }
+
+    # Critical rule order: PASS FIRST, BREACH SECOND.
+    # If highest equity has already hit the target, never let later DD overwrite it as critical/breached.
+    if passed_status:
+        zone = "passed"
+        priority = "passed"
+        next_phase = "phase2"
+        next_status = "phase2_waiting_mt5"
+        admin_note = payload.get("reason") or "Phase 1 passed. Assign a fresh Phase 2 MT5 account."
+
+        if passed_status == "phase2_passed":
+            next_phase = "funded_waiting"
+            next_status = "funded_waiting_mt5"
+            admin_note = payload.get("reason") or "Phase 2 passed. Assign funded/live account after admin review."
+
+        update_data.update({
+            "status": next_status,
+            "phase": next_phase,
+            "phase_pass_status": passed_status,
+            "phase_passed_at": trader.get("phase_passed_at") or now,
+            "passed_at": trader.get("passed_at") or now,
+            "risk_zone": "passed",
+            "critical_mode": False,
+            "monitoring_priority": "passed",
+            "mt5_access_disabled": True,
+            "mt5_account_active": False,
+            "monitoring_enabled": False,
+            "payout_blocked": False,
+            "payout_eligible": False,
+            "admin_note": admin_note,
+        })
+        if passed_status == "phase1_passed":
+            update_data["phase1_passed_at"] = trader.get("phase1_passed_at") or now
+        if passed_status == "phase2_passed":
+            update_data["phase2_passed_at"] = trader.get("phase2_passed_at") or now
+            update_data["certificate_status"] = trader.get("certificate_status") or "passed"
+            update_data["certificate_passed_at"] = trader.get("certificate_passed_at") or now
+
+    elif breached:
+        zone = "breached"
+        priority = "closed"
+        update_data.update({
+            "status": "breached",
+            "phase": "breached",
+            "risk_zone": "breached",
+            "critical_mode": False,
+            "monitoring_priority": "closed",
+            "breach_time": trader.get("breach_time") or now,
+            "breach_equity": equity,
+            "breach_reason": payload.get("reason") or "Maximum drawdown violation recorded by NairaPips monitoring engine.",
+            "admin_note": payload.get("reason") or "Auto-breach: maximum drawdown violation recorded by monitoring engine.",
+            "mt5_access_disabled": True,
+            "mt5_account_active": False,
+            "payout_eligible": False,
+            "payout_blocked": True,
+            "breach_detected_at": trader.get("breach_detected_at") or now,
+        })
+
+    elif incoming_status == "profit_protected" or incoming_zone == "profit_protected":
+        zone = "profit_protected"
+        update_data.update({
+            "status": "profit_protected",
+            "risk_zone": "profit_protected",
+            "critical_mode": False,
+            "monitoring_priority": "urgent",
+            "mt5_access_disabled": True,
+            "mt5_account_active": False,
+            "admin_note": payload.get("reason") or "Funded hybrid profit protection triggered. Account locked for payout/admin review.",
+        })
+
+    _safe_traders_update(trader.get("id"), update_data)
+
+    try:
+        supabase.table("monitoring_snapshots").insert({
+            "trader_id": trader.get("id"),
+            "trader_name": trader.get("name"),
+            "email": trader.get("email"),
+            "mt5_login": trader.get("mt5_login"),
+            "balance": balance,
+            "equity": equity,
+            "profit": profit,
+            "profit_percent": profit_percent,
+            "drawdown": equity_damage,
+            "drawdown_percent": drawdown_percent,
+            "max_drawdown_used": max_dd_used,
+            "risk_zone": update_data.get("risk_zone", zone),
+            "source": source,
+            "raw_data": payload
+        }).execute()
+    except Exception as e:
+        print("monitoring snapshot insert failed:", e)
+
+    if passed_status and old_status != passed_status:
+        _insert_monitoring_event(
+            trader,
+            "phase_passed",
+            "passed",
+            f"{passed_status} confirmed by highest equity target. Account locked for admin review / next stage.",
+            balance,
+            equity,
+            max_dd_used
+        )
+        _send_phase_pass_email_once(trader, passed_status, payload, old_status)
+
+    elif _should_record_snapshot_event(old_zone, update_data.get("risk_zone", zone), round(max_dd_used)):
+        event_type = "monitoring_snapshot"
+        event_zone = update_data.get("risk_zone", zone)
+        if event_zone != old_zone:
+            event_type = "risk_zone_change"
+        if event_zone == "critical":
+            event_type = "critical_mode"
+        if event_zone == "danger":
+            event_type = "danger_zone"
+        if event_zone == "breached":
+            event_type = "breach_detected"
+
+        _insert_monitoring_event(
+            trader,
+            event_type,
+            event_zone,
+            _snapshot_event_message(event_zone, balance, equity, profit_percent, drawdown_percent, max_dd_used),
+            balance,
+            equity,
+            max_dd_used
+        )
+
+    if update_data.get("risk_zone") == "breached" and old_status != "breached":
+        _insert_monitoring_event(
+            trader,
+            "account_locked",
+            "breached",
+            "Account locked permanently by NairaPips monitoring engine after maximum drawdown violation.",
+            balance,
+            equity,
+            max_dd_used
+        )
+        send_account_status_email(
+            trader,
+            "NairaPips account breached",
+            "Your NairaPips account has been breached and locked.",
+            update_data.get("breach_reason") or "Maximum drawdown violation recorded by NairaPips monitoring engine."
+        )
+        send_admin_alert(
+            "NairaPips account breached",
+            f"""A trader account has breached and has been locked.
+
+Trader: {trader.get('name') or 'Trader'}
+Email: {trader.get('email') or 'Not provided'}
+MT5 Login: {trader.get('mt5_login') or payload.get('mt5_login') or 'Not provided'}
+Equity: {email_money(equity)}
+Max DD Used: {round(max_dd_used, 1)}%"""
+        )
+
+    return {
+        "trader_id": trader.get("id"),
+        "balance": balance,
+        "equity": equity,
+        "profit": profit,
+        "profit_percent": profit_percent,
+        "drawdown_percent": drawdown_percent,
+        "max_drawdown_used": max_dd_used,
+        "risk_zone": update_data.get("risk_zone", zone),
+        "critical_mode": update_data.get("critical_mode", False),
+        "monitoring_priority": update_data.get("monitoring_priority", priority),
+        "status": update_data.get("status", trader.get("status")),
+        "phase_pass_status": update_data.get("phase_pass_status", trader.get("phase_pass_status"))
+    }
+
+@app.route("/register_fxblue", methods=["POST"])
+def register_fxblue():
+    data = request.get_json(force=True) or {}
+    trader_id = data.get("trader_id") or data.get("id")
+    if not trader_id:
+        return jsonify({"success": False, "error": "trader_id is required"}), 400
+
+    res = supabase.table("traders").update({
+        "fxblue_url": data.get("fxblue_url"),
+        "fxblue_account_id": data.get("fxblue_account_id")
+    }).eq("id", trader_id).execute()
+    return jsonify({"success": True, "data": getattr(res, "data", None)})
+
+@app.route("/monitoring_snapshot", methods=["POST"])
+def monitoring_snapshot():
+    data = request.get_json(force=True) or {}
+    trader_id = data.get("trader_id") or data.get("id")
+    if not trader_id:
+        return jsonify({"success": False, "error": "trader_id is required"}), 400
+    trader = _get_trader_by_id(trader_id)
+    if not trader:
+        return jsonify({"success": False, "error": "Trader not found"}), 404
+    return jsonify({"success": True, "data": _apply_monitoring_snapshot(trader, data, data.get("source", "manual"))})
+
+@app.route("/sync_fxblue_account", methods=["POST"])
+def sync_fxblue_account():
+    data = request.get_json(force=True) or {}
+    trader_id = data.get("trader_id") or data.get("id")
+    if not trader_id:
+        return jsonify({"success": False, "error": "trader_id is required"}), 400
+    trader = _get_trader_by_id(trader_id)
+    if not trader:
+        return jsonify({"success": False, "error": "Trader not found"}), 404
+    return jsonify({"success": True, "data": _apply_monitoring_snapshot(trader, data, "fxblue")})
+@app.route("/sync_trades", methods=["POST"])
+def sync_trades():
+    try:
+        d = request.json or {}
+        trades = d.get("trades", [])
+
+        if not isinstance(trades, list):
+            return bad("trades must be a list")
+
+        saved = []
+
+        for t in trades:
+            row = {
+                "trader_id": t.get("trader_id"),
+                "trader_name": t.get("trader_name"),
+                "email": t.get("email"),
+                "mt5_login": str(t.get("mt5_login") or ""),
+                "symbol": t.get("symbol"),
+                "ticket": str(t.get("ticket") or ""),
+                "trade_type": t.get("trade_type"),
+                "volume": t.get("volume") or 0,
+                "open_price": t.get("open_price") or 0,
+                "current_price": t.get("current_price") or 0,
+                "sl": t.get("sl") or 0,
+                "tp": t.get("tp") or 0,
+                "profit": t.get("profit") or 0,
+                "swap": t.get("swap") or 0,
+                "commission": t.get("commission") or 0,
+                "status": t.get("status") or "open",
+                "opened_at": t.get("opened_at"),
+                "closed_at": t.get("closed_at"),
+                "synced_at": now_iso()
+            }
+
+            existing = supabase.table("trader_trades").select("id").eq("ticket", row["ticket"]).limit(1).execute().data
+
+            if existing:
+                saved.append(
+                    supabase.table("trader_trades").update(row).eq("ticket", row["ticket"]).execute().data
+                )
+            else:
+                saved.append(
+                    supabase.table("trader_trades").insert(row).execute().data
+                )
+
+        return ok(saved, "Trades synced")
+
+    except Exception as e:
+        return bad(e)
+
+@app.route("/disable_mt5_access", methods=["POST"])
+def disable_mt5_access():
+    try:
+        d = request.json or {}
+
+        trader_id = d.get("trader_id")
+        mt5_login = str(d.get("mt5_login") or "")
+        reason = d.get("reason") or "This MT5 account has been locked by NairaPips monitoring engine."
+        incoming_status = str(d.get("status") or "breached").lower().strip()
+
+        if not trader_id and not mt5_login:
+            return bad("trader_id or mt5_login is required")
+
+        now = now_iso()
+        passed_statuses = {"phase1_passed", "phase2_passed", "passed", "funded_ready", "target_hit"}
+
+        if incoming_status in passed_statuses:
+            pass_status = "phase1_passed" if incoming_status in {"target_hit", "passed"} else incoming_status
+            next_phase = "phase2"
+            next_status = "phase2_waiting_mt5"
+            message = "Phase 1 passed. Account locked; assign fresh Phase 2 MT5."
+            if pass_status == "phase2_passed":
+                next_phase = "funded_waiting"
+                next_status = "funded_waiting_mt5"
+                message = "Phase 2 passed. Account locked; assign funded/live account after review."
+
+            update = {
+                "status": next_status,
+                "phase": next_phase,
+                "phase_pass_status": pass_status,
+                "phase_passed_at": now,
+                "passed_at": now,
+                "risk_zone": "passed",
+                "critical_mode": False,
+                "monitoring_priority": "passed",
+                "monitoring_enabled": False,
+                "mt5_account_active": False,
+                "mt5_access_disabled": True,
+                "payout_blocked": False,
+                "payout_eligible": False,
+                "admin_note": reason,
+                "updated_at": now
+            }
+            if pass_status == "phase1_passed":
+                update["phase1_passed_at"] = now
+            if pass_status == "phase2_passed":
+                update["phase2_passed_at"] = now
+        elif incoming_status == "profit_protected":
+            update = {
+                "status": "profit_protected",
+                "risk_zone": "profit_protected",
+                "critical_mode": False,
+                "monitoring_priority": "urgent",
+                "monitoring_enabled": False,
+                "mt5_account_active": False,
+                "mt5_access_disabled": True,
+                "admin_note": reason,
+                "updated_at": now
+            }
+            message = "Funded profit-protected MT5 account locked for payout/admin review."
+        else:
+            update = {
+                "status": "breached",
+                "phase": "breached",
+                "risk_zone": "breached",
+                "critical_mode": False,
+                "monitoring_priority": "closed",
+                "monitoring_enabled": False,
+                "mt5_account_active": False,
+                "mt5_access_disabled": True,
+                "payout_eligible": False,
+                "payout_blocked": True,
+                "breach_detected_at": now,
+                "admin_note": reason,
+                "updated_at": now
+            }
+            message = "Breached MT5 account locked. Trader profile remains active."
+
+        query = supabase.table("traders").update(update)
+
+        if trader_id:
+            res = query.eq("id", trader_id).execute()
+        else:
+            res = query.eq("mt5_login", mt5_login).execute()
+
+        return ok(res.data, message)
+    except Exception as e:
+        return bad(e)
+
+@app.route("/users_database", methods=["GET"])
+def users_database():
+    try:
+        status = request.args.get("status", "active")
+        search = request.args.get("search", "").strip()
+
+        q = supabase.table("traders").select(
+            "id,full_name,name,email,phone,whatsapp,country,status,phase,created_at,updated_at,marketing_deleted,marketing_consent,source"
+        ).order("created_at", desc=True)
+
+        if status == "deleted":
+            q = q.eq("marketing_deleted", True)
+        else:
+            q = q.or_("marketing_deleted.is.null,marketing_deleted.eq.false")
+
+        res = q.execute()
+        rows = getattr(res, "data", []) or []
+
+        if search:
+            s = search.lower()
+            rows = [
+                r for r in rows
+                if s in str(r.get("full_name") or r.get("name") or "").lower()
+                or s in str(r.get("email") or "").lower()
+                or s in str(r.get("phone") or "").lower()
+                or s in str(r.get("whatsapp") or "").lower()
+            ]
+
+        return jsonify(rows)
+
+    except Exception as e:
+        return bad(e)
+
+
+@app.route("/users_database/delete", methods=["POST"])
+def users_database_delete():
+    try:
+        d = request.json or {}
+        user_id = d.get("id")
+
+        if not user_id:
+            return bad("User id is required")
+
+        update = {
+            "marketing_deleted": True,
+            "deleted_at": now_iso(),
+            "updated_at": now_iso()
+        }
+
+        res = supabase.table("traders").update(update).eq("id", user_id).execute()
+        return ok(res.data, "User moved to deleted list")
+
+    except Exception as e:
+        return bad(e)
+
+
+@app.route("/users_database/restore", methods=["POST"])
+def users_database_restore():
+    try:
+        d = request.json or {}
+        user_id = d.get("id")
+
+        if not user_id:
+            return bad("User id is required")
+
+        update = {
+            "marketing_deleted": False,
+            "restored_at": now_iso(),
+            "updated_at": now_iso()
+        }
+
+        res = supabase.table("traders").update(update).eq("id", user_id).execute()
+        return ok(res.data, "User restored")
+
+    except Exception as e:
+        return bad(e)
+
+
+@app.route("/users_database/export", methods=["GET"])
+def users_database_export():
+    try:
+        field = request.args.get("field", "phone")
+
+        res = supabase.table("traders").select(
+            "email,phone,whatsapp,marketing_deleted,marketing_consent"
+        ).or_("marketing_deleted.is.null,marketing_deleted.eq.false").execute()
+
+        rows = getattr(res, "data", []) or []
+
+        values = []
+        for r in rows:
+            if r.get("marketing_consent") is False:
+                continue
+
+            value = r.get("whatsapp") or r.get("phone") if field == "phone" else r.get("email")
+
+            if value:
+                values.append(str(value).strip())
+
+        return jsonify({
+            "count": len(values),
+            "field": field,
+            "data": values,
+            "copy_text": "\n".join(values)
+        })
+
+    except Exception as e:
+        return bad(e)       
+@app.route("/trader_trades", methods=["GET"])
+def get_trader_trades():
+    try:
+        q = supabase.table("trader_trades") \
+            .select("*") \
+            .order("synced_at", desc=True) \
+            .execute()
+
+        return jsonify(getattr(q, "data", []) or [])
+
+    except Exception as e:
+        return bad(e)
+@app.route("/monitoring_events", methods=["GET"])
+def monitoring_events():
+    trader_id = request.args.get("trader_id")
+    query = supabase.table("monitoring_events").select("*").order("created_at", desc=True).limit(100)
+    if trader_id:
+        query = query.eq("trader_id", trader_id)
+    res = query.execute()
+    return jsonify(getattr(res, "data", []) or [])
+
+@app.route("/monitoring_snapshots", methods=["GET"])
+def monitoring_snapshots():
+    trader_id = request.args.get("trader_id")
+    query = supabase.table("monitoring_snapshots").select("*").order("created_at", desc=True).limit(100)
+    if trader_id:
+        query = query.eq("trader_id", trader_id)
+    res = query.execute()
+    return jsonify(getattr(res, "data", []) or [])
+
+@app.route("/breach_evidence/<trader_id>", methods=["GET"])
+def breach_evidence(trader_id):
+    trader = _get_trader_by_id(trader_id)
+    if not trader:
+        return jsonify({"success": False, "error": "Trader not found"}), 404
+
+    events = supabase.table("monitoring_events").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(20).execute()
+    snapshots = supabase.table("monitoring_snapshots").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(20).execute()
+
+    return jsonify({"success": True, "data": {
+        "trader_id": trader_id,
+        "status": trader.get("status"),
+        "risk_zone": trader.get("risk_zone"),
+        "highest_equity": trader.get("highest_equity"),
+        "lowest_equity": trader.get("lowest_equity"),
+        "max_drawdown_used": trader.get("max_drawdown_used"),
+        "breach_time": trader.get("breach_time"),
+        "breach_equity": trader.get("breach_equity"),
+        "breach_reason": trader.get("breach_reason"),
+        "events": getattr(events, "data", []) or [],
+        "snapshots": getattr(snapshots, "data", []) or []
+    }})
+
+
+
+
+
+@app.route("/test_monitoring_timeline/<trader_id>", methods=["POST", "GET"])
+def test_monitoring_timeline(trader_id):
+    """
+    Creates a safe -> warning -> danger -> critical -> breach timeline for one trader.
+    Use only for testing the evidence system.
+    """
+    trader = _get_trader_by_id(trader_id)
+    if not trader:
+        return jsonify({"success": False, "error": "Trader not found"}), 404
+
+    size = _num(trader.get("account_size"), _num(trader.get("balance"), 1000000))
+
+    test_points = [
+        {"balance": size, "equity": size, "source": "timeline_test_safe"},
+        {"balance": size, "equity": size * 0.88, "source": "timeline_test_warning"},
+        {"balance": size, "equity": size * 0.84, "source": "timeline_test_danger"},
+        {"balance": size, "equity": size * 0.815, "source": "timeline_test_critical"},
+        {"balance": size, "equity": size * 0.79, "source": "timeline_test_breach"},
+    ]
+
+    results = []
+    for p in test_points:
+        trader = _get_trader_by_id(trader_id)
+        results.append(_apply_monitoring_snapshot(trader, p, p["source"]))
+
+    return jsonify({"success": True, "message": "Test monitoring timeline created", "data": results})
+
+
+
+
+
+# ================================
+# FX BLUE AUTO-FEED RECEIVER
+# Accepts live MT5/FXBlue snapshot values and feeds NairaPips monitoring engine.
+# ================================
+
+def _find_trader_for_fxblue(data):
+    trader_id = data.get("trader_id") or data.get("id")
+    if trader_id:
+        return _get_trader_by_id(trader_id)
+
+    mt5_login = str(data.get("mt5_login") or data.get("login") or data.get("account") or "").strip()
+    if mt5_login:
+        res = supabase.table("traders").select("*").eq("mt5_login", mt5_login).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        if rows:
+            return rows[0]
+
+    fxblue_account_id = str(data.get("fxblue_account_id") or data.get("account_id") or "").strip()
+    if fxblue_account_id:
+        res = supabase.table("traders").select("*").eq("fxblue_account_id", fxblue_account_id).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        if rows:
+            return rows[0]
+
+    email = str(data.get("email") or "").strip().lower()
+    if email:
+        res = supabase.table("traders").select("*").eq("email", email).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        if rows:
+            return rows[0]
+
+    return None
+
+def _normalize_fxblue_payload(data):
+    """
+    Accepts different naming styles from FXBlue bridge/EA/webhook:
+    balance, equity, floating_pl, closed_profit, login, account, mt5_login.
+    """
+    balance = data.get("balance") or data.get("Balance") or data.get("account_balance")
+    equity = data.get("equity") or data.get("Equity") or data.get("account_equity")
+    profit = data.get("profit") or data.get("Profit") or data.get("floating_pl") or data.get("floating_profit")
+
+    normalized = dict(data)
+    normalized["balance"] = _num(balance, 0)
+    normalized["equity"] = _num(equity, normalized["balance"])
+    if profit is not None and profit != "":
+        normalized["profit"] = _num(profit, 0)
+
+    normalized["mt5_login"] = data.get("mt5_login") or data.get("login") or data.get("account")
+    normalized["source"] = data.get("source", "fxblue_auto_feed")
+    return normalized
+
+@app.route("/fxblue_webhook", methods=["POST", "GET"])
+def fxblue_webhook():
+    """
+    Main automatic feed route.
+
+    It accepts either:
+    GET:
+      /fxblue_webhook?login=123456&balance=1000000&e equity=950000
+
+    POST JSON:
+      {
+        "login": "123456",
+        "balance": 1000000,
+        "equity": 950000,
+        "server": "Exness-MT5Trial9"
       }
-    </div>
-  </div>
 
+    Optional security:
+      Set FXBLUE_WEBHOOK_SECRET in Render env.
+      Then send ?secret=YOUR_SECRET or header X-NAIRAPIPS-SECRET.
+    """
+    import os
 
-  <div class="mt5-plan-factory p-6 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5 mb-6">
-      <div>
-        <span class="badge">5-YEAR-OLD SIMPLE MT5 FACTORY</span>
-        <h3 class="text-4xl font-black gold mt-3">Create MT5 Pool In 4 Simple Steps</h3>
-        <p class="text-gray-400 mt-2">No commas. No technical setup. Select plan, paste logins, choose server, create pools. Challenge Plans module stays untouched.</p>
-      </div>
-      <div class="card2 p-5 rounded-2xl min-w-[210px]">
-        <p class="text-gray-500 text-sm">Plans Ready</p>
-        <h2 class="text-5xl font-black gold">${plans.length}</h2>
-      </div>
-    </div>
+    expected_secret = os.getenv("FXBLUE_WEBHOOK_SECRET", "").strip()
+    if expected_secret:
+        supplied = (
+            request.headers.get("X-NAIRAPIPS-SECRET")
+            or request.args.get("secret")
+            or ""
+        ).strip()
+        if supplied != expected_secret:
+            return jsonify({"success": False, "error": "Unauthorized FXBlue feed"}), 401
 
-    <div class="grid xl:grid-cols-[1.05fr_.95fr] gap-6">
-      <div class="grid gap-5">
-        <div class="vault p-5 rounded-3xl">
-          <div class="flex gap-4 items-start">
-            <div class="bg-gold rounded-2xl w-12 h-12 flex items-center justify-center text-2xl font-black shrink-0">1</div>
-            <div class="w-full">
-              <h4 class="text-2xl font-black gold mb-2">Choose Challenge Plan</h4>
-              <p class="text-gray-400 text-sm mb-3">Pick the plan you already created. The system will copy the plan name and account size automatically.</p>
-              <select id="bulk_plan_index" onchange="renderBulkPlanPreview(); renderSimpleMT5Preview();">
-                <option value="">Choose plan</option>
-                ${plans.map((p,i)=>`<option value="${i}">${escapeHtml(formatPlanLabel(p))}</option>`).join("")}
-              </select>
-            </div>
-          </div>
-        </div>
+    if request.method == "GET":
+        data = dict(request.args)
+    else:
+        data = request.get_json(force=True, silent=True) or dict(request.form)
 
-        <div class="vault p-5 rounded-3xl">
-          <div class="flex gap-4 items-start">
-            <div class="bg-gold rounded-2xl w-12 h-12 flex items-center justify-center text-2xl font-black shrink-0">2</div>
-            <div class="w-full">
-              <h4 class="text-2xl font-black gold mb-2">Paste MT5 Logins Only</h4>
-              <p class="text-gray-400 text-sm mb-3">Paste one MT5 login per line. Example: 12345678 then next line 12345679.</p>
-              <textarea id="bulk_mt5_lines" oninput="renderSimpleMT5Preview()" class="mt5-bulk-box mb-3" placeholder="12345678\n12345679\n12345680"></textarea>
-              <button onclick="document.getElementById('bulk_mt5_lines').value='';renderSimpleMT5Preview();" class="btn btn-dark" type="button">Clear Logins</button>
-            </div>
-          </div>
-        </div>
-      </div>
+    data = _normalize_fxblue_payload(data)
+    trader = _find_trader_for_fxblue(data)
 
-      <div class="grid gap-5">
-        <div class="vault p-5 rounded-3xl">
-          <div class="flex gap-4 items-start">
-            <div class="bg-gold rounded-2xl w-12 h-12 flex items-center justify-center text-2xl font-black shrink-0">3</div>
-            <div class="w-full">
-              <h4 class="text-2xl font-black gold mb-2">Select Server</h4>
-              <p class="text-gray-400 text-sm mb-3">Use the plan server automatically, or click another Exness server.</p>
-              <select id="bulk_default_server" onchange="renderSimpleMT5Preview()">${serverOptions(getPlanServer(getBulkSelectedPlan()) || "Exness-MT5Trial9")}</select>
-            </div>
-          </div>
-        </div>
+    if not trader:
+        return jsonify({
+            "success": False,
+            "error": "Trader not found. Send trader_id, mt5_login/login, fxblue_account_id, or email.",
+            "received": data
+        }), 404
 
-        <div class="vault p-5 rounded-3xl">
-          <div class="flex gap-4 items-start">
-            <div class="bg-gold rounded-2xl w-12 h-12 flex items-center justify-center text-2xl font-black shrink-0">4</div>
-            <div class="w-full">
-              <h4 class="text-2xl font-black gold mb-2">Password Mode</h4>
-              <p class="text-gray-400 text-sm mb-3">For fastest work, use Auto Generate. The system creates master and investor passwords for every MT5 account.</p>
-              <div class="grid md:grid-cols-2 gap-3 mb-3">
-                <button id="bulkModeUniqueBtn" onclick="setBulkPasswordMode('unique')" type="button" class="btn btn-gold">Auto Generate</button>
-                <button id="bulkModeSameBtn" onclick="setBulkPasswordMode('same')" type="button" class="btn btn-dark">Use Same Password</button>
-              </div>
-              <input id="bulk_password_mode" type="hidden" value="unique">
-              <div id="bulk_same_password_box" class="hidden grid gap-3">
-                <input id="bulk_master_same" placeholder="Master password for all accounts">
-                <input id="bulk_investor_same" placeholder="Investor password for all accounts">
-                <button type="button" onclick="generateBulkSamePasswords()" class="btn btn-gold">Generate Same Passwords</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
+    result = _apply_monitoring_snapshot(trader, data, "fxblue_auto_feed")
 
-    <div id="bulk_plan_preview" class="mt5-plan-preview mt-6">
-      <h4 class="text-2xl font-black gold">No plan selected</h4>
-      <p class="text-gray-400 mt-2">Choose a plan above. Then paste MT5 logins. The preview will show here before creation.</p>
-    </div>
+    # Update fxblue ID/server if sent
+    try:
+        extra = {}
+        if data.get("fxblue_account_id"):
+            extra["fxblue_account_id"] = data.get("fxblue_account_id")
+        if data.get("fxblue_url"):
+            extra["fxblue_url"] = data.get("fxblue_url")
+        if data.get("server") or data.get("mt5_server"):
+            extra["mt5_server"] = data.get("server") or data.get("mt5_server")
+        if extra:
+            supabase.table("traders").update(extra).eq("id", trader.get("id")).execute()
+    except Exception as e:
+        print("fxblue extra update failed:", e)
 
-    <div id="simple_mt5_preview" class="card2 p-5 rounded-3xl mt-5 border border-yellow-900/30">
-      <h4 class="text-2xl font-black gold mb-2">Ready Check</h4>
-      <p class="text-gray-400">Waiting for plan, logins and server.</p>
-    </div>
-
-    <div class="grid md:grid-cols-[1fr_auto_auto] gap-3 mt-5 items-center">
-      <div class="text-gray-400 text-sm">Final action: when the ready check is green, click the gold button. Every account will enter MT5 Pool as AVAILABLE.</div>
-      <button onclick="createBulkMT5FromPlan()" class="btn btn-gold text-lg px-8 py-4" type="button">CREATE MT5 POOLS</button>
-      <button onclick="clearBulkMT5Factory()" class="btn btn-red" type="button">Reset</button>
-    </div>
-  </div>
-  <div class="vault p-6 rounded-3xl mb-8 border border-yellow-900/40">
-    <div class="flex flex-wrap justify-between gap-5 mb-5">
-      <div>
-        <span class="badge">BULK SERVER REPAIR</span>
-        <h3 class="text-3xl font-black gold mt-3">Fix Wrong MT5 Server On Many Accounts</h3>
-        <p class="text-gray-400 mt-2">Use this when you created many pool accounts with one missing letter or wrong server name. It will update every matching account at once.</p>
-      </div>
-      <div class="card2 p-4 rounded-2xl min-w-[190px]">
-        <p class="text-gray-500 text-sm">MT5 Records</p>
-        <h2 class="text-4xl font-black gold">${mt5pool.length}</h2>
-      </div>
-    </div>
-
-    <div class="grid lg:grid-cols-[1fr_1fr_auto] gap-4 items-end">
-      <div>
-        <label class="text-gray-400 text-sm">Wrong server currently saved</label>
-        <input id="bulk_wrong_server" placeholder="Example: Exnes-MT5Trial9">
-        <p class="text-gray-500 text-xs mt-2">Type the wrong server exactly as it appears on the affected cards.</p>
-      </div>
-      <div>
-        <label class="text-gray-400 text-sm">Correct Exness server</label>
-        <select id="bulk_correct_server">${serverOptions("Exness-MT5Trial9")}</select>
-        <p class="text-gray-500 text-xs mt-2">Pick the correct server from the list.</p>
-      </div>
-      <button onclick="bulkCorrectMT5Server()" class="btn btn-gold px-8 py-4" type="button">Fix Matching Accounts</button>
-    </div>
-  </div>
-
-  <div class="mt5-vault-shell mb-8">
-    <div class="vault p-6 rounded-3xl">
-      <div class="mb-5">
-        <span class="badge">MT5 Vault Entry</span>
-        <h3 class="mt5-panel-title font-black gold mt-3">Add MT5 To Vault</h3>
-        <p class="text-gray-400 mt-2">Store unused Exness MT5 accounts here. They remain Available until assigned.</p>
-      </div>
-
-      <div class="grid gap-3 mb-4">
-        <input id="mt5_plan" placeholder="Plan Name e.g RUBBY">
-        <input id="mt5_size" placeholder="Account Size e.g 1000000">
-        <input id="mt5_login" placeholder="MT5 Login">
-        <select id="mt5_server">${serverOptions("Exness-MT5Trial9")}</select>
-      </div>
-
-      <div class="mt5-password-box mb-4">
-        <div class="flex flex-wrap justify-between gap-3 mb-4">
-          <div>
-            <h4 class="text-xl font-black gold">MT5 Password Generator</h4>
-            <p class="text-gray-500 text-sm">Inputs now stay clear and visible. Buttons sit under the fields.</p>
-          </div>
-          <span class="badge">Strong Password Vault</span>
-        </div>
-
-        <div class="mt5-password-row">
-          <label class="text-gray-400 text-sm">Master Password</label>
-          <input id="mt5_master" class="mt5-password-input" placeholder="Generate or paste MT5 Master Password" autocomplete="off">
-          <div class="mt5-password-actions">
-            <button onclick="generateMT5Password('mt5_master')" type="button" class="btn btn-gold">Generate Master</button>
-            <button onclick="copyMT5Field('mt5_master')" type="button" class="btn btn-dark">Copy Master</button>
-          </div>
-        </div>
-
-        <div class="mt5-password-row">
-          <label class="text-gray-400 text-sm">Investor Password</label>
-          <input id="mt5_investor" class="mt5-password-input" placeholder="Generate or paste MT5 Investor Password" autocomplete="off">
-          <div class="mt5-password-actions">
-            <button onclick="generateMT5Password('mt5_investor')" type="button" class="btn btn-green">Generate Investor</button>
-            <button onclick="copyMT5Field('mt5_investor')" type="button" class="btn btn-dark">Copy Investor</button>
-          </div>
-        </div>
-
-        <div class="mt5-mini-actions">
-          <button onclick="generateMT5Password('mt5_master');generateMT5Password('mt5_investor')" type="button" class="btn btn-gold">Generate Both</button>
-          <button onclick="clearMT5Passwords()" type="button" class="btn btn-dark">Clear</button>
-          <button onclick="previewMT5PasswordRules()" type="button" class="btn btn-dark">Rules</button>
-        </div>
-      </div>
-
-      <textarea id="mt5_note" rows="4" placeholder="Admin note" class="mb-4"></textarea>
-
-      <button onclick="createMT5()" class="btn btn-gold w-full">Add Unused MT5 Account</button>
-    </div>
-
-    <div>
-      <div class="vault p-6 rounded-3xl mb-6">
-        <div class="flex flex-wrap justify-between gap-4 mb-5">
-          <div>
-            <h3 class="text-3xl font-black gold">Available MT5 Accounts</h3>
-            <p class="text-gray-400">Only unused accounts appear here. This is your real stock room.</p>
-          </div>
-          <span class="badge">${filteredAvailable.length} visible</span>
-        </div>
-
-        <div class="grid gap-5">
-          ${filteredAvailable.map(mt5AvailableCard).join("") || empty("No available MT5 accounts left. Add more accounts to the vault.")}
-        </div>
-      </div>
-
-      <div class="vault p-6 rounded-3xl">
-        <div class="flex flex-wrap justify-between gap-4 mb-5">
-          <div>
-            <h3 class="text-3xl font-black gold">Assigned MT5 Accounts</h3>
-            <p class="text-gray-400">These accounts have already left the available pool and are attached to traders.</p>
-          </div>
-          <span class="badge">${filteredAssigned.length} visible</span>
-        </div>
-
-        <div class="grid gap-5">
-          ${filteredAssigned.map(mt5AssignedCard).join("") || empty("No assigned MT5 accounts yet.")}
-        </div>
-      </div>
-    </div>
-  </div>`;
-}
-
-function mt5AvailableCard(m){
-  return `
-  <div class="mt5-card p-5 rounded-2xl border border-green-900/30">
-    <div class="flex flex-wrap justify-between gap-4 mb-4">
-      <div>
-        <span class="badge">AVAILABLE</span>
-        <h3 class="text-2xl font-black gold mt-3">${m.mt5_login||"MT5 Login"}</h3>
-        <p class="text-gray-400">${m.mt5_server||""}</p>
-      </div>
-      <div class="text-right">
-        <p class="text-gray-500 text-sm">Account Size</p>
-        <b class="text-2xl">${money(m.account_size)}</b>
-      </div>
-    </div>
-
-    <div class="mt5-info-grid mb-4">
-      <div class="mt5-secret"><p class="text-gray-500 text-sm">Plan</p><b>${m.plan_name||"No plan"}</b></div>
-      <div class="mt5-secret"><p class="text-gray-500 text-sm">Created</p><b>${formatDate(m.created_at)}</b></div>
-    </div>
-
-    <div class="mt5-secret-grid mb-4">
-      <div class="mt5-secret"><p class="text-gray-500 text-sm">Master Password</p><span class="mt5-secret-value">${m.mt5_master_password||"—"}</span></div>
-      <div class="mt5-secret"><p class="text-gray-500 text-sm">Investor Password</p><span class="mt5-secret-value">${m.mt5_investor_password||"—"}</span></div>
-    </div>
-
-    <p class="text-gray-400 mb-4">Note: ${m.admin_note||"No note"}</p>
-
-    <div class="flex flex-wrap gap-3">
-      <button onclick="editMT5('${m.id}')" class="btn btn-gold">Edit</button>
-      <button onclick="deleteMT5('${m.id}')" class="btn btn-red">Delete</button>
-    </div>
-  </div>`;
-}
-
-function mt5AssignedCard(m){
-  return `
-  <div class="mt5-assigned-card p-5 rounded-2xl border border-yellow-900/30">
-    <div class="mt5-assigned-head mb-5">
-      <div class="min-w-0">
-        <div class="flex flex-wrap gap-2 items-center mb-3">
-          <span class="badge">ASSIGNED</span>
-          <span class="badge">IN USE</span>
-        </div>
-        <h3 class="mt5-assigned-login font-black gold">${m.mt5_login||"MT5 Login"}</h3>
-        <p class="text-gray-400 mt-2 break-words">${m.mt5_server||"No server saved"}</p>
-      </div>
-      <div class="mt5-assigned-size card2 p-4 rounded-2xl">
-        <p class="text-gray-500 text-sm">Account Size</p>
-        <b class="text-2xl gold block break-words">${money(m.account_size)}</b>
-      </div>
-    </div>
-
-    <div class="mt5-assigned-grid mb-4">
-      <div class="mt5-assigned-field">
-        <p class="text-gray-500 text-sm">Plan</p>
-        <b>${m.plan_name||"No plan"}</b>
-      </div>
-      <div class="mt5-assigned-field">
-        <p class="text-gray-500 text-sm">Assigned Trader</p>
-        <b>${m.assigned_trader_name||"Unknown"}</b>
-      </div>
-      <div class="mt5-assigned-field">
-        <p class="text-gray-500 text-sm">Trader Email</p>
-        <span class="mt5-assigned-value text-gray-200">${m.assigned_email||"—"}</span>
-      </div>
-      <div class="mt5-assigned-field">
-        <p class="text-gray-500 text-sm">Assigned Date</p>
-        <span class="mt5-assigned-value text-gray-200">${formatDate(m.assigned_at)}</span>
-      </div>
-    </div>
-
-    <div class="mt5-assigned-grid mb-4">
-      <div class="mt5-assigned-field">
-        <p class="text-gray-500 text-sm">Master Password</p>
-        <span class="mt5-secret-value">${m.mt5_master_password||"—"}</span>
-      </div>
-      <div class="mt5-assigned-field">
-        <p class="text-gray-500 text-sm">Investor Password</p>
-        <span class="mt5-secret-value">${m.mt5_investor_password||"—"}</span>
-      </div>
-      <div class="mt5-assigned-field">
-        <p class="text-gray-500 text-sm">Assigned Email</p>
-        <span class="mt5-assigned-value text-gray-200">${m.assigned_email||"—"}</span>
-      </div>
-      <div class="mt5-assigned-field">
-        <p class="text-gray-500 text-sm">Status</p>
-        <b class="gold">${npMt5DisplayStatus(m).toUpperCase()}</b>
-      </div>
-    </div>
-
-    <div class="mt5-assigned-note mb-4">
-      <p class="text-gray-500 text-sm mb-1">Admin Note</p>
-      <p class="text-gray-300">${m.admin_note||"No note"}</p>
-    </div>
-
-    <div class="mt5-assigned-actions">
-      <button onclick="editMT5('${m.id}')" class="btn btn-gold">Edit / Recycle</button>
-      <button class="btn btn-dark" disabled>Assigned - Locked</button>
-    </div>
-  </div>`;
-}
-
-
-function getBulkSelectedPlan(){
-  const idx = document.getElementById("bulk_plan_index")?.value;
-  if(idx === "" || idx === undefined || idx === null) return null;
-  return plans[Number(idx)] || null;
-}
-
-function renderBulkPlanPreview(){
-  const box = document.getElementById("bulk_plan_preview");
-  if(!box) return;
-  const p = getBulkSelectedPlan();
-  if(!p){
-    box.innerHTML = `<h4 class="text-2xl font-black gold">No plan selected</h4><p class="text-gray-400 mt-2">Choose a plan above. Then paste MT5 logins. The preview will show here before creation.</p>`;
-    return;
-  }
-  box.innerHTML = `
-    <div class="flex flex-wrap justify-between gap-4 items-start">
-      <div>
-        <span class="badge">SELECTED PLAN</span>
-        <h4 class="text-3xl font-black gold mt-3">${p.name||"Challenge Plan"}</h4>
-        <p class="text-gray-400 mt-2">This is the plan that will be attached to every MT5 pool account created below.</p>
-      </div>
-      <button type="button" onclick="loadBulkPlanToSingleMT5()" class="btn btn-dark">Use For Single Add</button>
-    </div>
-    <div class="mt5-plan-preview-grid">
-      <div class="mt5-plan-preview-item"><p class="text-gray-500 text-sm">Account Size</p><b class="gold">${money(p.account_size)}</b></div>
-      <div class="mt5-plan-preview-item"><p class="text-gray-500 text-sm">Fee</p><b>${money(p.fee)}</b></div>
-      <div class="mt5-plan-preview-item"><p class="text-gray-500 text-sm">Phase 1</p><b>${p.phase1_target||10}%</b></div>
-      <div class="mt5-plan-preview-item"><p class="text-gray-500 text-sm">Phase 2</p><b>${p.phase2_target||8}%</b></div>
-      <div class="mt5-plan-preview-item"><p class="text-gray-500 text-sm">Max DD</p><b>${p.max_drawdown||20}%</b></div>
-      <div class="mt5-plan-preview-item"><p class="text-gray-500 text-sm">Payout</p><b>${p.payout_split||"80%"}</b></div>
-    </div>`;
-}
-
-function setBulkPasswordMode(mode){
-  const hidden = document.getElementById("bulk_password_mode");
-  if(hidden) hidden.value = mode;
-  renderBulkPasswordMode();
-  renderSimpleMT5Preview();
-}
-
-function renderBulkPasswordMode(){
-  const mode = document.getElementById("bulk_password_mode")?.value || "unique";
-  const box = document.getElementById("bulk_same_password_box");
-  if(box) box.classList.toggle("hidden", mode !== "same");
-  const uniqueBtn = document.getElementById("bulkModeUniqueBtn");
-  const sameBtn = document.getElementById("bulkModeSameBtn");
-  if(uniqueBtn) uniqueBtn.className = mode === "unique" ? "btn btn-gold" : "btn btn-dark";
-  if(sameBtn) sameBtn.className = mode === "same" ? "btn btn-gold" : "btn btn-dark";
-}
-
-function makeMT5Password(length = 14){
-  const upper = "ABCDEFGHJKLMNPQRSTUVWXYZ";
-  const lower = "abcdefghijkmnopqrstuvwxyz";
-  const numbers = "23456789";
-  const symbols = "@#$%&*!?";
-  const all = upper + lower + numbers + symbols;
-  let password = "";
-  password += upper[Math.floor(Math.random() * upper.length)];
-  password += lower[Math.floor(Math.random() * lower.length)];
-  password += numbers[Math.floor(Math.random() * numbers.length)];
-  password += symbols[Math.floor(Math.random() * symbols.length)];
-  for(let i=password.length; i<length; i++) password += all[Math.floor(Math.random() * all.length)];
-  return password.split("").sort(() => Math.random() - 0.5).join("");
-}
-
-function generateBulkSamePasswords(){
-  const m = document.getElementById("bulk_master_same");
-  const i = document.getElementById("bulk_investor_same");
-  if(m) m.value = makeMT5Password();
-  if(i) i.value = makeMT5Password();
-  renderSimpleMT5Preview();
-}
-
-function loadBulkPlanToSingleMT5(){
-  const p = getBulkSelectedPlan();
-  if(!p){alert("Select a challenge plan first.");return;}
-  const plan = document.getElementById("mt5_plan");
-  const size = document.getElementById("mt5_size");
-  const server = document.getElementById("mt5_server");
-  if(plan) plan.value = p.name || "";
-  if(size) size.value = p.account_size || "";
-  if(server && getPlanServer(p)) server.value = getPlanServer(p);
-  alert("Plan name, account size and server loaded into the single MT5 add form.");
-}
-
-function syncBulkServerFromPlan(){
-  const p = getBulkSelectedPlan();
-  const server = document.getElementById("bulk_default_server");
-  if(server && p && getPlanServer(p)){
-    server.value = getPlanServer(p);
-  }
-}
-
-function parseBulkMT5Lines(){
-  const raw = document.getElementById("bulk_mt5_lines")?.value || "";
-  const defaultServer = (document.getElementById("bulk_default_server")?.value || "").trim();
-  return raw.split("\n")
-    .map(line=>line.trim())
-    .filter(Boolean)
-    .map(line=>{
-      const login = line.split(/[ ,;|]+/)[0].trim();
-      return {mt5_login: login, mt5_server: defaultServer};
+    return jsonify({
+        "success": True,
+        "message": "FXBlue snapshot received and processed by NairaPips monitoring engine.",
+        "data": result
     })
-    .filter(x=>x.mt5_login);
-}
 
-function renderSimpleMT5Preview(){
-  const box = document.getElementById("simple_mt5_preview");
-  if(!box) return;
-  const p = getBulkSelectedPlan();
-  const rows = parseBulkMT5Lines();
-  const server = (document.getElementById("bulk_default_server")?.value || "").trim();
-  const mode = document.getElementById("bulk_password_mode")?.value || "unique";
-  const sameMaster = document.getElementById("bulk_master_same")?.value || "";
-  const sameInvestor = document.getElementById("bulk_investor_same")?.value || "";
-  const ready = !!p && rows.length > 0 && !!server && (mode === "unique" || (sameMaster && sameInvestor));
-  const sample = rows.slice(0,6).map(r=>`
-    <tr>
-      <td class="gold font-bold">${r.mt5_login}</td>
-      <td>${p ? (p.name||"Challenge Plan") : "Choose plan"}</td>
-      <td>${p ? money(p.account_size) : "—"}</td>
-      <td>${server || "Add server"}</td>
-      <td>${mode === "unique" ? "Auto generated" : "Same password"}</td>
-    </tr>`).join("");
-  box.innerHTML = `
-    <div class="flex flex-wrap justify-between gap-4 mb-4">
-      <div>
-        <span class="badge ${ready ? "text-green-400" : "text-yellow-400"}">${ready ? "READY TO CREATE" : "COMPLETE THE 4 STEPS"}</span>
-        <h4 class="text-2xl font-black gold mt-3">${rows.length} MT5 login(s) detected</h4>
-        <p class="text-gray-400 mt-1">${ready ? "Everything is ready. Click CREATE MT5 POOLS." : "Select plan, paste logins, add server, and choose password mode."}</p>
-      </div>
-      <div class="card p-4 rounded-2xl min-w-[170px]"><p class="text-gray-500 text-sm">Status</p><h3 class="text-2xl font-black ${ready ? "text-green-400" : "text-yellow-400"}">${ready ? "GOOD" : "WAITING"}</h3></div>
-    </div>
-    <div class="tableWrap">
-      <table style="min-width:780px">
-        <thead><tr><th>MT5 Login</th><th>Plan</th><th>Size</th><th>Server</th><th>Password</th></tr></thead>
-        <tbody>${sample || `<tr><td colspan="5" class="text-center text-gray-400 py-6">Paste MT5 logins to preview.</td></tr>`}</tbody>
-      </table>
-    </div>
-    ${rows.length > 6 ? `<p class="text-gray-500 text-sm mt-3">Showing first 6 only. Total ready: ${rows.length}</p>` : ""}`;
-}
-
-async function createBulkMT5FromPlan(){
-  const p = getBulkSelectedPlan();
-  if(!p){alert("Step 1: Choose a challenge plan first.");return;}
-  const rows = parseBulkMT5Lines();
-  if(!rows.length){alert("Step 2: Paste at least one MT5 login.");return;}
-  const server = (document.getElementById("bulk_default_server")?.value || "").trim();
-  if(!server){alert("Step 3: Enter the MT5 server once.");return;}
-
-  const mode = document.getElementById("bulk_password_mode")?.value || "unique";
-  const sameMaster = document.getElementById("bulk_master_same")?.value || "";
-  const sameInvestor = document.getElementById("bulk_investor_same")?.value || "";
-  if(mode === "same" && (!sameMaster || !sameInvestor)){
-    alert("Step 4: Generate or enter the same Master and Investor passwords.");
-    return;
-  }
-
-  if(!confirm(`Create ${rows.length} MT5 pool account(s)?\n\nPlan: ${p.name || "Challenge Plan"}\nSize: ${money(p.account_size)}\nServer: ${server}`)) return;
-
-  let success = 0;
-  let failed = 0;
-  for(const r of rows){
-    const payload = {
-      plan_name: p.name || "Challenge Plan",
-      account_size: p.account_size || 0,
-      mt5_login: r.mt5_login,
-      mt5_server: server,
-      mt5_master_password: mode === "unique" ? makeMT5Password() : sameMaster,
-      mt5_investor_password: mode === "unique" ? makeMT5Password() : sameInvestor,
-      admin_note: `Simple bulk created from challenge plan: ${p.name || "Challenge Plan"}`,
-      status:"available"
-    };
-    try{
-      const res = await fetch(`${API_URL}/create_mt5_account`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-      const data = await res.json();
-      if(data.success) success++; else failed++;
-    }catch(e){ failed++; }
-  }
-  alert(`Done.\n\nCreated: ${success}\nFailed: ${failed}`);
-  if(success) loadData();
-}
-
-function clearBulkMT5Factory(){
-  const fields = ["bulk_plan_index","bulk_default_server","bulk_mt5_lines","bulk_master_same","bulk_investor_same"];
-  fields.forEach(id=>{const el=document.getElementById(id); if(el) el.value="";});
-  const mode = document.getElementById("bulk_password_mode");
-  if(mode) mode.value = "unique";
-  renderBulkPasswordMode();
-  renderBulkPlanPreview();
-  renderSimpleMT5Preview();
-}
-
-function generateMT5Password(inputId, length = 14){
-  const upper = "ABCDEFGHJKLMNPQRSTUVWXYZ";
-  const lower = "abcdefghijkmnopqrstuvwxyz";
-  const numbers = "23456789";
-  const symbols = "@#$%&*!?";
-  const all = upper + lower + numbers + symbols;
-
-  let password = "";
-  password += upper[Math.floor(Math.random() * upper.length)];
-  password += lower[Math.floor(Math.random() * lower.length)];
-  password += numbers[Math.floor(Math.random() * numbers.length)];
-  password += symbols[Math.floor(Math.random() * symbols.length)];
-
-  for(let i=password.length; i<length; i++){
-    password += all[Math.floor(Math.random() * all.length)];
-  }
-
-  password = password.split("").sort(() => Math.random() - 0.5).join("");
-
-  const field = document.getElementById(inputId);
-  if(field){
-    field.value = password;
-    field.focus();
-  }
-}
-
-async function copyMT5Field(inputId){
-  const field = document.getElementById(inputId);
-  if(!field || !field.value){
-    alert("Nothing to copy yet. Generate the password first.");
-    return;
-  }
-
-  try{
-    await navigator.clipboard.writeText(field.value);
-    alert("Password copied.");
-  }catch(e){
-    field.select();
-    document.execCommand("copy");
-    alert("Password copied.");
-  }
-}
-
-function clearMT5Passwords(){
-  const master = document.getElementById("mt5_master");
-  const investor = document.getElementById("mt5_investor");
-  if(master) master.value = "";
-  if(investor) investor.value = "";
-}
-
-function previewMT5PasswordRules(){
-  alert("Password rules:\\n\\n• 14 characters\\n• Uppercase letters\\n• Lowercase letters\\n• Numbers\\n• Symbols: @ # $ % & * ! ?\\n\\nUse different Master and Investor passwords for every MT5 account.");
-}
-
-
-async function createMT5(){
-  if(!canDo("mt5pool","create")){alert("Access denied: create MT5 pool");return;}
-  const payload = {
-    plan_name:document.getElementById("mt5_plan").value,
-    account_size:document.getElementById("mt5_size").value,
-    mt5_login:document.getElementById("mt5_login").value,
-    mt5_server:document.getElementById("mt5_server").value,
-    mt5_master_password:document.getElementById("mt5_master").value,
-    mt5_investor_password:document.getElementById("mt5_investor").value,
-    admin_note:document.getElementById("mt5_note").value,
-    status:"available"
-  };
-
-  const res = await fetch(`${API_URL}/create_mt5_account`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)
-  });
-  const data = await res.json();
-  if(data.success){alert("MT5 account added to vault.");loadData();}
-  else alert(data.error || "Failed to add MT5");
-}
-
-async function editMT5(id){
-  const m = mt5pool.find(x=>String(x.id)===String(id));
-  if(!m) return;
-  const plan_name = prompt("Plan name:", m.plan_name||"");
-  if(plan_name === null) return;
-  const account_size = prompt("Account size:", m.account_size||"");
-  if(account_size === null) return;
-  const mt5_login = prompt("MT5 login:", m.mt5_login||"");
-  if(mt5_login === null) return;
-  const mt5_server = prompt("MT5 server - correct any missing letter here:", m.mt5_server||"");
-  if(mt5_server === null) return;
-  const mt5_master_password = prompt("Master password:", m.mt5_master_password||"");
-  if(mt5_master_password === null) return;
-  const mt5_investor_password = prompt("Investor password:", m.mt5_investor_password||"");
-  if(mt5_investor_password === null) return;
-  const status = prompt("Status: available / assigned / inactive", npMt5DisplayStatus(m));
-  if(status === null) return;
-  const admin_note = prompt("Admin note:", m.admin_note||"");
-  if(admin_note === null) return;
-
-  const res = await fetch(`${API_URL}/update_mt5_account`,{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({id,plan_name,account_size,mt5_login,mt5_server,mt5_master_password,mt5_investor_password,status,admin_note})
-  });
-  const data = await res.json();
-  if(data.success){alert("MT5 account updated.");loadData();}
-  else alert(data.error || "Update failed");
-}
-
-async function bulkCorrectMT5Server(){
-  const wrong = (document.getElementById("bulk_wrong_server")?.value || "").trim();
-  const correct = (document.getElementById("bulk_correct_server")?.value || "").trim();
-  if(!wrong){alert("Type the wrong server exactly as it appears first.");return;}
-  if(!correct){alert("Choose the correct Exness server.");return;}
-  const matches = mt5pool.filter(m=>String(m.mt5_server||"").trim() === wrong);
-  if(!matches.length){alert(`No MT5 pool account found with server: ${wrong}`);return;}
-  if(!confirm(`Fix ${matches.length} MT5 account(s)?
-
-From: ${wrong}
-To: ${correct}`)) return;
-
-  let success = 0;
-  let failed = 0;
-  for(const m of matches){
-    const payload = {
-      id:m.id,
-      plan_name:m.plan_name || "",
-      account_size:m.account_size || "",
-      mt5_login:m.mt5_login || "",
-      mt5_server:correct,
-      mt5_master_password:m.mt5_master_password || "",
-      mt5_investor_password:m.mt5_investor_password || "",
-      status:m.status || "available",
-      admin_note:(m.admin_note || "") + ` | Server corrected from ${wrong} to ${correct}`
-    };
-    try{
-      const res = await fetch(`${API_URL}/update_mt5_account`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-      const data = await res.json();
-      if(data.success) success++; else failed++;
-    }catch(e){ failed++; }
-  }
-  alert(`Server correction finished.
-
-Updated: ${success}
-Failed: ${failed}`);
-  loadData();
-}
-
-async function deleteMT5(id){
-  if(!canDo("mt5pool","delete")){alert("Access denied: delete MT5 pool");return;}
-  if(!confirm("Delete this MT5 account from vault?")) return;
-  const res = await fetch(`${API_URL}/delete_mt5_account`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})
-  });
-  const data = await res.json();
-  if(data.success){alert("MT5 account deleted.");loadData();}
-  else alert(data.error || "Delete failed");
-}
-
-/* PAYMENTS */
-function paymentsModule(){
-  const list = filteredTraders().filter(t=>t.payment_status==="pending" || t.status==="payment_pending");
-  document.getElementById("content").innerHTML = `
-  <div class="mb-5 flex flex-wrap gap-3">
-    <span class="badge">${list.length} pending payment reviews</span>
-    <span class="badge">Receipt verification</span>
-    <span class="badge">Manual MT5 assignment</span>
-  </div>
-  <div class="grid gap-5">${list.map(paymentCard).join("") || empty("No pending payments.")}</div>`;
-}
-
-function paymentCard(t){
-return `
-<div class="vault p-6 rounded-3xl">
-  <div class="flex flex-wrap justify-between gap-4 mb-5">
-    <div>
-      <h3 class="text-2xl font-bold">${t.name||"No Name"}</h3>
-      <p class="text-gray-400">${t.email||""} • ${t.phone||""}</p>
-      <p class="text-gray-600 text-xs">Submitted: ${formatDate(t.created_at)}</p>
-    </div>
-    <span class="badge">${t.payment_status||"pending"}</span>
-  </div>
-
-  <div class="grid md:grid-cols-4 gap-4 mb-5">
-    <div><p class="text-gray-500 text-sm">Plan</p><b>${t.selected_plan||""}</b></div>
-    <div><p class="text-gray-500 text-sm">Reference</p><b>${t.account_reference||"Generating..."}</b></div>
-    <div><p class="text-gray-500 text-sm">Receipt</p><a class="gold underline" href="${t.payment_proof_url}" target="_blank">Open Receipt</a></div>
-    <div><p class="text-gray-500 text-sm">Record ID</p><b class="text-xs">${t.id}</b></div>
-  </div>
-
-  <div class="grid md:grid-cols-2 gap-4 mb-5">
-    <input id="size-${t.id}" placeholder="Account Size e.g 3000000">
-    <input id="login-${t.id}" placeholder="MT5 Login">
-    <input id="server-${t.id}" placeholder="MT5 Server e.g Exness-MT5Trial9">
-    <input id="master-${t.id}" placeholder="MT5 Master Password">
-    <input id="investor-${t.id}" placeholder="MT5 Investor Password">
-    <select id="phase-${t.id}">
-      <option value="phase1">phase1</option>
-      <option value="phase2">phase2</option>
-      <option value="funded">funded</option>
-    </select>
-  </div>
-
-  <div class="flex flex-wrap gap-3">
-    <button class="btn btn-gold" onclick="approvePayment('${t.id}')">Approve + Activate</button>
-    <button class="btn btn-red" onclick="rejectPayment('${t.id}')">Reject</button>
-    <a class="btn btn-dark" href="${t.payment_proof_url}" target="_blank">View Receipt</a>
-  </div>
-</div>`;
-}
-
-async function approvePayment(id){
-  if(!canDo("payments","approve")){alert("Access denied: approve payments");return;}
-  const payload = {
-    id,
-    account_size: document.getElementById(`size-${id}`).value,
-    mt5_login: document.getElementById(`login-${id}`).value,
-    mt5_server: document.getElementById(`server-${id}`).value,
-    mt5_master_password: document.getElementById(`master-${id}`).value,
-    mt5_investor_password: document.getElementById(`investor-${id}`).value,
-    phase: document.getElementById(`phase-${id}`).value,
-    approved_by: currentAdmin?.username || "admin",
-    admin_name: currentAdmin?.name || currentAdmin?.username || "admin",
-    admin_username: currentAdmin?.username || "admin"
-  };
-
-  const res = await fetch(`${API_URL}/approve_payment`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)
-  });
-  const data = await res.json();
-  if(data.success){await logAdminAudit("payments","payment_approved",`Trader payment approved and activated: ${id}`,id);alert("Payment approved and trader activated.");loadData();}
-  else alert(data.error || "Approval failed");
-}
-
-async function rejectPayment(id){
-  if(!canDo("payments","approve")){alert("Access denied: reject payments");return;}
-  const res = await fetch(`${API_URL}/reject_payment`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,admin_note:"Payment rejected"})
-  });
-  const data = await res.json();
-  if(data.success){alert("Payment rejected.");loadData();}
-  else alert(data.error || "Rejection failed");
-}
-
-/* TRADERS */
-
-
-let npGlobalFilter = "all";
-let npTMFilter = "all";
-let npPage = 1;
-let npPageSize = 50;
-
-function npNorm(v){ return String(v||"").toLowerCase().trim(); }
-function npDigits(v){ return String(v||"").replace(/\D/g,""); }
-function npSearchBlob(t){
-  return [
-    t.id,t.name,t.full_name,t.trader_name,t.email,t.phone,t.account_reference,
-    t.selected_plan,t.plan_name,t.status,t.phase,t.payment_status,t.mt5_login,
-    t.mt5_server,t.mt5_password,t.master_password,t.mt5_master_password,
-    t.mt5_investor_password,t.investor_password
-  ].map(v=>String(v||"").toLowerCase()).join(" ");
-}
-function npDeepMatch(t,s){
-  if(!s) return true;
-  const q = npNorm(s);
-  const qd = npDigits(q);
-  const blob = npSearchBlob(t);
-  if(blob.includes(q)) return true;
-  if(qd && npDigits(t.phone).includes(qd)) return true;
-  return false;
-}
-function npTMStage(t){
-  const phase = String(t.phase || "").toLowerCase().replace(/[\s_-]/g,"");
-  const status = String(t.status || "").toLowerCase().replace(/[\s_-]/g,"");
-  const passStatus = String(t.phase_pass_status || t.pass_status || t.phase_status || "").toLowerCase().replace(/[\s_-]/g,"");
-  const p1 = !!t.phase1_passed_at;
-  const p2 = !!t.phase2_passed_at;
-  const capital = Number(t.account_size || t.initial_balance || t.starting_balance || t.challenge_amount || t.balance || 0);
-  const high = Number(t.highest_equity || t.equity || t.current_equity || t.balance || 0);
-
-  // Only real assigned funded/live accounts should appear in Funded/Live.
-  // phase2_passed is only "awaiting funded assignment", not funded/live.
-  if(
-    phase === "funded" || phase === "live" ||
-    status === "funded" || status === "live" ||
-    status === "fundedactive" || status === "liveactive" ||
-    phase.includes("fundedlive") || status.includes("fundedlive")
-  ) return "funded_live";
-
-  // Phase 2 includes Phase 1 passed waiting for Phase 2, active Phase 2,
-  // and Phase 2 passed waiting for funded review.
-  if(
-    p1 || p2 ||
-    phase.includes("phase2") || status.includes("phase2") ||
-    passStatus.includes("phase1passed") || passStatus.includes("phase2passed") ||
-    status.includes("phase1passed")
-  ) return "phase2";
-
-  // Evidence fallback can only move display to Phase 2, never Funded.
-  if(capital && high >= capital * 1.10) return "phase2";
-
-  if(phase.includes("phase1") || status.includes("phase1")) return "phase1";
-  if(String(t.mt5_login || "").trim() && !status.includes("newsignup")) return "phase1";
-  return "unassigned";
-}
-function npTMLabel(s){ return s==="phase1"?"Phase 1":s==="phase2"?"Phase 2 / Review":s==="funded_live"?"Funded / Live":"Unassigned"; }
-function npTMLogin(t){ return String(t.mt5_login || t.login || t.mt5_account || t.account_login || "").trim(); }
-function npTMServer(t){ return String(t.mt5_server || t.server || t.account_server || "").trim(); }
-function npTMMaster(t){ return String(t.mt5_password || t.master_password || t.mt5_master_password || "").trim(); }
-function npTMInvestor(t){ return String(t.mt5_investor_password || t.investor_password || t.investor_pass || "").trim(); }
-
-function npActiveAccount(t){ return (t && (t.current_account || t.__current_account)) || null; }
-function npNum(v, fallback=0){ const n=Number(v); return Number.isFinite(n) ? n : fallback; }
-function npFirstMetric(source, keys, fallback=0){
-  for(const key of keys){
-    if(source && source[key] !== undefined && source[key] !== null && source[key] !== "") return npNum(source[key], fallback);
-  }
-  return fallback;
-}
-function npMetricTime(row){
-  if(!row) return 0;
-  const raw = row.created_at || row.synced_at || row.updated_at || row.last_sync_at || row.snapshot_at || row.time || "";
-  const ms = raw ? new Date(raw).getTime() : 0;
-  return Number.isFinite(ms) ? ms : 0;
-}
-function npAccountTime(t){
-  const a = npActiveAccount(t);
-  const raw = a?.display_assigned_at || a?.assignment_date || a?.assigned_at || a?.started_at || a?.created_at || t?.current_account_assigned_at || t?.assigned_at || t?.mt5_updated_at || t?.approved_at || "";
-  const ms = raw ? new Date(raw).getTime() : 0;
-  return Number.isFinite(ms) ? ms : 0;
-}
-function npLiveLogin(t){
-  const a = npActiveAccount(t);
-  return String(a?.mt5_login || t?.mt5_login || t?.login || t?.mt5_account || t?.account_login || "").trim();
-}
-function npLiveAccountId(t){
-  const a = npActiveAccount(t);
-  return String(a?.id || a?.account_id || a?.trader_account_id || "").trim();
-}
-function npRowLogin(row){
-  return String(row?.mt5_login || row?.login || row?.account_login || row?.mt5_account || "").trim();
-}
-function npRowAccountId(row){
-  return String(row?.trader_account_id || row?.account_id || row?.current_account_id || row?.mt5_account_id || "").trim();
-}
-function npMetricValue(row, keys, fallback=null){
-  for(const key of keys){
-    if(row && row[key] !== undefined && row[key] !== null && row[key] !== ""){
-      const n = Number(row[key]);
-      if(Number.isFinite(n)) return n;
-    }
-  }
-  return fallback;
-}
-function npPositiveMin(values, fallback=0){
-  const nums = values.map(v => Number(v)).filter(v => Number.isFinite(v) && v > 0);
-  return nums.length ? Math.min(...nums) : fallback;
-}
-function npBestLiveRow(t, rows){
-  if(!Array.isArray(rows) || !rows.length) return null;
-  const login = npLiveLogin(t);
-  const accountId = npLiveAccountId(t);
-  const traderId = String(t?.id || "").trim();
-  const email = String(t?.email || "").trim().toLowerCase();
-  const startMs = npAccountTime(t);
-  const marginMs = 24 * 60 * 60 * 1000;
-  const candidates = rows.filter(row => {
-    const rid = npRowAccountId(row);
-    if(accountId && rid && rid === accountId) return true;
-    const rLogin = npRowLogin(row);
-    if(login && rLogin && rLogin === login){
-      if(!rid && startMs){
-        const rowMs = npMetricTime(row);
-        return !rowMs || rowMs >= startMs - marginMs;
-      }
-      return !rid || !accountId || rid === accountId;
-    }
-    const rTrader = String(row?.trader_id || row?.user_id || "").trim();
-    if(traderId && rTrader && rTrader === traderId) return true;
-    const rEmail = String(row?.email || row?.trader_email || "").trim().toLowerCase();
-    return !!(email && rEmail && rEmail === email);
-  });
-  candidates.sort((a,b) => npMetricTime(b) - npMetricTime(a));
-  return candidates[0] || null;
-}
-function npLiveMetricPack(t){
-  const a = npActiveAccount(t) || {};
-  const snap = npBestLiveRow(t, monitoringSnapshots);
-  const event = npBestLiveRow(t, monitoringEvents);
-  const start = npFirstMetric(a, ["account_size","start_balance","initial_balance","starting_balance","current_balance"], npFirstMetric(t, ["account_size","initial_balance","starting_balance","challenge_amount","balance"], 0));
-  const balance = npMetricValue(snap, ["balance","current_balance","account_balance"], null)
-    ?? npMetricValue(event, ["balance","current_balance","account_balance"], null)
-    ?? npFirstMetric(a, ["current_balance","balance","start_balance","account_size"], start);
-  const equity = npMetricValue(snap, ["equity","current_equity","account_equity"], null)
-    ?? npMetricValue(event, ["equity","current_equity","account_equity"], null)
-    ?? npFirstMetric(a, ["current_equity","equity","current_balance","balance","start_balance","account_size"], balance || start);
-  const high = Math.max(
-    start || 0,
-    equity || 0,
-    balance || 0,
-    npFirstMetric(a, ["highest_equity"], 0),
-    npMetricValue(snap, ["highest_equity","high_equity","peak_equity"], 0) || 0,
-    npMetricValue(event, ["highest_equity","high_equity","peak_equity"], 0) || 0
-  );
-  const low = npPositiveMin([
-    npFirstMetric(a, ["lowest_equity"], 0),
-    npMetricValue(snap, ["lowest_equity","low_equity","min_equity"], 0),
-    npMetricValue(event, ["lowest_equity","low_equity","min_equity"], 0),
-    equity,
-    balance
-  ], equity || balance || start || 0);
-  const directProfit = npMetricValue(snap, ["profit","floating_profit","account_profit"], null)
-    ?? npMetricValue(event, ["profit","floating_profit","account_profit"], null)
-    ?? npMetricValue(a, ["profit"], null)
-    ?? npMetricValue(t, ["profit"], null);
-  const profit = directProfit !== null ? directProfit : ((equity || 0) - (start || 0));
-  const directProfitPct = npMetricValue(snap, ["profit_percent","profit_percentage"], null)
-    ?? npMetricValue(event, ["profit_percent","profit_percentage"], null)
-    ?? npMetricValue(a, ["profit_percent"], null)
-    ?? npMetricValue(t, ["profit_percent"], null);
-  const profitPercent = directProfitPct !== null ? directProfitPct : (start ? (profit / start) * 100 : 0);
-  const drawdown = npMetricValue(snap, ["drawdown_percent","actual_drawdown_percent","absolute_drawdown_percent"], null)
-    ?? npMetricValue(event, ["drawdown_percent","actual_drawdown_percent","absolute_drawdown_percent"], null)
-    ?? npMetricValue(a, ["absolute_drawdown_percent","drawdown_percent"], null)
-    ?? npMetricValue(t, ["drawdown_percent"], 0);
-  const ddUsed = npMetricValue(snap, ["max_drawdown_used","dd_used_percent"], null)
-    ?? npMetricValue(event, ["max_drawdown_used","dd_used_percent"], null)
-    ?? npMetricValue(a, ["dd_used_percent","max_drawdown_used"], null)
-    ?? npMetricValue(t, ["max_drawdown_used"], 0);
-  return {
-    start,
-    balance,
-    equity,
-    high,
-    low,
-    profit,
-    profit_percent: profitPercent,
-    drawdown_percent: drawdown || 0,
-    max_drawdown_used: ddUsed || 0,
-    last_sync: snap?.created_at || snap?.synced_at || event?.created_at || event?.synced_at || a?.last_sync_at || a?.updated_at || t?.mt5_updated_at || ""
-  };
-}
-function npApplyLiveMetrics(t){
-  if(!t) return t;
-  const live = npLiveMetricPack(t);
-  if(!t.current_account && t.__current_account) t.current_account = t.__current_account;
-  if(t.current_account){
-    t.current_account.current_balance = live.balance;
-    t.current_account.current_equity = live.equity;
-    t.current_account.highest_equity = live.high;
-    t.current_account.lowest_equity = live.low;
-    t.current_account.profit = live.profit;
-    t.current_account.profit_percent = live.profit_percent;
-    t.current_account.absolute_drawdown_percent = live.drawdown_percent;
-    t.current_account.dd_used_percent = live.max_drawdown_used;
-    t.current_account.last_sync_at = live.last_sync || t.current_account.last_sync_at;
-  }
-  t.balance = live.balance;
-  t.equity = live.equity;
-  t.current_equity = live.equity;
-  t.highest_equity = live.high;
-  t.lowest_equity = live.low;
-  t.profit = live.profit;
-  t.profit_percent = live.profit_percent;
-  t.drawdown_percent = live.drawdown_percent;
-  t.max_drawdown_used = live.max_drawdown_used;
-  t.mt5_updated_at = live.last_sync || t.mt5_updated_at;
-  return t;
-}
-function npStartingCapital(t){
-  return npLiveMetricPack(t).start;
-}
-function npLiveEquity(t){
-  return npLiveMetricPack(t).equity;
-}
-function npHighestEquity(t){
-  return npLiveMetricPack(t).high;
-}
-function npLowestEquity(t){
-  return npLiveMetricPack(t).low;
-}
-function npRealProfit(t){
-  return npLiveMetricPack(t).profit;
-}
-function npRealProfitPercent(t){
-  return npLiveMetricPack(t).profit_percent;
-}
-
-
-
-
-function npIsWaitingForFreshMt5(t){
-  const phase = String(t.phase || "").toLowerCase().replace(/[\s_-]/g,"");
-  const status = String(t.status || "").toLowerCase().replace(/[\s_-]/g,"");
-  return status.includes("phase2waiting") || status.includes("awaitingphase2") || status.includes("phase1passed") || phase.includes("phase1passed") || status.includes("fundedwaiting") || status.includes("awaitingfunded");
-}
-function npDisplayMt5Login(t){ return npIsWaitingForFreshMt5(t) ? "Awaiting new MT5" : (npTMLogin(t) || "—"); }
-function npDisplayServer(t){ return npIsWaitingForFreshMt5(t) ? "Not assigned yet" : (npTMServer(t) || "—"); }
-function npDisplayEquity(t){
-  if(npIsWaitingForFreshMt5(t)) return null;
-  return npLiveEquity(t);
-}
-function npDisplayProfit(t){
-  if(npIsWaitingForFreshMt5(t)) return null;
-  return npRealProfit(t);
-}
-function npDisplayProfitPercent(t){
-  if(npIsWaitingForFreshMt5(t)) return null;
-  return npRealProfitPercent(t);
-}
-function npDisplayHighestEquity(t){
-  if(npIsWaitingForFreshMt5(t)) return null;
-  return npHighestEquity(t);
-}
-function npDisplayLowestEquity(t){
-  if(npIsWaitingForFreshMt5(t)) return null;
-  return npLowestEquity(t);
-}
-function npPhaseWaitingText(t){
-  const status = String(t.status || "").toLowerCase();
-  if(status.includes("phase2_waiting") || status.includes("phase2waiting")) return "Phase 2 MT5 not assigned";
-  if(status.includes("funded_waiting") || status.includes("fundedwaiting")) return "Funded MT5 not assigned";
-  return "New MT5 not assigned";
-}
-
-function npTMCopy(v){ if(!v || v==="—") return alert("Nothing to copy"); navigator.clipboard?.writeText(String(v)); alert("Copied"); }
-function npStatusType(t){
-  const s = npNorm(t.status + " " + t.phase_pass_status + " " + t.phase_status);
-  if(s.includes("breach")) return "breached";
-  if(s.includes("passed")) return "passed";
-  if(s.includes("pending")) return "pending";
-  if(s.includes("new_signup") || s.includes("newsignup")) return "new";
-  if(s.includes("funded") || s.includes("live")) return "funded";
-  if(npTMStage(t)==="phase2") return "phase2";
-  if(npTMStage(t)==="phase1") return "phase1";
-  return "other";
-}
-function npFilterTraders(list, filter){
-  if(filter==="all") return list;
-  if(filter==="missing_mt5") return list.filter(t=>!npTMLogin(t));
-  if(filter==="has_mt5") return list.filter(t=>!!npTMLogin(t));
-  if(filter==="phase1" || filter==="phase2" || filter==="funded_live") return list.filter(t=>npTMStage(t)===filter);
-  if(filter==="passed") return list.filter(t=>npStatusType(t)==="passed");
-  if(filter==="breached") return list.filter(t=>npStatusType(t)==="breached");
-  if(filter==="pending") return list.filter(t=>npStatusType(t)==="pending" || String(t.payment_status||"").toLowerCase().includes("pending"));
-  if(filter==="today"){
-    const today = new Date().toISOString().slice(0,10);
-    return list.filter(t=>String(t.created_at||"").slice(0,10)===today || String(t.approved_at||"").slice(0,10)===today);
-  }
-  return list;
-}
-function npSortTraders(list, sort){
-  const arr = [...list];
-  if(sort==="oldest") arr.sort((a,b)=>new Date(a.created_at||0)-new Date(b.created_at||0));
-  else if(sort==="account_desc") arr.sort((a,b)=>Number(b.account_size||b.balance||0)-Number(a.account_size||a.balance||0));
-  else if(sort==="profit_desc") arr.sort((a,b)=>Number(b.profit||0)-Number(a.profit||0));
-  else if(sort==="dd_desc") arr.sort((a,b)=>Number(b.drawdown_percent||0)-Number(a.drawdown_percent||0));
-  else arr.sort((a,b)=>new Date(b.created_at||b.updated_at||0)-new Date(a.created_at||a.updated_at||0));
-  return arr;
-}
-function npPaginate(list){
-  const total = list.length;
-  const pages = Math.max(1, Math.ceil(total / npPageSize));
-  if(npPage > pages) npPage = pages;
-  const start = (npPage-1)*npPageSize;
-  return {rows:list.slice(start,start+npPageSize),total,pages,start};
-}
-function npPageBar(total,pages){
-  return `<div class="np-pagebar">
-    <div class="text-gray-400 text-sm">Showing page <b class="gold">${npPage}</b> of <b class="gold">${pages}</b> • Total: <b class="gold">${total}</b></div>
-    <div class="flex gap-2 items-center">
-      <select class="np-select" onchange="npPageSize=Number(this.value);npPage=1;render()">
-        ${[25,50,100,200].map(n=>`<option value="${n}" ${n===npPageSize?"selected":""}>${n} per page</option>`).join("")}
-      </select>
-      <button class="btn btn-dark" onclick="npPage=Math.max(1,npPage-1);render()">Prev</button>
-      <button class="btn btn-gold" onclick="npPage=Math.min(${pages},npPage+1);render()">Next</button>
-    </div>
-  </div>`;
-}
-function npStageBadge(t){
-  const st = npTMStage(t);
-  const cls = st==="funded_live" ? "green" : st==="phase2" ? "blue" : st==="phase1" ? "gold" : "red";
-  return `<span class="np-priority ${cls}">${npTMLabel(st)}</span>`;
-}
-function npStatusBadge2(t){
-  const s = String(t.status || "unknown");
-  const type = npStatusType(t);
-  const cls = type==="breached" ? "red" : type==="passed" || type==="funded" ? "green" : type==="pending" ? "gold" : "blue";
-  return `<span class="np-priority ${cls}">${s.toUpperCase()}</span>`;
-}
-function npOpenTraderProfile(id){
-  const t = traders.find(x=>String(x.id)===String(id));
-  if(!t) return alert("Trader not found");
-  const login=npTMLogin(t)||"—", server=npTMServer(t)||"—"; const shownLogin=npDisplayMt5Login(t), shownServer=npDisplayServer(t);
-  const email=t.email||"", phone=t.phone||"";
-  const relatedPayments = (purchases||[]).filter(p=>String(p.trader_id||"")===String(t.id)||String(p.email||"").toLowerCase()===String(email).toLowerCase());
-  const relatedPayouts = (payouts||[]).filter(p=>String(p.trader_id||"")===String(t.id)||String(p.email||"").toLowerCase()===String(email).toLowerCase());
-  const relatedTrades = (traderTrades||[]).filter(x=>String(x.trader_id||"")===String(t.id)||String(x.email||"").toLowerCase()===String(email).toLowerCase()||String(x.mt5_login||"")===String(login));
-  document.getElementById("npTraderDrawer").classList.add("open");
-  document.getElementById("npTraderDrawerBody").innerHTML = `
-    <div class="np-drawer-head"><div><h2 class="text-2xl font-black gold">${t.name||"Unnamed Trader"}</h2><p class="text-gray-400">${email}</p></div><button class="btn btn-dark" onclick="npCloseTraderProfile()">Close</button></div>
-    <div class="np-drawer-body">
-      <div class="grid md:grid-cols-2 gap-4 mb-5">
-        ${stat("Stage",npTMLabel(npTMStage(t)),"Current lifecycle")}
-        ${stat("Account",money(npStartingCapital(t)),"Plan capital")}
-      </div>
-      <div class="card p-5 rounded-2xl mb-5">
-        <div class="np-kv"><span>Name</span><b>${t.name||"—"}</b></div>
-        <div class="np-kv"><span>Email</span><b>${email||"—"}</b></div>
-        <div class="np-kv"><span>Phone</span><b>${phone||"—"}</b></div>
-        <div class="np-kv"><span>Reference</span><b>${t.account_reference||"—"}</b></div>
-        <div class="np-kv"><span>Status</span><b>${t.status||"—"}</b></div>
-        <div class="np-kv"><span>Phase</span><b>${t.phase||"—"}</b></div>
-        <div class="np-kv"><span>Payment</span><b>${t.payment_status||"—"}</b></div>
-        <div class="np-kv"><span>MT5 Login</span><b>${login}</b></div>
-        <div class="np-kv"><span>Server</span><b>${server}</b></div>
-        <div class="np-kv"><span>Master Password</span><b>${npTMMaster(t)||"—"}</b></div>
-        <div class="np-kv"><span>Investor Password</span><b>${npTMInvestor(t)||"—"}</b></div>
-        <div class="np-kv"><span>Equity</span><b>${npIsWaitingForFreshMt5(t) ? "Not started — assign fresh MT5" : money(npDisplayEquity(t))}</b></div>
-        <div class="np-kv"><span>Profit</span><b>${npIsWaitingForFreshMt5(t) ? "0.00% — waiting for Phase account" : `${money(npDisplayProfit(t))} (${pct(npDisplayProfitPercent(t))})`}</b></div>
-        <div class="np-kv"><span>Drawdown</span><b>${pct(t.drawdown_percent||0)}</b></div>
-        <div class="np-kv"><span>Highest Equity</span><b>${npIsWaitingForFreshMt5(t) ? "—" : money(npDisplayHighestEquity(t))}</b></div>
-        <div class="np-kv"><span>Lowest Equity</span><b>${npIsWaitingForFreshMt5(t) ? "—" : money(npDisplayLowestEquity(t))}</b></div>
-      </div>
-      <div class="np-action-row mb-5">
-        <button class="btn btn-gold" onclick="openMT5Reset('${t.id}')">Edit / Reset MT5</button>
-        <button class="btn btn-dark" onclick="npTMCopy('${String(email).replace(/'/g,"\\'")}')">Copy Email</button>
-        <button class="btn btn-dark" onclick="npTMCopy('${String(phone).replace(/'/g,"\\'")}')">Copy Phone</button>
-        <button class="btn btn-dark" onclick="npTMCopy('${String(login).replace(/'/g,"\\'")}')">Copy MT5</button>
-      </div>
-      <div class="grid md:grid-cols-3 gap-4 mb-5">
-        ${stat("Payments",relatedPayments.length,"Purchases")}
-        ${stat("Payouts",relatedPayouts.length,"Requests")}
-        ${stat("Trades",relatedTrades.length,"Open/history")}
-      </div>
-    </div>`;
-}
-function npCloseTraderProfile(){ document.getElementById("npTraderDrawer")?.classList.remove("open"); }
-function npDrawTraderTable(list,label){
-  if(!list.length) return empty(`No ${label} traders found.`);
-  const {rows,total,pages} = npPaginate(list);
-  return `${npPageBar(total,pages)}<div class="tableWrap mb-8"><table>
-    <tr><th>Trader</th><th>Stage / Status</th><th>Account</th><th>MT5</th><th>Server</th><th>Equity / Profit</th><th>Risk Evidence</th><th>Quick Actions</th></tr>
-    ${rows.map(t=>{
-      const login=npTMLogin(t)||"—", server=npTMServer(t)||"—"; const shownLogin=npDisplayMt5Login(t), shownServer=npDisplayServer(t);
-      return `<tr>
-        <td><b>${t.name||"Unnamed"}</b><br>${t.email||""}<br>${t.phone||""}<br><span class="text-gray-500">Ref: ${t.account_reference||"—"}</span></td>
-        <td>${npStageBadge(t)}<br>${npStatusBadge2(t)}<br><span class="text-gray-500">${formatDate(t.approved_at||t.created_at)}</span></td>
-        <td>${t.selected_plan||t.plan_name||"—"}<br><b>${money(npStartingCapital(t))}</b><br>${t.payment_status||""}</td>
-        <td><b class="${login==="—"?"text-red-400":"text-green-400"}">${shownLogin}</b><br><button class="np-small-btn" onclick="npTMCopy('${String(login).replace(/'/g,"\\'")}')">Copy</button></td>
-        <td>${shownServer}</td>
-        <td>${
-          npIsWaitingForFreshMt5(t)
-          ? `<b class="text-yellow-400">${npPhaseWaitingText(t)}</b><br><span class="text-gray-400">Assign fresh MT5 to start tracking</span>`
-          : `<b>${money(npDisplayEquity(t))}</b><br><span class="${npDisplayProfit(t)>=0?"text-green-400":"text-red-400"}">${money(npDisplayProfit(t))}</span><br>${pct(npDisplayProfitPercent(t))}`
-        }</td>
-        <td>${
-          npIsWaitingForFreshMt5(t)
-          ? `<b class="text-yellow-400">Not started</b><br>High: —<br>Low: —`
-          : `DD: <b>${pct(npLiveMetricPack(t).drawdown_percent||0)}</b><br>High: ${money(npLiveMetricPack(t).high)}<br>Low: ${money(npLiveMetricPack(t).low)}`
-        }</td>
-        <td>
-          <button class="btn btn-gold" onclick="npOpenTraderProfile('${t.id}')">Open Profile</button><br>
-          <button class="btn btn-dark mt-2" onclick="npViewTraderDashboard('${t.id}')">View Dashboard</button><br>
-          <button class="btn btn-dark mt-2" onclick="openMT5Reset('${t.id}')">Reset MT5</button><br><button class="btn btn-gold mt-2" onclick="setModule(\'phaseAssignment\',document.querySelector(\'[data-module=phaseAssignment]\'))">Assign Phase MT5</button>
-        </td>
-      </tr>`;
-    }).join("")}
-  </table></div>${npPageBar(total,pages)}`;
-}
-function npFiltersHtml(activeVarName, activeValue){
-  const filters = [
-    ["all","All"],["today","Today"],["phase1","Phase 1"],["phase2","Phase 2"],["funded_live","Funded/Live"],
-    ["passed","Passed"],["breached","Breached"],["pending","Pending"],["missing_mt5","Missing MT5"],["has_mt5","Has MT5"]
-  ];
-  return `<div class="np-scale-toolbar">${filters.map(([k,v])=>`<button class="np-filter-chip ${activeValue===k?"active":""}" onclick="${activeVarName}='${k}';npPage=1;render()">${v}</button>`).join("")}</div>`;
-}
-function npSortHtml(){
-  return `<select id="npSortSelect" class="np-select" onchange="npPage=1;render()">
-    <option value="newest">Newest First</option>
-    <option value="oldest">Oldest First</option>
-    <option value="account_desc">Largest Account</option>
-    <option value="profit_desc">Highest Profit</option>
-    <option value="dd_desc">Highest Drawdown</option>
-  </select>`;
-}
-function customerOSModule(){
-  const s = q();
-  let list = traders.filter(t=>npDeepMatch(t,s));
-  list = npFilterTraders(list,npGlobalFilter);
-  const sort = document.getElementById("npSortSelect")?.value || "newest";
-  list = npSortTraders(list,sort);
-  const missingMt5 = traders.filter(t=>!npTMLogin(t)).length;
-  const pendingPayments = traders.filter(t=>String(t.payment_status||"").toLowerCase().includes("pending")).length;
-  const passed = traders.filter(t=>npStatusType(t)==="passed").length;
-  const breached = traders.filter(t=>npStatusType(t)==="breached").length;
-
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div><span class="badge">CUSTOMER COMMAND CENTER</span><h3 class="text-4xl font-black gold mt-3">Find any trader in seconds</h3><p class="text-gray-400 mt-2">Search name, email, phone, MT5 login, reference, plan, phase or status across the company.</p></div>
-      <button onclick="loadData()" class="btn btn-gold">Reload Live Data</button>
-    </div>
-  </div>
-  <div class="grid md:grid-cols-3 xl:grid-cols-6 gap-4 mb-8">
-    ${stat("Total Traders",traders.length,"All records")}
-    ${stat("Visible Results",list.length,"After search/filter")}
-    ${stat("Missing MT5",missingMt5,"Needs action")}
-    ${stat("Pending Payments",pendingPayments,"Review queue")}
-    ${stat("Passed",passed,"Passed status")}
-    ${stat("Breached",breached,"Locked/risk")}
-  </div>
-  ${npFiltersHtml("npGlobalFilter",npGlobalFilter)}
-  <div class="np-scale-toolbar"><span class="text-gray-400 text-sm">Sort:</span>${npSortHtml()}</div>
-  ${npDrawTraderTable(list,"customers")}
-  <div id="npTraderDrawer" class="np-drawer"><div id="npTraderDrawerBody"></div></div>`;
-}
-function traderManagementModule(){
-  const s = q();
-  let all = traders.filter(t=>npDeepMatch(t,s));
-  all = npFilterTraders(all,npTMFilter);
-  const sort = document.getElementById("npSortSelect")?.value || "newest";
-  all = npSortTraders(all,sort);
-  const p1=all.filter(t=>npTMStage(t)==="phase1");
-  const p2=all.filter(t=>npTMStage(t)==="phase2");
-  const live=all.filter(t=>npTMStage(t)==="funded_live");
-  const unassigned=all.filter(t=>npTMStage(t)==="unassigned");
-  const selected = npTMFilter==="phase1" ? p1 : npTMFilter==="phase2" ? p2 : npTMFilter==="funded_live" ? live : npTMFilter==="all" ? all : all;
-
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div><span class="badge">TRADERS MANAGEMENT</span><h3 class="text-4xl font-black gold mt-3">Phase Control & MT5 Logins</h3><p class="text-gray-400 mt-2">Built for hundreds of traders: search, filter, sort, paginate and open 360 profile.</p></div>
-      <div class="flex gap-3 items-start"><button onclick="loadData()" class="btn btn-gold">Reload Traders</button><button onclick="setModule('mt5pool',document.querySelector('[data-module=mt5pool]'))" class="btn btn-dark">Open MT5 Pool</button></div>
-    </div>
-  </div>
-  <div class="grid md:grid-cols-3 xl:grid-cols-5 gap-4 mb-8">
-    ${stat("All Traders",all.length,"Current filter")}
-    ${stat("Phase 1",p1.length,"Evaluation")}
-    ${stat("Phase 2",p2.length,"Verification")}
-    ${stat("Funded / Live",live.length,"Capital stage")}
-    ${stat("Missing MT5",all.filter(t=>!npTMLogin(t)).length,"Needs assignment")}
-  </div>
-  ${npFiltersHtml("npTMFilter",npTMFilter)}
-  <div class="np-scale-toolbar"><span class="text-gray-400 text-sm">Sort:</span>${npSortHtml()}</div>
-  ${npTMFilter==="all" ? `
-    <h3 class="text-3xl font-black gold mb-4">Phase 1 Traders</h3>${npDrawTraderTable(p1,"Phase 1")}
-    <h3 class="text-3xl font-black gold mb-4">Phase 2 Traders</h3>${npDrawTraderTable(p2,"Phase 2")}
-    <h3 class="text-3xl font-black gold mb-4">Funded / Live Traders</h3>${npDrawTraderTable(live,"Funded / Live")}
-    <h3 class="text-3xl font-black gold mb-4">Unassigned / New Signups</h3>${npDrawTraderTable(unassigned,"unassigned")}
-  ` : npDrawTraderTable(selected,"selected")}
-  <div id="npTraderDrawer" class="np-drawer"><div id="npTraderDrawerBody"></div></div>`;
-}
-
-function tradersModule(){
-  const list = filteredTraders();
-  document.getElementById("content").innerHTML = `
-  <div class="tableWrap">
-  <table>
-    <tr>
-      <th>Trader</th><th>Reference</th><th>Joined</th><th>Approved</th><th>Last Login</th><th>Plan</th><th>Payment</th><th>Status</th><th>Phase</th><th>MT5</th><th>Equity</th><th>Profit/DD</th><th>Actions</th>
-    </tr>
-    ${list.map(t=>`
-    <tr>
-      <td><b>${t.name||""}</b><br>${t.email||""}<br>${t.phone||""}</td>
-      <td>${t.account_reference||"—"}</td>
-      <td>${formatDate(t.created_at)}</td>
-      <td>${formatDate(t.approved_at)}</td>
-      <td>${formatDate(t.last_login_at)}</td>
-      <td>${t.selected_plan||""}</td>
-      <td>${t.payment_status||""}</td>
-      <td>${t.status||""}</td>
-      <td>${t.phase||""}</td>
-      <td>${t.mt5_login||""}<br>${t.mt5_server||""}</td>
-      <td>${money(npLiveEquity(t))}</td>
-      <td>${pct(t.profit_percent)} / ${pct(t.drawdown_percent)}</td>
-      <td>
-        <button class="btn btn-green" onclick="activateTrader('${t.id}')">Activate</button>
-        <button class="btn btn-dark" onclick="deactivateTrader('${t.id}')">Deactivate</button>
-        <button class="btn btn-red" onclick="deleteTrader('${t.id}')">Delete</button>
-<button onclick="openMT5Reset('${t.id}')" class="btn btn-gold mt-2">Reset MT5</button>
-      </td>
-    </tr>`).join("")}
-  </table>
-  </div>`;
-}
-
-
-
-function openMT5Reset(id){
-  const trader = traders.find(t => String(t.id) === String(id));
-  if(!trader){
-    alert("Trader not found");
-    return;
-  }
-
-  const login = prompt("New MT5 Login:", trader.mt5_login || "");
-  if(login === null) return;
-
-  const server = prompt("New MT5 Server:", trader.mt5_server || "Exness-MT5Trial9");
-  if(server === null) return;
-
-  const master = prompt("New Master Password:", trader.mt5_password || trader.master_password || "");
-  if(master === null) return;
-
-  const investor = prompt("New Investor Password:", trader.mt5_investor_password || trader.investor_password || "");
-  if(investor === null) return;
-
-  const reason = prompt("Admin note only. Trader will not see this exact note:", "MT5 login details updated");
-  if(reason === null) return;
-
-  const publicNote = "Your MT5 login details have been updated. Please use the latest details shown on your dashboard.";
-
-  const payload = {
-    id:id,
-    trader_id:id,
-    mt5_login:login,
-    mt5_server:server,
-    mt5_password:master,
-    mt5_investor_password:investor,
-    master_password:master,
-    investor_password:investor,
-    status: trader.status || "active",
-    phase: trader.phase || "phase1",
-    mt5_updated_by: currentAdmin?.username || "admin",
-    admin_name: currentAdmin?.name || currentAdmin?.username || "admin",
-    admin_username: currentAdmin?.username || "admin",
-    mt5_reset_reason: reason || "MT5 login details updated",
-    admin_note: reason || "MT5 login details updated",
-    trader_note: publicNote,
-    mt5_notice: publicNote
-  };
-
-  async function tryReset(){
-    let lastError = "";
-
-    const endpoints = [
-      `${API_URL}/update_trader`,
-      `${API_URL}/update_trader_mt5`,
-      `${API_URL}/reset_trader_mt5`
-    ];
-
-    for(const url of endpoints){
-      try{
-        const res = await fetch(url,{
-          method:"POST",
-          headers:{"Content-Type":"application/json"},
-          body:JSON.stringify(payload)
-        });
-
-        const data = await res.json().catch(()=>({}));
-
-        if(res.ok && data.success !== false){
-          await logAdminAudit("mt5","mt5_account_update",`MT5 reset/update for trader ${id}: ${login} / ${server}`,id);
-          alert("MT5 details updated successfully.");
-          loadData();
-          return;
-        }
-
-        lastError = data.error || data.message || `Failed on ${url}`;
-      }catch(e){
-        lastError = e.message || "Connection error";
-      }
-    }
-
-    alert("MT5 reset could not reach a working backend update route. This is admin-only. It is NOT caused by the note you typed. Error: " + lastError);
-  }
-
-  if(confirm("Reset this trader's MT5 details now?")){
-    tryReset();
-  }
-}
-
-
-async function activateTrader(id){
-  const res = await fetch(`${API_URL}/activate_trader`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,admin_name:currentAdmin?.name||currentAdmin?.username||"admin",admin_username:currentAdmin?.username||"admin"})});
-  const data = await res.json();
-  if(data.success){await logAdminAudit("traders","trader_activated",`Trader activated: ${id}`,id);alert("Trader activated.");loadData();} else alert("Failed");
-}
-async function deactivateTrader(id){
-  const res = await fetch(`${API_URL}/deactivate_trader`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})});
-  const data = await res.json();
-  if(data.success){alert("Trader deactivated.");loadData();} else alert("Failed");
-}
-async function deleteTrader(id){
-  if(!canDo("traders","delete")){alert("Access denied: delete traders");return;}
-  const trader = traders.find(t=>String(t.id)===String(id)) || {};
-  const funded = ["funded","live"].includes(String(trader.status||"").toLowerCase()) || ["funded","live"].includes(String(trader.phase||"").toLowerCase()) || trader.funded_at;
-  const approvedPayment = String(trader.payment_status||"").toLowerCase()==="approved";
-  if(funded){alert("Funded/live traders cannot be deleted in production. Deactivate or mark as test instead.");return;}
-  if(approvedPayment){alert("Traders with approved payments cannot be deleted in production. Mark as test or exclude from revenue instead.");return;}
-  if(prompt("Dangerous action. Type DELETE TRADER to continue:") !== "DELETE TRADER") return;
-  const res = await fetch(`${API_URL}/delete_trader`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,admin_name:currentAdmin?.name||currentAdmin?.username||"admin",admin_username:currentAdmin?.username||"admin"})});
-  const data = await res.json();
-  if(data.success){await logAdminAudit("traders","trader_deleted",`Trader deleted from admin: ${id}`,id);alert("Deleted.");loadData();} else alert(data.error || "Failed");
-}
-
-/* ADD TRADER */
-function addTraderModule(){
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-6 rounded-3xl">
-    <h3 class="text-2xl font-bold gold mb-5">Manual Add Trader</h3>
-    <div class="grid md:grid-cols-2 gap-4 mb-5">
-      <input id="add_name" placeholder="Full Name">
-      <input id="add_phone" placeholder="Phone">
-      <input id="add_email" placeholder="Email">
-      <input id="add_plan" placeholder="Selected Plan">
-      <input id="add_size" placeholder="Account Size e.g 3000000">
-      <input id="add_mt5" placeholder="MT5 Login">
-      <input id="add_server" placeholder="MT5 Server">
-      <input id="add_master" placeholder="Master Password">
-      <input id="add_investor" placeholder="Investor Password">
-      <select id="add_phase"><option value="phase1">phase1</option><option value="phase2">phase2</option><option value="funded">funded</option></select>
-    </div>
-    <button class="btn btn-gold" onclick="manualAddTrader()">Add Trader</button>
-  </div>`;
-}
-
-async function manualAddTrader(){
-  const payload = {
-    name:document.getElementById("add_name").value,
-    phone:document.getElementById("add_phone").value,
-    email:document.getElementById("add_email").value,
-    selected_plan:document.getElementById("add_plan").value,
-    account_size:document.getElementById("add_size").value,
-    balance:document.getElementById("add_size").value,
-    mt5_login:document.getElementById("add_mt5").value,
-    mt5_server:document.getElementById("add_server").value,
-    mt5_master_password:document.getElementById("add_master").value,
-    mt5_investor_password:document.getElementById("add_investor").value,
-    phase:document.getElementById("add_phase").value,
-    status:"active",
-    payment_status:"approved"
-  };
-
-  const res = await fetch(`${API_URL}/traders`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)
-  });
-  const data = await res.json();
-  if(data.success){alert("Trader added.");loadData();}
-  else alert(data.error || "Failed to add trader");
-}
-
-function bulkTraderModule(){
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-6 rounded-3xl">
-    <h3 class="text-2xl font-bold gold mb-5">Bulk Add Traders</h3>
-    <p class="text-gray-400 mb-4">Format per line: name,phone,email,plan,account_size</p>
-    <textarea id="bulkText" rows="12" placeholder="John Doe,08012345678,john@email.com,₦500,000 Account,500000"></textarea>
-    <button class="btn btn-gold mt-5" onclick="bulkAddTraders()">Bulk Add</button>
-  </div>`;
-}
-
-async function bulkAddTraders(){
-  const lines = document.getElementById("bulkText").value.trim().split("\\n");
-  let success = 0;
-  for(const line of lines){
-    const p = line.split(",");
-    if(p.length < 5) continue;
-    const payload = {
-      name:p[0].trim(), phone:p[1].trim(), email:p[2].trim(),
-      selected_plan:p[3].trim(), account_size:p[4].trim(), balance:p[4].trim(),
-      payment_status:"approved", status:"active", phase:"phase1"
-    };
-    try{
-      await fetch(`${API_URL}/traders`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
-      success++;
-    }catch(e){}
-  }
-  alert(success + " traders processed.");
-  loadData();
-}
-
-/* PAYOUTS */
-
-function payoutKpi(label,value,extra="",tone="gold"){
-  const cls = tone==="red" ? "text-red-400" : tone==="green" ? "text-green-400" : "gold";
-  return `<div class="vault p-5 rounded-2xl overflow-hidden min-w-0">
-    <p class="text-gray-400 text-sm">${label}</p>
-    <h3 class="kpi-amount font-black ${cls}">${value}</h3>
-    <p class="text-gray-500 text-xs mt-1 break-words">${extra}</p>
-  </div>`;
-}
-
-
-async function payoutsModule(){
-  const s = q();
-  const filters = reportFilters(PAYOUT_FILTER_KEY);
-  const params = new URLSearchParams();
-  if(filters.from_date) params.set("from_date", filters.from_date);
-  if(filters.to_date) params.set("to_date", filters.to_date);
-  params.set("mode", productionMode());
-  const payoutRes = await getObject(`${API_URL}/payout_summary?${params.toString()}`, {});
-  const summary = payoutRes.data || payoutRes || {};
-
-  const rangedPayouts = payouts.filter(p=>reportInRange(p,filters,["paid_at","approved_at","requested_at","created_at"]));
-  const list = rangedPayouts.filter(p =>
-    (p.trader_name||"").toLowerCase().includes(s) ||
-    (p.email||"").toLowerCase().includes(s) ||
-    (p.phone||"").toLowerCase().includes(s) ||
-    (p.status||"").toLowerCase().includes(s) ||
-    (p.bank_name||"").toLowerCase().includes(s) ||
-    (p.account_number||"").toLowerCase().includes(s)
-  );
-
-  const pendingAmount = Number(summary.pending_amount ?? 0);
-  const approvedAmount = Number(summary.approved_amount ?? 0);
-  const paidAmount = Number(summary.paid_amount ?? 0);
-  const rejectedAmount = Number(summary.rejected_amount ?? 0);
-  const pendingCount = Number(summary.pending_count ?? 0);
-  const approvedCount = Number(summary.approved_count ?? 0);
-  const paidCount = Number(summary.paid_count ?? 0);
-  const rejectedCount = Number(summary.rejected_count ?? 0);
-  const dateLabel = reportRangeLabel(filters);
-  const modeLabel = productionMode()==="live" ? "LIVE MODE" : "TEST MODE";
-
-  const fundedTraders = traders.filter(t=>{
-    const status = String(t.status||"").toLowerCase();
-    const phase = String(t.phase||"").toLowerCase();
-    return status !== "breached" && (status==="funded" || status==="live" || phase==="funded" || phase==="live");
-  });
-  const totalFundedProfit = fundedTraders.reduce((a,t)=>a+Number(t.profit||0),0);
-  const payoutPressure = totalFundedProfit > 0 ? Math.min(100,(pendingAmount+approvedAmount)/totalFundedProfit*100) : 0;
-
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div>
-        <span class="badge">Payout Intelligence</span>
-        <h3 class="text-4xl font-black gold mt-3">Payout Report</h3>
-        <p class="text-gray-400 mt-2">Payout liability and cash-out by selected date range. Backend summary controls payout totals.</p>
-      </div>
-      <div class="card2 p-5 rounded-2xl min-w-[260px]">
-        <p class="text-gray-500 text-sm">Paid In Selected Range</p>
-        <h2 class="text-5xl font-black text-green-400">${money(paidAmount)}</h2>
-        <p class="text-gray-500 text-xs mt-1">${dateLabel} • ${modeLabel}</p>
-      </div>
-    </div>
-  </div>
-
-  <div class="vault p-5 rounded-3xl mb-8 border border-yellow-900/30">
-    <div class="flex flex-wrap justify-between gap-4 items-end">
-      <div class="grid md:grid-cols-2 gap-3 flex-1 min-w-[320px]">
-        <div><label class="text-gray-400 text-sm">Payout From Date</label><input id="payoutFromDate" type="date" value="${filters.from_date}"></div>
-        <div><label class="text-gray-400 text-sm">Payout To Date</label><input id="payoutToDate" type="date" value="${filters.to_date}"></div>
-      </div>
-      <button type="button" onclick="applyPayoutDateFilter()" class="btn btn-gold">Apply Payout Filter</button>
-    </div>
-    <div class="flex flex-wrap gap-2 mt-4">
-      <button type="button" onclick="setReportPreset('payout','today')" class="btn btn-dark">Today</button>
-      <button type="button" onclick="setReportPreset('payout','week')" class="btn btn-dark">This Week</button>
-      <button type="button" onclick="setReportPreset('payout','month')" class="btn btn-dark">This Month</button>
-      <button type="button" onclick="setReportPreset('payout','year')" class="btn btn-dark">This Year</button>
-      <button type="button" onclick="setReportPreset('payout','all')" class="btn btn-dark">All Time</button>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-3 xl:grid-cols-7 gap-4 mb-8">
-    ${payoutKpi("Pending Amount",money(pendingAmount),`${pendingCount} pending`,"gold")}
-    ${payoutKpi("Approved Liability",money(approvedAmount),`${approvedCount} approved`,"gold")}
-    ${payoutKpi("Paid Out",money(paidAmount),`${paidCount} paid`,"green")}
-    ${payoutKpi("Rejected Amount",money(rejectedAmount),`${rejectedCount} rejected`,"red")}
-    ${payoutKpi("Total Liability",money(summary.liability_amount ?? pendingAmount+approvedAmount),"Pending + approved","red")}
-    ${payoutKpi("Payout Pressure",payoutPressure.toFixed(1)+"%","Vs funded profit",payoutPressure>60?"red":payoutPressure>30?"gold":"green")}
-    ${payoutKpi("Excluded",Number(summary.excluded_payouts ?? 0),"Outside range/test-hidden","gold")}
-  </div>
-
-  <div class="vault p-5 rounded-3xl mb-8">
-    <h3 class="text-2xl font-black gold mb-3">Payout Debug</h3>
-    <div class="grid md:grid-cols-3 xl:grid-cols-6 gap-3 text-sm text-gray-400">
-      <div class="card2 p-3 rounded-2xl">Mode<br><b class="gold">${summary.mode_used || productionMode()}</b></div>
-      <div class="card2 p-3 rounded-2xl">From<br><b class="gold">${summary.from_date_used || "All start"}</b></div>
-      <div class="card2 p-3 rounded-2xl">To<br><b class="gold">${summary.to_date_used || "All end"}</b></div>
-      <div class="card2 p-3 rounded-2xl">Loaded<br><b class="gold">${summary.total_payouts_loaded ?? payouts.length}</b></div>
-      <div class="card2 p-3 rounded-2xl">Counted<br><b class="gold">${summary.counted_payouts ?? list.length}</b></div>
-      <div class="card2 p-3 rounded-2xl">Excluded<br><b class="gold">${summary.excluded_payouts ?? 0}</b></div>
-    </div>
-  </div>
-
-  <div class="grid lg:grid-cols-3 gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl"><h3 class="text-2xl font-black gold mb-4">Payout Risk Logic</h3><p class="text-gray-400">Payout pressure compares pending and approved payout liability against visible funded trader profit.</p></div>
-    <div class="vault p-6 rounded-3xl"><h3 class="text-2xl font-black gold mb-4">Approval Discipline</h3><p class="text-gray-400">Review → Approve → Mark Paid. Paid payouts reduce cashflow immediately.</p></div>
-    <div class="vault p-6 rounded-3xl"><h3 class="text-2xl font-black gold mb-4">Cashflow Protection</h3><p class="text-gray-400">Approved payouts are liability. Paid payouts are money already out.</p><p class="text-red-400 font-bold mt-4">${money(pendingAmount+approvedAmount)}</p></div>
-  </div>
-
-  <div class="vault p-6 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-4 mb-5">
-      <div><h3 class="text-3xl font-black gold">Payout Requests Queue</h3><p class="text-gray-400">Filtered by selected payout date range.</p></div>
-      <span class="badge">${list.length} visible</span>
-    </div>
-    <div class="grid gap-5">
-      ${list.map(payoutCard).join("") || empty("No payout requests in this selected range.")}
-    </div>
-  </div>`;
-}
-
-function payoutRiskBadge(p){
-  const amount = Number(p.amount||0);
-  const trader = traders.find(t =>
-    String(t.id||"")===String(p.trader_id||"") ||
-    String(t.email||"").toLowerCase()===String(p.email||"").toLowerCase() ||
-    String(t.phone||"").toLowerCase()===String(p.phone||"").toLowerCase()
-  );
-
-  const profit = Number(trader?.profit||0);
-  const status = String(trader?.status||"").toLowerCase();
-
-  if(status==="breached") return `<span class="badge text-red-400">BREACHED TRADER</span>`;
-  if(profit > 0 && amount > profit) return `<span class="badge text-red-400">ABOVE PROFIT</span>`;
-  if(amount >= 500000) return `<span class="badge text-yellow-400">HIGH VALUE</span>`;
-  if(p.status==="paid") return `<span class="badge text-green-400">PAID</span>`;
-  return `<span class="badge text-green-400">NORMAL</span>`;
-}
-
-function payoutCard(p){
-  const payoutStatus = String(p.status||"pending").toLowerCase();
-  const payoutActions = payoutStatus === "pending"
-    ? `<button class="btn btn-green" onclick="approvePayout('${p.id}')">Approve</button>
-      <button class="btn btn-red" onclick="rejectPayout('${p.id}')">Reject</button>
-      <button class="btn btn-dark" onclick="payoutReview('${p.id}')">Review</button>`
-    : payoutStatus === "approved"
-    ? `<button class="btn btn-gold" onclick="markPayoutPaid('${p.id}')">Mark Paid</button>
-      <button class="btn btn-dark" onclick="payoutReview('${p.id}')">Review</button>`
-    : `<button class="btn btn-dark" onclick="payoutReview('${p.id}')">Review</button>`;
-  const trader = traders.find(t =>
-    String(t.id||"")===String(p.trader_id||"") ||
-    String(t.email||"").toLowerCase()===String(p.email||"").toLowerCase() ||
-    String(t.phone||"").toLowerCase()===String(p.phone||"").toLowerCase()
-  );
-
-  const traderProfit = Number(trader?.profit||0);
-  const requestAmount = Number(p.amount||0);
-  const profitCoverage = traderProfit > 0 ? Math.min(999,requestAmount/traderProfit*100) : 0;
-
-  return `
-  <div class="vault p-6 rounded-3xl overflow-hidden">
-    <div class="flex flex-wrap justify-between gap-5 mb-6">
-      <div class="min-w-0 flex-1">
-        <div class="flex flex-wrap gap-2 mb-3">
-          <span class="badge">${p.status||"pending"}</span>
-          ${payoutRiskBadge(p)}
-        </div>
-        <h3 class="text-3xl font-black gold break-words">${p.trader_name||"Trader Payout"}</h3>
-        <p class="text-gray-400 break-words">${p.email||""} • ${p.phone||""}</p>
-      </div>
-
-      <div class="text-right min-w-[220px] max-w-full">
-        <p class="text-gray-500 text-sm">Requested Amount</p>
-        <h3 class="payout-amount-main font-black gold">${money(p.amount)}</h3>
-      </div>
-    </div>
-
-    <div class="grid payout-bank-grid gap-4 mb-6">
-      <div class="card2 p-5 rounded-2xl payout-field">
-        <p class="text-gray-500 text-sm mb-2">Bank</p>
-        <h3 class="payout-field-value font-black">${p.bank_name||"Not provided"}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl payout-field">
-        <p class="text-gray-500 text-sm mb-2">Account Number</p>
-        <h3 class="payout-field-value font-black">${p.account_number||"Not provided"}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl payout-field">
-        <p class="text-gray-500 text-sm mb-2">Account Name</p>
-        <h3 class="payout-field-value font-black">${p.account_name||"Not provided"}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl payout-field">
-        <p class="text-gray-500 text-sm mb-2">Trader Profit</p>
-        <h3 class="payout-field-value font-black text-green-400">${money(traderProfit)}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl payout-field">
-        <p class="text-gray-500 text-sm mb-2">Profit Coverage</p>
-        <h3 class="payout-field-value font-black ${profitCoverage > 100 ? "text-red-400" : "text-green-400"}">${profitCoverage.toFixed(1)}%</h3>
-      </div>
-    </div>
-
-    <div class="grid payout-date-grid gap-4 mb-6">
-      <div class="card2 p-4 rounded-2xl payout-field">
-        <p class="text-gray-500 text-sm mb-2">Requested</p>
-        <b class="payout-date-value block">${formatDate(p.requested_at || p.created_at)}</b>
-      </div>
-      <div class="card2 p-4 rounded-2xl payout-field">
-        <p class="text-gray-500 text-sm mb-2">Approved</p>
-        <b class="payout-date-value block">${formatDate(p.approved_at)}</b>
-      </div>
-      <div class="card2 p-4 rounded-2xl payout-field">
-        <p class="text-gray-500 text-sm mb-2">Paid</p>
-        <b class="payout-date-value block">${formatDate(p.paid_at)}</b>
-      </div>
-      <div class="card2 p-4 rounded-2xl payout-field">
-        <p class="text-gray-500 text-sm mb-2">Rejected</p>
-        <b class="payout-date-value block">${formatDate(p.rejected_at)}</b>
-      </div>
-    </div>
-
-    <div class="card2 p-5 rounded-2xl mb-6 overflow-hidden">
-      <p class="text-gray-500 text-sm">Payout Note</p>
-      <p class="text-gray-300 mt-2 break-words">${p.note || p.admin_note || "No payout note yet."}</p>
-    </div>
-
-    <div class="grid md:grid-cols-4 gap-3">
-      ${payoutActions}
-    </div>
-  </div>`;
-}
-
-function payoutReview(id){
-  const p = payouts.find(x=>String(x.id)===String(id));
-  if(!p){alert("Payout not found");return;}
-
-  const trader = traders.find(t =>
-    String(t.id||"")===String(p.trader_id||"") ||
-    String(t.email||"").toLowerCase()===String(p.email||"").toLowerCase() ||
-    String(t.phone||"").toLowerCase()===String(p.phone||"").toLowerCase()
-  );
-
-  alert(
-    `Payout Review\\n\\nTrader: ${p.trader_name || "Unknown"}\\nRequested: ${money(p.amount)}\\nBank: ${p.bank_name || "N/A"}\\nAccount: ${p.account_number || "N/A"}\\nTrader Profit: ${money(trader?.profit || 0)}\\nTrader Status: ${trader?.status || "Unknown"}\\n\\nCheck MT5, rules and identity before payment.`
-  );
-}
-
-async function approvePayout(id){
-  const admin_note = prompt("Approval note:", "Payout approved after admin review.") || "";
-  try{
-    const data = await postJSON(`${API_URL}/approve_payout`, {id, admin_note, admin_name:currentAdmin?.name||currentAdmin?.username||"admin",admin_username:currentAdmin?.username||"admin"});
-    await logAdminAudit("payouts","payout_approved",`Payout approved: ${id}`,id);
-    alert(data.message || "Payout approved.");
-    loadData();
-  }catch(e){
-    alert(e.message || "Payout approval failed");
-  }
-}
-
-async function markPayoutPaid(id){
-  const admin_note = prompt("Payment note:", "Payout marked as paid.") || "";
-  try{
-    const data = await postJSON(`${API_URL}/mark_payout_paid`, {id, admin_note, admin_name:currentAdmin?.name||currentAdmin?.username||"admin",admin_username:currentAdmin?.username||"admin"});
-    await logAdminAudit("payouts","payout_paid",`Payout marked paid: ${id}`,id);
-    alert(data.message || "Payout marked paid.");
-    loadData();
-  }catch(e){
-    alert(e.message || "Could not mark payout paid");
-  }
-}
-
-async function rejectPayout(id){
-  const admin_note = prompt("Reason for rejection:", "Payout rejected after admin review.") || "";
-  try{
-    const data = await postJSON(`${API_URL}/reject_payout`, {id, admin_note, admin_name:currentAdmin?.name||currentAdmin?.username||"admin",admin_username:currentAdmin?.username||"admin"});
-    await logAdminAudit("payouts","payout_rejected",`Payout rejected: ${id}`,id);
-    alert(data.message || "Payout rejected.");
-    loadData();
-  }catch(e){
-    alert(e.message || "Payout rejection failed");
-  }
-}
-
-
-
-function supportModule(){
-  const s = q();
-  const list = tickets.filter(t =>
-    (t.trader_name||"").toLowerCase().includes(s) ||
-    (t.email||"").toLowerCase().includes(s) ||
-    (t.status||"").toLowerCase().includes(s) ||
-    (t.priority||"").toLowerCase().includes(s) ||
-    (t.subject||"").toLowerCase().includes(s)
-  );
-
-  document.getElementById("content").innerHTML = `
-  <div class="grid md:grid-cols-4 gap-4 mb-6">
-    ${stat("Open",tickets.filter(t=>t.status==="open").length)}
-    ${stat("Replied",tickets.filter(t=>t.status==="replied").length)}
-    ${stat("Closed",tickets.filter(t=>t.status==="closed").length)}
-    ${stat("Urgent",tickets.filter(t=>t.priority==="urgent").length)}
-  </div>
-  <div class="grid gap-5">${list.map(ticketCard).join("") || empty("No support tickets yet.")}</div>`;
-}
-
-function ticketCard(t){
-  return `
-  <div class="vault p-6 rounded-3xl">
-    <div class="flex flex-wrap justify-between gap-4 mb-5">
-      <div>
-        <h3 class="text-2xl font-bold">${t.subject||"Support Ticket"}</h3>
-        <p class="text-gray-400">${t.trader_name||""} • ${t.email||""} • ${t.phone||""}</p>
-        <p class="text-gray-600 text-xs">Created: ${formatDate(t.created_at)}</p>
-      </div>
-      <div class="flex gap-2">
-        <span class="badge">${t.status||"open"}</span>
-        <span class="badge">${t.priority||"normal"}</span>
-      </div>
-    </div>
-
-    <div class="card2 p-4 rounded-2xl mb-5">
-      <p class="text-gray-500 text-sm">Trader Message</p>
-      <p>${t.message||""}</p>
-    </div>
-
-    <div class="card2 p-4 rounded-2xl mb-5">
-      <p class="text-gray-500 text-sm">Current Admin Reply</p>
-      <p class="gold">${t.admin_reply || "No reply yet"}</p>
-      <small class="text-gray-500">Replied: ${formatDate(t.replied_at)}</small>
-    </div>
-
-    <textarea id="reply-${t.id}" rows="4" placeholder="Write admin reply..." class="mb-4"></textarea>
-
-    <div class="flex flex-wrap gap-3">
-      <button class="btn btn-gold" onclick="replyTicket('${t.id}')">Send Reply</button>
-      <button class="btn btn-green" onclick="closeTicket('${t.id}')">Close Ticket</button>
-    </div>
-  </div>`;
-}
-
-async function replyTicket(id){
-  const admin_reply = document.getElementById(`reply-${id}`).value.trim();
-  if(!admin_reply){alert("Write reply first.");return;}
-  const res = await fetch(`${API_URL}/reply_support_ticket`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,admin_reply})
-  });
-  const data = await res.json();
-  if(data.success){alert("Reply sent.");loadData();} else alert(data.error || "Reply failed");
-}
-
-async function closeTicket(id){
-  if(!confirm("Close this ticket?")) return;
-  const res = await fetch(`${API_URL}/close_support_ticket`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})
-  });
-  const data = await res.json();
-  if(data.success){alert("Ticket closed.");loadData();} else alert(data.error || "Close failed");
-}
-
-/* ANNOUNCEMENTS */
-function announcementsModule(){
-  document.getElementById("content").innerHTML = `
-  <div class="grid lg:grid-cols-3 gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-2xl font-bold gold mb-5">Create Announcement</h3>
-      <input id="ann_title" placeholder="Announcement title" class="mb-4">
-      <textarea id="ann_message" rows="6" placeholder="Announcement message" class="mb-4"></textarea>
-      <select id="ann_type" class="mb-4">
-        <option value="public_notice">Public Notice</option>
-        <option value="trader_notice">Trader Notice</option>
-        <option value="marketing">Marketing</option>
-        <option value="referral">Referral</option>
-        <option value="maintenance">Maintenance</option>
-        <option value="payout_update">Payout Update</option>
-        <option value="competition">Competition</option>
-      </select>
-      <select id="ann_landing" class="mb-4">
-        <option value="true">Show on Landing Page</option>
-        <option value="false">Do NOT show on Landing Page</option>
-      </select>
-      <select id="ann_dashboard" class="mb-4">
-        <option value="true">Show on Trader Dashboard</option>
-        <option value="false">Do NOT show on Trader Dashboard</option>
-      </select>
-      <button class="btn btn-gold w-full" onclick="createAnnouncement()">Publish Announcement</button>
-    </div>
-
-    <div class="lg:col-span-2">
-      <div class="grid gap-5">
-        ${announcements.map(announcementCard).join("") || empty("No active announcements yet.")}
-      </div>
-    </div>
-  </div>`;
-}
-
-function announcementCard(a){
-  return `
-  <div class="vault p-6 rounded-3xl">
-    <div class="flex flex-wrap justify-between gap-4 mb-4">
-      <div>
-        <h3 class="text-2xl font-bold gold">${a.title}</h3>
-        <p class="text-gray-500 text-sm">${a.type} • ${formatDate(a.created_at)}</p>
-      </div>
-      <span class="badge">${a.status||"active"}</span>
-    </div>
-    <p class="text-gray-300 mb-4">${a.message}</p>
-    <div class="flex flex-wrap gap-3 mb-4">
-      <span class="badge">Landing: ${a.show_on_landing ? "Yes" : "No"}</span>
-      <span class="badge">Trader Dashboard: ${a.show_on_dashboard ? "Yes" : "No"}</span>
-    </div>
-    <button class="btn btn-red" onclick="disableAnnouncement('${a.id}')">Disable</button>
-  </div>`;
-}
-
-async function createAnnouncement(){
-  const title = document.getElementById("ann_title").value.trim();
-  const message = document.getElementById("ann_message").value.trim();
-  const type = document.getElementById("ann_type").value;
-  const show_on_landing = document.getElementById("ann_landing").value === "true";
-  const show_on_dashboard = document.getElementById("ann_dashboard").value === "true";
-
-  if(!title || !message){alert("Title and message required.");return;}
-
-  const res = await fetch(`${API_URL}/create_announcement`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title,message,type,show_on_landing,show_on_dashboard,created_by:"admin"})
-  });
-  const data = await res.json();
-  if(data.success){alert("Announcement published.");loadData();}
-  else alert(data.error || "Announcement failed");
-}
-
-async function disableAnnouncement(id){
-  if(!confirm("Disable this announcement?")) return;
-  const res = await fetch(`${API_URL}/disable_announcement`,{
-    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})
-  });
-  const data = await res.json();
-  if(data.success){alert("Announcement disabled.");loadData();}
-  else alert(data.error || "Disable failed");
-}
-
-/* TIMELINE / REVENUE / DATABASE */
-function timelineModule(){
-  const list = filteredTraders();
-  document.getElementById("content").innerHTML = `
-  <div class="grid gap-5">
-    ${list.map(t=>`
-    <div class="vault p-6 rounded-3xl">
-      <div class="flex flex-wrap justify-between gap-4 mb-5">
-        <div>
-          <h3 class="text-2xl font-bold">${t.name||"Trader"}</h3>
-          <p class="text-gray-400">${t.account_reference||"No reference"} • ${t.selected_plan||""}</p>
-        </div>
-        <span class="badge">${t.status||"processing"}</span>
-      </div>
-      <div class="grid md:grid-cols-3 lg:grid-cols-6 gap-4">
-        ${timelineBox("Joined",formatDate(t.created_at))}
-        ${timelineBox("Approved",formatDate(t.approved_at))}
-        ${timelineBox("Started",formatDate(t.challenge_started_at))}
-        ${timelineBox("Last Login",formatDate(t.last_login_at))}
-        ${timelineBox("Funded",formatDate(t.funded_at))}
-        ${timelineBox("Days Left",t.trading_days_left ?? 30)}
-      </div>
-    </div>`).join("")}
-  </div>`;
-}
-
-function timelineBox(label,value){
-  return `<div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-sm">${label}</p><b class="gold">${value}</b></div>`;
-}
-
-
-const LEAD_STATUS_KEY = "nairapips_lead_statuses";
-
-function revenueIsSuperAdmin(){return !currentAdmin || currentAdmin.role === "super_admin" || currentAdmin.permissions === "all";}
-function normalizeRevenueDateToIso(value){
-  const v = String(value || "").trim();
-  if(!v) return "";
-  if(/^\d{4}-\d{2}-\d{2}/.test(v)) return v.slice(0,10);
-  const parts = v.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-  if(parts){
-    const day = parts[1].padStart(2,"0");
-    const month = parts[2].padStart(2,"0");
-    return `${parts[3]}-${month}-${day}`;
-  }
-  const d = new Date(v);
-  return isNaN(d.getTime()) ? "" : d.toISOString().slice(0,10);
-}
-function formatRevenueDisplayDate(value){
-  const iso = normalizeRevenueDateToIso(value);
-  if(!iso) return "Not set";
-  const [y,m,d] = iso.split("-");
-  return `${d}/${m}/${y}`;
-}
-function applyBusinessSettingsFromServer(){
-  const settings = businessSettingsCache || {};
-  businessSettingsCache = {
-    revenue_launch_date: normalizeRevenueDateToIso(settings.revenue_launch_date || settings.launch_date || ""),
-    production_mode: settings.production_mode === "live" ? "live" : "test"
-  };
-}
-async function refreshBusinessSettingsFromBackend(){
-  const res = await getObject(`${API_URL}/business_settings`, {});
-  const settings = res.data || res || {};
-  businessSettingsCache = {
-    revenue_launch_date: normalizeRevenueDateToIso(settings.revenue_launch_date || settings.launch_date || ""),
-    production_mode: settings.production_mode === "live" ? "live" : "test"
-  };
-  return businessSettingsCache;
-}
-let revenueUiState = {saving:"", message:"", messageType:""};
-let latestRevenueResetBatch = [];
-function setRevenueMessage(message,type="success"){revenueUiState.message=message||""; revenueUiState.messageType=type;}
-function productionMode(){return (businessSettingsCache?.production_mode === "live" ? "live" : "test");}
-function isLiveMode(){return productionMode() === "live";}
-async function setProductionMode(mode){
-  if(!revenueIsSuperAdmin()){setRevenueMessage("Only super admin can switch production mode.","error"); revenueModule(); return;}
-  const safeMode = mode === "live" ? "live" : "test";
-  revenueUiState.saving = "mode";
-  setRevenueMessage(`Saving ${safeMode.toUpperCase()} MODE...`,"info");
-  revenueModule();
-  try{
-    await postJSON(`${API_URL}/business_settings`,{production_mode:safeMode, revenue_launch_date:revenueLaunchDateValue(), admin_name:currentAdmin?.name||currentAdmin?.username||"admin", admin_username:currentAdmin?.username||"admin"});
-    await refreshBusinessSettingsFromBackend();
-  }catch(e){
-    revenueUiState.saving = "";
-    setRevenueMessage("Production mode could not save to Supabase: " + e.message,"error");
-    revenueModule();
-    return;
-  }
-  revenueUiState.saving = "";
-  setRevenueMessage(`${safeMode.toUpperCase()} MODE saved. Revenue calculations refreshed.`,"success");
-  logAdminAudit("revenue", "production_mode", `Production mode set to ${safeMode.toUpperCase()}`, "production_mode");
-  revenueModule();
-}
-function revenueLaunchDateValue(){return businessSettingsCache?.revenue_launch_date || "";}
-function revenueLaunchDate(){const v=revenueLaunchDateValue(); if(!v) return null; const d=new Date(v+"T00:00:00"); return isNaN(d.getTime())?null:d;}
-function revenueLastReset(){return latestRevenueResetBatch || [];}
-function revenueSaveLastReset(rows){latestRevenueResetBatch = rows || [];}
-function revenueHiddenIds(){return {};}
-function revenueSaveHiddenIds(data){}
-function revenueRecordId(type,row){return `${type}:${row?.id || row?.account_reference || row?.created_at || row?.requested_at || row?.approved_at || "unknown"}`;}
-function testRecords(){return {};}
-function saveTestRecords(data){}
-function testRecordKey(type,row){return revenueRecordId(type,row);}
-function isMarkedTest(type,row){return row?.mark_as_test===true || String(row?.mark_as_test||"").toLowerCase()==="true";}
-function revenueIsExcluded(type,row){
-  if(!isLiveMode()) return false;
-  if(row?.excluded_from_revenue===true || String(row?.excluded_from_revenue||"").toLowerCase()==="true") return true;
-  if(isMarkedTest(type,row)) return true;
-  return false;
-}
-function revenueAfterLaunch(date){const launch=revenueLaunchDate(); if(!launch) return true; return !!date && date >= launch;}
-async function setRecordTestFlag(type,row,marked=true){
-  if(!revenueIsSuperAdmin()) throw new Error("Only super admin can change revenue flags.");
-  const tableMap={trader:"traders",purchase:"challenge_purchases",payout:"payouts",payment:"payments",referral:"referrals"};
-  if(!row?.id) throw new Error("Record id is required to update revenue flags.");
-  await postJSON(`${API_URL}/mark_record_test`,{table:tableMap[type]||type,id:row.id,mark_as_test:marked,excluded_from_revenue:marked,admin_name:currentAdmin?.name||currentAdmin?.username||"admin"});
-  row.mark_as_test = marked;
-  row.excluded_from_revenue = marked;
-}
-async function setRevenueLaunchDate(){
-  if(!revenueIsSuperAdmin()){setRevenueMessage("Only super admin can change revenue cleanup settings.","error"); revenueModule(); return;}
-  const value=normalizeRevenueDateToIso(document.getElementById("revenueLaunchDate")?.value || "");
-  revenueUiState.saving = "launch";
-  setRevenueMessage(value ? `Saving launch date ${formatRevenueDisplayDate(value)}...` : "Clearing launch date...","info");
-  revenueModule();
-  try{
-    await postJSON(`${API_URL}/business_settings`,{revenue_launch_date:value, production_mode:productionMode(), admin_name:currentAdmin?.name||currentAdmin?.username||"admin", admin_username:currentAdmin?.username||"admin"});
-    await refreshBusinessSettingsFromBackend();
-  }catch(e){
-    revenueUiState.saving = "";
-    setRevenueMessage("Launch date could not save to Supabase: " + e.message,"error");
-    revenueModule();
-    return;
-  }
-  revenueUiState.saving = "";
-  setRevenueMessage(value ? `Launch date saved: ${formatRevenueDisplayDate(value)}. Revenue calculations refreshed.` : "Launch date cleared. Revenue calculations refreshed.","success");
-  logAdminAudit("revenue","launch_date_set",value?`Business launch date set to ${value}`:"Business launch date cleared","business_launch_date");
-  revenueModule();
-}
-async function clearRevenueLaunchDate(){
-  if(!revenueIsSuperAdmin()){setRevenueMessage("Only super admin can change revenue cleanup settings.","error"); revenueModule(); return;}
-  revenueUiState.saving = "launch";
-  setRevenueMessage("Clearing launch date...","info");
-  revenueModule();
-  try{
-    await postJSON(`${API_URL}/business_settings`,{revenue_launch_date:"", production_mode:productionMode(), admin_name:currentAdmin?.name||currentAdmin?.username||"admin", admin_username:currentAdmin?.username||"admin"});
-    await refreshBusinessSettingsFromBackend();
-  }catch(e){
-    revenueUiState.saving = "";
-    setRevenueMessage("Launch date could not clear in Supabase: " + e.message,"error");
-    revenueModule();
-    return;
-  }
-  revenueUiState.saving = "";
-  setRevenueMessage("Launch date cleared in Supabase. Revenue calculations refreshed.","success");
-  logAdminAudit("revenue","launch_date_cleared","Business launch date cleared","business_launch_date");
-  revenueModule();
-}
-
-window.nairaPipsRevenueModeClick = async function(mode){
-  await setProductionMode(mode);
-};
-window.nairaPipsSaveLaunchDateClick = async function(){
-  await setRevenueLaunchDate();
-};
-window.nairaPipsClearLaunchDateClick = async function(){
-  await clearRevenueLaunchDate();
-};
-function adminAuditQueue(){try{return JSON.parse(localStorage.getItem("nairapips_pending_audit_logs")||"[]")||[];}catch(e){return [];}}
-function saveAdminAuditQueue(rows){localStorage.setItem("nairapips_pending_audit_logs",JSON.stringify(rows||[]));}
-async function logAdminAudit(module,action,details,recordAffected=""){
-  const payload={module,action,details,record_affected:recordAffected,admin_name:currentAdmin?.name||currentAdmin?.username||"admin",admin_username:currentAdmin?.username||"admin",admin_role:currentAdmin?.role||"admin",created_at:new Date().toISOString()};
-  try{await postJSON(`${API_URL}/audit_event`,payload);}catch(e){const q=adminAuditQueue(); q.push(payload); saveAdminAuditQueue(q.slice(-100)); console.warn("Audit log queued locally until backend audit route is available:", e.message);}
-}
-
-function csvEscape(v){return `"${String(v??"").replace(/"/g,'""')}"`;}
-function downloadCSV(name, headers, rows){
-  const body=[headers.map(csvEscape).join(","),...rows.map(r=>headers.map(h=>csvEscape(r[h])).join(","))].join("\n");
-  const blob=new Blob([body],{type:"text/csv;charset=utf-8"});
-  const url=URL.createObjectURL(blob); const a=document.createElement("a");
-  a.href=url; a.download=name; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-}
-function exportTradersCSV(){downloadCSV(`nairapips-traders-${new Date().toISOString().slice(0,10)}.csv`,["name","email","phone","status","phase","payment_status","account_size","mt5_login","created_at"],traders);}
-function exportPaymentsCSV(){downloadCSV(`nairapips-payments-${new Date().toISOString().slice(0,10)}.csv`,["trader_name","email","phone","plan_name","account_size","fee","payment_status","status","created_at","approved_at"],purchases);}
-function exportPayoutsCSV(){downloadCSV(`nairapips-payouts-${new Date().toISOString().slice(0,10)}.csv`,["trader_name","email","phone","amount","status","requested_at","approved_at","paid_at"],payouts);}
-function exportRevenueCSV(){
-  const rows=[
-    {metric:"Gross Revenue",value:window.__revenueSnapshot?.salesAll||0},
-    {metric:"Approved Payouts",value:window.__revenueSnapshot?.approvedLiability||0},
-    {metric:"Pending Payouts",value:window.__revenueSnapshot?.pendingLiability||0},
-    {metric:"Net Revenue",value:window.__revenueSnapshot?.netRevenue||0},
-    {metric:"Active Traders",value:window.__revenueSnapshot?.activeTraders||0},
-    {metric:"Funded Traders",value:window.__revenueSnapshot?.fundedTraders||0},
-    {metric:"Conversion Rate",value:window.__revenueSnapshot?.conversionRate||"0%"}
-  ];
-  downloadCSV(`nairapips-revenue-${new Date().toISOString().slice(0,10)}.csv`,["metric","value"],rows);
-}
-function exportLeadsCSV(){const rows=traders.filter(isUnconvertedLead).map(t=>({...t,lead_status:leadStatusValue(t)})); downloadCSV(`nairapips-leads-${new Date().toISOString().slice(0,10)}.csv`,["name","email","phone","status","payment_status","lead_status","created_at"],rows);}
-
-function leadStatuses(){try{return JSON.parse(localStorage.getItem(LEAD_STATUS_KEY)||"{}")||{};}catch(e){return {};}}
-function saveLeadStatuses(data){localStorage.setItem(LEAD_STATUS_KEY,JSON.stringify(data||{}));}
-function leadStatusValue(t){const v=leadStatuses()[String(t.id)]; return (v && v.status) || t.lead_status || "New";}
-async function setLeadStatus(id,status){
-  try{
-    await postJSON(`${API_URL}/update_status`,{id,lead_status:status,follow_up_at:status==="Follow Up Tomorrow"?new Date(Date.now()+86400000).toISOString():null,admin_note:`Lead status: ${status}`});
-  }catch(e){
-    alert(e.message || "Lead status could not be saved. Check backend lead_status/follow_up_at columns.");
-    return;
-  }
-  const data=leadStatuses(); data[String(id)]={status,updated_at:new Date().toISOString()}; saveLeadStatuses(data);
-  logAdminAudit("leads","lead_status_update",`Lead ${id} set to ${status}`,id);
-  leadsModule();
-}
-async function hideTestRevenue(){
-  if(!revenueIsSuperAdmin()){setRevenueMessage("Only super admin can hide revenue records.","error"); revenueModule(); return;}
-  const typed=prompt('Type RESET REVENUE to hide test revenue from reporting. This does not delete customer data.');
-  if(typed!=="RESET REVENUE") return;
-  revenueUiState.saving = "hide";
-  setRevenueMessage("Hiding test revenue records in Supabase...","info");
-  revenueModule();
-  const launch=revenueLaunchDate(); let count=0;
-  const latestReset=[];
-  const shouldHidePurchase=p=>{const d=new Date(p.approved_at||p.created_at||""); const before=launch&&!isNaN(d.getTime())&&d<launch; const text=`${p.trader_name||""} ${p.email||""} ${p.phone||""} ${p.plan_name||""} ${p.admin_note||""}`.toLowerCase(); return before || /\b(test|demo|dummy|sample)\b/.test(text);};
-  const shouldHidePayout=p=>{const d=new Date(p.paid_at||p.approved_at||p.requested_at||p.created_at||""); const before=launch&&!isNaN(d.getTime())&&d<launch; const text=`${p.trader_name||""} ${p.email||""} ${p.phone||""} ${p.note||""} ${p.admin_note||""}`.toLowerCase(); return before || /\b(test|demo|dummy|sample)\b/.test(text);};
-  try{
-    for(const p of purchases){if(shouldHidePurchase(p)){await setRecordTestFlag("purchase",p,true); latestReset.push({type:"purchase",id:p.id}); count++;}}
-    for(const p of payouts){if(shouldHidePayout(p)){await setRecordTestFlag("payout",p,true); latestReset.push({type:"payout",id:p.id}); count++;}}
-  }catch(e){
-    revenueUiState.saving = "";
-    setRevenueMessage("Hide Test Revenue failed: " + e.message,"error");
-    revenueModule();
-    return;
-  }
-  revenueSaveLastReset(latestReset);
-  logAdminAudit("revenue","revenue_reset",`${count} test revenue record(s) hidden from reporting only. Customer data was not deleted.`,"revenue_reporting");
-  revenueUiState.saving = "";
-  setRevenueMessage(`${count} record(s) hidden from revenue reporting. No customer data was deleted.`,"success");
-  revenueModule();
-}
-async function restoreHiddenRevenue(){
-  if(!revenueIsSuperAdmin()){setRevenueMessage("Only super admin can restore hidden revenue records.","error"); revenueModule(); return;}
-  const latestReset = revenueLastReset();
-  if(!latestReset.length){setRevenueMessage("There is no latest Revenue Reset batch to restore.","error"); revenueModule(); return;}
-  const typed=prompt('Type RESET REVENUE to restore only the latest Revenue Reset batch.');
-  if(typed!=="RESET REVENUE") return;
-  revenueUiState.saving = "restore";
-  setRevenueMessage("Restoring latest Revenue Reset batch...","info");
-  revenueModule();
-  let count=0;
-  try{
-    for(const item of latestReset){
-      const row = item.type==="purchase"
-        ? purchases.find(p=>String(p.id)===String(item.id))
-        : payouts.find(p=>String(p.id)===String(item.id));
-      if(row){await setRecordTestFlag(item.type,row,false); count++;}
-    }
-  }catch(e){
-    revenueUiState.saving = "";
-    setRevenueMessage("Restore Hidden Revenue failed: " + e.message,"error");
-    revenueModule();
-    return;
-  }
-  revenueSaveLastReset([]);
-  logAdminAudit("revenue","revenue_restore","Hidden revenue records restored to reporting. Customer data was not changed.","revenue_reporting");
-  revenueUiState.saving = "";
-  setRevenueMessage(`${count} record(s) restored from the latest Revenue Reset batch.`,"success");
-  revenueModule();
-}
-
-
-const REVENUE_FILTER_KEY = "nairapips_revenue_date_filter_v2";
-function todayIsoLocal(){
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth()+1).padStart(2,"0");
-  const day = String(d.getDate()).padStart(2,"0");
-  return `${y}-${m}-${day}`;
-}
-function revenueDateFilters(){
-  try{
-    const saved = JSON.parse(localStorage.getItem(REVENUE_FILTER_KEY)||"{}") || {};
-    return {from_date: normalizeRevenueDateToIso(saved.from_date||""), to_date: normalizeRevenueDateToIso(saved.to_date||"")};
-  }catch(e){return {from_date:"", to_date:""};}
-}
-function saveRevenueDateFilters(filters){
-  localStorage.setItem(REVENUE_FILTER_KEY, JSON.stringify({from_date:filters.from_date||"", to_date:filters.to_date||""}));
-}
-function applyRevenueDateFilter(){
-  const from_date = normalizeRevenueDateToIso(document.getElementById("revenueFromDate")?.value || "");
-  const to_date = normalizeRevenueDateToIso(document.getElementById("revenueToDate")?.value || "");
-  if(from_date && to_date && new Date(from_date) > new Date(to_date)){
-    setRevenueMessage("From Date cannot be after To Date.","error");
-    revenueModule();
-    return;
-  }
-  saveRevenueDateFilters({from_date,to_date});
-  setRevenueMessage(`Revenue filter applied: ${from_date||"All start"} → ${to_date||"All end"}.`,"success");
-  revenueModule();
-}
-function setRevenueDateFilterPreset(preset){
-  const now = new Date();
-  let from_date = "";
-  let to_date = todayIsoLocal();
-  const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
-  if(preset === "today"){
-    from_date = to_date;
-  }else if(preset === "week"){
-    const d = new Date(now);
-    const day = d.getDay() || 7;
-    d.setDate(d.getDate() - day + 1);
-    from_date = iso(d);
-  }else if(preset === "month"){
-    from_date = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-01`;
-  }else if(preset === "year"){
-    from_date = `${now.getFullYear()}-01-01`;
-  }else if(preset === "all"){
-    from_date = "";
-    to_date = "";
-  }
-  saveRevenueDateFilters({from_date,to_date});
-  setRevenueMessage(`Revenue preset applied: ${preset.toUpperCase()}.`,"success");
-  revenueModule();
-}
-window.nairaPipsApplyRevenueDateFilter = applyRevenueDateFilter;
-window.nairaPipsRevenuePreset = setRevenueDateFilterPreset;
-
-async function revenueModule(){
-  const content = document.getElementById("content");
-  if(content){
-    content.innerHTML = `
-    <div class="vault p-10 rounded-3xl flex items-center gap-5">
-      <div class="loader"></div>
-      <div>
-        <h3 class="text-2xl font-black gold">Loading backend revenue summary...</h3>
-        <p class="text-gray-400">Revenue is calculated directly from Supabase on the backend.</p>
-      </div>
-    </div>`;
-  }
-
-  let summary;
-  const filters = revenueDateFilters();
-  const params = new URLSearchParams();
-  if(filters.from_date) params.set("from_date", filters.from_date);
-  if(filters.to_date) params.set("to_date", filters.to_date);
-  params.set("mode", productionMode());
-  try{
-    const res = await getObject(`${API_URL}/revenue_summary?${params.toString()}`, {});
-    summary = res.data || res || {};
-  }catch(e){
-    if(content){
-      content.innerHTML = `<div class="vault p-8 rounded-3xl"><h3 class="text-3xl font-black text-red-400">Revenue summary failed</h3><p class="text-gray-400 mt-2">${e.message || "Could not load backend revenue summary."}</p></div>`;
-    }
-    return;
-  }
-
-  let salesSummary = {};
-  let payoutSummary = {};
-  try{
-    const salesRes = await getObject(`${API_URL}/sales_summary?${params.toString()}`, {});
-    salesSummary = salesRes.data || salesRes || {};
-  }catch(e){ salesSummary = {}; }
-  try{
-    const payoutRes = await getObject(`${API_URL}/payout_summary?${params.toString()}`, {});
-    payoutSummary = payoutRes.data || payoutRes || {};
-  }catch(e){ payoutSummary = {}; }
-
-  businessSettingsCache = {
-    production_mode: summary.production_mode_used === "live" ? "live" : "test",
-    revenue_launch_date: normalizeRevenueDateToIso(summary.launch_date_used || "")
-  };
-
-  const launchValue = businessSettingsCache.revenue_launch_date || "";
-  const fromDateValue = normalizeRevenueDateToIso(summary.from_date_used || filters.from_date || "");
-  const toDateValue = normalizeRevenueDateToIso(summary.to_date_used || filters.to_date || "");
-  const dateRangeLabel = `${fromDateValue ? formatRevenueDisplayDate(fromDateValue) : "All start"} → ${toDateValue ? formatRevenueDisplayDate(toDateValue) : "All end"}`;
-  const latestResetCount = revenueLastReset().length;
-  const modeLabel = summary.production_mode_used === "live" ? "LIVE MODE" : "TEST MODE";
-  const modeSubtext = summary.production_mode_used === "live"
-    ? "Production-only: test/excluded records are hidden."
-    : "Test-inclusive: backend keeps test records visible while still applying the launch date.";
-  const saving = revenueUiState.saving;
-  const msgClass = revenueUiState.messageType === "error" ? "text-red-400 border-red-900/40" : revenueUiState.messageType === "info" ? "text-yellow-300 border-yellow-900/40" : "text-green-400 border-green-900/40";
-
-  const rangeSales = Number(summary.range_sales ?? summary.gross_revenue ?? 0);
-  const rangePayouts = Number(summary.range_payouts ?? summary.paid_payouts ?? 0);
-  const rangeRevenue = Number(summary.range_net ?? summary.net_revenue ?? 0);
-  const weeklySales = Number(summary.weekly_sales || 0);
-  const monthlySales = Number(summary.monthly_sales || 0);
-  const yearlySales = Number(summary.yearly_sales || 0);
-  const weeklyPayouts = Number(summary.weekly_payouts || 0);
-  const monthlyPayouts = Number(summary.monthly_payouts || 0);
-  const yearlyPayouts = Number(summary.yearly_payouts || 0);
-  const weeklyRevenue = Number(summary.weekly_net || 0);
-  const monthlyRevenue = Number(summary.monthly_net || 0);
-  const yearlyRevenue = Number(summary.yearly_net || 0);
-  const salesAll = Number(summary.gross_revenue || 0);
-  const paidAll = Number(summary.paid_payouts || 0);
-  const approvedLiability = Number(summary.approved_payouts || 0);
-  const pendingLiability = Number(summary.pending_payouts || 0);
-  const pendingSales = Number(summary.pending_sales || 0);
-  const rejectedSales = Number(summary.rejected_sales || 0);
-  const netRevenue = Number(summary.net_revenue || 0);
-  const activeTraders = Number(summary.active_traders || 0);
-  const fundedTraders = Number(summary.funded_traders || 0);
-  const conversionRate = summary.conversion_rate || "0%";
-  const excludedRevenueCount = Number(summary.excluded_purchases || 0) + Number(summary.excluded_payouts || 0);
-  const planRows = summary.plan_rows || [];
-  const monthRows = summary.month_rows || [];
-  const countedPurchases = Number(summary.counted_purchases || 0);
-
-  const salesApprovedAmount = Number(salesSummary.approved_sales_amount ?? rangeSales);
-  const salesApprovedCount = Number(salesSummary.counted_sales ?? countedPurchases);
-  const salesPendingAmount = Number(salesSummary.pending_sales_amount ?? pendingSales);
-  const salesPendingCount = Number(salesSummary.pending_sales_count ?? 0);
-  const salesRejectedAmount = Number(salesSummary.rejected_sales_amount ?? rejectedSales);
-  const salesRejectedCount = Number(salesSummary.rejected_sales_count ?? 0);
-  const salesAverage = Number(salesSummary.average_sale ?? 0);
-  const salesExcluded = Number(salesSummary.excluded_sales ?? summary.excluded_purchases ?? 0);
-  const salesPlanRows = salesSummary.plan_rows || planRows || [];
-  const salesDayRows = salesSummary.day_rows || [];
-
-  const payoutPendingAmount = Number(payoutSummary.pending_amount ?? pendingLiability);
-  const payoutApprovedAmount = Number(payoutSummary.approved_amount ?? approvedLiability);
-  const payoutPaidAmount = Number(payoutSummary.paid_amount ?? rangePayouts);
-  const payoutRejectedAmount = Number(payoutSummary.rejected_amount ?? 0);
-  const payoutLiabilityAmount = Number(payoutSummary.liability_amount ?? (payoutPendingAmount + payoutApprovedAmount));
-  const payoutPendingCount = Number(payoutSummary.pending_count ?? 0);
-  const payoutApprovedCount = Number(payoutSummary.approved_count ?? 0);
-  const payoutPaidCount = Number(payoutSummary.paid_count ?? summary.counted_payouts ?? 0);
-  const payoutRejectedCount = Number(payoutSummary.rejected_count ?? 0);
-  const payoutExcluded = Number(payoutSummary.excluded_payouts ?? summary.excluded_payouts ?? 0);
-  const payoutBankRows = payoutSummary.bank_rows || [];
-  const payoutDayRows = payoutSummary.day_rows || [];
-
-  window.__revenueSnapshot = {salesAll, approvedLiability, pendingLiability, netRevenue, activeTraders, fundedTraders, conversionRate};
-  const debugSummary = {
-    totalPurchasesLoaded:Number(summary.total_purchases_loaded || 0),
-    totalPayoutsLoaded:Number(summary.total_payouts_loaded || 0),
-    purchasesCounted:countedPurchases,
-    payoutsCounted:Number(summary.counted_payouts || 0),
-    excludedPurchases:Number(summary.excluded_purchases || 0),
-    supabaseProductionMode:summary.production_mode_used || "Not loaded",
-    supabaseRevenueLaunchDate:summary.launch_date_used || "Not set",
-    launchDateUsed:summary.launch_date_used || "Not set",
-    fromDateUsed:summary.from_date_used || "All start",
-    toDateUsed:summary.to_date_used || "All end",
-    dateRange:dateRangeLabel,
-    launchDateDisplay:formatRevenueDisplayDate(summary.launch_date_used),
-    currentMode:modeLabel
-  };
-
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div>
-        <span class="badge">Revenue Intelligence</span>
-        <h3 class="text-4xl font-black gold mt-3">Sales, Payouts & Net Revenue</h3>
-        <p class="text-gray-400 mt-2">
-          Weekly, monthly and yearly command view for NairaPips challenge sales and payout pressure.
-        </p>
-      </div>
-      <div class="card2 p-5 rounded-2xl min-w-[250px]">
-        <p class="text-gray-500 text-sm">Total Net Position</p>
-        <h2 class="text-4xl font-black ${netRevenue >= 0 ? "text-green-400" : "text-red-400"}">${money(netRevenue)}</h2>
-      </div>
-    </div>
-  </div>
-
-  ${revenueIsSuperAdmin() ? `
-  <div class="vault p-6 rounded-3xl mb-8 staff-danger-zone">
-    <div class="flex flex-wrap justify-between gap-5 items-start mb-5">
-      <div>
-        <span class="badge text-red-400">PRODUCTION REVENUE CONTROL</span>
-        <h3 class="text-3xl font-black gold mt-3">Revenue Launch Mode</h3>
-        <p class="text-gray-300 mt-2">This does not delete customer data. It only removes test data from revenue reporting.</p>
-        <p class="text-gray-500 text-sm mt-2">LIVE MODE hides test data and counts only production records after the launch date.</p>
-      </div>
-      <div class="card2 p-4 rounded-2xl min-w-[230px]">
-        <p class="text-gray-500 text-sm">Hidden / Filtered Records</p>
-        <h3 class="text-3xl font-black gold">${excludedRevenueCount}</h3>
-        <p class="text-gray-500 text-xs mt-1">${latestResetCount} record(s) in latest reset batch (local restore list)</p>
-      </div>
-    </div>
-    ${revenueUiState.message ? `<div class="card2 p-4 rounded-2xl mb-5 border ${msgClass}">${revenueUiState.message}</div>` : ""}
-    <div class="production-warning p-4 rounded-2xl mb-5">
-      <div class="flex flex-wrap justify-between gap-4 items-center">
-        <div><h4 class="text-xl font-black gold">Production Mode</h4><p class="text-gray-400 text-sm">${modeSubtext}</p></div>
-        <div>
-          <div class="production-toggle">
-            <button type="button" onclick="window.nairaPipsRevenueModeClick('test')" class="btn ${productionMode()==='test'?'btn-gold':'btn-dark'}" ${saving==="mode"?"disabled":""}>${saving==="mode" && productionMode()==='test' ? "Saving..." : "TEST MODE"}</button>
-            <button type="button" onclick="window.nairaPipsRevenueModeClick('live')" class="btn ${productionMode()==='live'?'btn-gold':'btn-dark'}" ${saving==="mode"?"disabled":""}>${saving==="mode" && productionMode()==='live' ? "Saving..." : "LIVE MODE"}</button>
-          </div>
-          <p class="text-gray-400 text-sm mt-3 text-center">Current Mode: <b class="gold">${modeLabel}</b></p>
-        </div>
-      </div>
-    </div>
-    <div class="vault p-5 rounded-2xl mb-5 border border-yellow-900/30">
-      <div class="flex flex-wrap justify-between gap-4 items-end">
-        <div class="grid md:grid-cols-2 gap-3 flex-1 min-w-[320px]">
-          <div><label class="text-gray-400 text-sm">Revenue From Date</label><input id="revenueFromDate" type="date" value="${fromDateValue}"><p class="text-gray-500 text-xs mt-2">Start date for this revenue report.</p></div>
-          <div><label class="text-gray-400 text-sm">Revenue To Date</label><input id="revenueToDate" type="date" value="${toDateValue}"><p class="text-gray-500 text-xs mt-2">End date for this revenue report.</p></div>
-        </div>
-        <button type="button" onclick="window.nairaPipsApplyRevenueDateFilter()" class="btn btn-gold">Apply Date Filter</button>
-      </div>
-      <div class="flex flex-wrap gap-2 mt-4">
-        <button type="button" onclick="window.nairaPipsRevenuePreset('today')" class="btn btn-dark">Today</button>
-        <button type="button" onclick="window.nairaPipsRevenuePreset('week')" class="btn btn-dark">This Week</button>
-        <button type="button" onclick="window.nairaPipsRevenuePreset('month')" class="btn btn-dark">This Month</button>
-        <button type="button" onclick="window.nairaPipsRevenuePreset('year')" class="btn btn-dark">This Year</button>
-        <button type="button" onclick="window.nairaPipsRevenuePreset('all')" class="btn btn-dark">All Time</button>
-      </div>
-      <p class="text-gray-400 text-sm mt-3">Current Revenue Range: <b class="gold">${dateRangeLabel}</b></p>
-    </div>
-    <div class="grid lg:grid-cols-[1fr_auto_auto] gap-3 items-end">
-      <div><label class="text-gray-400 text-sm">Business Launch Date</label><input id="revenueLaunchDate" type="date" value="${launchValue}"><p class="text-gray-500 text-xs mt-2">Optional business setting only. Reporting now uses From Date and To Date above. Display: ${formatRevenueDisplayDate(launchValue)}</p></div>
-      <button type="button" onclick="window.nairaPipsSaveLaunchDateClick()" class="btn btn-gold" ${saving==="launch"?"disabled":""}>${saving==="launch"?"Saving...":"Save Launch Date"}</button>
-      <button type="button" onclick="window.nairaPipsClearLaunchDateClick()" class="btn btn-dark" ${saving==="launch"?"disabled":""}>${saving==="launch"?"Saving...":"Clear Date"}</button>
-    </div>
-    <div class="flex flex-wrap gap-3 mt-5">
-      <button onclick="hideTestRevenue()" class="btn btn-red" ${saving==="hide"?"disabled":""}>${saving==="hide"?"Hiding...":"Hide Test Revenue"}</button>
-      <button onclick="restoreHiddenRevenue()" class="btn btn-green" ${saving==="restore"?"disabled":""}>${saving==="restore"?"Restoring...":"Restore Hidden Revenue"}</button>
-      <button onclick="exportTradersCSV()" class="btn btn-dark">Export Traders CSV</button>
-      <button onclick="exportPaymentsCSV()" class="btn btn-dark">Export Payments CSV</button>
-      <button onclick="exportPayoutsCSV()" class="btn btn-dark">Export Payouts CSV</button>
-      <button onclick="exportRevenueCSV()" class="btn btn-dark">Export Revenue CSV</button>
-      <button onclick="exportLeadsCSV()" class="btn btn-dark">Export Leads CSV</button>
-    </div>
-  </div>` : ""}
-
-  <div class="grid md:grid-cols-3 gap-5 mb-8">
-    <div class="vault p-6 rounded-3xl border border-yellow-900/40">
-      <p class="text-gray-400 text-sm">Selected Range Sales</p>
-      <h3 class="text-4xl font-black gold">${money(rangeSales)}</h3>
-      <p class="text-gray-500 mt-2">Approved challenge fees in ${dateRangeLabel}</p>
-    </div>
-    <div class="vault p-6 rounded-3xl border border-yellow-900/40">
-      <p class="text-gray-400 text-sm">Selected Range Paid Payouts</p>
-      <h3 class="text-4xl font-black text-red-400">${money(rangePayouts)}</h3>
-      <p class="text-gray-500 mt-2">Paid payouts in ${dateRangeLabel}</p>
-    </div>
-    <div class="vault p-6 rounded-3xl border border-yellow-900/40">
-      <p class="text-gray-400 text-sm">Selected Range Net Revenue</p>
-      <h3 class="text-4xl font-black ${rangeRevenue >= 0 ? "text-green-400" : "text-red-400"}">${money(rangeRevenue)}</h3>
-      <p class="text-gray-500 mt-2">Sales minus paid payouts in selected range</p>
-    </div>
-  </div>
-
-  <div class="vault p-6 rounded-3xl mb-8 border border-yellow-900/30">
-    <div class="flex flex-wrap justify-between gap-4 items-start mb-5">
-      <div>
-        <span class="badge">SALES RANGE WORKFLOW</span>
-        <h3 class="text-3xl font-black gold mt-3">Sales Report Inside Revenue</h3>
-        <p class="text-gray-400 mt-2">Approved challenge sales for the same selected Revenue range: <b class="gold">${dateRangeLabel}</b>.</p>
-      </div>
-      <div class="card2 p-5 rounded-2xl min-w-[240px]">
-        <p class="text-gray-500 text-sm">Approved Sales</p>
-        <h3 class="text-4xl font-black gold">${money(salesApprovedAmount)}</h3>
-        <p class="text-gray-500 text-xs mt-1">${salesApprovedCount} counted • ${modeLabel}</p>
-      </div>
-    </div>
-    <div class="grid md:grid-cols-4 xl:grid-cols-7 gap-4 mb-6">
-      ${stat("Approved Sales",money(salesApprovedAmount),`${salesApprovedCount} approved purchases`)}
-      ${stat("Pending Sales",money(salesPendingAmount),`${salesPendingCount} pending purchases`)}
-      ${stat("Rejected Sales",money(salesRejectedAmount),`${salesRejectedCount} rejected purchases`)}
-      ${stat("Average Sale",money(salesAverage),"Approved average")}
-      ${stat("Sales Excluded",salesExcluded,"Outside range/test-hidden")}
-      ${stat("Sales Loaded",Number(salesSummary.total_sales_loaded ?? summary.total_purchases_loaded ?? 0),"Backend loaded")}
-      ${stat("Sales Mode",salesSummary.mode_used || productionMode(),"Backend mode")}
-    </div>
-    <div class="grid lg:grid-cols-2 gap-5">
-      <div class="card2 p-5 rounded-2xl">
-        <h4 class="text-xl font-black gold mb-4">Sales By Plan</h4>
-        <div class="grid gap-3">
-          ${salesPlanRows.map(row=>`
-            <div class="border-b border-white/10 pb-3 flex justify-between gap-4">
-              <div><b>${row.plan_name || row.name || "Unknown Plan"}</b><p class="text-gray-500 text-sm">${money(row.account_size || 0)} account • ${row.count || 0} sales</p></div>
-              <b class="gold">${money(row.amount ?? row.fee ?? 0)}</b>
-            </div>
-          `).join("") || `<p class="text-gray-400">No approved sales in this range.</p>`}
-        </div>
-      </div>
-      <div class="card2 p-5 rounded-2xl">
-        <h4 class="text-xl font-black gold mb-4">Sales By Day</h4>
-        <div class="grid gap-3 max-h-[300px] overflow-auto pr-2">
-          ${salesDayRows.map(row=>`
-            <div class="border-b border-white/10 pb-3 flex justify-between gap-4">
-              <div><b>${formatRevenueDisplayDate(row.date)}</b><p class="text-gray-500 text-sm">${row.count || 0} sale(s)</p></div>
-              <b class="gold">${money(row.amount || 0)}</b>
-            </div>
-          `).join("") || `<p class="text-gray-400">No daily sales breakdown in this range.</p>`}
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="vault p-6 rounded-3xl mb-8 border border-red-900/30">
-    <div class="flex flex-wrap justify-between gap-4 items-start mb-5">
-      <div>
-        <span class="badge">PAYOUT RANGE WORKFLOW</span>
-        <h3 class="text-3xl font-black gold mt-3">Payout Report Inside Revenue</h3>
-        <p class="text-gray-400 mt-2">Payout cashflow and liabilities for the same selected Revenue range: <b class="gold">${dateRangeLabel}</b>.</p>
-      </div>
-      <div class="card2 p-5 rounded-2xl min-w-[240px]">
-        <p class="text-gray-500 text-sm">Paid Out</p>
-        <h3 class="text-4xl font-black text-red-400">${money(payoutPaidAmount)}</h3>
-        <p class="text-gray-500 text-xs mt-1">${payoutPaidCount} paid • ${modeLabel}</p>
-      </div>
-    </div>
-    <div class="grid md:grid-cols-4 xl:grid-cols-8 gap-4 mb-6">
-      ${stat("Pending Payouts",money(payoutPendingAmount),`${payoutPendingCount} pending`)}
-      ${stat("Approved Liability",money(payoutApprovedAmount),`${payoutApprovedCount} approved`)}
-      ${stat("Paid Payouts",money(payoutPaidAmount),`${payoutPaidCount} paid`)}
-      ${stat("Rejected Payouts",money(payoutRejectedAmount),`${payoutRejectedCount} rejected`)}
-      ${stat("Total Liability",money(payoutLiabilityAmount),"Pending + approved")}
-      ${stat("Payout Excluded",payoutExcluded,"Outside range/test-hidden")}
-      ${stat("Payouts Loaded",Number(payoutSummary.total_payouts_loaded ?? summary.total_payouts_loaded ?? 0),"Backend loaded")}
-      ${stat("Payout Mode",payoutSummary.mode_used || productionMode(),"Backend mode")}
-    </div>
-    <div class="grid lg:grid-cols-2 gap-5">
-      <div class="card2 p-5 rounded-2xl">
-        <h4 class="text-xl font-black gold mb-4">Paid Payouts By Bank</h4>
-        <div class="grid gap-3">
-          ${payoutBankRows.map(row=>`
-            <div class="border-b border-white/10 pb-3 flex justify-between gap-4">
-              <div><b>${row.bank_name || "Unknown Bank"}</b><p class="text-gray-500 text-sm">${row.count || 0} payout(s)</p></div>
-              <b class="text-red-400">${money(row.amount || 0)}</b>
-            </div>
-          `).join("") || `<p class="text-gray-400">No paid payout bank breakdown in this range.</p>`}
-        </div>
-      </div>
-      <div class="card2 p-5 rounded-2xl">
-        <h4 class="text-xl font-black gold mb-4">Paid Payouts By Day</h4>
-        <div class="grid gap-3 max-h-[300px] overflow-auto pr-2">
-          ${payoutDayRows.map(row=>`
-            <div class="border-b border-white/10 pb-3 flex justify-between gap-4">
-              <div><b>${formatRevenueDisplayDate(row.date)}</b><p class="text-gray-500 text-sm">${row.count || 0} payout(s)</p></div>
-              <b class="text-red-400">${money(row.amount || 0)}</b>
-            </div>
-          `).join("") || `<p class="text-gray-400">No paid payout daily breakdown in this range.</p>`}
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-3 gap-5 mb-8">
-    <div class="vault p-6 rounded-3xl">
-      <p class="text-gray-400 text-sm">Weekly Sales</p>
-      <h3 class="text-4xl font-black gold">${money(weeklySales)}</h3>
-      <p class="text-gray-500 mt-2">Approved challenge fees this week</p>
-    </div>
-    <div class="vault p-6 rounded-3xl">
-      <p class="text-gray-400 text-sm">Weekly Payouts</p>
-      <h3 class="text-4xl font-black text-red-400">${money(weeklyPayouts)}</h3>
-      <p class="text-gray-500 mt-2">Paid payouts this week</p>
-    </div>
-    <div class="vault p-6 rounded-3xl">
-      <p class="text-gray-400 text-sm">Weekly Revenue</p>
-      <h3 class="text-4xl font-black ${weeklyRevenue >= 0 ? "text-green-400" : "text-red-400"}">${money(weeklyRevenue)}</h3>
-      <p class="text-gray-500 mt-2">Sales minus paid payouts</p>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-3 gap-5 mb-8">
-    <div class="vault p-6 rounded-3xl">
-      <p class="text-gray-400 text-sm">Monthly Sales</p>
-      <h3 class="text-4xl font-black gold">${money(monthlySales)}</h3>
-      <p class="text-gray-500 mt-2">Approved challenge fees this month</p>
-    </div>
-    <div class="vault p-6 rounded-3xl">
-      <p class="text-gray-400 text-sm">Monthly Payouts</p>
-      <h3 class="text-4xl font-black text-red-400">${money(monthlyPayouts)}</h3>
-      <p class="text-gray-500 mt-2">Paid payouts this month</p>
-    </div>
-    <div class="vault p-6 rounded-3xl">
-      <p class="text-gray-400 text-sm">Monthly Revenue</p>
-      <h3 class="text-4xl font-black ${monthlyRevenue >= 0 ? "text-green-400" : "text-red-400"}">${money(monthlyRevenue)}</h3>
-      <p class="text-gray-500 mt-2">Sales minus paid payouts</p>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-3 gap-5 mb-8">
-    <div class="vault p-6 rounded-3xl">
-      <p class="text-gray-400 text-sm">Yearly Sales</p>
-      <h3 class="text-4xl font-black gold">${money(yearlySales)}</h3>
-      <p class="text-gray-500 mt-2">Approved challenge fees this year</p>
-    </div>
-    <div class="vault p-6 rounded-3xl">
-      <p class="text-gray-400 text-sm">Yearly Payouts</p>
-      <h3 class="text-4xl font-black text-red-400">${money(yearlyPayouts)}</h3>
-      <p class="text-gray-500 mt-2">Paid payouts this year</p>
-    </div>
-    <div class="vault p-6 rounded-3xl">
-      <p class="text-gray-400 text-sm">Yearly Revenue</p>
-      <h3 class="text-4xl font-black ${yearlyRevenue >= 0 ? "text-green-400" : "text-red-400"}">${money(yearlyRevenue)}</h3>
-      <p class="text-gray-500 mt-2">Sales minus paid payouts</p>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-4 gap-4 mb-8">
-    ${stat("Gross Revenue",money(salesAll),"Approved challenge fees")}
-    ${stat("Approved Payouts",money(approvedLiability),"Approved but not paid")}
-    ${stat("Pending Payouts",money(pendingLiability),"Requested but not approved")}
-    ${stat("Net Revenue",money(netRevenue),"Gross revenue minus paid payouts")}
-    ${stat("Active Traders",activeTraders,"Production active accounts")}
-    ${stat("Funded Traders",fundedTraders,"Production funded/live accounts")}
-    ${stat("Conversion Rate",conversionRate,"Approved purchases / traders")}
-    ${stat("Mode",productionMode().toUpperCase(),isLiveMode()?"Test data hidden":"Testing records visible")}
-    ${stat("Pending Sales",money(pendingSales),"Awaiting verification")}
-    ${stat("Rejected Sales",money(rejectedSales),"Declined purchases")}
-    ${stat("Paid Payouts",money(paidAll),"Total cash outflow")}
-    ${stat("Approved Purchases",countedPurchases,"Backend-counted paid challenge buyers")}
-  </div>
-
-  <div class="vault p-6 rounded-3xl mb-8">
-    <h3 class="text-2xl font-black gold mb-4">Revenue Debug Summary</h3>
-    <div class="grid md:grid-cols-4 lg:grid-cols-12 gap-3">
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-xs">Purchases Loaded</p><b>${debugSummary.totalPurchasesLoaded}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-xs">Payouts Loaded</p><b>${debugSummary.totalPayoutsLoaded}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-xs">Purchases Counted</p><b>${debugSummary.purchasesCounted}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-xs">Payouts Counted</p><b>${debugSummary.payoutsCounted}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-xs">Excluded Purchases</p><b>${debugSummary.excludedPurchases}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-xs">Supabase Mode</p><b>${debugSummary.supabaseProductionMode}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-xs">Supabase Launch</p><b>${debugSummary.supabaseRevenueLaunchDate}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-xs">From Date Used</p><b>${debugSummary.fromDateUsed}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-xs">To Date Used</p><b>${debugSummary.toDateUsed}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-xs">Range Used</p><b>${debugSummary.dateRange}</b></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-xs">Launch Date Used</p><b>${debugSummary.launchDateUsed}</b><p class="text-gray-500 text-xs mt-1">${debugSummary.launchDateDisplay}</p></div>
-      <div class="card2 p-4 rounded-2xl"><p class="text-gray-500 text-xs">Current Mode</p><b>${debugSummary.currentMode}</b></div>
-    </div>
-  </div>
-
-  <div class="grid lg:grid-cols-2 gap-6">
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-3xl font-black gold mb-5">Revenue by Plan</h3>
-      <div class="grid gap-4">
-        ${
-          planRows.map(row=>`
-          <div class="card2 p-5 rounded-2xl">
-            <div class="flex justify-between gap-4">
-              <div>
-                <h3 class="text-xl font-black">${row.name}</h3>
-                <p class="text-gray-500">${money(row.account_size)} account • ${row.count} sales</p>
-              </div>
-              <h3 class="text-2xl font-black gold">${money(row.fee)}</h3>
-            </div>
-          </div>
-          `).join("") || `<p class="text-gray-400">No approved sales yet.</p>`
-        }
-      </div>
-    </div>
-
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-3xl font-black gold mb-5">Monthly Sales History</h3>
-      <div class="grid gap-4">
-        ${
-          monthRows.map(row=>`
-          <div class="card2 p-5 rounded-2xl">
-            <div class="flex justify-between gap-4">
-              <div>
-                <h3 class="text-xl font-black">${row.month}</h3>
-                <p class="text-gray-500">${row.count} approved challenge sales</p>
-              </div>
-              <h3 class="text-2xl font-black gold">${money(row.sales)}</h3>
-            </div>
-          </div>
-          `).join("") || `<p class="text-gray-400">No monthly sales history yet.</p>`
-        }
-      </div>
-    </div>
-  </div>`;
-}
-
-
-
-function fundedModule(){
-  const s = q();
-
-  const fundedTraders = traders.filter(t=>{
-    const status = String(t.status||"").toLowerCase();
-    const phase = String(t.phase||"").toLowerCase();
-    const breached = status === "breached";
-    return !breached && (status==="funded" || status==="live" || phase==="funded" || phase==="live");
-  });
-
-  const breachedFunded = traders.filter(t=>{
-    const status = String(t.status||"").toLowerCase();
-    const phase = String(t.phase||"").toLowerCase();
-    return status==="breached" && (phase==="funded" || phase==="live" || t.funded_at);
-  });
-
-  const list = fundedTraders.filter(t =>
-    (t.name||"").toLowerCase().includes(s) ||
-    (t.email||"").toLowerCase().includes(s) ||
-    (t.phone||"").toLowerCase().includes(s) ||
-    (t.mt5_login||"").toLowerCase().includes(s) ||
-    (t.selected_plan||"").toLowerCase().includes(s) ||
-    (t.admin_note||"").toLowerCase().includes(s)
-  );
-
-  const live = fundedTraders.filter(t=>String(t.status||"").toLowerCase()==="live").length;
-  const funded = fundedTraders.filter(t=>String(t.status||"").toLowerCase()==="funded" || String(t.phase||"").toLowerCase()==="funded").length;
-  const eligible = fundedTraders.filter(t=>payoutEligible(t)).length;
-  const totalFundedCapital = fundedTraders.reduce((a,t)=>a+Number(npStartingCapital(t)),0);
-  const totalProfit = fundedTraders.reduce((a,t)=>a+Number(t.profit||0),0);
-  const totalPayouts = payouts
-    .filter(p=>p.status==="paid")
-    .reduce((a,p)=>a+Number(p.amount||0),0);
-
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div>
-        <span class="badge">Funded Trader Engine</span>
-        <h3 class="text-4xl font-black gold mt-3">Funded / Live Account Command</h3>
-        <p class="text-gray-400 mt-2">
-          Only active funded/live traders appear here. Breached accounts are removed from this command center.
-        </p>
-      </div>
-
-      <div class="card2 p-5 rounded-2xl min-w-[250px]">
-        <p class="text-gray-500 text-sm">Clean Funded Capital</p>
-        <h2 class="text-4xl font-black gold">${money(totalFundedCapital)}</h2>
-      </div>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-3 xl:grid-cols-7 gap-4 mb-8">
-    ${stat("Funded / Live",fundedTraders.length,"Excludes breached")}
-    ${stat("Live Accounts",live,"Currently live")}
-    ${stat("Funded Stage",funded,"Funded not breached")}
-    ${stat("Payout Eligible",eligible,"Ready for payout review")}
-    ${stat("Funded Profit",money(totalProfit),"Clean funded profit")}
-    ${stat("Paid Payouts",money(totalPayouts),"All paid payouts")}
-    ${stat("Removed Breached",breachedFunded.length,"Moved to breach control")}
-  </div>
-
-  <div class="grid lg:grid-cols-3 gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-2xl font-black gold mb-4">Clean Funded View</h3>
-      <p class="text-gray-400">
-        Breached traders no longer pollute the funded section. This page is now only for real funded/live traders.
-      </p>
-      <div class="card2 p-4 rounded-2xl mt-5">
-        <p class="text-gray-500 text-sm">Rule</p>
-        <p class="text-green-400 font-bold">Funded/Live + Not Breached</p>
-      </div>
-    </div>
-
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-2xl font-black gold mb-4">Payout Control</h3>
-      <p class="text-gray-400">
-        Payout eligibility is shown only for traders still in good standing.
-      </p>
-      <div class="card2 p-4 rounded-2xl mt-5">
-        <p class="text-gray-500 text-sm">Eligibility</p>
-        <p class="text-gray-300">Live/Funded + Profit above ₦0 + Not breached</p>
-      </div>
-    </div>
-
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-2xl font-black gold mb-4">Breach Separation</h3>
-      <p class="text-gray-400">
-        Breached funded accounts are now counted separately and managed through Account Management.
-      </p>
-      <div class="card2 p-4 rounded-2xl mt-5">
-        <p class="text-gray-500 text-sm">Removed breached accounts</p>
-        <p class="text-red-400 font-bold">${breachedFunded.length}</p>
-      </div>
-    </div>
-  </div>
-
-  <div class="vault p-6 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-4 mb-5">
-      <div>
-        <h3 class="text-3xl font-black gold">Funded Traders List</h3>
-        <p class="text-gray-400">Clean table-style command center for funded/live traders only.</p>
-      </div>
-      <span class="badge">${list.length} visible</span>
-    </div>
-
-    ${
-      list.length
-      ? `<div class="overflow-x-auto">
-          <table class="w-full text-left border-separate border-spacing-y-3">
-            <thead>
-              <tr class="text-gray-500 text-sm">
-                <th class="p-3">Trader</th>
-                <th class="p-3">Status</th>
-                <th class="p-3">Capital</th>
-                <th class="p-3">Profit</th>
-                <th class="p-3">Drawdown</th>
-                <th class="p-3">Payout</th>
-                <th class="p-3">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${list.map(fundedTraderRow).join("")}
-            </tbody>
-          </table>
-        </div>`
-      : empty("No clean funded/live traders yet. Promote traders from Account Management.")
-    }
-  </div>`;
-}
-
-function fundedTraderRow(t){
-  const eligible = payoutEligible(t);
-  const status = String(t.status||"").toLowerCase();
-  const isLive = status==="live";
-
-  return `
-  <tr class="card2 rounded-2xl overflow-hidden">
-    <td class="p-4 rounded-l-2xl">
-      <h3 class="text-xl font-black gold">${t.name || "Unnamed Trader"}</h3>
-      <p class="text-gray-400 text-sm">${t.email || ""}</p>
-      <p class="text-gray-500 text-xs">${t.phone || ""}</p>
-    </td>
-
-    <td class="p-4">
-      <span class="badge ${isLive ? "text-green-400" : "gold"}">${isLive ? "LIVE" : "FUNDED"}</span>
-      <p class="text-gray-500 text-sm mt-2">${t.phase || "funded"}</p>
-    </td>
-
-    <td class="p-4">
-      <h3 class="text-2xl font-black gold">${money(t.account_size || t.balance || 0)}</h3>
-      <p class="text-gray-500 text-xs">${t.selected_plan || "No plan"}</p>
-    </td>
-
-    <td class="p-4">
-      <h3 class="text-2xl font-black text-green-400">${money(t.profit || 0)}</h3>
-      <p class="text-green-400 text-sm">${pct(t.profit_percent || 0)}</p>
-    </td>
-
-    <td class="p-4">
-      <h3 class="text-2xl font-black text-red-400">${pct(t.drawdown_percent || 0)}</h3>
-      <p class="text-gray-500 text-xs">Risk usage</p>
-    </td>
-
-    <td class="p-4">
-      <span class="badge ${eligible ? "text-green-400" : "text-yellow-400"}">${eligible ? "ELIGIBLE" : "NOT READY"}</span>
-      <p class="text-gray-500 text-xs mt-2">${eligible ? "Profit visible" : "No payout yet"}</p>
-    </td>
-
-    <td class="p-4 rounded-r-2xl">
-      <div class="flex flex-wrap gap-2">
-        <button class="btn btn-green" onclick="markLive('${t.id}')">Live</button>
-        <button class="btn btn-gold" onclick="openPayoutReview('${t.id}')">Review</button>
-        <button class="btn btn-red" onclick="fundedBreach('${t.id}')">Breach</button>
-      </div>
-    </td>
-  </tr>`;
-}
-
-
-
-function payoutEligible(t){
-  const status = String(t.status||"").toLowerCase();
-  const phase = String(t.phase||"").toLowerCase();
-  const isFunded = status==="funded" || status==="live" || phase==="funded" || phase==="live";
-  const notBreached = status !== "breached";
-  const profit = Number(t.profit||0);
-  return isFunded && notBreached && profit > 0;
-}
-
-function fundedTraderCard(t){
-  const eligible = payoutEligible(t);
-  const status = String(t.status||"").toLowerCase();
-  const isLive = status==="live";
-
-  return `
-  <div class="vault p-6 rounded-3xl">
-    <div class="flex flex-wrap justify-between gap-4 mb-6">
-      <div>
-        <div class="flex flex-wrap gap-2 mb-3">
-          <span class="badge ${isLive ? "text-green-400" : "gold"}">${isLive ? "LIVE ACCOUNT" : "FUNDED ACCOUNT"}</span>
-          <span class="badge">${t.phase || "funded"}</span>
-          <span class="badge ${eligible ? "text-green-400" : "text-yellow-400"}">${eligible ? "PAYOUT ELIGIBLE" : "NOT ELIGIBLE YET"}</span>
-        </div>
-        <h3 class="text-3xl font-black gold">${t.name || "Unnamed Trader"}</h3>
-        <p class="text-gray-400">${t.email || ""} • ${t.phone || ""}</p>
-        <p class="text-gray-500 text-sm mt-1">Reference: ${t.account_reference || "No reference"}</p>
-      </div>
-
-      <div class="text-right">
-        <p class="text-gray-500 text-sm">Funded Date</p>
-        <b>${formatDate(t.funded_at || t.updated_at || t.approved_at)}</b>
-        <p class="text-gray-500 text-sm mt-2">Status</p>
-        <b class="${isLive ? "text-green-400" : "gold"}">${t.status || "funded"}</b>
-      </div>
-    </div>
-
-    <div class="grid md:grid-cols-5 gap-4 mb-6">
-      <div class="card2 p-5 rounded-2xl md:col-span-2">
-        <p class="text-gray-500 text-sm">Funded Account Size</p>
-        <h3 class="text-4xl font-black gold">${money(t.account_size || t.balance || 0)}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl">
-        <p class="text-gray-500 text-sm">Profit</p>
-        <h3 class="text-3xl font-black text-green-400">${money(t.profit || 0)}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl">
-        <p class="text-gray-500 text-sm">Profit %</p>
-        <h3 class="text-3xl font-black text-green-400">${pct(t.profit_percent || 0)}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl">
-        <p class="text-gray-500 text-sm">Drawdown</p>
-        <h3 class="text-3xl font-black text-red-400">${pct(t.drawdown_percent || 0)}</h3>
-      </div>
-    </div>
-
-    <div class="grid md:grid-cols-4 gap-4 mb-6">
-      <div><p class="text-gray-500 text-sm">MT5 Login</p><b>${t.mt5_login || "Not assigned"}</b></div>
-      <div><p class="text-gray-500 text-sm">Server</p><b>${t.mt5_server || "Not assigned"}</b></div>
-      <div><p class="text-gray-500 text-sm">Plan</p><b>${t.selected_plan || "No plan"}</b></div>
-      <div><p class="text-gray-500 text-sm">Trading Days Left</p><b>${t.trading_days_left ?? 30}</b></div>
-    </div>
-
-    <div class="card2 p-5 rounded-2xl mb-6">
-      <p class="text-gray-500 text-sm">Funded Admin Note</p>
-      <p class="text-gray-300 mt-2">${t.admin_note || "No funded note yet."}</p>
-    </div>
-
-    <div class="grid md:grid-cols-2 xl:grid-cols-5 gap-3">
-      <button class="btn btn-green" onclick="markLive('${t.id}')">Mark Live</button>
-      <button class="btn btn-gold" onclick="openPayoutReview('${t.id}')">Payout Review</button>
-      <button class="btn btn-red" onclick="fundedBreach('${t.id}')">Mark Breached</button>
-      <button class="btn btn-dark" onclick="fundedReset('${t.id}')">Return to Funded</button>
-      <button class="btn btn-dark" onclick="archiveTrader('${t.id}')">Archive</button>
-    </div>
-  </div>`;
-}
-
-function markLive(id){
-  const note = prompt("Admin note:", "Funded trader moved to live account status.") || "";
-  lifecycleUpdate({
-    id,
-    status:"live",
-    phase:"live",
-    admin_note:note
-  },"Trader marked as live.");
-}
-
-function openPayoutReview(id){
-  const t = traders.find(x=>String(x.id)===String(id));
-  if(!t){alert("Trader not found");return;}
-  const eligible = payoutEligible(t);
-
-  alert(
-    `Payout Review\\n\\nTrader: ${t.name || "Unknown"}\\nAccount: ${money(t.account_size || t.balance || 0)}\\nProfit: ${money(t.profit || 0)}\\nStatus: ${t.status}\\nEligible: ${eligible ? "YES" : "NO"}\\n\\nUse Payouts module to approve or pay actual payout request.`
-  );
-}
-
-function fundedBreach(id){
-  const reason = prompt("Reason for funded breach:", "Funded/live account breached due to drawdown or rule violation.");
-  if(reason === null) return;
-
-  lifecycleUpdate({
-    id,
-    status:"breached",
-    admin_note:reason
-  },"Funded trader marked as breached.");
-}
-
-function fundedReset(id){
-  const note = prompt("Admin note:", "Trader returned to funded status after review.") || "";
-  lifecycleUpdate({
-    id,
-    status:"funded",
-    phase:"funded",
-    admin_note:note
-  },"Trader returned to funded status.");
-}
-
-
-
-function accountsModule(){
-  const s = q();
-
-  const list = filteredTraders().filter(t =>
-    (t.status||"").toLowerCase().includes(s) ||
-    (t.phase||"").toLowerCase().includes(s) ||
-    (t.admin_note||"").toLowerCase().includes(s) ||
-    (t.selected_plan||"").toLowerCase().includes(s)
-  );
-
-  const active = traders.filter(t=>t.status==="active").length;
-  const breached = traders.filter(t=>t.status==="breached").length;
-  const phase1 = traders.filter(t=>t.phase==="phase1").length;
-  const phase2 = traders.filter(t=>t.phase==="phase2").length;
-  const funded = traders.filter(t=>t.phase==="funded" || t.status==="funded" || t.status==="live").length;
-  const inactive = traders.filter(t=>t.status==="inactive" || t.status==="archived").length;
-
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div>
-        <span class="badge">Account Lifecycle Engine</span>
-        <h3 class="text-4xl font-black gold mt-3">Breach, Pass, Funded & Reset Control</h3>
-        <p class="text-gray-400 mt-2">
-          Move traders through the NairaPips lifecycle. Mark breaches, promote phases, activate funded accounts and manage retries.
-        </p>
-      </div>
-      <div class="card2 p-5 rounded-2xl min-w-[230px]">
-        <p class="text-gray-500 text-sm">Breached Accounts</p>
-        <h2 class="text-5xl font-black text-red-400">${breached}</h2>
-      </div>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-3 xl:grid-cols-6 gap-4 mb-8">
-    ${stat("Active",active,"Currently trading")}
-    ${stat("Phase 1",phase1,"Evaluation stage")}
-    ${stat("Phase 2",phase2,"Verification stage")}
-    ${stat("Funded / Live",funded,"Advanced accounts")}
-    ${stat("Breached",breached,"Rule violation")}
-    ${stat("Inactive",inactive,"Archived or paused")}
-  </div>
-
-  <div class="grid lg:grid-cols-3 gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-2xl font-black gold mb-4">Breach Command</h3>
-      <p class="text-gray-400">
-        Use this when a trader breaks maximum drawdown, fails challenge rules, violates trading behaviour, or fails evaluation.
-      </p>
-      <div class="mt-5 card2 p-4 rounded-2xl">
-        <p class="text-gray-500 text-sm">Recommended Admin Note</p>
-        <p class="text-gray-300 mt-2">Breached due to max drawdown / rule violation. Account closed pending review.</p>
-      </div>
-    </div>
-
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-2xl font-black gold mb-4">Phase Promotion</h3>
-      <p class="text-gray-400">
-        Move successful traders from Phase 1 to Phase 2, then to Funded/Live after verification.
-      </p>
-      <div class="mt-5 card2 p-4 rounded-2xl">
-        <p class="text-gray-500 text-sm">Promotion Path</p>
-        <p class="text-gray-300 mt-2">Phase 1 → Phase 2 → Funded → Live → Payout</p>
-      </div>
-    </div>
-
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-2xl font-black gold mb-4">Retry / Reset</h3>
-      <p class="text-gray-400">
-        Reset account status for retry offers, corrections, support decisions or admin overrides.
-      </p>
-      <div class="mt-5 card2 p-4 rounded-2xl">
-        <p class="text-gray-500 text-sm">Reset Result</p>
-        <p class="text-gray-300 mt-2">Status becomes active, phase returns to Phase 1, drawdown/profit reset to zero.</p>
-      </div>
-    </div>
-  </div>
-
-  <div class="grid gap-5">
-    ${list.map(accountLifecycleCard).join("") || empty("No trader record found.")}
-  </div>`;
-}
-
-function lifecycleBadge(value){
-  const v = String(value||"").toLowerCase();
-  if(v==="breached") return `<span class="badge text-red-400">BREACHED</span>`;
-  if(v==="funded" || v==="live") return `<span class="badge text-green-400">${String(value).toUpperCase()}</span>`;
-  if(v==="active") return `<span class="badge text-green-400">ACTIVE</span>`;
-  if(v==="inactive" || v==="archived") return `<span class="badge text-gray-400">${String(value).toUpperCase()}</span>`;
-  return `<span class="badge">${value||"PROCESSING"}</span>`;
-}
-
-function accountLifecycleCard(t){
-  const isBreached = t.status === "breached";
-  const isFunded = t.status === "funded" || t.phase === "funded" || t.status === "live";
-
-  return `
-  <div class="vault p-6 rounded-3xl ${isBreached ? "danger" : ""}">
-    <div class="flex flex-wrap justify-between gap-4 mb-6">
-      <div>
-        <div class="flex flex-wrap gap-2 mb-3">
-          ${lifecycleBadge(t.status)}
-          <span class="badge">${t.phase || "no_phase"}</span>
-          <span class="badge">${t.payment_status || "payment_unknown"}</span>
-        </div>
-        <h3 class="text-3xl font-black gold">${t.name || "Unnamed Trader"}</h3>
-        <p class="text-gray-400">${t.email || ""} • ${t.phone || ""}</p>
-        <p class="text-gray-500 text-sm mt-1">Reference: ${t.account_reference || "No reference"}</p>
-      </div>
-
-      <div class="text-right">
-        <p class="text-gray-500 text-sm">Joined</p>
-        <b>${formatDate(t.created_at)}</b>
-        <p class="text-gray-500 text-sm mt-2">Approved</p>
-        <b>${formatDate(t.approved_at)}</b>
-      </div>
-    </div>
-
-    <div class="grid md:grid-cols-5 gap-4 mb-6">
-      <div class="card2 p-5 rounded-2xl md:col-span-2">
-        <p class="text-gray-500 text-sm">Account Size</p>
-        <h3 class="text-4xl font-black gold">${money(t.account_size || t.balance || 0)}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl">
-        <p class="text-gray-500 text-sm">Profit %</p>
-        <h3 class="text-3xl font-black text-green-400">${pct(t.profit_percent || 0)}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl">
-        <p class="text-gray-500 text-sm">Drawdown %</p>
-        <h3 class="text-3xl font-black text-red-400">${pct(t.drawdown_percent || 0)}</h3>
-      </div>
-      <div class="card2 p-5 rounded-2xl">
-        <p class="text-gray-500 text-sm">Days Left</p>
-        <h3 class="text-3xl font-black">${t.trading_days_left ?? 30}</h3>
-      </div>
-    </div>
-
-    <div class="grid md:grid-cols-4 gap-4 mb-6">
-      <div><p class="text-gray-500 text-sm">MT5 Login</p><b>${t.mt5_login || "Not assigned"}</b></div>
-      <div><p class="text-gray-500 text-sm">Server</p><b>${t.mt5_server || "Not assigned"}</b></div>
-      <div><p class="text-gray-500 text-sm">Plan</p><b>${t.selected_plan || "No plan"}</b></div>
-      <div><p class="text-gray-500 text-sm">Last Login</p><b>${formatDate(t.last_login_at)}</b></div>
-    </div>
-
-    <div class="card2 p-5 rounded-2xl mb-6">
-      <p class="text-gray-500 text-sm">Admin Note / Breach Reason</p>
-      <p class="${isBreached ? "text-red-400" : "text-gray-300"} mt-2">${t.admin_note || "No lifecycle note yet."}</p>
-    </div>
-
-    <div class="grid md:grid-cols-2 xl:grid-cols-5 gap-3">
-      <button class="btn btn-green" onclick="promotePhase2('${t.id}')">Pass Phase 1 → Phase 2</button>
-      <button class="btn btn-gold" onclick="markFunded('${t.id}')">Mark Funded</button>
-      <button class="btn btn-red" onclick="markBreached('${t.id}')">Mark Breached</button>
-      <button class="btn btn-dark" onclick="resetTraderLifecycle('${t.id}')">Reset / Retry</button>
-      <button class="btn btn-dark" onclick="archiveTrader('${t.id}')">Archive</button>
-    </div>
-  </div>`;
-}
-
-async function lifecycleUpdate(payload,successMessage){
-  const res = await fetch(`${API_URL}/update_status`,{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(payload)
-  });
-
-  const data = await res.json();
-
-  if(data.success){
-    alert(successMessage);
-    loadData();
-  }else{
-    alert(data.error || "Lifecycle update failed");
-  }
-}
-
-function markBreached(id){
-  const reason = prompt(
-    "Reason for breach:",
-    "Breached due to max drawdown / rule violation."
-  );
-
-  if(reason === null) return;
-
-  lifecycleUpdate({
-    id,
-    status:"breached",
-    admin_note:reason
-  },"Trader marked as breached.");
-}
-
-function promotePhase2(id){
-  const note = prompt(
-    "Admin note:",
-    "Phase 1 passed. Trader promoted to Phase 2."
-  );
-
-  if(note === null) return;
-
-  lifecycleUpdate({
-    id,
-    status:"active",
-    phase:"phase2",
-    admin_note:note,
-    profit:0,
-    drawdown:0,
-    profit_percent:0,
-    drawdown_percent:0,
-    trading_days_left:30
-  },"Trader promoted to Phase 2.");
-}
-
-function markFunded(id){
-  const note = prompt(
-    "Admin note:",
-    "Trader passed verification and is now funded/live."
-  );
-
-  if(note === null) return;
-
-  lifecycleUpdate({
-    id,
-    status:"funded",
-    phase:"funded",
-    admin_note:note,
-    trading_days_left:30
-  },"Trader marked as funded.");
-}
-
-function resetTraderLifecycle(id){
-  if(!confirm("Reset this trader for retry? Profit/drawdown will return to zero and phase will return to Phase 1.")) return;
-
-  lifecycleUpdate({
-    id,
-    status:"active",
-    phase:"phase1",
-    profit:0,
-    drawdown:0,
-    profit_percent:0,
-    drawdown_percent:0,
-    trading_days_left:30,
-    admin_note:"Account reset for retry / admin override."
-  },"Trader reset for retry.");
-}
-
-function archiveTrader(id){
-  if(!confirm("Archive this trader account?")) return;
-
-  lifecycleUpdate({
-    id,
-    status:"archived",
-    admin_note:"Account archived by admin."
-  },"Trader archived.");
-}
-
-
-
-
-function monitoringModule(){
-  const s = q();
-  const monitored = traders.filter(t =>
-    (t.payment_status==="approved" || ["active","funded","live","breached"].includes(String(t.status||"").toLowerCase())) &&
-    (t.mt5_login || t.account_size || t.balance)
-  );
-  const list = monitored.filter(t =>
-    (t.name||"").toLowerCase().includes(s) ||
-    (t.email||"").toLowerCase().includes(s) ||
-    (t.phone||"").toLowerCase().includes(s) ||
-    (t.mt5_login||"").toLowerCase().includes(s) ||
-    (t.status||"").toLowerCase().includes(s) ||
-    (t.phase||"").toLowerCase().includes(s)
-  );
-  const safe = monitored.filter(t=>monitorZone(t).zone==="safe").length;
-  const warning = monitored.filter(t=>monitorZone(t).zone==="warning").length;
-  const danger = monitored.filter(t=>monitorZone(t).zone==="danger").length;
-  const breached = monitored.filter(t=>monitorZone(t).zone==="breached").length;
-  const totalCapital = monitored.reduce((a,t)=>a+Number(npStartingCapital(t)),0);
-  const totalEquity = monitored.reduce((a,t)=>a+Number(npLiveEquity(t)),0);
-  const totalProfit = monitored.reduce((a,t)=>a+Number(t.profit||0),0);
-
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div>
-        <span class="badge">MT5 Monitoring Command</span>
-        <h3 class="text-4xl font-black gold mt-3">Maximum Drawdown Monitoring</h3>
-        <p class="text-gray-400 mt-2">NairaPips operates with maximum drawdown only. No daily drawdown logic is used here.</p>
-      </div>
-      <div class="card2 p-5 rounded-2xl min-w-[260px] monitor-card">
-        <p class="text-gray-500 text-sm">Total Monitored Capital</p>
-        <h2 class="monitor-text font-black gold">${money(totalCapital)}</h2>
-      </div>
-    </div>
-  </div>
-  <div class="grid md:grid-cols-3 xl:grid-cols-7 gap-4 mb-8">
-    ${stat("Monitored",monitored.length,"Approved/active MT5 accounts")}
-    ${stat("Safe",safe,"0% - 50% DD used")}
-    ${stat("Warning",warning,"51% - 75% DD used")}
-    ${stat("Danger",danger,"76% - 99% DD used")}
-    ${stat("Breached",breached,"100% max DD used")}
-    ${monitorStat("Total Equity",money(totalEquity),"Equity snapshot")}
-    ${monitorStat("Total Profit",money(totalProfit),"Visible profit")}
-  </div>
-  <div class="grid lg:grid-cols-3 gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl"><h3 class="text-2xl font-black gold mb-4">Rule Model</h3><p class="text-gray-400">This engine tracks only overall maximum drawdown.</p><div class="card2 p-4 rounded-2xl mt-5"><p class="text-gray-500 text-sm">NairaPips Rule</p><p class="text-green-400 font-bold">No Daily Drawdown. Maximum Drawdown Only.</p></div></div>
-    <div class="vault p-6 rounded-3xl"><h3 class="text-2xl font-black gold mb-4">Auto-Breach Foundation</h3><p class="text-gray-400">When MT5 live sync is connected, these statuses can update automatically.</p><div class="card2 p-4 rounded-2xl mt-5"><p class="text-gray-500 text-sm">Auto rule</p><p class="text-red-400 font-bold">If max DD used ≥ 100% → Breached</p></div></div>
-    <div class="vault p-6 rounded-3xl"><h3 class="text-2xl font-black gold mb-4">Profit Target Intelligence</h3><p class="text-gray-400">Profit target progress can later auto-detect phase pass.</p><div class="card2 p-4 rounded-2xl mt-5"><p class="text-gray-500 text-sm">Pass logic</p><p class="text-green-400 font-bold">Phase 1: 10% • Phase 2: 8%</p></div></div>
-  </div>
-  <div class="vault p-6 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-4 mb-5"><div><h3 class="text-3xl font-black gold">Monitoring Table</h3><p class="text-gray-400">Simulation-ready now. Later this receives live MT5 values.</p></div><span class="badge">${list.length} visible</span></div>
-    <div class="grid gap-5">${list.map(monitorTraderCard).join("") || empty("No monitored account yet. Approved traders with MT5 will appear here.")}</div>
-  </div>`;
-}
-function monitorStat(label,value,extra=""){
-  return `<div class="vault p-5 rounded-2xl overflow-hidden monitor-card"><p class="text-gray-400 text-sm">${label}</p><h3 class="monitor-text font-black gold">${value}</h3><p class="text-gray-500 text-xs mt-1">${extra}</p></div>`;
-}
-function maxDrawdownLimit(t){ return Number(t.current_account?.dd_limit_percent || t.dd_limit_percent || 20); }
-function actualDrawdownPercent(t){
-  return Math.abs(Number(t.drawdown_percent || t.current_account?.absolute_drawdown_percent || 0));
-}
-function ddLimitUsagePercent(t){
-  const limit = maxDrawdownLimit(t);
-  const incoming = Number(t.max_drawdown_used || t.current_account?.dd_used_percent || 0);
-  const computed = limit > 0 ? (actualDrawdownPercent(t) / limit) * 100 : 0;
-  return Math.max(incoming || 0, computed || 0);
-}
-function targetForPhase(t){ return String(t.phase||"").toLowerCase()==="phase2" ? 8 : 10; }
-function monitorZone(t){
-  if(String(t.status||"").toLowerCase()==="breached") return {zone:"breached",label:"BREACHED",cls:"monitor-breached",text:"text-red-400",usage:100};
-  const usage = ddLimitUsagePercent(t);
-  if(usage >= 100) return {zone:"breached",label:"BREACH LEVEL",cls:"monitor-breached",text:"text-red-400",usage};
-  if(usage >= 76) return {zone:"danger",label:"DANGER",cls:"monitor-danger",text:"text-red-400",usage};
-  if(usage >= 51) return {zone:"warning",label:"WARNING",cls:"monitor-warning",text:"text-yellow-400",usage};
-  return {zone:"safe",label:"SAFE",cls:"monitor-safe",text:"text-green-400",usage};
-}
-function monitorTraderCard(t){
-  const z = monitorZone(t);
-  const maxDD = maxDrawdownLimit(t);
-  const ddUsed = actualDrawdownPercent(t);
-  const ddUsage = z.usage ?? ddLimitUsagePercent(t);
-  const target = targetForPhase(t);
-  const profitPct = Number(t.profit_percent||0);
-  const targetProgress = target > 0 ? Math.min(100,(profitPct/target)*100) : 0;
-  return `
-  <div class="vault p-6 rounded-3xl ${z.zone==="breached" ? "danger" : ""}">
-    <div class="flex flex-wrap justify-between gap-4 mb-6">
-      <div><div class="flex flex-wrap gap-2 mb-3"><span class="badge ${z.text}">${z.label}</span><span class="badge">${t.phase || "phase1"}</span><span class="badge">${t.status || "processing"}</span></div><h3 class="text-3xl font-black gold">${t.name || "Unnamed Trader"}</h3><p class="text-gray-400">${t.email || ""} • ${t.phone || ""}</p><p class="text-gray-500 text-sm mt-1">MT5: ${t.mt5_login || "Not assigned"} • ${t.mt5_server || "No server"}</p></div>
-      <div class="text-right min-w-[230px]"><p class="text-gray-500 text-sm">Account Size</p><h3 class="monitor-text font-black gold">${money(t.account_size || t.balance || 0)}</h3></div>
-    </div>
-    <div class="grid md:grid-cols-5 gap-4 mb-6">
-      <div class="card2 p-5 rounded-2xl monitor-card"><p class="text-gray-500 text-sm">Balance</p><h3 class="payout-field-value font-black">${money(t.balance || 0)}</h3></div>
-      <div class="card2 p-5 rounded-2xl monitor-card"><p class="text-gray-500 text-sm">Equity</p><h3 class="payout-field-value font-black text-green-400">${money(t.equity || t.balance || 0)}</h3></div>
-      <div class="card2 p-5 rounded-2xl monitor-card"><p class="text-gray-500 text-sm">Profit</p><h3 class="payout-field-value font-black text-green-400">${money(t.profit || 0)}</h3></div>
-      <div class="card2 p-5 rounded-2xl monitor-card"><p class="text-gray-500 text-sm">Profit %</p><h3 class="payout-field-value font-black text-green-400">${pct(t.profit_percent || 0)}</h3></div>
-      <div class="card2 p-5 rounded-2xl monitor-card"><p class="text-gray-500 text-sm">Max DD Used</p><h3 class="payout-field-value font-black ${z.text}">${ddUsage.toFixed(1)}%</h3></div>
-    </div>
-    <div class="grid lg:grid-cols-2 gap-5 mb-6">
-      <div class="card2 p-5 rounded-2xl"><div class="flex justify-between gap-4 mb-3"><p class="text-gray-400">Maximum Drawdown Usage</p><b class="${z.text}">${ddUsed.toFixed(2)}% / ${maxDD}%</b></div><div class="monitor-meter"><div class="${z.cls}" style="height:100%;width:${ddUsage}%"></div></div><p class="text-gray-500 text-sm mt-3">Safe 0-50% • Warning 51-75% • Danger 76-99% • Breached 100%</p></div>
-      <div class="card2 p-5 rounded-2xl"><div class="flex justify-between gap-4 mb-3"><p class="text-gray-400">Profit Target Progress</p><b class="text-green-400">${profitPct.toFixed(2)}% / ${target}%</b></div><div class="monitor-meter"><div class="monitor-safe" style="height:100%;width:${targetProgress}%"></div></div><p class="text-gray-500 text-sm mt-3">Target: Phase 1 = 10%, Phase 2 = 8%</p></div>
-    </div>
-    <div class="grid md:grid-cols-2 xl:grid-cols-5 gap-3"><button class="btn btn-green" onclick="simulateProfit('${t.id}')">Sim Profit</button><button class="btn btn-gold" onclick="simulateDrawdown('${t.id}')">Sim DD</button><button class="btn btn-red" onclick="monitorBreach('${t.id}')">Mark Breached</button><button class="btn btn-dark" onclick="monitorReset('${t.id}')">Reset Metrics</button><button class="btn btn-dark" onclick="openMonitoringEvidence('${t.id}')">Evidence</button></div>
-  </div>`;
-}
-function simulateProfit(id){
-  const t = traders.find(x=>String(x.id)===String(id)); if(!t){alert("Trader not found");return;}
-  const add = Number(prompt("Add profit percent for simulation:", "1") || 0);
-  const newPct = Number(t.profit_percent||0) + add;
-  const size = Number(npStartingCapital(t));
-  const newProfit = size * (newPct/100);
-  lifecycleUpdate({id,profit_percent:newPct,profit:newProfit,equity:size+newProfit,admin_note:"Monitoring simulation: profit updated."},"Profit simulation updated.");
-}
-function simulateDrawdown(id){
-  const t = traders.find(x=>String(x.id)===String(id)); if(!t){alert("Trader not found");return;}
-  const dd = Number(prompt("Set total maximum drawdown percent used:", "5") || 0);
-  const size = Number(npStartingCapital(t));
-  const drawdownAmount = size * (dd/100);
-  const shouldBreach = dd >= maxDrawdownLimit(t);
-  lifecycleUpdate({id,drawdown_percent:dd,drawdown:drawdownAmount,equity:size-drawdownAmount,status:shouldBreach?"breached":t.status,admin_note:shouldBreach?"Auto simulation: breached due to maximum drawdown.":"Monitoring simulation: drawdown updated."},shouldBreach?"Trader breached by max drawdown simulation.":"Drawdown simulation updated.");
-}
-function monitorBreach(id){
-  const reason = prompt("Breach reason:", "Breached due to maximum drawdown rule.");
-  if(reason === null) return;
-  lifecycleUpdate({id,status:"breached",admin_note:reason},"Trader marked as breached.");
-}
-function monitorReset(id){
-  if(!confirm("Reset monitoring metrics for this trader?")) return;
-  const t = traders.find(x=>String(x.id)===String(id));
-  const size = Number(t?.account_size||t?.balance||0);
-  lifecycleUpdate({id,profit:0,drawdown:0,profit_percent:0,drawdown_percent:0,equity:size,admin_note:"Monitoring metrics reset by admin."},"Monitoring metrics reset.");
-}
-
-
-
-function zoneClass(zone){
-  zone = String(zone||"safe").toLowerCase();
-  if(zone==="warning") return "zone-warning";
-  if(zone==="danger") return "zone-danger";
-  if(zone==="critical") return "zone-critical";
-  if(zone==="breached") return "zone-breached";
-  return "zone-safe";
-}
-
-async function openMonitoringEvidence(traderId){
-  try{
-    const res = await fetch(`${API_URL}/breach_evidence/${traderId}`);
-    const data = await res.json();
-    if(!data.success){alert(data.error || "Evidence not found");return;}
-
-    const ev = data.data;
-    const events = ev.events || [];
-    const snapshots = ev.snapshots || [];
-
-    document.getElementById("content").innerHTML = `
-    <div class="vault p-7 rounded-3xl mb-8">
-      <button class="btn btn-dark mb-5" onclick="setModule('monitoring')">← Back to Monitoring</button>
-      <span class="badge">Monitoring Evidence</span>
-      <h3 class="text-4xl font-black gold mt-3">Breach Evidence & Equity Memory</h3>
-      <p class="text-gray-400 mt-2">System-recorded proof from NairaPips monitoring engine.</p>
-    </div>
-
-    <div class="grid evidence-grid gap-4 mb-8">
-      <div class="vault p-5 rounded-2xl"><p class="text-gray-500 text-sm">Status</p><h3 class="evidence-value font-black ${zoneClass(ev.status)}">${ev.status||"unknown"}</h3></div>
-      <div class="vault p-5 rounded-2xl"><p class="text-gray-500 text-sm">Risk Zone</p><h3 class="evidence-value font-black ${zoneClass(ev.risk_zone)}">${ev.risk_zone||"safe"}</h3></div>
-      <div class="vault p-5 rounded-2xl"><p class="text-gray-500 text-sm">Highest Equity</p><h3 class="evidence-value font-black gold">${money(ev.highest_equity||0)}</h3></div>
-      <div class="vault p-5 rounded-2xl"><p class="text-gray-500 text-sm">Lowest Equity</p><h3 class="evidence-value font-black text-red-400">${money(ev.lowest_equity||0)}</h3></div>
-      <div class="vault p-5 rounded-2xl"><p class="text-gray-500 text-sm">Max DD Used</p><h3 class="evidence-value font-black ${zoneClass(ev.risk_zone)}">${Number(ev.max_drawdown_used||0).toFixed(1)}%</h3></div>
-      <div class="vault p-5 rounded-2xl"><p class="text-gray-500 text-sm">Breach Time</p><h3 class="text-xl font-black">${formatDate(ev.breach_time)}</h3></div>
-    </div>
-
-    <div class="grid lg:grid-cols-2 gap-6">
-      <div class="vault p-6 rounded-3xl">
-        <h3 class="text-3xl font-black gold mb-5">Monitoring Timeline</h3>
-        <div class="grid gap-4">
-          ${
-            events.length ? events.map(e=>`
-              <div class="flex gap-4">
-                <div>
-                  <div class="timeline-dot"></div>
-                  <div class="timeline-line h-14"></div>
-                </div>
-                <div class="card2 p-4 rounded-2xl flex-1">
-                  <div class="flex flex-wrap justify-between gap-3">
-                    <b class="${zoneClass(e.risk_zone)}">${e.event_type||"event"}</b>
-                    <span class="text-gray-500 text-sm">${formatDate(e.created_at)}</span>
-                  </div>
-                  <p class="text-gray-300 mt-2">${e.message||""}</p>
-                  <p class="text-gray-500 text-xs mt-2">Equity: ${money(e.equity||0)} • Max DD Used: ${Number(e.max_drawdown_used||0).toFixed(1)}%</p>
-                </div>
-              </div>
-            `).join("") : `<p class="text-gray-400">No monitoring events recorded yet.</p>`
-          }
-        </div>
-      </div>
-
-      <div class="vault p-6 rounded-3xl">
-        <h3 class="text-3xl font-black gold mb-5">Recent Equity Snapshots</h3>
-        <div class="grid gap-4">
-          ${
-            snapshots.length ? snapshots.map(s=>`
-              <div class="card2 p-4 rounded-2xl">
-                <div class="flex flex-wrap justify-between gap-3">
-                  <b class="${zoneClass(s.risk_zone)}">${s.risk_zone||"safe"}</b>
-                  <span class="text-gray-500 text-sm">${formatDate(s.created_at)}</span>
-                </div>
-                <div class="grid grid-cols-2 gap-3 mt-3 text-sm">
-                  <p>Balance: <b>${money(s.balance||0)}</b></p>
-                  <p>Equity: <b>${money(s.equity||0)}</b></p>
-                  <p>Profit: <b class="text-green-400">${money(s.profit||0)}</b></p>
-                  <p>DD Used: <b class="${zoneClass(s.risk_zone)}">${Number(s.max_drawdown_used||0).toFixed(1)}%</b></p>
-                </div>
-              </div>
-            `).join("") : `<p class="text-gray-400">No equity snapshots recorded yet.</p>`
-          }
-        </div>
-      </div>
-    </div>`;
-  }catch(e){
-    alert("Could not load evidence: " + e.message);
-  }
-}
-
-
-
-function marketingDeletedIds(){
-  return (marketingDeletedIdCache || []).map(String);
-}
-
-async function saveMarketingDeletedIds(ids){
-  const unique = [...new Set((ids || []).map(String))];
-  try{
-    await postJSON(`${API_URL}/marketing_deleted_contacts/save`, {contact_ids: unique});
-    marketingDeletedIdCache = unique;
-  }catch(e){
-    alert("Marketing contacts could not update in Supabase: " + e.message);
-    throw e;
-  }
-}
-
-function normalizeNairaPhone(phone){
-  const d = normalizeNairaPhoneDigits(phone);
-  return d ? "+" + d : "";
-}
-
-function marketingUsers(){
-  const deleted = marketingDeletedIds();
-  const seen = new Set();
-  const rows = (traders || []).map(t => {
-    const phone = normalizeNairaPhone(t.phone || t.whatsapp || t.whatsapp_number || "");
-    const email = String(t.email || "").trim();
-    const id = String(t.id || email || phone || Math.random());
+@app.route("/fxblue_test/<mt5_login>", methods=["GET"])
+def fxblue_test(mt5_login):
+    """
+    Simple browser test route.
+    Example:
+    /fxblue_test/123456?balance=1000000&equity=950000
+    """
+    data = dict(request.args)
+    data["login"] = mt5_login
+    data["source"] = "fxblue_browser_test"
+
+    trader = _find_trader_for_fxblue(data)
+    if not trader:
+        return jsonify({"success": False, "error": "Trader not found for this MT5 login"}), 404
+
+    data = _normalize_fxblue_payload(data)
+    result = _apply_monitoring_snapshot(trader, data, "fxblue_browser_test")
+    return jsonify({"success": True, "data": result})
+@app.route("/debug/supabase", methods=["GET"])
+def debug_supabase():
+    try:
+        response = supabase.table("traders").select("id,name,mt5_login,mt5_server,mt5_investor_password,status,monitoring_enabled").limit(5).execute()
+
+        return jsonify({
+            "success": True,
+            "supabase_url": SUPABASE_URL,
+            "count": len(response.data or []),
+            "sample": response.data or []
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "supabase_url": SUPABASE_URL,
+            "error": str(e)
+        }), 500
+@app.route("/api/admin/traders", methods=["GET"])
+def get_admin_traders():
+    try:
+        response = supabase.table("traders").select("*").execute()
+
+        return jsonify(response.data), 200
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+@app.get('/marketing_deleted_contacts')
+def marketing_deleted_contacts():
+    try:
+        res = supabase.table('marketing_deleted_contacts').select('contact_id').execute()
+        return jsonify(res.data or [])
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/marketing_deleted_contacts/save')
+def save_marketing_deleted_contacts():
+    try:
+        body = request.get_json(silent=True) or {}
+        contact_ids = [str(x) for x in body.get('contact_ids', []) if str(x).strip()]
+
+        # Replace the admin soft-delete list in Supabase.
+        supabase.table('marketing_deleted_contacts').delete().neq('contact_id', '__never__').execute()
+        if contact_ids:
+            rows = [{'contact_id': cid, 'deleted_by': 'admin'} for cid in sorted(set(contact_ids))]
+            supabase.table('marketing_deleted_contacts').insert(rows).execute()
+
+        return jsonify({'success': True, 'contact_ids': contact_ids})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+def referral_settings_default():
     return {
-      id,
-      name: t.name || t.full_name || t.trader_name || "Unknown",
-      email,
-      phone,
-      created_at: t.created_at || t.joined_at || t.approved_at || "",
-      deleted: deleted.includes(id)
-    };
-  }).filter(u => {
-    const key = `${u.email}|${u.phone}`.toLowerCase();
-    if(seen.has(key)) return false;
-    seen.add(key);
-    return (u.name || u.email || u.phone);
-  });
-
-  return rows;
-}
-
-function selectedMarketingIds(){
-  return [...document.querySelectorAll('.marketing-select:checked')].map(x=>x.value);
-}
-
-function visibleMarketingIds(){
-  return [...document.querySelectorAll('.marketing-select')].map(x=>x.value);
-}
-
-function toggleMarketingSelection(master){
-  document.querySelectorAll('.marketing-select').forEach(cb=>cb.checked = master.checked);
-}
-
-
-function marketingDateValue(u){
-  const raw = u.created_at || u.joined_at || u.approved_at || "";
-  const d = raw ? new Date(raw) : null;
-  return d && !isNaN(d.getTime()) ? d : null;
-}
-
-function marketingDateStart(unit){
-  const now = new Date();
-  if(unit === "today") return new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  if(unit === "yesterday") return new Date(now.getFullYear(), now.getMonth(), now.getDate()-1);
-  if(unit === "week"){
-    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const day = d.getDay() || 7;
-    d.setDate(d.getDate() - day + 1);
-    return d;
-  }
-  if(unit === "month") return new Date(now.getFullYear(), now.getMonth(), 1);
-  if(unit === "last30") return new Date(now.getFullYear(), now.getMonth(), now.getDate()-30);
-  if(unit === "last90") return new Date(now.getFullYear(), now.getMonth(), now.getDate()-90);
-  return null;
-}
-
-function marketingMatchesDateRange(u, range){
-  if(!range || range === "alltime") return true;
-  const d = marketingDateValue(u);
-  if(!d) return false;
-  const now = new Date();
-
-  if(range === "today") return d >= marketingDateStart("today");
-  if(range === "yesterday"){
-    const start = marketingDateStart("yesterday");
-    const end = marketingDateStart("today");
-    return d >= start && d < end;
-  }
-  if(range === "thisweek") return d >= marketingDateStart("week");
-  if(range === "thismonth") return d >= marketingDateStart("month");
-  if(range === "last30") return d >= marketingDateStart("last30") && d <= now;
-  if(range === "last90") return d >= marketingDateStart("last90") && d <= now;
-  if(range === "nodate") return !d;
-  return true;
-}
-
-function marketingDateLabel(range){
-  const labels = {
-    alltime:"All Time",
-    today:"Today",
-    yesterday:"Yesterday",
-    thisweek:"This Week",
-    thismonth:"This Month",
-    last30:"Last 30 Days",
-    last90:"Last 90 Days",
-    nodate:"No Date"
-  };
-  return labels[range] || "All Time";
-}
-
-function databaseModule(){
-  const s = q();
-  const filter = document.getElementById("marketingFilter")?.value || "active";
-  const dateRange = document.getElementById("marketingDateRange")?.value || "alltime";
-  const sort = document.getElementById("marketingSort")?.value || "newest";
-
-  let list = marketingUsers().filter(u => {
-    const hay = `${u.name} ${u.email} ${u.phone}`.toLowerCase();
-    const matchSearch = hay.includes(s);
-    const matchFilter = filter === "all" ||
-      (filter === "active" && !u.deleted) ||
-      (filter === "deleted" && u.deleted) ||
-      (filter === "email" && !u.deleted && u.email) ||
-      (filter === "whatsapp" && !u.deleted && u.phone);
-    const matchDate = marketingMatchesDateRange(u, dateRange);
-    return matchSearch && matchFilter && matchDate;
-  });
-
-  list.sort((a,b)=>{
-    const da = marketingDateValue(a)?.getTime() || 0;
-    const db = marketingDateValue(b)?.getTime() || 0;
-    if(sort === "name") return String(a.name).localeCompare(String(b.name));
-    if(sort === "email") return String(a.email).localeCompare(String(b.email));
-    if(sort === "phone") return String(a.phone).localeCompare(String(b.phone));
-    if(sort === "oldest") return da - db;
-    if(sort === "newest") return db - da;
-    if(sort === "deleted") return Number(b.deleted) - Number(a.deleted) || db - da;
-    return db - da;
-  });
-
-  const all = marketingUsers();
-  const active = all.filter(u=>!u.deleted);
-  const removed = all.filter(u=>u.deleted);
-  const withEmail = active.filter(u=>u.email);
-  const withPhone = active.filter(u=>u.phone);
-  const today = active.filter(u=>marketingMatchesDateRange(u,"today"));
-  const week = active.filter(u=>marketingMatchesDateRange(u,"thisweek"));
-  const month = active.filter(u=>marketingMatchesDateRange(u,"thismonth"));
-
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5 items-start">
-      <div>
-        <span class="badge">MARKETING CRM</span>
-        <h3 class="text-5xl font-black gold mt-3">Users Database</h3>
-        <p class="text-gray-400 mt-3 max-w-3xl">Pure NairaPips marketing contact system. No MT5 monitoring here — only name, email and WhatsApp contacts formatted for outreach, with date filters for campaigns.</p>
-      </div>
-      <div class="flex flex-wrap gap-3">
-        <button onclick="copyMarketingEmails()" class="btn btn-gold">Copy All Emails</button>
-        <button onclick="copyMarketingPhones()" class="btn btn-dark">Copy All WhatsApp</button>
-        <button onclick="exportMarketingCSV()" class="btn btn-dark">Export All CSV</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-4 xl:grid-cols-8 gap-4 mb-6">
-    ${stat("Active Contacts", active.length, "Marketing ready")}
-    ${stat("Emails", withEmail.length, "Copy / export ready")}
-    ${stat("WhatsApp", withPhone.length, "+234 normalized")}
-    ${stat("Today", today.length, "New today")}
-    ${stat("This Week", week.length, "Recent leads")}
-    ${stat("This Month", month.length, "Monthly growth")}
-    ${stat("Deleted", removed.length, "Can be restored")}
-    ${stat("Total Records", all.length, "All contacts")}
-  </div>
-
-  <div class="crm-toolbar p-5 rounded-3xl mb-6">
-    <div class="grid xl:grid-cols-[1fr_1fr_1fr_auto] gap-4 items-center">
-      <select id="marketingFilter" onchange="databaseModule()">
-        <option value="active" ${filter==="active"?"selected":""}>Active Contacts</option>
-        <option value="deleted" ${filter==="deleted"?"selected":""}>Deleted Contacts</option>
-        <option value="email" ${filter==="email"?"selected":""}>Email Ready</option>
-        <option value="whatsapp" ${filter==="whatsapp"?"selected":""}>WhatsApp Ready</option>
-        <option value="all" ${filter==="all"?"selected":""}>All Contacts</option>
-      </select>
-      <select id="marketingDateRange" onchange="databaseModule()">
-        <option value="alltime" ${dateRange==="alltime"?"selected":""}>All Time</option>
-        <option value="today" ${dateRange==="today"?"selected":""}>Today</option>
-        <option value="yesterday" ${dateRange==="yesterday"?"selected":""}>Yesterday</option>
-        <option value="thisweek" ${dateRange==="thisweek"?"selected":""}>This Week</option>
-        <option value="thismonth" ${dateRange==="thismonth"?"selected":""}>This Month</option>
-        <option value="last30" ${dateRange==="last30"?"selected":""}>Last 30 Days</option>
-        <option value="last90" ${dateRange==="last90"?"selected":""}>Last 90 Days</option>
-        <option value="nodate" ${dateRange==="nodate"?"selected":""}>No Date Records</option>
-      </select>
-      <select id="marketingSort" onchange="databaseModule()">
-        <option value="newest" ${sort==="newest"?"selected":""}>Newest First</option>
-        <option value="oldest" ${sort==="oldest"?"selected":""}>Oldest First</option>
-        <option value="name" ${sort==="name"?"selected":""}>Sort By Name</option>
-        <option value="email" ${sort==="email"?"selected":""}>Sort By Email</option>
-        <option value="phone" ${sort==="phone"?"selected":""}>Sort By WhatsApp</option>
-        <option value="deleted" ${sort==="deleted"?"selected":""}>Deleted First</option>
-      </select>
-      <div class="flex flex-wrap gap-2">
-        <button onclick="copySelectedMarketingEmails()" class="btn btn-dark">Copy Selected Emails</button>
-        <button onclick="copySelectedMarketingPhones()" class="btn btn-dark">Copy Selected WhatsApp</button>
-        <button onclick="exportSelectedMarketingCSV()" class="btn btn-gold">Export Selected</button>
-        <button onclick="deleteSelectedMarketingUsers()" class="btn btn-red">Delete Selected</button>
-        <button onclick="restoreSelectedMarketingUsers()" class="btn btn-green">Restore Selected</button>
-        <button onclick="deleteAllMarketingUsers()" class="btn btn-red">Delete All Contacts</button>
-        <button onclick="restoreAllMarketingUsers()" class="btn btn-green">Restore All Contacts</button>
-      </div>
-    </div>
-    <div class="mt-4 flex flex-wrap gap-2">
-      <button onclick="setMarketingDateQuick('today')" class="btn btn-dark">Today</button>
-      <button onclick="setMarketingDateQuick('thisweek')" class="btn btn-dark">This Week</button>
-      <button onclick="setMarketingDateQuick('thismonth')" class="btn btn-dark">This Month</button>
-      <button onclick="setMarketingDateQuick('last30')" class="btn btn-dark">Last 30 Days</button>
-      <button onclick="setMarketingDateQuick('alltime')" class="btn btn-gold">All Time</button>
-    </div>
-  </div>
-
-  <div class="vault p-6 rounded-3xl">
-    <div class="flex flex-wrap justify-between gap-4 mb-5">
-      <div>
-        <h3 class="text-3xl font-black gold">Contact List</h3>
-        <p class="text-gray-400">${list.length} contact(s) visible • ${marketingDateLabel(dateRange)} • ${sort === "newest" ? "Newest first" : sort === "oldest" ? "Oldest first" : "Sorted by " + sort}. Select contacts for bulk actions.</p>
-      </div>
-      <label class="badge cursor-pointer"><input type="checkbox" class="crm-check mr-2" onchange="toggleMarketingSelection(this)"> Select Visible</label>
-    </div>
-
-    <div class="grid gap-4">
-      ${list.map(marketingUserCard).join("") || `<div class="card p-10 rounded-3xl text-center text-gray-400">No contacts found in this date/filter segment.</div>`}
-    </div>
-  </div>`;
-}
-
-function setMarketingDateQuick(range){
-  const el = document.getElementById("marketingDateRange");
-  if(el) el.value = range;
-  databaseModule();
-}
-
-function marketingUserCard(u){
-  const wa = normalizeNairaPhoneDigits(u.phone);
-  return `
-  <div class="crm-contact-card p-5 rounded-2xl ${u.deleted ? "opacity-55" : ""}">
-    <div class="grid lg:grid-cols-[auto_1.2fr_1.4fr_1.2fr_auto] gap-4 items-center">
-      <input type="checkbox" class="marketing-select crm-check" value="${escapeQuotes(u.id)}">
-      <div>
-        <p class="text-gray-500 text-xs">Name</p>
-        <h3 class="text-xl font-black">${escapeHtml(u.name)}</h3>
-      </div>
-      <div>
-        <p class="text-gray-500 text-xs">Email</p>
-        ${u.email ? `<a class="gold break-all" href="mailto:${escapeHtml(u.email)}">${escapeHtml(u.email)}</a>` : `<span class="text-gray-500">No email</span>`}
-      </div>
-      <div>
-        <p class="text-gray-500 text-xs">WhatsApp</p>
-        ${u.phone ? `<a class="gold font-bold" href="https://wa.me/${wa}" target="_blank">${escapeHtml(u.phone)}</a>` : `<span class="text-gray-500">No number</span>`}
-        <p class="text-gray-600 text-xs mt-1">Joined: ${formatDate(u.created_at)}</p>
-      </div>
-      <div class="flex flex-wrap gap-2 justify-start lg:justify-end">
-        <span class="badge">${u.deleted ? "DELETED" : "ACTIVE"}</span>
-        ${u.email ? `<button class="btn btn-dark" onclick="copyText('${escapeQuotes(u.email)}','Email copied')">Copy Email</button>` : ""}
-        ${u.phone ? `<button class="btn btn-dark" onclick="copyText('${escapeQuotes(u.phone)}','Phone copied')">Copy Phone</button>` : ""}
-        ${canDo("database","reveal_passwords") ? `<button class="btn btn-gold" onclick="adminResetTraderPassword('${escapeQuotes(u.id)}')">Reset Password</button>` : ""}
-        ${u.deleted ? `<button class="btn btn-gold" onclick="restoreMarketingUser('${escapeQuotes(u.id)}')">Restore</button>` : `<button class="btn btn-red" onclick="deleteMarketingUser('${escapeQuotes(u.id)}')">Delete</button>`}
-      </div>
-    </div>
-  </div>`;
-}
-
-async function adminResetTraderPassword(id){
-  if(!canDo("database","reveal_passwords")){
-    alert("Access denied: password reset permission required.");
-    return;
-  }
-  const u = marketingUsers().find(x=>String(x.id)===String(id)) || traders.find(x=>String(x.id)===String(id));
-  if(!u){
-    alert("User not found.");
-    return;
-  }
-  if(!confirm(`Generate a new temporary login password for ${u.name || u.email || "this trader"}? The old password will stop working.`)) return;
-  try{
-    const data = await postJSON(`${API_URL}/admin_reset_trader_password`, {
-      id,
-      email:u.email || "",
-      phone:u.phone || "",
-      admin_id:currentAdmin?.id || "",
-      admin_name:currentAdmin?.name || currentAdmin?.username || "admin",
-      admin_username:currentAdmin?.username || "",
-      admin_role:currentAdmin?.role || "admin"
-    });
-    const temp = data?.data?.temporary_password || data?.temporary_password || "";
-    if(!temp){
-      alert(data?.message || "Password reset, but no temporary password was returned.");
-      return;
-    }
-    try{ await navigator.clipboard?.writeText(temp); }catch(e){}
-    alert(`Temporary password for ${u.name || u.email || "trader"}:\n\n${temp}\n\nIt has been copied. Share it privately with the trader.`);
-    await logAdminAudit("database","trader_password_reset",`Temporary password generated for ${u.email || id}`,id);
-  }catch(e){
-    alert(e.message || "Could not reset password.");
-  }
-}
-
-function marketingByIds(ids){
-  const set = new Set(ids.map(String));
-  return marketingUsers().filter(u=>set.has(String(u.id)));
-}
-
-async function deleteMarketingUser(id){
-  if(!confirm("Delete this contact from marketing database view? You can restore later.")) return;
-  const ids = marketingDeletedIds();
-  ids.push(String(id));
-  await saveMarketingDeletedIds(ids);
-  databaseModule();
-}
-
-async function restoreMarketingUser(id){
-  const ids = marketingDeletedIds().filter(x => String(x) !== String(id));
-  await saveMarketingDeletedIds(ids);
-  databaseModule();
-}
-
-async function deleteSelectedMarketingUsers(){
-  const selected = selectedMarketingIds();
-  if(!selected.length){alert("Select contacts first.");return;}
-  if(!confirm(`Delete ${selected.length} selected contact(s)? You can restore later.`)) return;
-  await saveMarketingDeletedIds([...marketingDeletedIds(), ...selected]);
-  databaseModule();
-}
-
-async function restoreSelectedMarketingUsers(){
-  const selected = selectedMarketingIds();
-  if(!selected.length){alert("Select contacts first.");return;}
-  const keep = marketingDeletedIds().filter(id=>!selected.includes(String(id)));
-  await saveMarketingDeletedIds(keep);
-  databaseModule();
-}
-
-async function deleteAllMarketingUsers(){
-  const active = marketingUsers().filter(u=>!u.deleted).map(u=>u.id);
-  if(!active.length){alert("No active contacts to delete.");return;}
-  if(!confirm(`Delete all ${active.length} active marketing contacts? You can restore them later.`)) return;
-  await saveMarketingDeletedIds([...marketingDeletedIds(), ...active]);
-  databaseModule();
-}
-
-async function restoreAllMarketingUsers(){
-  if(!confirm("Restore all deleted marketing contacts?")) return;
-  await saveMarketingDeletedIds([]);
-  databaseModule();
-}
-
-function activeMarketingUsers(){
-  return marketingUsers().filter(u=>!u.deleted);
-}
-
-function copyMarketingEmails(){
-  const emails = activeMarketingUsers().map(u=>u.email).filter(Boolean);
-  copyText(emails.join(", "), `${emails.length} emails copied`);
-}
-
-function copyMarketingPhones(){
-  const phones = activeMarketingUsers().map(u=>u.phone).filter(Boolean);
-  copyText(phones.join("\n"), `${phones.length} WhatsApp numbers copied`);
-}
-
-function copySelectedMarketingEmails(){
-  const emails = marketingByIds(selectedMarketingIds()).map(u=>u.email).filter(Boolean);
-  copyText(emails.join(", "), `${emails.length} selected emails copied`);
-}
-
-function copySelectedMarketingPhones(){
-  const phones = marketingByIds(selectedMarketingIds()).map(u=>u.phone).filter(Boolean);
-  copyText(phones.join("\n"), `${phones.length} selected WhatsApp numbers copied`);
-}
-
-function marketingCSV(rows){
-  return [["Name","Email","WhatsApp","Status","Joined"].join(","), ...rows.map(u => [u.name,u.email,u.phone,u.deleted?"deleted":"active",formatDate(u.created_at)].map(csvCell).join(","))].join("\n");
-}
-
-function downloadMarketingCSV(rows, name){
-  const blob = new Blob([marketingCSV(rows)], {type:"text/csv;charset=utf-8"});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-function exportMarketingCSV(){
-  downloadMarketingCSV(activeMarketingUsers(), `nairapips-marketing-users-${new Date().toISOString().slice(0,10)}.csv`);
-}
-
-function exportSelectedMarketingCSV(){
-  const rows = marketingByIds(selectedMarketingIds());
-  if(!rows.length){alert("Select contacts first.");return;}
-  downloadMarketingCSV(rows, `nairapips-selected-marketing-users-${new Date().toISOString().slice(0,10)}.csv`);
-}
-
-function csvCell(v){
-  return `"${String(v||"").replace(/"/g,'""')}"`;
-}
-
-async function copyText(text,msg="Copied"){
-  if(!text){ alert("Nothing to copy."); return; }
-  try{
-    await navigator.clipboard.writeText(text);
-    alert(msg);
-  }catch(e){
-    const ta=document.createElement("textarea");
-    ta.value=text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand("copy");
-    ta.remove();
-    alert(msg);
-  }
-}
-
-function cleanPhone(phone){
-  return normalizeNairaPhoneDigits(phone);
-}
-
-function escapeHtml(v){
-  return String(v||"")
-    .replace(/&/g,"&amp;")
-    .replace(/</g,"&lt;")
-    .replace(/>/g,"&gt;")
-    .replace(/"/g,"&quot;")
-    .replace(/'/g,"&#039;");
-}
-
-function escapeQuotes(v){
-  return String(v || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-}
-
-/* REFERRAL MARKETING */
-function referralDefaults(){
-  return {
-    programName:"NairaPips Referral Program",
-    baseUrl:"https://nairapips.com",
-    defaultCode:"NAIRAPIPS",
-    rebateType:"percent",
-    rebateValue:"10",
-    customerBonus:"0",
-    cookieDays:"30",
-    minPayout:"5000",
-    status:"active",
-    payoutRule:"Rebate is approved only after a referred trader pays and passes payment verification.",
-    publicMessage:"Refer a trader to NairaPips and earn rebate when they buy a challenge."
-  };
-}
-
-function getReferralSettings(){
-  return {...referralDefaults(), ...(referralSettingsCache || {})};
-}
-
-async function setReferralSettings(data){
-  const merged = {...getReferralSettings(), ...data};
-  const saved = await postJSON(`${API_URL}/referral_settings`, merged);
-  referralSettingsCache = saved.data || merged;
-}
-
-function cleanReferralCode(v){
-  const x = String(v||"").trim().toUpperCase().replace(/[^A-Z0-9_-]/g,"");
-  return x || "NAIRAPIPS";
-}
-
-function referralLink(code){
-  const r = getReferralSettings();
-  const base = String(r.baseUrl||"https://nairapips.com").replace(/\/$/,"");
-  return `${base}?ref=${encodeURIComponent(cleanReferralCode(code || r.defaultCode))}`;
-}
-
-function referralRebateText(){
-  const r = getReferralSettings();
-  return r.rebateType === "fixed" ? money(r.rebateValue) : `${Number(r.rebateValue||0)}%`;
-}
-
-function referralEstimate(amount){
-  const r = getReferralSettings();
-  const n = Number(amount||0);
-  if(r.rebateType === "fixed") return Number(r.rebateValue||0);
-  return Math.round(n * (Number(r.rebateValue||0) / 100));
-}
-
-function referralGlobalBar(){
-  const r = getReferralSettings();
-  if(r.status !== "active") return `
-    <div class="referral-bar rounded-3xl p-4 flex flex-wrap justify-between items-center gap-3">
-      <div><span class="referral-chip">REFERRAL PAUSED</span><p class="text-gray-400 text-sm mt-2">Referral visibility is currently paused from the Referrals module.</p></div>
-      <button class="btn btn-gold" onclick="setModule('referrals',document.querySelectorAll('.sidebar-btn')[16])">Open Referrals</button>
-    </div>`;
-  return `
-  <div class="referral-bar rounded-3xl p-4 flex flex-wrap justify-between items-center gap-4">
-    <div class="min-w-0">
-      <div class="flex flex-wrap gap-2 mb-2">
-        <span class="referral-chip">MARKETING REFERRAL LIVE</span>
-        <span class="referral-chip">REBATE: ${referralRebateText()}</span>
-        <span class="referral-chip">COOKIE: ${r.cookieDays} DAYS</span>
-      </div>
-      <p class="text-gray-300 text-sm break-words">${escapeHtml(r.publicMessage)} <b class="gold">${referralLink(r.defaultCode)}</b></p>
-    </div>
-    <div class="flex flex-wrap gap-2">
-      <button class="btn btn-gold" onclick="copyReferralLink()">Copy Link</button>
-      <button class="btn btn-dark" onclick="setModule('referrals',document.querySelectorAll('.sidebar-btn')[16])">Edit Rebates</button>
-    </div>
-  </div>`;
-}
-
-async function copyTextValue(text,msg="Copied."){
-  try{ await navigator.clipboard.writeText(text); alert(msg); }
-  catch(e){
-    const ta=document.createElement("textarea"); ta.value=text; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); alert(msg);
-  }
-}
-
-function copyReferralLink(code){ copyTextValue(referralLink(code),"Referral link copied."); }
-
-function copyReferralMessage(){
-  const r=getReferralSettings();
-  const msg=`${r.publicMessage}\n\nReferral Link: ${referralLink(r.defaultCode)}\nRebate: ${referralRebateText()}\nRule: ${r.payoutRule}`;
-  copyTextValue(msg,"Referral marketing message copied.");
-}
-
-async function saveReferralSettings(){
-  const data={
-    programName:document.getElementById("ref_program")?.value || "NairaPips Referral Program",
-    baseUrl:document.getElementById("ref_base")?.value || "https://nairapips.com",
-    defaultCode:cleanReferralCode(document.getElementById("ref_code")?.value || "NAIRAPIPS"),
-    rebateType:document.getElementById("ref_type")?.value || "percent",
-    rebateValue:document.getElementById("ref_value")?.value || "10",
-    customerBonus:document.getElementById("ref_customer_bonus")?.value || "0",
-    cookieDays:document.getElementById("ref_cookie")?.value || "30",
-    minPayout:document.getElementById("ref_min_payout")?.value || "5000",
-    status:document.getElementById("ref_status")?.value || "active",
-    publicMessage:document.getElementById("ref_message")?.value || "Refer a trader to NairaPips and earn rebate when they buy a challenge.",
-    payoutRule:document.getElementById("ref_rule")?.value || "Rebate is approved only after a referred trader pays and passes payment verification."
-  };
-  try{
-    await setReferralSettings(data);
-    alert("Referral settings saved to NairaPips Supabase. The referral banner has been updated across the admin pages.");
-  }catch(e){
-    alert("Referral settings could not save to Supabase: " + e.message);
-    return;
-  }
-  referralsModule();
-}
-
-async function resetReferralSettings(){
-  if(!confirm("Reset referral settings to NairaPips default?")) return;
-  try{
-    const saved = await postJSON(`${API_URL}/referral_settings/reset`, {});
-    referralSettingsCache = saved.data || referralDefaults();
-    referralsModule();
-  }catch(e){
-    alert("Referral settings could not reset in Supabase: " + e.message);
-  }
-}
-
-function referralKnownCode(row){
-  return cleanReferralCode(row.referral_code || row.ref_code || row.affiliate_code || row.referred_by || row.source_ref || "");
-}
-
-
-function referralSelfReferralRisk(p){
-  const ref = referralKnownCode(p);
-  if(!ref) return false;
-  const email = String(p.email||"").toLowerCase();
-  const phone = normalizeNairaPhoneDigits(p.phone||"");
-  return traders.some(t => referralKnownCode(t) === ref && (String(t.email||"").toLowerCase() === email || normalizeNairaPhoneDigits(t.phone||"") === phone));
-}
-
-function referralsModule(){
-  const r = getReferralSettings();
-  const referredPurchases = purchases.filter(p => referralKnownCode(p));
-  const referredTraders = traders.filter(t => referralKnownCode(t));
-  const approvedRefPurchases = referredPurchases.filter(p => p.payment_status === "approved" || p.status === "approved");
-  const approvedRevenue = approvedRefPurchases.reduce((a,p)=>a+Number(p.fee||0),0);
-  const estimatedRebate = approvedRefPurchases.reduce((a,p)=>a+referralEstimate(p.fee||0),0);
-  const baseLink = referralLink(r.defaultCode);
-
-  document.getElementById("content").innerHTML = `
-  <div class="referral-hero p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div>
-        <span class="badge">REFERRAL MARKETING ENGINE</span>
-        <h3 class="text-4xl font-black gold mt-3">Referral Links & Rebate Control</h3>
-        <p class="text-gray-300 mt-2 max-w-4xl">Create one public referral link, adjust rebates from admin, copy campaign messages, and keep the offer visible across every admin page. This is built for marketing growth without touching MT5 monitoring.</p>
-      </div>
-      <div class="card2 p-5 rounded-2xl min-w-[240px]">
-        <p class="text-gray-500 text-sm">Current Rebate</p>
-        <h2 class="text-5xl font-black gold">${referralRebateText()}</h2>
-        <p class="text-gray-400 text-sm mt-2">Status: <b class="${r.status==='active'?'text-green-400':'text-red-400'}">${String(r.status).toUpperCase()}</b></p>
-      </div>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-4 gap-4 mb-8">
-    ${stat("Referral Purchases",referredPurchases.length,"Detected with referral codes")}
-    ${stat("Approved Referral Sales",approvedRefPurchases.length,"Eligible for rebate review")}
-    ${stat("Referral Revenue",money(approvedRevenue),"Approved referred fees")}
-    ${stat("Estimated Rebates",money(estimatedRebate),"Based on current rule")}
-    ${stat("Self-Referral Risk",referredPurchases.filter(referralSelfReferralRisk).length,"Blocked/flagged for review")}
-  </div>
-
-  <div class="grid lg:grid-cols-[430px_1fr] gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-3xl font-black gold mb-2">Edit Referral Rules</h3>
-      <p class="text-gray-400 mb-5">Adjust rebate, campaign link, payout rule and visibility. Saved permanently in NairaPips Supabase through the backend API.</p>
-
-      <label class="text-gray-400 text-sm">Program Name</label>
-      <input id="ref_program" value="${escapeHtml(r.programName)}" class="mb-3">
-
-      <label class="text-gray-400 text-sm">Website / Landing Base URL</label>
-      <input id="ref_base" value="${escapeHtml(r.baseUrl)}" class="mb-3">
-
-      <label class="text-gray-400 text-sm">Main Referral Code</label>
-      <input id="ref_code" value="${escapeHtml(r.defaultCode)}" class="mb-3">
-
-      <div class="grid md:grid-cols-2 gap-3 mb-3">
-        <div>
-          <label class="text-gray-400 text-sm">Rebate Type</label>
-          <select id="ref_type">
-            <option value="percent" ${r.rebateType==='percent'?'selected':''}>Percentage %</option>
-            <option value="fixed" ${r.rebateType==='fixed'?'selected':''}>Fixed Naira</option>
-          </select>
-        </div>
-        <div>
-          <label class="text-gray-400 text-sm">Rebate Value</label>
-          <input id="ref_value" value="${escapeHtml(r.rebateValue)}" placeholder="10 or 5000">
-        </div>
-      </div>
-
-      <div class="grid md:grid-cols-3 gap-3 mb-3">
-        <div><label class="text-gray-400 text-sm">Customer Bonus</label><input id="ref_customer_bonus" value="${escapeHtml(r.customerBonus)}"></div>
-        <div><label class="text-gray-400 text-sm">Cookie Days</label><input id="ref_cookie" value="${escapeHtml(r.cookieDays)}"></div>
-        <div><label class="text-gray-400 text-sm">Min Payout</label><input id="ref_min_payout" value="${escapeHtml(r.minPayout)}"></div>
-      </div>
-
-      <label class="text-gray-400 text-sm">Visibility</label>
-      <select id="ref_status" class="mb-3">
-        <option value="active" ${r.status==='active'?'selected':''}>Active - show across pages</option>
-        <option value="paused" ${r.status==='paused'?'selected':''}>Paused - show paused notice</option>
-      </select>
-
-      <label class="text-gray-400 text-sm">Public Marketing Message</label>
-      <textarea id="ref_message" rows="3" class="mb-3">${escapeHtml(r.publicMessage)}</textarea>
-
-      <label class="text-gray-400 text-sm">Admin Payout Rule</label>
-      <textarea id="ref_rule" rows="3" class="mb-4">${escapeHtml(r.payoutRule)}</textarea>
-
-      <div class="grid md:grid-cols-2 gap-3">
-        <button onclick="saveReferralSettings()" class="btn btn-gold">Save Referral Settings</button>
-        <button onclick="resetReferralSettings()" class="btn btn-dark">Reset Default</button>
-      </div>
-    </div>
-
-    <div class="grid gap-6">
-      <div class="vault p-6 rounded-3xl">
-        <div class="flex flex-wrap justify-between gap-4 mb-4">
-          <div>
-            <h3 class="text-3xl font-black gold">Live Referral Link</h3>
-            <p class="text-gray-400">Use this in WhatsApp, TikTok bio, landing page buttons, trader dashboard banners and email campaigns.</p>
-          </div>
-          <span class="badge">${r.cookieDays} day tracking window</span>
-        </div>
-        <div class="referral-link-box mb-4">${baseLink}</div>
-        <div class="flex flex-wrap gap-3">
-          <button onclick="copyReferralLink()" class="btn btn-gold">Copy Referral Link</button>
-          <button onclick="copyReferralMessage()" class="btn btn-dark">Copy Marketing Message</button>
-        </div>
-      </div>
-
-      <div class="vault p-6 rounded-3xl">
-        <h3 class="text-3xl font-black gold mb-4">Plan Rebate Preview</h3>
-        <div class="grid referral-grid gap-4">
-          ${plans.map(p=>`
-            <div class="referral-plan-card p-5 rounded-2xl">
-              <p class="text-gray-500 text-sm">${escapeHtml(p.name||'Challenge Plan')}</p>
-              <h3 class="text-3xl font-black gold mt-1">${money(p.fee)}</h3>
-              <p class="text-gray-400 mt-2">Estimated rebate per approved sale:</p>
-              <b class="text-2xl text-green-400">${money(referralEstimate(p.fee))}</b>
-            </div>`).join("") || `<div class="card2 p-5 rounded-2xl text-gray-400">No challenge plans found yet.</div>`}
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="vault p-6 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-4 mb-5">
-      <div>
-        <h3 class="text-3xl font-black gold">Referral Tracking Table</h3>
-        <p class="text-gray-400">This reads referral fields if your backend supplies ref_code, referral_code, affiliate_code, source_ref or referred_by.</p>
-      </div>
-      <span class="badge">Soft admin tracking</span>
-    </div>
-    <div class="tableWrap">
-      <table>
-        <thead><tr><th>Referral Code</th><th>Trader</th><th>Email</th><th>Plan</th><th>Fee</th><th>Status</th><th>Estimated Rebate</th><th>Date</th></tr></thead>
-        <tbody>
-          ${referredPurchases.map(p=>`
-            <tr>
-              <td><b class="gold">${referralKnownCode(p)}</b>${referralSelfReferralRisk(p)?`<br><span class="badge test-badge">SELF-REFERRAL RISK</span>`:""}</td>
-              <td>${escapeHtml(p.trader_name||p.name||'Trader')}</td>
-              <td class="text-gray-400">${escapeHtml(p.email||'-')}</td>
-              <td>${escapeHtml(p.plan_name||p.selected_plan||'-')}</td>
-              <td>${money(p.fee)}</td>
-              <td><span class="badge">${escapeHtml(p.payment_status||p.status||'pending')}</span></td>
-              <td class="text-green-400 font-black">${money(referralEstimate(p.fee))}</td>
-              <td class="text-gray-400">${formatDate(p.created_at)}</td>
-            </tr>`).join("") || `<tr><td colspan="8" class="text-center text-gray-400 py-10">No referred purchases detected yet. Add referral capture to landing/trader pages using ?ref=CODE and store it with purchases.</td></tr>`}
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="vault p-6 rounded-3xl">
-    <h3 class="text-3xl font-black gold mb-4">How to Show It On All NairaPips Pages</h3>
-    <div class="grid md:grid-cols-3 gap-4">
-      <div class="card2 p-5 rounded-2xl"><b class="gold">Landing Page</b><p class="text-gray-400 mt-2">Put the referral offer near pricing and checkout CTA. Track ?ref=CODE before payment.</p></div>
-      <div class="card2 p-5 rounded-2xl"><b class="gold">Trader Dashboard</b><p class="text-gray-400 mt-2">Show each trader their personal referral link and rebate rule.</p></div>
-      <div class="card2 p-5 rounded-2xl"><b class="gold">Admin Pages</b><p class="text-gray-400 mt-2">The global referral banner above is now visible across every admin module.</p></div>
-    </div>
-  </div>`;
-}
-
-
-
-/* STAFF RBAC */
-function roleLabel(role){
-  if(role === "super_admin") return "Super Admin";
-  return role || "Custom Staff";
-}
-
-function staffStatusBadge(status){
-  const s = String(status||"active").toLowerCase();
-  const cls = s === "active" ? "text-green-400" : s === "suspended" ? "text-red-400" : "text-yellow-400";
-  return `<span class="badge ${cls}">${s.toUpperCase()}</span>`;
-}
-
-function permissionCount(perms, role){
-  const p = normalizePermissions(perms, role);
-  if(p === "all") return "All access";
-  return Object.keys(p).filter(m=>p[m]?.view).length + " module(s)";
-}
-
-function staffModule(){
-  if(!canDo("staff","view")) return document.getElementById("content").innerHTML = empty("You do not have access to Staff Management.");
-  const activeStaff = staffMembers.filter(s=>String(s.status||"active").toLowerCase()==="active").length;
-  const suspendedStaff = staffMembers.filter(s=>String(s.status||"").toLowerCase()==="suspended").length;
-
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5">
-      <div>
-        <span class="badge">SUPER ADMIN MANUAL ACCESS CONTROL</span>
-        <h3 class="text-4xl font-black gold mt-3">Staff Command Center</h3>
-        <p class="text-gray-400 mt-2">Create workers and personally choose exactly what each one can see, edit, delete, approve, export or reveal.</p>
-      </div>
-      <div class="card2 p-5 rounded-2xl min-w-[260px]">
-        <p class="text-gray-500 text-sm">Logged in as</p>
-        <h3 class="text-2xl font-black gold">${currentAdmin.name || currentAdmin.username || "Super Admin"}</h3>
-        <p class="text-gray-400">${roleLabel(currentAdmin.role)}</p>
-      </div>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-4 gap-4 mb-8">
-    ${stat("Staff Accounts",staffMembers.length,"Workers created")}
-    ${stat("Active",activeStaff,"Can login")}
-    ${stat("Suspended",suspendedStaff,"Blocked access")}
-    ${stat("Audit Logs",auditLogs.length,"Recent actions")}
-  </div>
-
-  <div class="grid xl:grid-cols-[420px_1fr] gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-3xl font-black gold mb-2">Create Staff</h3>
-      <p class="text-gray-400 mb-5">You are the Super Admin. Give the worker a title, then tick exactly what they can see or do. No prepared role controls them.</p>
-      <input id="staff_name" placeholder="Full name" class="mb-3">
-      <input id="staff_email" placeholder="Email" class="mb-3">
-      <input id="staff_username" placeholder="Username" class="mb-3">
-      <input id="staff_password" placeholder="Temporary password" class="mb-3">
-      <input id="staff_role" placeholder="Custom role title e.g My Finance Boy / Support Girl" class="mb-4">
-
-      <div class="card2 p-4 rounded-2xl mb-4 border border-yellow-900/30">
-        <div class="flex flex-wrap justify-between gap-3 items-center mb-4">
-          <div>
-            <h4 class="text-xl font-black gold">Manual Permission Control</h4>
-            <p class="text-gray-500 text-sm">Tick what this staff can access. Unticked modules will be hidden from their sidebar.</p>
-          </div>
-          <div class="flex flex-wrap gap-2">
-            <button type="button" onclick="selectCommonStaffPreset('viewonly')" class="btn btn-dark">View Only</button>
-            <button type="button" onclick="selectCommonStaffPreset('support')" class="btn btn-dark">Support Helper</button>
-            <button type="button" onclick="selectCommonStaffPreset('marketing')" class="btn btn-dark">Marketing Helper</button>
-            <button type="button" onclick="selectCommonStaffPreset('clear')" class="btn btn-red">Clear All</button>
-          </div>
-        </div>
-        <div id="createPermissionGrid" class="permission-grid"></div>
-      </div>
-      <button onclick="createStaff()" class="btn btn-gold w-full">Create Staff With These Permissions</button>
-    </div>
-
-    <div class="vault p-6 rounded-3xl">
-      <div class="flex flex-wrap justify-between gap-4 mb-5">
-        <div>
-          <h3 class="text-3xl font-black gold">Staff Members</h3>
-          <p class="text-gray-400">Control who can enter NairaPips admin and what they can touch.</p>
-        </div>
-        <button onclick="loadData()" class="btn btn-dark">Refresh Staff</button>
-      </div>
-      <div class="grid gap-5">
-        ${staffMembers.map(staffCard).join("") || empty("No staff accounts yet. Create your first worker account.")}
-      </div>
-    </div>
-  </div>
-
-  <div class="vault p-6 rounded-3xl">
-    <h3 class="text-3xl font-black gold mb-4">Audit Logs</h3>
-    <div class="tableWrap">
-      <table>
-        <tr><th>Staff</th><th>Action</th><th>Module</th><th>Details</th><th>Date</th></tr>
-        ${(auditLogs||[]).slice(0,50).map(a=>`
-          <tr>
-            <td>${a.staff_name || a.username || "System"}</td>
-            <td><b>${a.action || "activity"}</b></td>
-            <td>${a.module || "admin"}</td>
-            <td class="text-gray-400">${a.details || "—"}</td>
-            <td>${formatDate(a.created_at)}</td>
-          </tr>`).join("") || `<tr><td colspan="5" class="text-center text-gray-400 py-8">No audit logs yet.</td></tr>`}
-      </table>
-    </div>
-  </div>`;
-  setTimeout(renderCreatePermissionGrid, 50);
-}
-
-function renderCreatePermissionGrid(){
-  const box = document.getElementById("createPermissionGrid");
-  if(!box) return;
-  if(!staffCreatePermissionDraft || Object.keys(staffCreatePermissionDraft).length === 0){
-    staffCreatePermissionDraft = emptyPermissions();
-  }
-  box.innerHTML = STAFF_MODULES.map(([module,label])=>createPermissionModuleCard(module,label)).join("");
-}
-
-function createPermissionModuleCard(module,label){
-  const p = staffCreatePermissionDraft[module] || {};
-  return `<div class="staff-permission-card">
-    <div class="flex justify-between items-center gap-3 mb-2">
-      <b class="gold">${label}</b>
-      <label class="staff-switch"><input type="checkbox" ${p.view?"checked":""} onchange="toggleCreatePerm('${module}','view',this.checked)"> View</label>
-    </div>
-    <div class="grid grid-cols-2 gap-x-3">
-      ${["create","edit","delete","approve","export","reveal_passwords"].map(a=>`
-        <label class="staff-switch"><input type="checkbox" ${p[a]?"checked":""} onchange="toggleCreatePerm('${module}','${a}',this.checked)"> ${a.replace("_"," ")}</label>
-      `).join("")}
-    </div>
-  </div>`;
-}
-
-function toggleCreatePerm(module, action, checked){
-  if(!staffCreatePermissionDraft[module]) staffCreatePermissionDraft[module] = {};
-  staffCreatePermissionDraft[module][action] = checked;
-  if(action !== "view" && checked) staffCreatePermissionDraft[module].view = true;
-  renderCreatePermissionGrid();
-}
-
-function selectCommonStaffPreset(type){
-  staffCreatePermissionDraft = emptyPermissions();
-  const allow = (mods, actions=["view"])=>{
-    mods.forEach(m=>{
-      if(!staffCreatePermissionDraft[m]) staffCreatePermissionDraft[m] = {};
-      actions.forEach(a=>staffCreatePermissionDraft[m][a]=true);
-      staffCreatePermissionDraft[m].view = true;
-    });
-  };
-  if(type === "viewonly") allow(STAFF_MODULES.map(x=>x[0]), ["view"]);
-  if(type === "support") allow(["overview","traders","support","announcements","database"], ["view","create","edit"]);
-  if(type === "marketing") allow(["overview","database","referrals","announcements","revenue"], ["view","create","edit","export"]);
-  if(type === "clear") staffCreatePermissionDraft = emptyPermissions();
-  renderCreatePermissionGrid();
-}
-
-function staffCard(s){
-  const perms = normalizePermissions(s.permissions, s.role);
-  const visibleModules = perms === "all" ? STAFF_MODULES.map(x=>x[0]) : Object.keys(perms).filter(m=>perms[m]?.view);
-  return `<div class="card2 p-5 rounded-2xl">
-    <div class="flex flex-wrap justify-between gap-4 mb-4">
-      <div>
-        ${staffStatusBadge(s.status)}
-        <h3 class="text-2xl font-black gold mt-3">${s.name || "Staff Member"}</h3>
-        <p class="text-gray-400">${s.email || ""} • @${s.username || ""}</p>
-      </div>
-      <div class="text-right">
-        <p class="text-gray-500 text-sm">Role</p>
-        <b>${roleLabel(s.role)}</b>
-        <p class="text-gray-500 text-xs mt-1">${permissionCount(s.permissions, s.role)}</p>
-      </div>
-    </div>
-    <div class="flex flex-wrap gap-2 mb-4">
-      ${visibleModules.slice(0,8).map(m=>`<span class="staff-pill">${STAFF_MODULES.find(x=>x[0]===m)?.[1] || m}</span>`).join("")}
-      ${visibleModules.length>8 ? `<span class="staff-pill">+${visibleModules.length-8} more</span>` : ""}
-    </div>
-    <div class="grid md:grid-cols-4 gap-3">
-      <button onclick="openPermissionEditor('${s.id}')" class="btn btn-gold">Edit Access</button>
-      <button onclick="resetStaffPassword('${s.id}')" class="btn btn-dark">Reset Password</button>
-      <button onclick="toggleStaffStatus('${s.id}','${String(s.status||"active").toLowerCase()==="active" ? "suspended" : "active"}')" class="btn ${String(s.status||"active").toLowerCase()==="active" ? "btn-red" : "btn-green"}">${String(s.status||"active").toLowerCase()==="active" ? "Suspend" : "Activate"}</button>
-      <button onclick="deleteStaff('${s.id}')" class="btn btn-red">Delete</button>
-    </div>
-  </div>`;
-}
-
-function openPermissionEditor(id){
-  const s = staffMembers.find(x=>String(x.id)===String(id));
-  if(!s) return;
-  staffPermissionDraft = normalizePermissions(s.permissions, s.role);
-  document.getElementById("content").innerHTML = `
-  <div class="vault p-7 rounded-3xl mb-8">
-    <button onclick="staffModule()" class="btn btn-dark mb-5">← Back to Staff</button>
-    <span class="badge">Permission Matrix</span>
-    <h3 class="text-4xl font-black gold mt-3">${s.name || "Staff"}</h3>
-    <p class="text-gray-400 mt-2">Tick only what this worker should see or do. Unticked modules disappear from their sidebar.</p>
-  </div>
-  <div class="vault p-6 rounded-3xl mb-8">
-    <div class="grid md:grid-cols-3 gap-4 mb-6">
-      <input id="edit_staff_name" value="${s.name || ""}" placeholder="Name">
-      <input id="edit_staff_email" value="${s.email || ""}" placeholder="Email">
-      <input id="edit_staff_role" value="${s.role || ""}" placeholder="Custom role title">
-    </div>
-    <div class="permission-grid">
-      ${STAFF_MODULES.map(([module,label])=>permissionModuleCard(module,label)).join("")}
-    </div>
-    <div class="flex flex-wrap gap-3 mt-6">
-      <button onclick="saveStaffPermissions('${s.id}')" class="btn btn-gold">Save Staff Permissions</button>
-      <button onclick="staffModule()" class="btn btn-dark">Cancel</button>
-    </div>
-  </div>`;
-}
-
-function permissionModuleCard(module,label){
-  const p = staffPermissionDraft[module] || {};
-  return `<div class="staff-permission-card">
-    <div class="flex justify-between items-center gap-3 mb-2">
-      <b class="gold">${label}</b>
-      <label class="staff-switch"><input type="checkbox" ${p.view?"checked":""} onchange="togglePerm('${module}','view',this.checked)"> View</label>
-    </div>
-    <div class="grid grid-cols-2 gap-x-3">
-      ${["create","edit","delete","approve","export","reveal_passwords"].map(a=>`
-        <label class="staff-switch"><input type="checkbox" ${p[a]?"checked":""} onchange="togglePerm('${module}','${a}',this.checked)"> ${a.replace("_"," ")}</label>
-      `).join("")}
-    </div>
-  </div>`;
-}
-
-function togglePerm(module, action, checked){
-  if(!staffPermissionDraft[module]) staffPermissionDraft[module] = {};
-  staffPermissionDraft[module][action] = checked;
-  if(action !== "view" && checked) staffPermissionDraft[module].view = true;
-}
-
-async function createStaff(){
-  const role = document.getElementById("staff_role").value || "Custom Staff";
-  const permissions = staffCreatePermissionDraft && Object.keys(staffCreatePermissionDraft).length ? staffCreatePermissionDraft : emptyPermissions();
-  const payload = {
-    name:document.getElementById("staff_name").value,
-    email:document.getElementById("staff_email").value,
-    username:document.getElementById("staff_username").value,
-    password:document.getElementById("staff_password").value,
-    role,
-    permissions,
-    status:"active"
-  };
-  if(!payload.name || !payload.username || !payload.password){alert("Name, username and password are required.");return;}
-  const visibleCount = Object.keys(permissions).filter(m=>permissions[m]?.view).length;
-  if(visibleCount === 0 && !confirm("This staff has no module access. Create anyway?")) return;
-  try{ await postJSON(`${API_URL}/staff_members`, payload); alert("Staff account created with your custom permissions."); staffCreatePermissionDraft = emptyPermissions(); loadData(); }
-  catch(e){ alert(e.message || "Could not create staff."); }
-}
-
-async function saveStaffPermissions(id){
-  const payload = {id, name:document.getElementById("edit_staff_name").value, email:document.getElementById("edit_staff_email").value, role:document.getElementById("edit_staff_role").value, permissions:staffPermissionDraft};
-  try{ await postJSON(`${API_URL}/staff_members/update`, payload); alert("Permissions saved."); loadData(); }
-  catch(e){ alert(e.message || "Could not save permissions."); }
-}
-
-async function toggleStaffStatus(id,status){
-  try{ await postJSON(`${API_URL}/staff_members/status`, {id,status}); alert("Staff status updated."); loadData(); }
-  catch(e){ alert(e.message || "Could not update staff."); }
-}
-
-async function resetStaffPassword(id){
-  const password = prompt("New temporary password:");
-  if(!password) return;
-  try{ await postJSON(`${API_URL}/staff_members/password`, {id,password}); alert("Password reset."); }
-  catch(e){ alert(e.message || "Could not reset password."); }
-}
-
-async function deleteStaff(id){
-  if(!confirm("Delete this staff account?")) return;
-  try{ await postJSON(`${API_URL}/staff_members/delete`, {id}); alert("Staff deleted."); loadData(); }
-  catch(e){ alert(e.message || "Could not delete staff."); }
-}
-
-
-function placeholder(title,msg){
-  document.getElementById("content").innerHTML = `<div class="vault p-8 rounded-3xl"><h3 class="text-3xl font-black gold mb-4">${title}</h3><p class="text-gray-400 text-lg">${msg}</p></div>`;
-}
-
-/* AFFILIATE & PARTNER MANAGER - SUPABASE BACKED */
-function affCode(v){return String(v||"").toUpperCase().replace(/[^A-Z0-9_-]/g,"").slice(0,40)}
-function affLink(code){return `https://nairapips.com/?ref=${affCode(code)}`}
-function affStatusBadge(s){s=String(s||"active").toLowerCase(); const c=s==="active"?"text-green-400":s==="paid"?"text-green-400":s==="pending"?"text-yellow-400":"text-red-400"; return `<span class="badge ${c}">${s.toUpperCase()}</span>`}
-function affiliateStat(label,value,extra=""){return `<div class="vault p-5 rounded-2xl"><p class="text-gray-400 text-sm">${label}</p><h3 class="text-3xl font-black gold">${value}</h3><p class="text-gray-500 text-xs mt-1">${extra}</p></div>`}
-
-function affiliatesModule(){
-  const summary=affiliateSummary||{};
-  const top=summary.top_partner||{};
-  document.getElementById("content").innerHTML=`
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5 items-start">
-      <div>
-        <span class="badge">GROWTH ENGINE</span>
-        <h3 class="text-4xl font-black gold mt-3">Affiliate & Partner Manager</h3>
-        <p class="text-gray-400 mt-2">Create marketer codes, partner links, promo/flash sale codes and track commissions from real Supabase records.</p>
-      </div>
-      <button onclick="loadData()" class="btn btn-gold">Refresh Affiliate Data</button>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-4 xl:grid-cols-8 gap-4 mb-8">
-    ${affiliateStat("Total Partners", summary.total_partners||affiliatePartners.length, "All partner accounts")}
-    ${affiliateStat("Active Partners", summary.active_partners||affiliatePartners.filter(p=>String(p.status||'active').toLowerCase()==='active').length, "Ready to sell")}
-    ${affiliateStat("Codes", summary.total_codes||affiliateCodes.length, "Promo + partner codes")}
-    ${affiliateStat("Affiliate Sales", money(summary.total_sales||0), "Tracked approved sales")}
-    ${affiliateStat("Pending Commissions", money(summary.pending_commissions||0), "Owed, not approved")}
-    ${affiliateStat("Approved Commissions", money(summary.approved_commissions||0), "Ready to pay")}
-    ${affiliateStat("Paid Commissions", money(summary.paid_commissions||0), "Already paid")}
-    ${affiliateStat("Top Partner", top.code||"None", top.sales?money(top.sales):"No sales yet")}
-  </div>
-
-  <div class="grid xl:grid-cols-[420px_1fr] gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl h-fit">
-      <span class="badge">CREATE PARTNER</span>
-      <h3 class="text-3xl font-black gold mt-3 mb-4">New Partner / Marketer</h3>
-      <input id="aff_partner_name" placeholder="Partner / influencer / marketer name" class="mb-3">
-      <label class="text-gray-400 text-sm font-bold">Partner Custom Code</label>
-      <div class="grid grid-cols-[1fr_auto] gap-3 mb-3">
-        <input id="aff_partner_code" placeholder="Type partner code e.g KUNLEFX, TRADERMIKE, FXACADEMY" oninput="this.value=affCode(this.value)">
-        <button type="button" onclick="generatePartnerCode()" class="btn btn-dark">Auto</button>
-      </div>
-      <div class="grid grid-cols-2 gap-3"><input id="aff_partner_email" placeholder="Email"><input id="aff_partner_phone" placeholder="Phone"></div>
-      <input id="aff_partner_company" placeholder="Company / TikTok / Telegram name" class="my-3">
-      <select id="aff_partner_type" class="mb-3"><option value="affiliate">Affiliate</option><option value="influencer">Influencer</option><option value="academy">Trading Academy</option><option value="corporate">Corporate Partner</option><option value="staff_marketer">Staff Marketer</option></select>
-      <div class="grid grid-cols-2 gap-3"><input id="aff_partner_comm" placeholder="Commission %" value="20"><input id="aff_partner_disc" placeholder="Discount %" value="0"></div>
-      <button onclick="createAffiliatePartner()" class="btn btn-gold w-full mt-4">Create Partner</button>
-    </div>
-    <div class="vault p-6 rounded-3xl">
-      <div class="flex flex-wrap justify-between gap-3 mb-5"><div><h3 class="text-3xl font-black gold">Partners</h3><p class="text-gray-400">Dedicated affiliate links for marketers, creators and partners.</p></div><button onclick="exportAffiliateCSV()" class="btn btn-dark">Export CSV</button></div>
-      <div class="tableWrap"><table><thead><tr><th>Partner</th><th>Type</th><th>Code</th><th>Link</th><th>Comm</th><th>Disc</th><th>Status</th><th>Action</th></tr></thead><tbody>
-      ${affiliatePartners.map(p=>`<tr><td><b>${escapeHtml(p.name||'')}</b><br><small class="text-gray-400">${escapeHtml(p.email||'')} ${escapeHtml(p.phone||'')}</small></td><td>${escapeHtml(p.partner_type||'affiliate')}</td><td class="gold font-black">${escapeHtml(p.code||'')}</td><td><button class="btn btn-dark" onclick="copyText('${affLink(p.code)}')">Copy Link</button></td><td>${p.commission_percent||0}%</td><td>${p.discount_percent||0}%</td><td>${affStatusBadge(p.status)}</td><td><button class="btn btn-red" onclick="deactivateAffiliatePartner('${p.id}')">Deactivate</button></td></tr>`).join('') || `<tr><td colspan="8" class="text-center text-gray-400 py-8">No partners yet.</td></tr>`}
-      </tbody></table></div>
-    </div>
-  </div>
-
-  <div class="grid xl:grid-cols-[420px_1fr] gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl h-fit">
-      <span class="badge">PROMO / FLASH / PARTNER CODE</span>
-      <h3 class="text-3xl font-black gold mt-3 mb-4">Create Sales Code</h3>
-      <label class="text-gray-400 text-sm font-bold">Custom Code Name</label>
-      <div class="grid grid-cols-[1fr_auto] gap-3 mb-3">
-        <input id="aff_code" placeholder="Type your own code e.g XMAS50, FLASH30, EIDDEAL, KUNLEFX" oninput="this.value=affCode(this.value)">
-        <button type="button" onclick="generateAffiliateCode()" class="btn btn-dark">Auto Generate</button>
-      </div>
-      <p class="text-gray-500 text-xs mb-3">You can name codes yourself for festive sales, urgent campaigns, influencers, partners or flash promos.</p>
-      <input id="aff_owner" placeholder="Owner / campaign name e.g Christmas Promo, Kunle TikTok, Eid Sales" class="mb-3">
-      <label class="text-gray-400 text-sm font-bold">Code Purpose</label>
-      <select id="aff_code_type" class="mb-3"><option value="affiliate">Affiliate Code</option><option value="partner">Partner Code</option><option value="promo">Promo Code</option><option value="flash_sale">Flash Sale</option><option value="event">Event / Festive Sales</option><option value="urgent_sale">Urgent Sales Push</option><option value="creator">Creator / Influencer Code</option></select>
-      <div class="grid grid-cols-2 gap-3"><input id="aff_code_comm" placeholder="Commission %" value="0"><input id="aff_code_disc" placeholder="Discount %" value="10"></div>
-      <div class="grid grid-cols-2 gap-3 my-3"><input id="aff_start" type="date"><input id="aff_end" type="date"></div>
-      <input id="aff_limit" placeholder="Usage limit, 0 = unlimited" value="0" class="mb-3">
-      <button onclick="createAffiliateCode()" class="btn btn-gold w-full">Create Code</button>
-    </div>
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-3xl font-black gold mb-5">Affiliate / Promo Codes</h3>
-      <div class="tableWrap"><table><thead><tr><th>Code</th><th>Owner</th><th>Type</th><th>Discount</th><th>Commission</th><th>Dates</th><th>Uses</th><th>Status</th><th>Action</th></tr></thead><tbody>
-      ${affiliateCodes.map(c=>`<tr><td class="gold font-black">${escapeHtml(c.code||'')}</td><td>${escapeHtml(c.owner_name||'')}</td><td>${escapeHtml(c.code_type||'affiliate')}</td><td>${c.discount_percent||0}%</td><td>${c.commission_percent||0}%</td><td><small>${c.start_date||'Any'} → ${c.end_date||'Any'}</small></td><td>${c.total_uses||0}/${c.usage_limit||'∞'}</td><td>${affStatusBadge(c.status)}</td><td><button class="btn btn-dark" onclick="copyText('${affLink(c.code)}')">Copy Link</button> <button class="btn btn-red" onclick="deactivateAffiliateCode('${c.id}')">Deactivate</button></td></tr>`).join('') || `<tr><td colspan="9" class="text-center text-gray-400 py-8">No codes yet.</td></tr>`}
-      </tbody></table></div>
-    </div>
-  </div>
-
-  <div class="vault p-6 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-3 mb-5"><div><h3 class="text-3xl font-black gold">Commission Wallet</h3><p class="text-gray-400">Approve, reject and mark affiliate commissions paid.</p></div><button onclick="createManualCommission()" class="btn btn-gold">Add Manual Commission</button></div>
-    <div class="tableWrap"><table><thead><tr><th>Status</th><th>Partner</th><th>Customer</th><th>Sale</th><th>Commission</th><th>Date</th><th>Actions</th></tr></thead><tbody>
-    ${affiliateCommissions.map(c=>`<tr><td>${affStatusBadge(c.status)}</td><td><b class="gold">${escapeHtml(c.partner_code||'')}</b><br><small>${escapeHtml(c.partner_name||'')}</small></td><td>${escapeHtml(c.customer_name||'')}<br><small class="text-gray-400">${escapeHtml(c.customer_email||'')}</small></td><td>${money(c.sale_amount||0)}</td><td><b>${money(c.commission_amount||0)}</b><br><small>${c.commission_percent||0}%</small></td><td>${formatDate(c.created_at)}</td><td><button class="btn btn-green" onclick="setAffiliateCommission('${c.id}','approved')">Approve</button> <button class="btn btn-gold" onclick="setAffiliateCommission('${c.id}','paid')">Paid</button> <button class="btn btn-red" onclick="setAffiliateCommission('${c.id}','rejected')">Reject</button></td></tr>`).join('') || `<tr><td colspan="7" class="text-center text-gray-400 py-8">No commissions yet.</td></tr>`}
-    </tbody></table></div>
-  </div>`;
-}
-
-function escapeHtml(v){return String(v??"").replace(/[&<>'"]/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[m]))}
-function copyText(text){navigator.clipboard?.writeText(text); alert("Copied: "+text)}
-async function createAffiliatePartner(){try{await postJSON(`${API_URL}/create_affiliate_partner`,{name:document.getElementById('aff_partner_name').value,code:document.getElementById('aff_partner_code').value,email:document.getElementById('aff_partner_email').value,phone:document.getElementById('aff_partner_phone').value,company:document.getElementById('aff_partner_company').value,partner_type:document.getElementById('aff_partner_type').value,commission_percent:document.getElementById('aff_partner_comm').value,discount_percent:document.getElementById('aff_partner_disc').value,admin_name:currentAdmin.name,admin_role:currentAdmin.role});alert('Partner created');loadData();}catch(e){alert(e.message)}}
-
-
-function generatePartnerCode(){
-  const name = (document.getElementById('aff_partner_name')?.value || 'PARTNER').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,10);
-  const stamp = Math.random().toString(36).toUpperCase().replace(/[^A-Z0-9]/g,'').slice(2,5);
-  const input = document.getElementById('aff_partner_code');
-  if(input) input.value = affCode(`${name}${stamp}`);
-}
-function generateAffiliateCode(){
-  const type = (document.getElementById('aff_code_type')?.value || 'promo').toUpperCase().replace(/[^A-Z0-9]/g,'');
-  const owner = (document.getElementById('aff_owner')?.value || '').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,8);
-  const stamp = Math.random().toString(36).toUpperCase().replace(/[^A-Z0-9]/g,'').slice(2,6);
-  const prefix = owner || (type === 'FLASH_SALE' ? 'FLASH' : type === 'EVENT' ? 'EVENT' : type === 'PARTNER' ? 'PARTNER' : 'NP');
-  const input = document.getElementById('aff_code');
-  if(input) input.value = affCode(`${prefix}${stamp}`);
-}
-async function createAffiliateCode(){try{const code=affCode(document.getElementById('aff_code').value); if(!code){alert('Please type a custom code name, for example XMAS50, FLASH30, EIDDEAL or KUNLEFX.');return;} await postJSON(`${API_URL}/create_affiliate_code`,{code,owner_name:document.getElementById('aff_owner').value,code_type:document.getElementById('aff_code_type').value,commission_percent:document.getElementById('aff_code_comm').value,discount_percent:document.getElementById('aff_code_disc').value,start_date:document.getElementById('aff_start').value,end_date:document.getElementById('aff_end').value,usage_limit:document.getElementById('aff_limit').value,admin_name:currentAdmin.name,admin_role:currentAdmin.role});alert('Code created: '+code);loadData();}catch(e){alert(e.message)}}
-async function deactivateAffiliatePartner(id){if(!confirm('Deactivate this partner?'))return;try{await postJSON(`${API_URL}/delete_affiliate_partner`,{id,admin_name:currentAdmin.name});loadData();}catch(e){alert(e.message)}}
-async function deactivateAffiliateCode(id){if(!confirm('Deactivate this code?'))return;try{await postJSON(`${API_URL}/delete_affiliate_code`,{id,admin_name:currentAdmin.name});loadData();}catch(e){alert(e.message)}}
-async function setAffiliateCommission(id,status){try{await postJSON(`${API_URL}/update_affiliate_commission`,{id,status,admin_name:currentAdmin.name});loadData();}catch(e){alert(e.message)}}
-async function createManualCommission(){const partner_code=affCode(prompt('Partner code?')||''); if(!partner_code)return; const customer_name=prompt('Customer name?')||''; const customer_email=prompt('Customer email?')||''; const sale_amount=prompt('Sale amount?')||'0'; const commission_percent=prompt('Commission percent?')||'20'; try{await postJSON(`${API_URL}/create_affiliate_commission`,{partner_code,customer_name,customer_email,sale_amount,commission_percent,partner_name:partner_code});loadData();}catch(e){alert(e.message)}}
-function exportAffiliateCSV(){const rows=[['type','name/code','email','sales/commission','status'],...affiliatePartners.map(p=>['partner',p.name,p.email,p.code,p.status]),...affiliateCommissions.map(c=>['commission',c.partner_code,c.customer_email,c.commission_amount,c.status])]; const csv=rows.map(r=>r.map(x=>`"${String(x??'').replace(/"/g,'""')}"`).join(',')).join('\n'); const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'})); a.download='nairapips-affiliates.csv'; a.click();}
-
-</script>
-
-<script>
-
-// Safe MT5 Password Generator Patch
-window.generateMT5Password = window.generateMT5Password || function(inputId, length = 14){
-  const upper = "ABCDEFGHJKLMNPQRSTUVWXYZ";
-  const lower = "abcdefghijkmnopqrstuvwxyz";
-  const numbers = "23456789";
-  const symbols = "@#$%&*!?";
-  const all = upper + lower + numbers + symbols;
-  let password = "";
-  password += upper[Math.floor(Math.random() * upper.length)];
-  password += lower[Math.floor(Math.random() * lower.length)];
-  password += numbers[Math.floor(Math.random() * numbers.length)];
-  password += symbols[Math.floor(Math.random() * symbols.length)];
-  for(let i=password.length; i<length; i++){
-    password += all[Math.floor(Math.random() * all.length)];
-  }
-  password = password.split("").sort(() => Math.random() - 0.5).join("");
-  const field = document.getElementById(inputId);
-  if(field) field.value = password;
-};
-
-window.copyMT5Field = window.copyMT5Field || async function(inputId){
-  const field = document.getElementById(inputId);
-  if(!field || !field.value){ alert("Nothing to copy yet."); return; }
-  try{
-    await navigator.clipboard.writeText(field.value);
-    alert("Password copied.");
-  }catch(e){
-    field.select();
-    document.execCommand("copy");
-    alert("Password copied.");
-  }
-};
-
-window.clearMT5Passwords = window.clearMT5Passwords || function(){
-  const master = document.getElementById("mt5_master");
-  const investor = document.getElementById("mt5_investor");
-  if(master) master.value = "";
-  if(investor) investor.value = "";
-};
-
-window.previewMT5PasswordRules = window.previewMT5PasswordRules || function(){
-  alert("Password rules:\\n\\n• 14 characters\\n• Uppercase letters\\n• Lowercase letters\\n• Numbers\\n• Symbols: @ # $ % & * ! ?\\n\\nUse different Master and Investor passwords for every MT5 account.");
-};
-
-
-/* AFFILIATE & PARTNER MANAGER - SUPABASE BACKED */
-function affCode(v){return String(v||"").toUpperCase().replace(/[^A-Z0-9_-]/g,"").slice(0,40)}
-function affLink(code){return `https://nairapips.com/?ref=${affCode(code)}`}
-function affStatusBadge(s){s=String(s||"active").toLowerCase(); const c=s==="active"?"text-green-400":s==="paid"?"text-green-400":s==="pending"?"text-yellow-400":"text-red-400"; return `<span class="badge ${c}">${s.toUpperCase()}</span>`}
-function affiliateStat(label,value,extra=""){return `<div class="vault p-5 rounded-2xl"><p class="text-gray-400 text-sm">${label}</p><h3 class="text-3xl font-black gold">${value}</h3><p class="text-gray-500 text-xs mt-1">${extra}</p></div>`}
-
-function affiliatesModule(){
-  const summary=affiliateSummary||{};
-  const top=summary.top_partner||{};
-  document.getElementById("content").innerHTML=`
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5 items-start">
-      <div>
-        <span class="badge">GROWTH ENGINE</span>
-        <h3 class="text-4xl font-black gold mt-3">Affiliate & Partner Manager</h3>
-        <p class="text-gray-400 mt-2">Create marketer codes, partner links, promo/flash sale codes and track commissions from real Supabase records.</p>
-      </div>
-      <button onclick="loadData()" class="btn btn-gold">Refresh Affiliate Data</button>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-4 xl:grid-cols-8 gap-4 mb-8">
-    ${affiliateStat("Total Partners", summary.total_partners||affiliatePartners.length, "All partner accounts")}
-    ${affiliateStat("Active Partners", summary.active_partners||affiliatePartners.filter(p=>String(p.status||'active').toLowerCase()==='active').length, "Ready to sell")}
-    ${affiliateStat("Codes", summary.total_codes||affiliateCodes.length, "Promo + partner codes")}
-    ${affiliateStat("Affiliate Sales", money(summary.total_sales||0), "Tracked approved sales")}
-    ${affiliateStat("Pending Commissions", money(summary.pending_commissions||0), "Owed, not approved")}
-    ${affiliateStat("Approved Commissions", money(summary.approved_commissions||0), "Ready to pay")}
-    ${affiliateStat("Paid Commissions", money(summary.paid_commissions||0), "Already paid")}
-    ${affiliateStat("Top Partner", top.code||"None", top.sales?money(top.sales):"No sales yet")}
-  </div>
-
-  <div class="grid xl:grid-cols-[420px_1fr] gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl h-fit">
-      <span class="badge">CREATE PARTNER</span>
-      <h3 class="text-3xl font-black gold mt-3 mb-4">New Partner / Marketer</h3>
-      <input id="aff_partner_name" placeholder="Partner / influencer / marketer name" class="mb-3">
-      <label class="text-gray-400 text-sm font-bold">Partner Custom Code</label>
-      <div class="grid grid-cols-[1fr_auto] gap-3 mb-3">
-        <input id="aff_partner_code" placeholder="Type partner code e.g KUNLEFX, TRADERMIKE, FXACADEMY" oninput="this.value=affCode(this.value)">
-        <button type="button" onclick="generatePartnerCode()" class="btn btn-dark">Auto</button>
-      </div>
-      <div class="grid grid-cols-2 gap-3"><input id="aff_partner_email" placeholder="Email"><input id="aff_partner_phone" placeholder="Phone"></div>
-      <input id="aff_partner_company" placeholder="Company / TikTok / Telegram name" class="my-3">
-      <select id="aff_partner_type" class="mb-3"><option value="affiliate">Affiliate</option><option value="influencer">Influencer</option><option value="academy">Trading Academy</option><option value="corporate">Corporate Partner</option><option value="staff_marketer">Staff Marketer</option></select>
-      <div class="grid grid-cols-2 gap-3"><input id="aff_partner_comm" placeholder="Commission %" value="20"><input id="aff_partner_disc" placeholder="Discount %" value="0"></div>
-      <button onclick="createAffiliatePartner()" class="btn btn-gold w-full mt-4">Create Partner</button>
-    </div>
-    <div class="vault p-6 rounded-3xl">
-      <div class="flex flex-wrap justify-between gap-3 mb-5"><div><h3 class="text-3xl font-black gold">Partners</h3><p class="text-gray-400">Dedicated affiliate links for marketers, creators and partners.</p></div><button onclick="exportAffiliateCSV()" class="btn btn-dark">Export CSV</button></div>
-      <div class="tableWrap"><table><thead><tr><th>Partner</th><th>Type</th><th>Code</th><th>Link</th><th>Comm</th><th>Disc</th><th>Status</th><th>Action</th></tr></thead><tbody>
-      ${affiliatePartners.map(p=>`<tr><td><b>${escapeHtml(p.name||'')}</b><br><small class="text-gray-400">${escapeHtml(p.email||'')} ${escapeHtml(p.phone||'')}</small></td><td>${escapeHtml(p.partner_type||'affiliate')}</td><td class="gold font-black">${escapeHtml(p.code||'')}</td><td><button class="btn btn-dark" onclick="copyText('${affLink(p.code)}')">Copy Link</button></td><td>${p.commission_percent||0}%</td><td>${p.discount_percent||0}%</td><td>${affStatusBadge(p.status)}</td><td><button class="btn btn-red" onclick="deactivateAffiliatePartner('${p.id}')">Deactivate</button></td></tr>`).join('') || `<tr><td colspan="8" class="text-center text-gray-400 py-8">No partners yet.</td></tr>`}
-      </tbody></table></div>
-    </div>
-  </div>
-
-  <div class="grid xl:grid-cols-[420px_1fr] gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl h-fit">
-      <span class="badge">PROMO / FLASH / PARTNER CODE</span>
-      <h3 class="text-3xl font-black gold mt-3 mb-4">Create Sales Code</h3>
-      <label class="text-gray-400 text-sm font-bold">Custom Code Name</label>
-      <div class="grid grid-cols-[1fr_auto] gap-3 mb-3">
-        <input id="aff_code" placeholder="Type your own code e.g XMAS50, FLASH30, EIDDEAL, KUNLEFX" oninput="this.value=affCode(this.value)">
-        <button type="button" onclick="generateAffiliateCode()" class="btn btn-dark">Auto Generate</button>
-      </div>
-      <p class="text-gray-500 text-xs mb-3">You can name codes yourself for festive sales, urgent campaigns, influencers, partners or flash promos.</p>
-      <input id="aff_owner" placeholder="Owner / campaign name e.g Christmas Promo, Kunle TikTok, Eid Sales" class="mb-3">
-      <label class="text-gray-400 text-sm font-bold">Code Purpose</label>
-      <select id="aff_code_type" class="mb-3"><option value="affiliate">Affiliate Code</option><option value="partner">Partner Code</option><option value="promo">Promo Code</option><option value="flash_sale">Flash Sale</option><option value="event">Event / Festive Sales</option><option value="urgent_sale">Urgent Sales Push</option><option value="creator">Creator / Influencer Code</option></select>
-      <div class="grid grid-cols-2 gap-3"><input id="aff_code_comm" placeholder="Commission %" value="0"><input id="aff_code_disc" placeholder="Discount %" value="10"></div>
-      <div class="grid grid-cols-2 gap-3 my-3"><input id="aff_start" type="date"><input id="aff_end" type="date"></div>
-      <input id="aff_limit" placeholder="Usage limit, 0 = unlimited" value="0" class="mb-3">
-      <button onclick="createAffiliateCode()" class="btn btn-gold w-full">Create Code</button>
-    </div>
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-3xl font-black gold mb-5">Affiliate / Promo Codes</h3>
-      <div class="tableWrap"><table><thead><tr><th>Code</th><th>Owner</th><th>Type</th><th>Discount</th><th>Commission</th><th>Dates</th><th>Uses</th><th>Status</th><th>Action</th></tr></thead><tbody>
-      ${affiliateCodes.map(c=>`<tr><td class="gold font-black">${escapeHtml(c.code||'')}</td><td>${escapeHtml(c.owner_name||'')}</td><td>${escapeHtml(c.code_type||'affiliate')}</td><td>${c.discount_percent||0}%</td><td>${c.commission_percent||0}%</td><td><small>${c.start_date||'Any'} → ${c.end_date||'Any'}</small></td><td>${c.total_uses||0}/${c.usage_limit||'∞'}</td><td>${affStatusBadge(c.status)}</td><td><button class="btn btn-dark" onclick="copyText('${affLink(c.code)}')">Copy Link</button> <button class="btn btn-red" onclick="deactivateAffiliateCode('${c.id}')">Deactivate</button></td></tr>`).join('') || `<tr><td colspan="9" class="text-center text-gray-400 py-8">No codes yet.</td></tr>`}
-      </tbody></table></div>
-    </div>
-  </div>
-
-  <div class="vault p-6 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-3 mb-5"><div><h3 class="text-3xl font-black gold">Commission Wallet</h3><p class="text-gray-400">Approve, reject and mark affiliate commissions paid.</p></div><button onclick="createManualCommission()" class="btn btn-gold">Add Manual Commission</button></div>
-    <div class="tableWrap"><table><thead><tr><th>Status</th><th>Partner</th><th>Customer</th><th>Sale</th><th>Commission</th><th>Date</th><th>Actions</th></tr></thead><tbody>
-    ${affiliateCommissions.map(c=>`<tr><td>${affStatusBadge(c.status)}</td><td><b class="gold">${escapeHtml(c.partner_code||'')}</b><br><small>${escapeHtml(c.partner_name||'')}</small></td><td>${escapeHtml(c.customer_name||'')}<br><small class="text-gray-400">${escapeHtml(c.customer_email||'')}</small></td><td>${money(c.sale_amount||0)}</td><td><b>${money(c.commission_amount||0)}</b><br><small>${c.commission_percent||0}%</small></td><td>${formatDate(c.created_at)}</td><td><button class="btn btn-green" onclick="setAffiliateCommission('${c.id}','approved')">Approve</button> <button class="btn btn-gold" onclick="setAffiliateCommission('${c.id}','paid')">Paid</button> <button class="btn btn-red" onclick="setAffiliateCommission('${c.id}','rejected')">Reject</button></td></tr>`).join('') || `<tr><td colspan="7" class="text-center text-gray-400 py-8">No commissions yet.</td></tr>`}
-    </tbody></table></div>
-  </div>`;
-}
-
-function escapeHtml(v){return String(v??"").replace(/[&<>'"]/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[m]))}
-function copyText(text){navigator.clipboard?.writeText(text); alert("Copied: "+text)}
-async function createAffiliatePartner(){try{await postJSON(`${API_URL}/create_affiliate_partner`,{name:document.getElementById('aff_partner_name').value,code:document.getElementById('aff_partner_code').value,email:document.getElementById('aff_partner_email').value,phone:document.getElementById('aff_partner_phone').value,company:document.getElementById('aff_partner_company').value,partner_type:document.getElementById('aff_partner_type').value,commission_percent:document.getElementById('aff_partner_comm').value,discount_percent:document.getElementById('aff_partner_disc').value,admin_name:currentAdmin.name,admin_role:currentAdmin.role});alert('Partner created');loadData();}catch(e){alert(e.message)}}
-async function createAffiliateCode(){try{const code=affCode(document.getElementById('aff_code').value); if(!code){alert('Please type a custom code name, for example XMAS50, FLASH30, EIDDEAL or KUNLEFX.');return;} await postJSON(`${API_URL}/create_affiliate_code`,{code,owner_name:document.getElementById('aff_owner').value,code_type:document.getElementById('aff_code_type').value,commission_percent:document.getElementById('aff_code_comm').value,discount_percent:document.getElementById('aff_code_disc').value,start_date:document.getElementById('aff_start').value,end_date:document.getElementById('aff_end').value,usage_limit:document.getElementById('aff_limit').value,admin_name:currentAdmin.name,admin_role:currentAdmin.role});alert('Code created: '+code);loadData();}catch(e){alert(e.message)}}
-async function deactivateAffiliatePartner(id){if(!confirm('Deactivate this partner?'))return;try{await postJSON(`${API_URL}/delete_affiliate_partner`,{id,admin_name:currentAdmin.name});loadData();}catch(e){alert(e.message)}}
-async function deactivateAffiliateCode(id){if(!confirm('Deactivate this code?'))return;try{await postJSON(`${API_URL}/delete_affiliate_code`,{id,admin_name:currentAdmin.name});loadData();}catch(e){alert(e.message)}}
-async function setAffiliateCommission(id,status){try{await postJSON(`${API_URL}/update_affiliate_commission`,{id,status,admin_name:currentAdmin.name});loadData();}catch(e){alert(e.message)}}
-async function createManualCommission(){const partner_code=affCode(prompt('Partner code?')||''); if(!partner_code)return; const customer_name=prompt('Customer name?')||''; const customer_email=prompt('Customer email?')||''; const sale_amount=prompt('Sale amount?')||'0'; const commission_percent=prompt('Commission percent?')||'20'; try{await postJSON(`${API_URL}/create_affiliate_commission`,{partner_code,customer_name,customer_email,sale_amount,commission_percent,partner_name:partner_code});loadData();}catch(e){alert(e.message)}}
-function exportAffiliateCSV(){const rows=[['type','name/code','email','sales/commission','status'],...affiliatePartners.map(p=>['partner',p.name,p.email,p.code,p.status]),...affiliateCommissions.map(c=>['commission',c.partner_code,c.customer_email,c.commission_amount,c.status])]; const csv=rows.map(r=>r.map(x=>`"${String(x??'').replace(/"/g,'""')}"`).join(',')).join('\n'); const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'})); a.download='nairapips-affiliates.csv'; a.click();}
-
-</script>
-
-<script>
-document.addEventListener("DOMContentLoaded", function(){
-  const pass = document.getElementById("adminPass");
-  const user = document.getElementById("adminUser");
-  [user, pass].forEach(el=>{
-    if(el){
-      el.addEventListener("keydown", function(e){
-        if(e.key === "Enter") adminLogin();
-      });
-    }
-  });
-});
-
-/* AFFILIATE & PARTNER MANAGER - SUPABASE BACKED */
-function affCode(v){return String(v||"").toUpperCase().replace(/[^A-Z0-9_-]/g,"").slice(0,40)}
-function affLink(code){return `https://nairapips.com/?ref=${affCode(code)}`}
-function affStatusBadge(s){s=String(s||"active").toLowerCase(); const c=s==="active"?"text-green-400":s==="paid"?"text-green-400":s==="pending"?"text-yellow-400":"text-red-400"; return `<span class="badge ${c}">${s.toUpperCase()}</span>`}
-function affiliateStat(label,value,extra=""){return `<div class="vault p-5 rounded-2xl"><p class="text-gray-400 text-sm">${label}</p><h3 class="text-3xl font-black gold">${value}</h3><p class="text-gray-500 text-xs mt-1">${extra}</p></div>`}
-
-function affiliatesModule(){
-  const summary=affiliateSummary||{};
-  const top=summary.top_partner||{};
-  document.getElementById("content").innerHTML=`
-  <div class="vault p-7 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-5 items-start">
-      <div>
-        <span class="badge">GROWTH ENGINE</span>
-        <h3 class="text-4xl font-black gold mt-3">Affiliate & Partner Manager</h3>
-        <p class="text-gray-400 mt-2">Create marketer codes, partner links, promo/flash sale codes and track commissions from real Supabase records.</p>
-      </div>
-      <button onclick="loadData()" class="btn btn-gold">Refresh Affiliate Data</button>
-    </div>
-  </div>
-
-  <div class="grid md:grid-cols-4 xl:grid-cols-8 gap-4 mb-8">
-    ${affiliateStat("Total Partners", summary.total_partners||affiliatePartners.length, "All partner accounts")}
-    ${affiliateStat("Active Partners", summary.active_partners||affiliatePartners.filter(p=>String(p.status||'active').toLowerCase()==='active').length, "Ready to sell")}
-    ${affiliateStat("Codes", summary.total_codes||affiliateCodes.length, "Promo + partner codes")}
-    ${affiliateStat("Affiliate Sales", money(summary.total_sales||0), "Tracked approved sales")}
-    ${affiliateStat("Pending Commissions", money(summary.pending_commissions||0), "Owed, not approved")}
-    ${affiliateStat("Approved Commissions", money(summary.approved_commissions||0), "Ready to pay")}
-    ${affiliateStat("Paid Commissions", money(summary.paid_commissions||0), "Already paid")}
-    ${affiliateStat("Top Partner", top.code||"None", top.sales?money(top.sales):"No sales yet")}
-  </div>
-
-  <div class="grid xl:grid-cols-[420px_1fr] gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl h-fit">
-      <span class="badge">CREATE PARTNER</span>
-      <h3 class="text-3xl font-black gold mt-3 mb-4">New Partner / Marketer</h3>
-      <input id="aff_partner_name" placeholder="Partner / influencer / marketer name" class="mb-3">
-      <label class="text-gray-400 text-sm font-bold">Partner Custom Code</label>
-      <div class="grid grid-cols-[1fr_auto] gap-3 mb-3">
-        <input id="aff_partner_code" placeholder="Type partner code e.g KUNLEFX, TRADERMIKE, FXACADEMY" oninput="this.value=affCode(this.value)">
-        <button type="button" onclick="generatePartnerCode()" class="btn btn-dark">Auto</button>
-      </div>
-      <div class="grid grid-cols-2 gap-3"><input id="aff_partner_email" placeholder="Email"><input id="aff_partner_phone" placeholder="Phone"></div>
-      <input id="aff_partner_company" placeholder="Company / TikTok / Telegram name" class="my-3">
-      <select id="aff_partner_type" class="mb-3"><option value="affiliate">Affiliate</option><option value="influencer">Influencer</option><option value="academy">Trading Academy</option><option value="corporate">Corporate Partner</option><option value="staff_marketer">Staff Marketer</option></select>
-      <div class="grid grid-cols-2 gap-3"><input id="aff_partner_comm" placeholder="Commission %" value="20"><input id="aff_partner_disc" placeholder="Discount %" value="0"></div>
-      <button onclick="createAffiliatePartner()" class="btn btn-gold w-full mt-4">Create Partner</button>
-    </div>
-    <div class="vault p-6 rounded-3xl">
-      <div class="flex flex-wrap justify-between gap-3 mb-5"><div><h3 class="text-3xl font-black gold">Partners</h3><p class="text-gray-400">Dedicated affiliate links for marketers, creators and partners.</p></div><button onclick="exportAffiliateCSV()" class="btn btn-dark">Export CSV</button></div>
-      <div class="tableWrap"><table><thead><tr><th>Partner</th><th>Type</th><th>Code</th><th>Link</th><th>Comm</th><th>Disc</th><th>Status</th><th>Action</th></tr></thead><tbody>
-      ${affiliatePartners.map(p=>`<tr><td><b>${escapeHtml(p.name||'')}</b><br><small class="text-gray-400">${escapeHtml(p.email||'')} ${escapeHtml(p.phone||'')}</small></td><td>${escapeHtml(p.partner_type||'affiliate')}</td><td class="gold font-black">${escapeHtml(p.code||'')}</td><td><button class="btn btn-dark" onclick="copyText('${affLink(p.code)}')">Copy Link</button></td><td>${p.commission_percent||0}%</td><td>${p.discount_percent||0}%</td><td>${affStatusBadge(p.status)}</td><td><button class="btn btn-red" onclick="deactivateAffiliatePartner('${p.id}')">Deactivate</button></td></tr>`).join('') || `<tr><td colspan="8" class="text-center text-gray-400 py-8">No partners yet.</td></tr>`}
-      </tbody></table></div>
-    </div>
-  </div>
-
-  <div class="grid xl:grid-cols-[420px_1fr] gap-6 mb-8">
-    <div class="vault p-6 rounded-3xl h-fit">
-      <span class="badge">PROMO / FLASH / PARTNER CODE</span>
-      <h3 class="text-3xl font-black gold mt-3 mb-4">Create Sales Code</h3>
-      <label class="text-gray-400 text-sm font-bold">Custom Code Name</label>
-      <div class="grid grid-cols-[1fr_auto] gap-3 mb-3">
-        <input id="aff_code" placeholder="Type your own code e.g XMAS50, FLASH30, EIDDEAL, KUNLEFX" oninput="this.value=affCode(this.value)">
-        <button type="button" onclick="generateAffiliateCode()" class="btn btn-dark">Auto Generate</button>
-      </div>
-      <p class="text-gray-500 text-xs mb-3">You can name codes yourself for festive sales, urgent campaigns, influencers, partners or flash promos.</p>
-      <input id="aff_owner" placeholder="Owner / campaign name e.g Christmas Promo, Kunle TikTok, Eid Sales" class="mb-3">
-      <label class="text-gray-400 text-sm font-bold">Code Purpose</label>
-      <select id="aff_code_type" class="mb-3"><option value="affiliate">Affiliate Code</option><option value="partner">Partner Code</option><option value="promo">Promo Code</option><option value="flash_sale">Flash Sale</option><option value="event">Event / Festive Sales</option><option value="urgent_sale">Urgent Sales Push</option><option value="creator">Creator / Influencer Code</option></select>
-      <div class="grid grid-cols-2 gap-3"><input id="aff_code_comm" placeholder="Commission %" value="0"><input id="aff_code_disc" placeholder="Discount %" value="10"></div>
-      <div class="grid grid-cols-2 gap-3 my-3"><input id="aff_start" type="date"><input id="aff_end" type="date"></div>
-      <input id="aff_limit" placeholder="Usage limit, 0 = unlimited" value="0" class="mb-3">
-      <button onclick="createAffiliateCode()" class="btn btn-gold w-full">Create Code</button>
-    </div>
-    <div class="vault p-6 rounded-3xl">
-      <h3 class="text-3xl font-black gold mb-5">Affiliate / Promo Codes</h3>
-      <div class="tableWrap"><table><thead><tr><th>Code</th><th>Owner</th><th>Type</th><th>Discount</th><th>Commission</th><th>Dates</th><th>Uses</th><th>Status</th><th>Action</th></tr></thead><tbody>
-      ${affiliateCodes.map(c=>`<tr><td class="gold font-black">${escapeHtml(c.code||'')}</td><td>${escapeHtml(c.owner_name||'')}</td><td>${escapeHtml(c.code_type||'affiliate')}</td><td>${c.discount_percent||0}%</td><td>${c.commission_percent||0}%</td><td><small>${c.start_date||'Any'} → ${c.end_date||'Any'}</small></td><td>${c.total_uses||0}/${c.usage_limit||'∞'}</td><td>${affStatusBadge(c.status)}</td><td><button class="btn btn-dark" onclick="copyText('${affLink(c.code)}')">Copy Link</button> <button class="btn btn-red" onclick="deactivateAffiliateCode('${c.id}')">Deactivate</button></td></tr>`).join('') || `<tr><td colspan="9" class="text-center text-gray-400 py-8">No codes yet.</td></tr>`}
-      </tbody></table></div>
-    </div>
-  </div>
-
-  <div class="vault p-6 rounded-3xl mb-8">
-    <div class="flex flex-wrap justify-between gap-3 mb-5"><div><h3 class="text-3xl font-black gold">Commission Wallet</h3><p class="text-gray-400">Approve, reject and mark affiliate commissions paid.</p></div><button onclick="createManualCommission()" class="btn btn-gold">Add Manual Commission</button></div>
-    <div class="tableWrap"><table><thead><tr><th>Status</th><th>Partner</th><th>Customer</th><th>Sale</th><th>Commission</th><th>Date</th><th>Actions</th></tr></thead><tbody>
-    ${affiliateCommissions.map(c=>`<tr><td>${affStatusBadge(c.status)}</td><td><b class="gold">${escapeHtml(c.partner_code||'')}</b><br><small>${escapeHtml(c.partner_name||'')}</small></td><td>${escapeHtml(c.customer_name||'')}<br><small class="text-gray-400">${escapeHtml(c.customer_email||'')}</small></td><td>${money(c.sale_amount||0)}</td><td><b>${money(c.commission_amount||0)}</b><br><small>${c.commission_percent||0}%</small></td><td>${formatDate(c.created_at)}</td><td><button class="btn btn-green" onclick="setAffiliateCommission('${c.id}','approved')">Approve</button> <button class="btn btn-gold" onclick="setAffiliateCommission('${c.id}','paid')">Paid</button> <button class="btn btn-red" onclick="setAffiliateCommission('${c.id}','rejected')">Reject</button></td></tr>`).join('') || `<tr><td colspan="7" class="text-center text-gray-400 py-8">No commissions yet.</td></tr>`}
-    </tbody></table></div>
-  </div>`;
-}
-
-function escapeHtml(v){return String(v??"").replace(/[&<>'"]/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[m]))}
-function copyText(text){navigator.clipboard?.writeText(text); alert("Copied: "+text)}
-async function createAffiliatePartner(){try{await postJSON(`${API_URL}/create_affiliate_partner`,{name:document.getElementById('aff_partner_name').value,code:document.getElementById('aff_partner_code').value,email:document.getElementById('aff_partner_email').value,phone:document.getElementById('aff_partner_phone').value,company:document.getElementById('aff_partner_company').value,partner_type:document.getElementById('aff_partner_type').value,commission_percent:document.getElementById('aff_partner_comm').value,discount_percent:document.getElementById('aff_partner_disc').value,admin_name:currentAdmin.name,admin_role:currentAdmin.role});alert('Partner created');loadData();}catch(e){alert(e.message)}}
-async function createAffiliateCode(){try{const code=affCode(document.getElementById('aff_code').value); if(!code){alert('Please type a custom code name, for example XMAS50, FLASH30, EIDDEAL or KUNLEFX.');return;} await postJSON(`${API_URL}/create_affiliate_code`,{code,owner_name:document.getElementById('aff_owner').value,code_type:document.getElementById('aff_code_type').value,commission_percent:document.getElementById('aff_code_comm').value,discount_percent:document.getElementById('aff_code_disc').value,start_date:document.getElementById('aff_start').value,end_date:document.getElementById('aff_end').value,usage_limit:document.getElementById('aff_limit').value,admin_name:currentAdmin.name,admin_role:currentAdmin.role});alert('Code created: '+code);loadData();}catch(e){alert(e.message)}}
-async function deactivateAffiliatePartner(id){if(!confirm('Deactivate this partner?'))return;try{await postJSON(`${API_URL}/delete_affiliate_partner`,{id,admin_name:currentAdmin.name});loadData();}catch(e){alert(e.message)}}
-async function deactivateAffiliateCode(id){if(!confirm('Deactivate this code?'))return;try{await postJSON(`${API_URL}/delete_affiliate_code`,{id,admin_name:currentAdmin.name});loadData();}catch(e){alert(e.message)}}
-async function setAffiliateCommission(id,status){try{await postJSON(`${API_URL}/update_affiliate_commission`,{id,status,admin_name:currentAdmin.name});loadData();}catch(e){alert(e.message)}}
-async function createManualCommission(){const partner_code=affCode(prompt('Partner code?')||''); if(!partner_code)return; const customer_name=prompt('Customer name?')||''; const customer_email=prompt('Customer email?')||''; const sale_amount=prompt('Sale amount?')||'0'; const commission_percent=prompt('Commission percent?')||'20'; try{await postJSON(`${API_URL}/create_affiliate_commission`,{partner_code,customer_name,customer_email,sale_amount,commission_percent,partner_name:partner_code});loadData();}catch(e){alert(e.message)}}
-function exportAffiliateCSV(){const rows=[['type','name/code','email','sales/commission','status'],...affiliatePartners.map(p=>['partner',p.name,p.email,p.code,p.status]),...affiliateCommissions.map(c=>['commission',c.partner_code,c.customer_email,c.commission_amount,c.status])]; const csv=rows.map(r=>r.map(x=>`"${String(x??'').replace(/"/g,'""')}"`).join(',')).join('\n'); const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'})); a.download='nairapips-affiliates.csv'; a.click();}
-
-</script>
-
-<script>
-/* NAIRAPIPS ADMIN CANONICAL LIFECYCLE OVERRIDE
-   Keeps old admin modules working while making their inputs production-safe.
-   Every trader row is mirrored from challenge_state/current_account before rendering. */
-(function(){
-  function clean(v){ return String(v || "").trim(); }
-  function norm(v){ return String(v || "").toLowerCase().replace(/[\s-]+/g,"_").trim(); }
-  function acct(t){ return t?.current_account || t?.__current_account || null; }
-  function state(t){ return norm(t?.challenge_state || "registered"); }
-  function isAssigned(a){ return !!(a && String(a.account_status || "").toLowerCase() === "assigned_active"); }
-  function mirrorTrader(t){
-    if(!t) return t;
-    const a = acct(t);
-    const s = state(t);
-    if(isAssigned(a)){
-      t.current_account = a;
-      t.__current_account = a;
-      t.mt5_login = a.mt5_login || "";
-      t.mt5_server = a.mt5_server || "";
-      t.mt5_master_password = a.mt5_master_password || "";
-      t.mt5_password = a.mt5_master_password || "";
-      t.master_password = a.mt5_master_password || "";
-      t.mt5_investor_password = a.mt5_investor_password || "";
-      t.investor_password = a.mt5_investor_password || "";
-      t.phase = a.stage || t.phase;
-      t.status = s === "funded_active" ? "funded" : `${a.stage || "phase1"}_active`;
-      t.account_size = a.account_size ?? a.start_balance ?? t.account_size;
-      t.starting_balance = a.start_balance ?? a.account_size ?? t.starting_balance;
-      t.balance = a.current_balance ?? t.balance;
-      t.equity = a.current_equity ?? t.equity;
-      t.current_equity = a.current_equity ?? t.current_equity;
-      t.highest_equity = a.highest_equity ?? a.current_equity ?? a.current_balance ?? a.account_size ?? t.highest_equity;
-      t.lowest_equity = a.lowest_equity ?? a.current_equity ?? a.current_balance ?? a.account_size ?? t.lowest_equity;
-      t.profit = a.profit ?? 0;
-      t.profit_percent = a.profit_percent ?? 0;
-      t.drawdown_percent = a.absolute_drawdown_percent ?? 0;
-      t.max_drawdown_used = Math.max(Number(a.dd_used_percent || 0), Number(a.dd_limit_percent || 20) > 0 ? (Math.abs(Number(a.absolute_drawdown_percent || 0)) / Number(a.dd_limit_percent || 20)) * 100 : 0);
-      const accountDate = a.display_assigned_at || a.assignment_date || a.assigned_at || a.created_at || a.updated_at || a.started_at;
-      t.assigned_at = accountDate || t.assigned_at;
-      t.current_account_assigned_at = accountDate || t.current_account_assigned_at;
-      t.challenge_started_at = accountDate || t.challenge_started_at;
-      t.mt5_updated_at = a.updated_at || accountDate || t.mt5_updated_at;
-      t.monitoring_enabled = a.monitoring_enabled !== false;
-      t.mt5_account_active = true;
-      t.mt5_access_disabled = false;
-      return t;
-    }
-    if(["phase2_waiting_mt5","phase1_passed","funded_waiting_mt5","phase2_passed","registered","purchase_pending","payment_rejected","breached","closed"].includes(s)){
-      t.mt5_login = "";
-      t.mt5_server = "";
-      t.mt5_master_password = "";
-      t.mt5_password = "";
-      t.master_password = "";
-      t.mt5_investor_password = "";
-      t.investor_password = "";
-      t.monitoring_enabled = false;
-      t.mt5_account_active = false;
-      t.mt5_access_disabled = true;
-    }
-    if(s === "phase2_waiting_mt5" || s === "phase1_passed"){ t.phase = "phase2_waiting"; t.status = "phase2_waiting_mt5"; }
-    if(s === "funded_waiting_mt5" || s === "phase2_passed"){ t.phase = "funded_waiting"; t.status = "funded_waiting_mt5"; }
-    if(s === "registered"){ t.phase = "no_account"; t.status = "new_signup"; }
-    if(s === "purchase_pending"){ t.status = "payment_pending"; }
-    if(s === "payment_rejected"){ t.status = "payment_rejected"; }
-    if(s === "breached"){ t.phase = "breached"; t.status = "breached"; }
-    return t;
-  }
-  async function enrichTrader(t){
-    try{
-      const key = encodeURIComponent(t.id || t.email || t.phone || t.account_reference || "");
-      if(!key) return mirrorTrader(t);
-      const res = await fetch(`${API_URL}/trader_current_account/${key}?fresh=${Date.now()}`, {cache:"no-store"});
-      const d = await res.json();
-      const p = d && d.data ? d.data : d;
-      if(p && p.trader){
-        const merged = Object.assign(t, p.trader);
-        merged.current_account = p.current_account || null;
-        merged.__current_account = p.current_account || null;
-        merged.challenge_state = p.challenge_state || merged.challenge_state || "registered";
-        if(typeof npApplyLiveMetrics === "function") npApplyLiveMetrics(merged);
-        return mirrorTrader(merged);
-      }
-    }catch(e){ console.warn("Lifecycle enrich skipped", e); }
-    if(typeof npApplyLiveMetrics === "function") npApplyLiveMetrics(t);
-    return mirrorTrader(t);
-  }
-  async function enrichAllTraders(){
-    if(!Array.isArray(traders)) return;
-    traders = await Promise.all(traders.map(enrichTrader));
-  }
-  window.npIsFundedActive = function(t){
-    const a = acct(t);
-    return state(t) === "funded_active" && isAssigned(a) && String(a.stage || "").toLowerCase() === "funded";
-  };
-  window.npNeedsPhaseAssignment = function(t){
-    return ["phase2_waiting_mt5","phase1_passed","funded_waiting_mt5","phase2_passed"].includes(state(t));
-  };
-  window.npAssignmentTargetPhase = function(t){
-    return ["funded_waiting_mt5","phase2_passed"].includes(state(t)) ? "funded" : "phase2";
-  };
-  window.npHasCurrentAssignedMt5 = function(t){ return isAssigned(acct(t)); };
-  window.npTMStage = function(t){
-    const a = acct(t), s = state(t);
-    if(isAssigned(a) && a.stage === "funded") return "funded_live";
-    if(isAssigned(a) && a.stage === "phase2") return "phase2";
-    if(isAssigned(a) && a.stage === "phase1") return "phase1";
-    if(["phase2_waiting_mt5","phase1_passed","funded_waiting_mt5","phase2_passed"].includes(s)) return "phase2";
-    return "unassigned";
-  };
-  window.npTMLogin = function(t){ return clean(acct(t)?.mt5_login || t?.mt5_login || ""); };
-  window.npTMServer = function(t){ return clean(acct(t)?.mt5_server || t?.mt5_server || ""); };
-  window.npTMMaster = function(t){ return clean(acct(t)?.mt5_master_password || t?.mt5_master_password || t?.mt5_password || t?.master_password || ""); };
-  window.npTMInvestor = function(t){ return clean(acct(t)?.mt5_investor_password || t?.mt5_investor_password || t?.investor_password || ""); };
-
-  const oldLoadData = window.loadData;
-  if(oldLoadData && !window.__npCanonicalAdminLoadWrapped){
-    window.__npCanonicalAdminLoadWrapped = true;
-    window.loadData = async function(){
-      await oldLoadData.apply(this, arguments);
-      await enrichAllTraders();
-      if(typeof render === "function") render();
-    };
-  }
-  const oldRender = window.render;
-  if(oldRender && !window.__npCanonicalAdminRenderWrapped){
-    window.__npCanonicalAdminRenderWrapped = true;
-    window.render = function(){
-      if(Array.isArray(traders)) traders = traders.map(mirrorTrader);
-      return oldRender.apply(this, arguments);
-    };
-  }
-})();
-</script>
-
-<script>
-/* NAIRAPIPS ADMIN LIFECYCLE HARD LOCK V7
-   Root rule: admin display/actions must read current_account + challenge_state,
-   not stale traders.phase/status/mt5_login or old challenge_purchases rows. */
-(function(){
-  function clean(v){ return String(v || "").trim(); }
-  function norm(v){ return clean(v).toLowerCase().replace(/[\s-]+/g,"_"); }
-  function acct(t){ return t && (t.current_account || t.__current_account) || null; }
-  function assigned(a){ return !!(a && norm(a.account_status || "assigned_active") === "assigned_active"); }
-  function state(t){ return norm(t && t.challenge_state || "registered"); }
-  function accountDate(a){
-    if(!a) return "";
-    return a.display_assigned_at || a.assignment_date || a.assigned_at || a.created_at || a.updated_at || a.started_at || "";
-  }
-  function mirror(t){
-    if(!t) return t;
-    const a = acct(t), s = state(t);
-    if(assigned(a)){
-      t.current_account = a;
-      t.__current_account = a;
-      t.mt5_login = clean(a.mt5_login);
-      t.mt5_server = clean(a.mt5_server);
-      t.mt5_master_password = clean(a.mt5_master_password);
-      t.mt5_password = clean(a.mt5_master_password);
-      t.master_password = clean(a.mt5_master_password);
-      t.mt5_investor_password = clean(a.mt5_investor_password);
-      t.investor_password = clean(a.mt5_investor_password);
-      t.phase = a.stage || t.phase;
-      t.status = s === "funded_active" ? "funded" : (a.stage ? `${a.stage}_active` : "active");
-      t.account_size = a.account_size ?? a.start_balance ?? t.account_size;
-      t.starting_balance = a.start_balance ?? a.account_size ?? t.starting_balance;
-      t.balance = a.current_balance ?? t.balance;
-      t.equity = a.current_equity ?? t.equity;
-      t.current_equity = a.current_equity ?? t.current_equity;
-      t.highest_equity = a.highest_equity ?? a.current_equity ?? a.current_balance ?? a.account_size ?? t.highest_equity;
-      t.lowest_equity = a.lowest_equity ?? a.current_equity ?? a.current_balance ?? a.account_size ?? t.lowest_equity;
-      t.profit = a.profit ?? 0;
-      t.profit_percent = a.profit_percent ?? 0;
-      t.drawdown_percent = a.absolute_drawdown_percent ?? 0;
-      t.max_drawdown_used = Math.max(Number(a.dd_used_percent || 0), Number(a.dd_limit_percent || 20) > 0 ? (Math.abs(Number(a.absolute_drawdown_percent || 0)) / Number(a.dd_limit_percent || 20)) * 100 : 0);
-      const d = accountDate(a);
-      t.assigned_at = d || t.assigned_at;
-      t.current_account_assigned_at = d || t.current_account_assigned_at;
-      t.challenge_started_at = d || t.challenge_started_at;
-      t.mt5_updated_at = a.updated_at || d || t.mt5_updated_at;
-      t.monitoring_enabled = a.monitoring_enabled !== false;
-      t.mt5_account_active = true;
-      t.mt5_access_disabled = false;
-      return t;
-    }
-    if(["phase2_waiting_mt5","phase1_passed","funded_waiting_mt5","phase2_passed","registered","purchase_pending","payment_rejected","breached","closed"].includes(s)){
-      t.mt5_login = "";
-      t.mt5_server = "";
-      t.mt5_master_password = "";
-      t.mt5_password = "";
-      t.master_password = "";
-      t.mt5_investor_password = "";
-      t.investor_password = "";
-      t.monitoring_enabled = false;
-      t.mt5_account_active = false;
-      t.mt5_access_disabled = true;
-    }
-    return t;
-  }
-  async function fetchLifecycle(t){
-    try{
-      const key = encodeURIComponent(clean(t.id || t.email || t.phone || t.account_reference));
-      if(!key) return mirror(t);
-      const res = await fetch(`${API_URL}/trader_current_account/${key}?_=${Date.now()}`, {cache:"no-store"});
-      const d = await res.json();
-      const p = d && d.data ? d.data : d;
-      if(p && p.trader){
-        Object.assign(t, p.trader);
-        t.current_account = p.current_account || null;
-        t.__current_account = p.current_account || null;
-        t.challenge_state = p.challenge_state || t.challenge_state || "registered";
-        if(typeof npApplyLiveMetrics === "function") npApplyLiveMetrics(t);
-      }
-    }catch(e){ console.warn("admin lifecycle fetch skipped", e); }
-    return mirror(t);
-  }
-  window.npAdminMirrorTrader = mirror;
-  window.npAdminLifecycleState = state;
-  window.npAdminCurrentAccount = acct;
-  window.npTraderAssignedAt = function(t){ return accountDate(acct(t)) || t?.current_account_assigned_at || t?.assigned_at || t?.mt5_updated_at || t?.updated_at || t?.created_at || ""; };
-  window.npTraderMt5Login = function(t){ const a=acct(t); return clean(a?.mt5_login || t?.mt5_login || ""); };
-  window.npTraderMt5Server = function(t){ const a=acct(t); return clean(a?.mt5_server || t?.mt5_server || ""); };
-  window.npTraderStage = function(t){
-    const a=acct(t), s=state(t);
-    if(assigned(a) && a.stage === "funded") return "funded";
-    if(assigned(a) && a.stage === "phase2") return "phase2";
-    if(assigned(a) && a.stage === "phase1") return "phase1";
-    if(["phase2_waiting_mt5","phase1_passed"].includes(s)) return "phase2_waiting";
-    if(["funded_waiting_mt5","phase2_passed"].includes(s)) return "funded_waiting";
-    return s || "registered";
-  };
-  window.npIsFundedActive = function(t){
-    const a=acct(t);
-    return state(t)==="funded_active" && assigned(a) && a.stage==="funded";
-  };
-  window.npPayoutEligible = function(t){
-    const a=acct(t);
-    return state(t)==="funded_active" && assigned(a) && a.stage==="funded";
-  };
-  window.npNeedsPhaseAssignment = function(t){
-    return ["phase2_waiting_mt5","phase1_passed","funded_waiting_mt5","phase2_passed"].includes(state(t));
-  };
-  window.npAssignmentTargetPhase = function(t){
-    return ["funded_waiting_mt5","phase2_passed"].includes(state(t)) ? "funded" : "phase2";
-  };
-  const oldLoadData = window.loadData;
-  if(oldLoadData && !window.__npAdminHardLockV7Load){
-    window.__npAdminHardLockV7Load = true;
-    window.loadData = async function(){
-      await oldLoadData.apply(this, arguments);
-      if(Array.isArray(traders)){
-        traders = await Promise.all(traders.map(fetchLifecycle));
-      }
-      if(typeof render === "function") render();
-    };
-  }
-  const oldRender = window.render;
-  if(oldRender && !window.__npAdminHardLockV7Render){
-    window.__npAdminHardLockV7Render = true;
-    window.render = function(){
-      if(Array.isArray(traders)) traders = traders.map(mirror);
-      return oldRender.apply(this, arguments);
-    };
-  }
-})();
-
-
-/* ADMIN SUPPORT: real-time view of exact trader dashboard.
-   Does not reveal or reset trader password. Trader is not notified. */
-async function npViewTraderDashboard(id){
-  try{
-    const t = (traders || []).find(x => String(x.id) === String(id));
-    if(!t) return alert("Trader not found");
-    const lookup = t.email || t.phone || t.id || t.account_reference;
-    if(!lookup) return alert("Trader lookup missing");
-
-    const admin_username = sessionStorage.getItem("np_admin_username") || (currentAdmin && currentAdmin.username) || "";
-    const admin_password = sessionStorage.getItem("np_admin_password") || "";
-    if(!admin_username || !admin_password){
-      return alert("Admin session expired. Please refresh and login to admin again.");
+        'programName': 'NairaPips Referral Program',
+        'baseUrl': 'https://nairapips.com',
+        'defaultCode': 'NAIRAPIPS',
+        'rebateType': 'percent',
+        'rebateValue': '10',
+        'rebate_percent': 10,
+        'customerBonus': '0',
+        'cookieDays': '30',
+        'cookie_days': 30,
+        'minPayout': '5000',
+        'status': 'active',
+        'publicMessage': 'Refer a trader to NairaPips and earn rebate when they buy a challenge.',
+        'payoutRule': 'Rebate is approved only after a referred trader pays and passes payment verification.'
     }
 
-    const res = await fetch(`${API_URL}/admin_view_trader_token`, {
-      method: "POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({lookup, admin_username, admin_password}),
-      cache: "no-store"
-    });
+@app.get('/referral_settings')
+def get_referral_settings():
+    default = referral_settings_default()
+    try:
+        res = supabase.table('referral_settings').select('*').eq('id', 'main').limit(1).execute()
+        rows = getattr(res, 'data', None) or []
+        row = rows[0] if rows else {}
+        data = dict(default)
+        if row:
+            rebate_value = row.get('rebate_value') if row.get('rebate_value') is not None else default['rebateValue']
+            cookie_days = row.get('cookie_days') if row.get('cookie_days') is not None else default['cookie_days']
+            data.update({
+                'programName': row.get('program_name') or default['programName'],
+                'baseUrl': row.get('base_url') or default['baseUrl'],
+                'defaultCode': row.get('default_code') or default['defaultCode'],
+                'rebateType': row.get('rebate_type') or default['rebateType'],
+                'rebateValue': str(rebate_value),
+                'rebate_percent': float(rebate_value or 10),
+                'customerBonus': row.get('customer_bonus') or default['customerBonus'],
+                'cookieDays': str(cookie_days),
+                'cookie_days': int(cookie_days or 30),
+                'minPayout': str(row.get('min_payout') or default['minPayout']),
+                'status': row.get('status') or default['status'],
+                'publicMessage': row.get('public_message') or default['publicMessage'],
+                'payoutRule': row.get('payout_rule') or default['payoutRule']
+            })
+        return jsonify({'success': True, 'data': data})
+    except Exception as e:
+        print('REFERRAL SETTINGS LOAD ERROR:', str(e))
+        return jsonify({'success': True, 'data': default})
 
-    const d = await res.json().catch(()=>({success:false,error:"Connection error"}));
-    if(!res.ok || d.success === false){
-      return alert(d.error || "Failed to open trader dashboard");
-    }
-
-    const p = d.data || d;
-    const q = new URLSearchParams();
-    q.set("admin_view", "1");
-    q.set("lookup", p.lookup || lookup);
-    q.set("auth_token", p.auth_token);
-    q.set("fresh", Date.now());
-    window.open(`/dashboard/?${q.toString()}`, "_blank", "noopener,noreferrer");
-  }catch(e){
-    alert("Could not open trader dashboard: " + (e.message || e));
-  }
-}
-
-</script>
-
-<script>
-/* NAIRAPIPS ADMIN GLOBAL FEED + LIFECYCLE AUTHORITY FINAL
-   Source of truth: Monitoring API -> Supabase trader_accounts.
-   Fixes admin stale values, Phase 2 passed -> Funded waiting, and Phase 1 passed -> Phase 2 waiting.
-   This patch intentionally uses the real admin `traders` array, not window.traders. */
-(function(){
-  'use strict';
-  const MONITORING_API = 'https://nairapips-monitoring-api.onrender.com';
-  const STALE_SECONDS = 120;
-  const REFRESH_MS = 7000;
-
-  function clean(v){ return String(v || '').trim(); }
-  function norm(v){ return clean(v).toLowerCase().replace(/[\s-]+/g,'_'); }
-  function compact(v){ return clean(v).toLowerCase().replace(/[\s_-]+/g,''); }
-  function num(v, d=0){ const n = Number(String(v ?? '').replace(/[₦,%\s]/g,'')); return Number.isFinite(n) ? n : d; }
-  function pack(d){ return d && d.data !== undefined ? d.data : d; }
-  function rowsFrom(d){ const x = pack(d); return Array.isArray(x) ? x : (Array.isArray(x?.accounts) ? x.accounts : []); }
-  function sameId(a,b){ return clean(a) && clean(b) && clean(a) === clean(b); }
-
-  function lifecycleFromAccount(a){
-    const stage = compact(a.stage || a.phase || '');
-    const pass = compact(a.phase_pass_status || a.pass_status || a.phase_status || '');
-    const status = compact(a.account_status || a.status || '');
-    const risk = compact(a.risk_zone || a.zone || '');
-
-    if(risk === 'breached' || status.includes('breach')){
-      return {phase:'breached', status:'breached', phase_pass_status: pass || '', target:'none', label:'BREACHED'};
-    }
-    if(pass.includes('phase2passed') || status.includes('phase2passed') || status.includes('fundedwaiting') || stage.includes('fundedwaiting')){
-      return {phase:'funded_waiting', status:'funded_waiting_mt5', phase_pass_status:'phase2_passed', target:'funded', label:'PHASE 2 PASSED — FUNDED WAITING'};
-    }
-    if(pass.includes('phase1passed') || status.includes('phase1passed') || status.includes('phase2waiting') || stage.includes('phase2waiting')){
-      return {phase:'phase2_waiting', status:'phase2_waiting_mt5', phase_pass_status:'phase1_passed', target:'phase2', label:'PHASE 1 PASSED — PHASE 2 WAITING'};
-    }
-    if(stage === 'funded' || stage === 'live' || status.includes('fundedactive') || status.includes('live')){
-      return {phase:'funded', status:'funded_active', phase_pass_status: pass || '', target:'none', label:'FUNDED / LIVE ACTIVE'};
-    }
-    if(stage === 'phase2' || status.includes('phase2')){
-      return {phase:'phase2', status:'active', phase_pass_status: pass || '', target:'none', label:'PHASE 2 ACTIVE'};
-    }
-    return {phase:'phase1', status: status || 'active', phase_pass_status: pass || '', target:'none', label:'PHASE 1 ACTIVE'};
-  }
-
-  function normalizeAccount(a){
-    a = a || {};
-    const start = num(a.start_balance ?? a.account_size ?? a.balance ?? a.current_balance, 0);
-    const equity = num(a.current_equity ?? a.equity ?? a.current_balance, start);
-    const currentDD = start > 0 ? Math.max(((start - equity) / start) * 100, 0) : 0;
-    const ddUsed = Math.max(num(a.dd_used_percent ?? a.max_drawdown_used, 0), (currentDD / 20) * 100);
-    const high = Math.max(num(a.highest_equity, start), equity, start);
-    const low = num(a.lowest_equity ?? a.recorded_lowest_equity, start || equity);
-    const life = lifecycleFromAccount(a);
-    return Object.assign({}, a, {
-      source_of_truth:'trader_accounts',
-      id: a.id,
-      trader_account_id: a.trader_account_id || a.id,
-      current_equity: equity,
-      equity: equity,
-      start_balance: start,
-      balance: start,
-      account_size: num(a.account_size, start),
-      current_profit: num(a.current_profit, equity - start),
-      current_profit_percent: num(a.current_profit_percent, start ? ((equity - start) / start) * 100 : 0),
-      profit_percent: num(a.profit_percent ?? a.current_profit_percent, start ? ((high - start) / start) * 100 : 0),
-      highest_equity: high,
-      lowest_equity: low,
-      drawdown_percent: +currentDD.toFixed(2),
-      absolute_drawdown_percent: +currentDD.toFixed(2),
-      dd_used_percent: +ddUsed.toFixed(2),
-      max_drawdown_used: +ddUsed.toFixed(2),
-      dd_remaining_percent: num(a.dd_remaining_percent, Math.max(20 - currentDD, 0)),
-      breach_equity_level: num(a.breach_equity_level, start * 0.8),
-      phase: life.phase,
-      stage: life.phase,
-      status: life.status,
-      phase_pass_status: life.phase_pass_status,
-      assignment_target: life.target,
-      lifecycle_label: life.label,
-      last_sync_at: a.last_sync_at || a.updated_at || a.synced_at || a.created_at || ''
-    });
-  }
-
-  function rowFromAccount(a, existing={}){
-    const t = a.trader || {};
-    const merged = Object.assign({}, existing, t, a, {
-      id: a.trader_id || t.id || existing.id || a.id,
-      trader_id: a.trader_id || t.id || existing.trader_id || existing.id,
-      trader_account_id: a.trader_account_id || a.id,
-      current_account: a,
-      __current_account: a,
-      active_accounts: [a],
-      name: a.full_name || a.name || t.name || existing.name || existing.full_name || 'Trader',
-      full_name: a.full_name || t.full_name || t.name || existing.full_name || existing.name || 'Trader',
-      email: a.email || t.email || existing.email || '',
-      phone: a.phone || t.phone || existing.phone || '',
-      phase: a.phase,
-      stage: a.phase,
-      status: a.status,
-      phase_pass_status: a.phase_pass_status,
-      mt5_login: a.mt5_login || existing.mt5_login || '',
-      mt5_server: a.mt5_server || existing.mt5_server || '',
-      risk_zone: a.risk_zone || a.zone || existing.risk_zone || 'safe',
-      balance: a.start_balance,
-      equity: a.current_equity,
-      current_equity: a.current_equity,
-      profit_percent: a.profit_percent,
-      current_profit_percent: a.current_profit_percent,
-      drawdown_percent: a.drawdown_percent,
-      max_drawdown_used: a.dd_used_percent,
-      dd_used_percent: a.dd_used_percent,
-      last_sync_at: a.last_sync_at,
-      source_of_truth: 'trader_accounts'
-    });
-    if(a.phase_pass_status === 'phase2_passed'){
-      merged.phase = 'funded_waiting';
-      merged.status = 'funded_waiting_mt5';
-    }else if(a.phase_pass_status === 'phase1_passed'){
-      merged.phase = 'phase2_waiting';
-      merged.status = 'phase2_waiting_mt5';
-    }
-    return merged;
-  }
-
-  function sameTraderOrAccount(t,a){
-    return sameId(t?.trader_account_id || t?.current_account?.id || t?.__current_account?.id, a.trader_account_id || a.id)
-      || sameId(t?.id || t?.trader_id, a.trader_id)
-      || sameId(t?.email, a.email)
-      || sameId(t?.mt5_login || t?.current_account?.mt5_login, a.mt5_login);
-  }
-
-  function setStatusBadge(accounts){
-    // Production admin must not show warning/toast banners.
-    // Live feed is applied silently; failed/stale monitoring must not disturb business modules.
-    const old = document.getElementById('npAdminGlobalFeedStatus');
-    if(old) old.remove();
-  }
-
-  function mergeIntoAdmin(accounts){
-    if(!Array.isArray(accounts)) return;
-    if(typeof traders === 'undefined' || !Array.isArray(traders)) return;
-    const normalized = accounts.map(normalizeAccount);
-    const used = new Set();
-    traders = traders.map(t=>{
-      const idx = normalized.findIndex((a,i)=>!used.has(i) && sameTraderOrAccount(t,a));
-      if(idx < 0) return t;
-      used.add(idx);
-      return rowFromAccount(normalized[idx], t);
-    });
-    normalized.forEach((a,i)=>{ if(!used.has(i)) traders.push(rowFromAccount(a)); });
-    window.npGlobalFeedAccounts = normalized;
-    window.npAdminLiveTraders = traders;
-    if(typeof npApplyLiveMetrics === 'function') traders = traders.map(t=>npApplyLiveMetrics(t));
-  }
-
-  function npAdminIsTypingInForm(){
-    const el = document.activeElement;
-    if(!el) return false;
-    const tag = String(el.tagName || '').toLowerCase();
-    return ['input','textarea','select'].includes(tag);
-  }
-
-  async function refreshAdminGlobalFeed(renderAfter=true){
-    try{
-      const controller = new AbortController();
-      const timer = setTimeout(()=>controller.abort(), 3500);
-      const r = await fetch(`${MONITORING_API}/monitorable_accounts?fresh=${Date.now()}`, {cache:'no-store', signal:controller.signal, headers:{'Cache-Control':'no-cache'}});
-      clearTimeout(timer);
-      const accounts = rowsFrom(await r.json().catch(()=>null));
-      const normalized = accounts.map(normalizeAccount);
-      setStatusBadge(normalized);
-      mergeIntoAdmin(normalized);
-
-      // Production safety: never redraw the screen while admin is typing into MT5 Pool forms.
-      // The old auto-render was wiping Plan Name, Account Size, MT5 Login, password and note fields.
-      const safeToRender = renderAfter && !npAdminIsTypingInForm();
-      if(safeToRender && typeof render === 'function') render();
-      return normalized;
-    }catch(e){
-      console.warn('Admin global feed refresh failed', e);
-      const old = document.getElementById('npAdminGlobalFeedStatus');
-      if(old) old.remove();
-      return [];
-    }
-  }
-
-  window.npRefreshAdminGlobalFeed = refreshAdminGlobalFeed;
-  window.npNeedsPhaseAssignment = function(t){
-    const pass = compact(t?.phase_pass_status || t?.current_account?.phase_pass_status || '');
-    const st = compact(t?.status || '');
-    const ph = compact(t?.phase || t?.stage || '');
-    if(pass.includes('phase2passed') || st.includes('phase2passed') || st.includes('fundedwaiting') || ph.includes('fundedwaiting')) return true;
-    if(pass.includes('phase1passed') || st.includes('phase1passed') || st.includes('phase2waiting') || ph.includes('phase2waiting')) return true;
-    return false;
-  };
-  window.npAssignmentTargetPhase = function(t){
-    const pass = compact(t?.phase_pass_status || t?.current_account?.phase_pass_status || '');
-    const st = compact(t?.status || '');
-    const ph = compact(t?.phase || t?.stage || '');
-    return (pass.includes('phase2passed') || st.includes('phase2passed') || st.includes('fundedwaiting') || ph.includes('fundedwaiting')) ? 'funded' : 'phase2';
-  };
-  // In this file, many modules call the lexical functions directly. Replace them too.
-  try{ npNeedsPhaseAssignment = window.npNeedsPhaseAssignment; }catch(e){}
-  try{ npAssignmentTargetPhase = window.npAssignmentTargetPhase; }catch(e){}
-
-  const oldLoadData = (typeof loadData === 'function') ? loadData : null;
-  if(oldLoadData && !oldLoadData.__npGlobalFeedProductionWrapped){
-    loadData = async function(){
-      // Business/admin modules load from the main API first. The MT5 global feed is a non-blocking enhancer.
-      const out = await oldLoadData.apply(this, arguments);
-      setTimeout(()=>{
-        refreshAdminGlobalFeed(false).then(()=>{
-          const allowed = ['overview','traderManagement','phaseAssignment','monitoring','mt5pool','funded'];
-          if(allowed.includes(String(currentModule||'')) && !npAdminIsTypingInForm() && typeof render === 'function') render();
-        }).catch(()=>{});
-      }, 80);
-      return out;
-    };
-    loadData.__npGlobalFeedProductionWrapped = true;
-  }
-
-  // No setInterval and no DOMContentLoaded auto-render. Auto-refresh was blocking/wiping production forms.
-  // Use the normal Refresh button to reload business data and silently merge live MT5 metrics.
-})();
-</script>
-
-<script>
-/* NAIRAPIPS FINAL ADMIN PHASE ASSIGNMENT FIX
-   Root fix:
-   - Phase MT5 Assignment must not depend on stale /traders deduped phase/status.
-   - It fetches each trader's current_account from the main API and derives assignment need
-     from the current account stage + phase_pass_status + risk/pass metrics.
-   - Active Phase 1/Phase 2 accounts stay out unless the account has truly passed.
-*/
-(function(){
-  'use strict';
-  const FETCH_TIMEOUT_MS = 9000;
-  const CONCURRENCY = 8;
-  let assignmentCache = [];
-  let assignmentLoadedAt = 0;
-
-  function clean(v){ return String(v == null ? '' : v).trim(); }
-  function compact(v){ return clean(v).toLowerCase().replace(/[\s_-]+/g,''); }
-  function num(v, d=0){ const n = Number(String(v ?? '').replace(/[₦,%\s]/g,'')); return Number.isFinite(n) ? n : d; }
-  function moneySafe(v){ return (typeof money === 'function') ? money(v) : ('₦' + num(v).toLocaleString()); }
-  function statSafe(a,b,c){ return (typeof stat === 'function') ? stat(a,b,c) : `<div class="vault p-5 rounded-2xl"><p class="text-gray-400 text-sm">${a}</p><h3 class="text-3xl font-black gold">${b}</h3><p class="text-gray-500 text-xs mt-1">${c||''}</p></div>`; }
-  function qSafe(){ return (typeof q === 'function') ? String(q()||'').toLowerCase() : ''; }
-  function blob(row){
-    try{ if(typeof npSearchBlob === 'function') return npSearchBlob(row); }catch(e){}
-    return Object.values(row || {}).map(v=>String(v||'')).join(' ').toLowerCase();
-  }
-  function activeMt5Pool(){
-    return (Array.isArray(mt5pool) ? mt5pool : []).filter(m => clean(m.status || 'available').toLowerCase() === 'available');
-  }
-  function availableMt5For(row){
-    const size = num(row.account_size || row.balance || row.current_account?.account_size || row.current_account?.start_balance, 0);
-    return activeMt5Pool().filter(m => {
-      const ms = num(m.account_size, 0);
-      return !size || !ms || Math.round(ms) === Math.round(size);
-    });
-  }
-  async function fetchJsonWithTimeout(url){
-    const controller = new AbortController();
-    const timer = setTimeout(()=>controller.abort(), FETCH_TIMEOUT_MS);
-    try{
-      const r = await fetch(url, {cache:'no-store', signal:controller.signal});
-      return await r.json().catch(()=>null);
-    }finally{
-      clearTimeout(timer);
-    }
-  }
-  function rowsFrom(x){
-    if(Array.isArray(x)) return x;
-    if(Array.isArray(x?.data)) return x.data;
-    if(Array.isArray(x?.rows)) return x.rows;
-    return [];
-  }
-  function keyForTrader(t){ return clean(t?.id || t?.email || t?.phone || t?.account_reference || t?.mt5_login); }
-  function accountKey(a){ return clean(a?.id || a?.trader_account_id || a?.mt5_login || a?.email); }
-  function accountStage(a){ return compact(a?.stage || a?.phase || ''); }
-  function accountBlob(a, t, pack){
-    return compact([
-      pack?.challenge_state, t?.challenge_state, t?.status, t?.phase, t?.phase_pass_status,
-      a?.stage, a?.phase, a?.status, a?.account_status, a?.phase_pass_status, a?.pass_status,
-      a?.phase_status, a?.risk_zone, a?.event_type, a?.message
-    ].join(' '));
-  }
-  function targetForAccount(a, t, pack){
-    if(!a) return null;
-    const b = accountBlob(a,t,pack);
-    const stg = accountStage(a);
-    const passProgress = num(a.pass_progress_percent, 0);
-    const profitPercent = num(a.profit_percent ?? a.current_profit_percent, 0);
-    const high = num(a.highest_equity, 0);
-    const base = num(a.account_size || a.start_balance || a.current_balance || t?.account_size || t?.balance, 0);
-    const risk = compact(a.risk_zone);
-
-    const phase2Evidence =
-      b.includes('phase2passed') || b.includes('phase2pass') ||
-      (stg.includes('phase2') && (risk === 'passed' || passProgress >= 100 || profitPercent >= 8 || (base > 0 && high >= base * 1.08)));
-
-    if(phase2Evidence) return 'funded';
-
-    const phase1Evidence =
-      b.includes('phase1passed') || b.includes('phase1pass') ||
-      (stg.includes('phase1') && (risk === 'passed' || passProgress >= 100 || profitPercent >= 10 || (base > 0 && high >= base * 1.10)));
-
-    if(phase1Evidence) return 'phase2';
-    return null;
-  }
-  function buildAssignmentRow(t, a, target, pack){
-    const size = num(a?.account_size || a?.start_balance || a?.current_balance || t?.account_size || t?.balance, 0);
-    return {
-      id: t?.id || a?.trader_id || '',
-      trader_id: t?.id || a?.trader_id || '',
-      trader_account_id: a?.id || a?.trader_account_id || '',
-      current_account: a || null,
-      name: t?.name || t?.full_name || a?.full_name || a?.name || 'Unnamed Trader',
-      email: t?.email || a?.email || '',
-      phone: t?.phone || a?.phone || '',
-      account_reference: t?.account_reference || a?.account_reference || a?.reference || '',
-      account_size: size,
-      balance: size,
-      plan_name: t?.plan_name || t?.selected_plan || a?.plan_name || a?.selected_plan || '',
-      selected_plan: t?.selected_plan || t?.plan_name || a?.selected_plan || a?.plan_name || '',
-      old_mt5_login: a?.mt5_login || t?.mt5_login || '',
-      old_mt5_server: a?.mt5_server || t?.mt5_server || '',
-      target_phase: target,
-      phase_pass_status: target === 'funded' ? 'phase2_passed' : 'phase1_passed',
-      pass_progress_percent: num(a?.pass_progress_percent, 0),
-      profit_percent: num(a?.profit_percent ?? a?.current_profit_percent, 0),
-      highest_equity: num(a?.highest_equity, 0),
-      last_sync_at: a?.last_sync_at || a?.updated_at || pack?.trader?.updated_at || t?.updated_at || ''
-    };
-  }
-  async function enrichOneTrader(t){
-    const key = encodeURIComponent(keyForTrader(t));
-    if(!key) return {trader:t, current_account:null, accounts:[]};
-    try{
-      const pack = await fetchJsonWithTimeout(`${API_URL}/trader_current_account/${key}?fresh=${Date.now()}`);
-      const p = pack && pack.data ? pack.data : pack;
-      if(p && (p.trader || p.current_account || p.accounts)){
-        const allAccounts = Array.isArray(p.all_accounts) ? p.all_accounts : [];
-        const visibleAccounts = Array.isArray(p.accounts) ? p.accounts : [];
-        const currentAccount = p.current_account || null;
-        const mergedAccounts = [];
-        const seenAccountKeys = new Set();
-        function addPhaseQueueAccount(acc){
-          if(!acc) return;
-          const k = String(acc.id || acc.trader_account_id || acc.mt5_login || JSON.stringify(acc));
-          if(seenAccountKeys.has(k)) return;
-          seenAccountKeys.add(k);
-          mergedAccounts.push(acc);
+@app.post('/referral_settings')
+def update_referral_settings():
+    body = request.get_json(silent=True) or {}
+    default = referral_settings_default()
+    try:
+        row = {
+            'id': 'main',
+            'program_name': body.get('programName') or default['programName'],
+            'base_url': body.get('baseUrl') or default['baseUrl'],
+            'default_code': body.get('defaultCode') or default['defaultCode'],
+            'rebate_type': body.get('rebateType') or default['rebateType'],
+            'rebate_value': body.get('rebateValue') or body.get('rebate_percent') or default['rebateValue'],
+            'customer_bonus': body.get('customerBonus') or default['customerBonus'],
+            'cookie_days': int(body.get('cookieDays') or body.get('cookie_days') or default['cookie_days']),
+            'min_payout': body.get('minPayout') or default['minPayout'],
+            'status': body.get('status') or default['status'],
+            'public_message': body.get('publicMessage') or default['publicMessage'],
+            'payout_rule': body.get('payoutRule') or default['payoutRule']
         }
-        allAccounts.forEach(addPhaseQueueAccount);
-        visibleAccounts.forEach(addPhaseQueueAccount);
-        addPhaseQueueAccount(currentAccount);
-        return {
-          trader: Object.assign({}, t || {}, p.trader || {}),
-          current_account: currentAccount,
-          accounts: mergedAccounts,
-          all_accounts: allAccounts,
-          challenge_state: p.challenge_state || ''
-        };
-      }
-    }catch(e){ console.warn('Phase assignment lifecycle fetch skipped', e); }
-    return {trader:t, current_account:t?.current_account || t?.__current_account || null, accounts:[t?.current_account || t?.__current_account].filter(Boolean), challenge_state:t?.challenge_state || ''};
-  }
-  async function limitMap(items, limit, mapper){
-    const out = new Array(items.length);
-    let idx = 0;
-    async function worker(){
-      while(idx < items.length){
-        const my = idx++;
-        out[my] = await mapper(items[my], my);
-      }
+        try:
+            supabase.table('referral_settings').upsert(row, on_conflict='id').execute()
+            return get_referral_settings()
+        except Exception as e:
+            print('REFERRAL SETTINGS SAVE ERROR:', str(e))
+            data = dict(default)
+            data.update({
+                'programName': row['program_name'],
+                'baseUrl': row['base_url'],
+                'defaultCode': row['default_code'],
+                'rebateType': row['rebate_type'],
+                'rebateValue': str(row['rebate_value']),
+                'rebate_percent': float(row['rebate_value'] or 10),
+                'customerBonus': row['customer_bonus'],
+                'cookieDays': str(row['cookie_days']),
+                'cookie_days': int(row['cookie_days'] or 30),
+                'minPayout': str(row['min_payout']),
+                'status': row['status'],
+                'publicMessage': row['public_message'],
+                'payoutRule': row['payout_rule']
+            })
+            return jsonify({'success': True, 'data': data, 'warning': 'Referral settings table unavailable; returned safe settings.'})
+    except Exception as e:
+        print('REFERRAL SETTINGS UPDATE ERROR:', str(e))
+        return jsonify({'success': True, 'data': default, 'warning': 'Referral settings update failed safely.'})
+
+@app.post('/referral_settings/reset')
+def reset_referral_settings():
+    default = referral_settings_default()
+    default_row = {
+        'id': 'main',
+        'program_name': default['programName'],
+        'base_url': default['baseUrl'],
+        'default_code': default['defaultCode'],
+        'rebate_type': default['rebateType'],
+        'rebate_value': default['rebateValue'],
+        'customer_bonus': default['customerBonus'],
+        'cookie_days': default['cookie_days'],
+        'min_payout': default['minPayout'],
+        'status': default['status'],
+        'public_message': default['publicMessage'],
+        'payout_rule': default['payoutRule']
     }
-    await Promise.all(Array.from({length:Math.min(limit, items.length)}, worker));
-    return out;
-  }
-  async function loadPhaseAssignmentRows(force=false){
-    if(!force && assignmentCache.length && Date.now() - assignmentLoadedAt < 20000) return assignmentCache;
+    try:
+        supabase.table('referral_settings').upsert(default_row, on_conflict='id').execute()
+    except Exception as e:
+        print('REFERRAL SETTINGS RESET SAVE ERROR:', str(e))
+    return jsonify({'success': True, 'data': default})
 
-    // Source of truth for this module: backend phase assignment queue.
-    // This endpoint already includes archived_phase1/archived_phase2 passed accounts.
-    try{
-      const queuePayload = await fetchJsonWithTimeout(`${API_URL}/phase_assignment_queue?fresh=${Date.now()}`);
-      const directRows = Array.isArray(queuePayload?.assignment_queue) ? queuePayload.assignment_queue : rowsFrom(queuePayload);
-      if(Array.isArray(queuePayload?.available_mt5)){
-        mt5pool = queuePayload.available_mt5;
-      }
-      if(directRows && directRows.length){
-        assignmentCache = directRows.map(r => ({
-          id: clean(r.trader_id || r.id || r.trader_account_id),
-          trader_id: clean(r.trader_id || r.id),
-          trader_account_id: clean(r.trader_account_id || r.completed_account_id || r.account_id),
-          completed_account_id: clean(r.completed_account_id || r.trader_account_id || r.account_id),
-          name: r.name || r.full_name || 'Unnamed Trader',
-          email: r.email || '',
-          phone: r.phone || '',
-          account_reference: r.account_reference || r.reference || '',
-          account_size: num(r.account_size || r.balance || r.current_equity, 0),
-          balance: num(r.account_size || r.balance || r.current_equity, 0),
-          plan_name: r.plan_name || r.selected_plan || '',
-          selected_plan: r.selected_plan || r.plan_name || '',
-          old_mt5_login: r.old_mt5_login || r.completed_mt5_login || r.mt5_login || '',
-          old_mt5_server: r.old_mt5_server || r.mt5_server || '',
-          target_phase: clean(r.target_phase || r.target_stage || '').toLowerCase().includes('funded') ? 'funded' : 'phase2',
-          phase_pass_status: r.phase_pass_status || (String(r.target_phase||'').toLowerCase().includes('funded') ? 'phase2_passed' : 'phase1_passed'),
-          pass_progress_percent: num(r.pass_progress_percent, 0),
-          profit_percent: num(r.profit_percent ?? r.current_profit_percent, 0),
-          highest_equity: num(r.highest_equity, 0),
-          last_sync_at: r.last_sync_at || r.archived_at || r.updated_at || r.passed_at || '',
-          source: r.source || 'phase_assignment_queue'
-        })).sort((a,b)=>{
-          if(a.target_phase !== b.target_phase) return a.target_phase === 'funded' ? -1 : 1;
-          return new Date(b.last_sync_at || 0) - new Date(a.last_sync_at || 0);
-        });
-        assignmentLoadedAt = Date.now();
-        return assignmentCache;
-      }
-    }catch(e){ console.warn('Direct phase_assignment_queue fetch skipped; falling back to local scan', e); }
+# ===== NAIRAPIPS STAFF RBAC ROUTES =====
+# Paste above: if __name__ == "__main__":
 
-    let source = Array.isArray(traders) ? traders.slice() : [];
-    try{
-      const raw = await fetchJsonWithTimeout(`${API_URL}/traders_raw?fresh=${Date.now()}`);
-      const rawRows = rowsFrom(raw);
-      if(rawRows.length) source = rawRows;
-    }catch(e){ console.warn('traders_raw skipped', e); }
+@app.get('/staff_members')
+def staff_members():
+    try:
+        res = supabase.table('admin_staff_members').select('*').order('created_at', desc=True).execute()
+        rows = res.data or []
+        for r in rows:
+            r.pop('password', None)
+        return jsonify(rows)
+    except Exception as e:
+        return jsonify([])
 
-    const byIdentity = new Map();
-    source.forEach(t => {
-      const k = clean(t?.id || t?.email || t?.phone || Math.random());
-      if(k) byIdentity.set(k, t);
-    });
+@app.post('/staff_login')
+def staff_login():
+    try:
+        data = request.get_json() or {}
+        username = (data.get('username') or '').strip()
+        password = data.get('password') or ''
+        res = supabase.table('admin_staff_members').select('*').eq('username', username).eq('password', password).limit(1).execute()
+        rows = res.data or []
+        if not rows:
+            return jsonify({'success': False, 'error': 'Invalid login'}), 401
+        staff = rows[0]
+        if (staff.get('status') or 'active') != 'active':
+            return jsonify({'success': False, 'error': 'Staff account is not active'}), 403
+        supabase.table('admin_staff_members').update({'last_login_at': 'now()'}).eq('id', staff['id']).execute()
+        audit_log(staff, 'auth', 'login', 'Staff logged in')
+        staff.pop('password', None)
+        return jsonify({'success': True, 'staff': staff})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-    const packs = await limitMap(Array.from(byIdentity.values()), CONCURRENCY, enrichOneTrader);
-    const map = new Map();
-    packs.forEach(pack => {
-      const t = pack.trader || {};
-      const accounts = [];
-      if(pack.current_account) accounts.push(pack.current_account);
-      (pack.accounts || []).forEach(a => { if(a && !accounts.find(x=>accountKey(x) === accountKey(a))) accounts.push(a); });
-      accounts.forEach(a => {
-        const target = targetForAccount(a, t, pack);
-        if(!target) return;
-        const row = buildAssignmentRow(t, a, target, pack);
-        if(!row.trader_id){ row.trader_id = t.id || a.trader_id || ''; row.id = row.trader_id; }
-        if(row.trader_id) map.set(`${row.trader_id}|${row.trader_account_id || row.old_mt5_login || target}`, row);
-      });
-    });
+@app.post('/staff_members')
+def create_staff_member():
+    try:
+        data = request.get_json() or {}
+        payload = {
+            'name': data.get('name'),
+            'email': data.get('email'),
+            'username': data.get('username'),
+            'password': data.get('password'),
+            'role': data.get('role') or 'support',
+            'permissions': data.get('permissions') or {},
+            'status': data.get('status') or 'active'
+        }
+        res = supabase.table('admin_staff_members').insert(payload).execute()
+        return jsonify({'success': True, 'data': res.data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-    assignmentCache = Array.from(map.values()).sort((a,b)=>{
-      if(a.target_phase !== b.target_phase) return a.target_phase === 'funded' ? -1 : 1;
-      return new Date(b.last_sync_at || 0) - new Date(a.last_sync_at || 0);
-    });
-    assignmentLoadedAt = Date.now();
-    return assignmentCache;
-  }
-  function renderPhaseAssignmentRows(rows){
-    const search = qSafe();
-    rows = (rows || []).filter(r => !search || blob(r).includes(search));
-    const phase2Count = rows.filter(r=>r.target_phase === 'phase2').length;
-    const fundedCount = rows.filter(r=>r.target_phase === 'funded').length;
-    const availableCount = activeMt5Pool().length;
-    const c = document.getElementById('content');
-    if(!c) return;
-    c.innerHTML = `
-    <div class="vault p-7 rounded-3xl mb-8">
-      <div class="flex flex-wrap justify-between gap-5">
-        <div>
-          <span class="badge">PRODUCTION PHASE CONTROL</span>
-          <h3 class="text-4xl font-black gold mt-3">Phase MT5 Assignment Center</h3>
-          <p class="text-gray-400 mt-2">Shows only accounts that have PASSED a phase and now need a fresh MT5. Active Phase 1/Phase 2 accounts are excluded.</p>
-        </div>
-        <button onclick="phaseAssignmentModule(true)" class="btn btn-gold">Reload Phase Queue</button>
-      </div>
-    </div>
-    <div class="grid md:grid-cols-4 gap-4 mb-8">
-      ${statSafe('Waiting Assignment', rows.length, 'Passed accounts needing next MT5')}
-      ${statSafe('Available MT5', availableCount, 'Pool stock')}
-      ${statSafe('Phase 2 Assignment', phase2Count, 'After Phase 1 pass')}
-      ${statSafe('Funded Assignment', fundedCount, 'After Phase 2 pass')}
-    </div>
-    <div class="tableWrap"><table>
-      <tr><th>Trader</th><th>Passed Stage</th><th>Account Size</th><th>Assign To</th><th>Available MT5</th><th>Action</th></tr>
-      ${rows.map(r=>{
-        const options = availableMt5For(r);
-        const selectId = clean([r.trader_id || r.id, r.completed_account_id || r.trader_account_id || r.old_mt5_login || r.target_phase].filter(Boolean).join('_')).replace(/[^a-zA-Z0-9_-]/g,'_');
-        const stageLabel = r.target_phase === 'funded' ? 'PHASE 2 PASSED → ASSIGN FUNDED MT5' : 'PHASE 1 PASSED → ASSIGN PHASE 2 MT5';
-        const targetLabel = r.target_phase === 'funded' ? 'Funded / Live' : 'Phase 2';
-        window.__npPhaseAssignRows = window.__npPhaseAssignRows || {};
-        window.__npPhaseAssignRows[selectId] = r;
-        return `<tr>
-          <td><b>${r.name}</b><br>${r.email}<br>${r.phone}<br><span class="text-gray-500">Trader Ref: ${r.account_reference || '—'}<br>Account Ref: ${r.trader_account_id || '—'}</span></td>
-          <td><span class="badge">${stageLabel}</span><br><span class="text-gray-400">Completed MT5: ${r.old_mt5_login || '—'}</span><br><span class="text-gray-500">Profit: ${num(r.profit_percent).toFixed(2)}% • Progress: ${num(r.pass_progress_percent).toFixed(2)}%</span></td>
-          <td><b>${moneySafe(r.account_size || r.balance || 0)}</b><br>${r.plan_name || ''}</td>
-          <td>
-            <select id="assign_phase_${selectId}" class="np-select">
-              <option value="phase2" ${r.target_phase==='phase2'?'selected':''}>Phase 2</option>
-              <option value="funded" ${r.target_phase==='funded'?'selected':''}>Funded / Live</option>
-            </select>
-          </td>
-          <td>
-            <select id="assign_mt5_${selectId}" class="np-select">
-              <option value="">Choose fresh MT5</option>
-              ${options.map(m=>`<option value="${m.id}">${m.mt5_login} • ${m.mt5_server} • ${moneySafe(m.account_size||0)}</option>`).join('')}
-            </select>
-            <div class="text-xs text-gray-500 mt-2">${options.length} matching account(s) available</div>
-          </td>
-          <td><button class="btn btn-gold" onclick="assignPhaseMt5('${selectId}')">Assign Fresh MT5</button></td>
-        </tr>`;
-      }).join('') || `<tr><td colspan="6" class="text-gray-400 p-6">No phase-passed account is waiting for fresh MT5 assignment. If a trader dashboard says passed, click Reload Phase Queue once.</td></tr>`}
-    </table></div>`;
-  }
-  window.phaseAssignmentModule = phaseAssignmentModule = async function(force=false){
-    const c = document.getElementById('content');
-    if(c){
-      c.innerHTML = `<div class="vault p-7 rounded-3xl"><div class="flex gap-4 items-center"><div class="loader"></div><div><h3 class="text-3xl font-black gold">Loading Phase Assignment Queue...</h3><p class="text-gray-400">Checking current account lifecycle, not stale admin status.</p></div></div></div>`;
+@app.post('/staff_members/update')
+def update_staff_member():
+    try:
+        data = request.get_json() or {}
+        staff_id = data.get('id')
+        payload = {k: data.get(k) for k in ['name','email','role','permissions'] if k in data}
+        res = supabase.table('admin_staff_members').update(payload).eq('id', staff_id).execute()
+        return jsonify({'success': True, 'data': res.data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/staff_members/status')
+def staff_member_status():
+    try:
+        data = request.get_json() or {}
+        res = supabase.table('admin_staff_members').update({'status': data.get('status')}).eq('id', data.get('id')).execute()
+        return jsonify({'success': True, 'data': res.data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/staff_members/password')
+def staff_member_password():
+    try:
+        data = request.get_json() or {}
+        res = supabase.table('admin_staff_members').update({'password': data.get('password')}).eq('id', data.get('id')).execute()
+        return jsonify({'success': True, 'data': res.data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/staff_members/delete')
+def staff_member_delete():
+    try:
+        data = request.get_json() or {}
+        res = supabase.table('admin_staff_members').delete().eq('id', data.get('id')).execute()
+        return jsonify({'success': True, 'data': res.data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.get('/audit_logs')
+def audit_logs():
+    try:
+        res = supabase.table('admin_audit_logs').select('*').order('created_at', desc=True).limit(100).execute()
+        return jsonify(res.data or [])
+    except Exception as e:
+        return jsonify([])
+
+def audit_log(staff, module, action, details='', record_affected='', created_at=None):
+    try:
+        row = {
+            'staff_id': str(staff.get('id','')),
+            'staff_name': staff.get('name'),
+            'username': staff.get('username'),
+            'role': staff.get('role'),
+            'module': module,
+            'action': action,
+            'details': details,
+            'record_affected': record_affected,
+            'created_at': created_at or now_iso()
+        }
+        try:
+            supabase.table('admin_audit_logs').insert(row).execute()
+        except Exception:
+            row.pop('record_affected', None)
+            row.pop('created_at', None)
+            supabase.table('admin_audit_logs').insert(row).execute()
+    except Exception as e:
+        print('AUDIT LOG ERROR:', str(e))
+
+
+
+
+
+def _business_setting_defaults():
+    return {
+        "revenue_launch_date": "",
+        "production_mode": "test"
     }
-    try{
-      const rows = await loadPhaseAssignmentRows(!!force);
-      renderPhaseAssignmentRows(rows);
-    }catch(e){
-      console.error('Phase assignment queue failed', e);
-      if(c) c.innerHTML = `<div class="vault p-7 rounded-3xl"><h3 class="text-3xl font-black text-red-400">Phase queue failed to load</h3><p class="text-gray-400">${clean(e.message || e)}</p><button class="btn btn-gold mt-4" onclick="phaseAssignmentModule(true)">Try Again</button></div>`;
+
+
+def _coerce_business_settings_from_row(row):
+    settings = {}
+    if not isinstance(row, dict):
+        return settings
+
+    # Direct-column schema support: id/main row with launch_date + production_mode columns.
+    for date_key in ["revenue_launch_date", "launch_date", "business_launch_date"]:
+        if row.get(date_key) not in [None, ""]:
+            settings["revenue_launch_date"] = row.get(date_key)
+            break
+    if row.get("production_mode") not in [None, ""]:
+        settings["production_mode"] = row.get("production_mode")
+
+    # Key/value schema support: key/value, setting_key/setting_value, name/data.
+    key = row.get("key") or row.get("setting_key") or row.get("name")
+    if key:
+        value = row.get("value")
+        if value is None:
+            value = row.get("setting_value")
+        if value is None:
+            value = row.get("data")
+        if value is None:
+            value = row.get("setting_data")
+        key = str(key)
+        if key == "launch_date":
+            key = "revenue_launch_date"
+        settings[key] = value if value is not None else ""
+
+    return settings
+
+
+def _load_business_settings():
+    settings = _business_setting_defaults()
+    try:
+        res = supabase.table('business_settings').select('*').execute()
+        rows = getattr(res, 'data', []) or []
+        for row in rows:
+            settings.update(_coerce_business_settings_from_row(row))
+    except Exception as e:
+        print('BUSINESS SETTINGS LOAD ERROR:', str(e))
+    if settings.get("production_mode") not in ["test", "live"]:
+        settings["production_mode"] = "test"
+    settings["revenue_launch_date"] = str(settings.get("revenue_launch_date") or settings.get("launch_date") or "")
+    return settings
+
+
+def _try_business_settings_write(row, on_conflict=None, update_column=None, update_value=None):
+    try:
+        table = supabase.table('business_settings')
+        if update_column:
+            table.update(row).eq(update_column, update_value).execute()
+        elif on_conflict:
+            table.upsert(row, on_conflict=on_conflict).execute()
+        else:
+            table.insert(row).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def _save_business_settings(settings, admin=None):
+    current = _load_business_settings()
+    current.update(settings or {})
+    launch = str(current.get('revenue_launch_date') or current.get('launch_date') or '')
+    mode = 'live' if str(current.get('production_mode') or '').lower() == 'live' else 'test'
+    who = (admin or {}).get('name') or (admin or {}).get('username') or 'admin'
+    now = now_iso()
+
+    attempts = [
+        # Direct-column schemas.
+        ({'id': 'main', 'revenue_launch_date': launch, 'launch_date': launch, 'production_mode': mode, 'updated_at': now, 'updated_by': who}, 'id', None, None),
+        ({'id': 'main', 'revenue_launch_date': launch, 'production_mode': mode, 'updated_at': now, 'updated_by': who}, 'id', None, None),
+        ({'id': 'main', 'launch_date': launch, 'production_mode': mode, 'updated_at': now, 'updated_by': who}, 'id', None, None),
+        ({'id': 'main', 'revenue_launch_date': launch, 'launch_date': launch, 'production_mode': mode}, 'id', None, None),
+        ({'id': 'main', 'revenue_launch_date': launch, 'production_mode': mode}, 'id', None, None),
+        ({'id': 'main', 'launch_date': launch, 'production_mode': mode}, 'id', None, None),
+        ({'revenue_launch_date': launch, 'launch_date': launch, 'production_mode': mode, 'updated_at': now, 'updated_by': who}, None, 'id', 'main'),
+        ({'revenue_launch_date': launch, 'production_mode': mode, 'updated_at': now, 'updated_by': who}, None, 'id', 'main'),
+        ({'launch_date': launch, 'production_mode': mode, 'updated_at': now, 'updated_by': who}, None, 'id', 'main'),
+        ({'revenue_launch_date': launch, 'launch_date': launch, 'production_mode': mode}, None, 'id', 'main'),
+        ({'revenue_launch_date': launch, 'production_mode': mode}, None, 'id', 'main'),
+        ({'launch_date': launch, 'production_mode': mode}, None, 'id', 'main'),
+    ]
+
+    errors = []
+    for row, conflict, update_column, update_value in attempts:
+        ok_saved, err = _try_business_settings_write(row, conflict, update_column, update_value)
+        if ok_saved:
+            return True, None
+        errors.append(err)
+
+    # Key/value schemas. Save both settings independently; this supports tables with key/value rows.
+    kv_attempts = []
+    for key, value in [('revenue_launch_date', launch), ('production_mode', mode)]:
+        kv_attempts.extend([
+            ({'key': key, 'value': value, 'updated_at': now, 'updated_by': who}, 'key', None, None),
+            ({'key': key, 'value': value}, 'key', None, None),
+            ({'setting_key': key, 'setting_value': value, 'updated_at': now, 'updated_by': who}, 'setting_key', None, None),
+            ({'setting_key': key, 'setting_value': value}, 'setting_key', None, None),
+            ({'name': key, 'value': value, 'updated_at': now, 'updated_by': who}, 'name', None, None),
+            ({'name': key, 'value': value}, 'name', None, None),
+            ({'key': key, 'value': value}, None, 'key', key),
+            ({'setting_key': key, 'setting_value': value}, None, 'setting_key', key),
+            ({'name': key, 'value': value}, None, 'name', key),
+        ])
+
+    saved_any = False
+    for row, conflict, update_column, update_value in kv_attempts:
+        ok_saved, err = _try_business_settings_write(row, conflict, update_column, update_value)
+        if ok_saved:
+            saved_any = True
+        else:
+            errors.append(err)
+
+    if saved_any:
+        return True, None
+    return False, ' | '.join([e for e in errors if e][-5:]) or 'Business settings table schema is unsupported'
+
+
+def _save_business_setting(key, value, admin=None):
+    if key == 'launch_date':
+        key = 'revenue_launch_date'
+    return _save_business_settings({key: value}, admin)
+
+@app.get('/business_settings')
+def get_business_settings():
+    return jsonify({'success': True, 'data': _load_business_settings()})
+
+@app.post('/business_settings')
+def update_business_settings():
+    data = request.get_json(silent=True) or {}
+    admin = _admin_from_payload(data)
+    updates = {}
+    if 'revenue_launch_date' in data:
+        updates['revenue_launch_date'] = data.get('revenue_launch_date') or ''
+    if 'launch_date' in data:
+        updates['revenue_launch_date'] = data.get('launch_date') or ''
+    if 'production_mode' in data:
+        updates['production_mode'] = 'live' if str(data.get('production_mode')).lower() == 'live' else 'test'
+    if not updates:
+        return jsonify({'success': True, 'data': _load_business_settings()})
+    ok_saved, err = _save_business_settings(updates, admin)
+    if not ok_saved:
+        return jsonify({'success': False, 'error': err or 'Could not save business settings'}), 500
+    _audit_safe('business_settings', 'settings_update', f'Business settings updated: {updates}', admin, 'business_settings')
+    return jsonify({'success': True, 'data': _load_business_settings()})
+
+def _revenue_date(value):
+    try:
+        if not value:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if "/" in text and len(text.split("/")) == 3:
+            day, month_part, year_part = text.split("/")
+            text = f"{year_part}-{month_part.zfill(2)}-{day.zfill(2)}"
+        return datetime.fromisoformat(text[:10]).replace(tzinfo=timezone.utc)
+    except Exception:
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+def _revenue_bool(value):
+    return value is True or str(value or "").strip().lower() in ["true", "1", "yes", "y"]
+
+def _revenue_period_flags(dt):
+    now = datetime.now(timezone.utc)
+    if dt and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return {
+        "week": bool(dt and dt.isocalendar()[:2] == now.isocalendar()[:2]),
+        "month": bool(dt and dt.year == now.year and dt.month == now.month),
+        "year": bool(dt and dt.year == now.year),
     }
-  };
-})();
-</script>
 
+def _normalize_launch_date(value):
+    dt = _revenue_date(value)
+    return dt.date().isoformat() if dt else ""
 
-<script>
-/* Production final: central API readers and Phase Queue assignment dispatcher are now queue-aware. */
-window.__npPhaseAssignRows = window.__npPhaseAssignRows || {};
-window.assignPhaseMt5 = async function(rowKey){
-  const row = (window.__npPhaseAssignRows || {})[rowKey] || {};
-  const phase = document.getElementById(`assign_phase_${rowKey}`)?.value || row.target_phase || "phase2";
-  const mt5_id = document.getElementById(`assign_mt5_${rowKey}`)?.value || "";
-  if(!mt5_id){ alert("Choose a fresh MT5 account from the pool first."); return; }
-  if(!confirm(`Assign this fresh MT5 to ${String(phase).toUpperCase()} for ${row.name || 'this trader'}?`)) return;
-  try{
-    await postJSON(`${API_URL}/assign_phase_mt5`, {
-      trader_id: row.trader_id || row.id || rowKey,
-      completed_account_id: row.completed_account_id || row.trader_account_id || "",
-      trader_account_id: row.completed_account_id || row.trader_account_id || "",
-      mt5_id,
-      phase,
-      target_phase: phase,
-      admin_name: currentAdmin?.name || currentAdmin?.username || "admin"
-    });
-    alert("Fresh MT5 assigned successfully.");
-    if(typeof assignmentCache !== 'undefined') assignmentCache = [];
-    await loadData();
-    if(typeof phaseAssignmentModule === 'function') phaseAssignmentModule(true);
-  }catch(e){
-    alert(e.message || "Assignment failed");
-  }
-};
-</script>
+@app.get('/revenue_summary')
+def revenue_summary():
+    try:
+        settings = _load_business_settings()
 
+        requested_mode = str(request.args.get("mode") or settings.get("production_mode") or "test").lower()
+        mode = "live" if requested_mode == "live" else "test"
 
+        from_iso = _normalize_launch_date(request.args.get("from_date") or "")
+        to_iso = _normalize_launch_date(request.args.get("to_date") or "")
+        launch_iso = _normalize_launch_date(settings.get("revenue_launch_date") or settings.get("launch_date") or "")
 
-<script>
-/* NAIRAPIPS INSTANT ADMIN BOOTSTRAP FINAL
-   One backend call loads the whole admin. Cached data shows immediately, then
-   /admin_bootstrap refreshes everything silently. This stops module collapse
-   from many slow independent endpoint calls. */
-(function(){
-  'use strict';
-  const BOOTSTRAP_KEY = 'np_admin_bootstrap_cache_v1';
-  const BOOTSTRAP_URL = (typeof API_URL !== 'undefined' ? API_URL : 'https://nairapips-api.onrender.com') + '/admin_bootstrap';
-  function isArr(v){ return Array.isArray(v); }
-  function arr(v){ return Array.isArray(v) ? v : []; }
-  function obj(v){ return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {}; }
-  function cacheRead(){ try{ return JSON.parse(localStorage.getItem(BOOTSTRAP_KEY) || 'null') || null; }catch(e){ return null; } }
-  function cacheWrite(payload){ try{ if(payload && payload.success !== false) localStorage.setItem(BOOTSTRAP_KEY, JSON.stringify(payload)); }catch(e){} }
-  function firstArray(payload, keys){
-    payload = obj(payload);
-    for(const k of keys){ if(Array.isArray(payload[k])) return payload[k]; }
-    for(const k of keys){ const inner = payload[k]; if(inner && typeof inner === 'object' && !Array.isArray(inner)){ const nested = firstArray(inner, keys); if(nested.length) return nested; } }
-    return [];
-  }
-  function applyBootstrap(payload, allowEmpty=false){
-    if(!payload || typeof payload !== 'object') return false;
-    const setArray = (name, keys) => {
-      const rows = firstArray(payload, keys);
-      if(rows.length || allowEmpty){ try{ window[name] = rows; eval(name + ' = window["' + name + '"]'); }catch(e){ window[name] = rows; } }
-    };
-    setArray('traders', ['traders','users','data']);
-    setArray('payouts', ['payouts']);
-    setArray('tickets', ['tickets','support_tickets']);
-    setArray('announcements', ['announcements']);
-    setArray('plans', ['plans','challenge_plans']);
-    setArray('purchases', ['purchases','challenge_purchases']);
-    setArray('mt5pool', ['mt5_pool','mt5pool']);
-    setArray('traderTrades', ['trader_trades','trades']);
-    setArray('monitoringSnapshots', ['monitoring_snapshots','snapshots']);
-    setArray('monitoringEvents', ['monitoring_events','events']);
-    const deleted = firstArray(payload, ['marketing_deleted_contacts','deleted_contacts']);
-    if(deleted.length || allowEmpty){ try{ marketingDeletedIdCache = deleted.map(x => String(x.contact_id || x.id || x)); }catch(e){} }
-    const rs = obj(payload.referral_settings?.data || payload.referral_settings);
-    const bs = obj(payload.business_settings?.data || payload.business_settings);
-    const aff = obj(payload.affiliate_summary?.data || payload.affiliate_summary);
-    try{ referralSettingsCache = Object.keys(rs).length ? rs : referralSettingsCache; }catch(e){}
-    try{ businessSettingsCache = Object.keys(bs).length ? bs : businessSettingsCache; if(typeof applyBusinessSettingsFromServer === 'function') applyBusinessSettingsFromServer(); }catch(e){}
-    setArray('staffMembers', ['staff_members','staff']);
-    setArray('auditLogs', ['audit_logs','logs']);
-    setArray('affiliatePartners', ['affiliate_partners']);
-    setArray('affiliateCodes', ['affiliate_codes']);
-    setArray('affiliateCommissions', ['affiliate_commissions']);
-    try{ affiliateSummary = Object.keys(aff).length ? aff : affiliateSummary; }catch(e){}
-    if(Array.isArray(payload.assignment_queue) || Array.isArray(payload.phase_assignment_queue)){
-      window.__npPhaseAssignmentBootstrapQueue = payload.assignment_queue || payload.phase_assignment_queue || [];
-      window.__npPhaseAssignmentBootstrapAt = Date.now();
+        from_dt = _revenue_date(from_iso) if from_iso else None
+        to_dt = _revenue_date(to_iso) if to_iso else None
+        if to_dt:
+            # Inclusive end date: records on the selected To Date must count.
+            to_dt = to_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+        purchase_rows = supabase.table("challenge_purchases").select("*").execute().data or []
+        payout_rows = supabase.table("payouts").select("*").execute().data or []
+
+        try:
+            trader_rows = supabase.table("traders").select("id,status,phase").execute().data or []
+        except Exception:
+            trader_rows = []
+
+        def in_selected_range(dt):
+            if not dt:
+                return False
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if from_dt and dt < from_dt:
+                return False
+            if to_dt and dt > to_dt:
+                return False
+            return True
+
+        def live_excluded(row):
+            if mode != "live":
+                return False
+            return _revenue_bool(row.get("excluded_from_revenue")) or _revenue_bool(row.get("mark_as_test"))
+
+        def purchase_date(row):
+            return _revenue_date(row.get("approved_at") or row.get("assigned_at") or row.get("created_at"))
+
+        def payout_date(row):
+            return _revenue_date(row.get("paid_at") or row.get("approved_at") or row.get("requested_at") or row.get("created_at"))
+
+        counted_purchases = []
+        excluded_purchases = 0
+        for row in purchase_rows:
+            payment_status = str(row.get("payment_status") or "").strip().lower()
+            status = str(row.get("status") or "").strip().lower()
+            approved = payment_status == "approved" or status in ["approved", "approved_active", "active"]
+            dt = purchase_date(row)
+            if not approved or live_excluded(row) or not in_selected_range(dt):
+                excluded_purchases += 1
+                continue
+            counted_purchases.append((row, dt))
+
+        counted_payouts = []
+        excluded_payouts = 0
+        for row in payout_rows:
+            status = str(row.get("status") or "").strip().lower()
+            # Money that has actually left the business should be PAID only.
+            included = status == "paid"
+            dt = payout_date(row)
+            if not included or live_excluded(row) or not in_selected_range(dt):
+                excluded_payouts += 1
+                continue
+            counted_payouts.append((row, dt))
+
+        summary = {
+            "weekly_sales": 0,
+            "monthly_sales": 0,
+            "yearly_sales": 0,
+            "weekly_payouts": 0,
+            "monthly_payouts": 0,
+            "yearly_payouts": 0,
+            "weekly_net": 0,
+            "monthly_net": 0,
+            "yearly_net": 0,
+            "range_sales": 0,
+            "range_payouts": 0,
+            "range_net": 0,
+            "gross_revenue": 0,
+            "net_revenue": 0,
+            "approved_payouts": 0,
+            "pending_payouts": 0,
+            "paid_payouts": 0,
+            "pending_sales": 0,
+            "rejected_sales": 0,
+            "counted_purchases": len(counted_purchases),
+            "excluded_purchases": excluded_purchases,
+            "counted_payouts": len(counted_payouts),
+            "excluded_payouts": excluded_payouts,
+            "total_purchases_loaded": len(purchase_rows),
+            "total_payouts_loaded": len(payout_rows),
+            "launch_date_used": launch_iso,
+            "from_date_used": from_iso,
+            "to_date_used": to_iso,
+            "date_filter_used": {"from_date": from_iso, "to_date": to_iso},
+            "production_mode_used": mode,
+            "active_traders": len([t for t in trader_rows if str(t.get("status") or "").lower() == "active"]),
+            "funded_traders": len([t for t in trader_rows if str(t.get("status") or "").lower() in ["funded", "live"] or str(t.get("phase") or "").lower() in ["funded", "live"]]),
+            "conversion_rate": "0%",
+            "plan_rows": [],
+            "month_rows": []
+        }
+
+        plan_map = {}
+        month_map = {}
+        for row, dt in counted_purchases:
+            amount = clean(row.get("fee"))
+            flags = _revenue_period_flags(dt)
+            summary["gross_revenue"] += amount
+            summary["range_sales"] += amount
+            if flags["week"]: summary["weekly_sales"] += amount
+            if flags["month"]: summary["monthly_sales"] += amount
+            if flags["year"]: summary["yearly_sales"] += amount
+
+            plan_name = row.get("plan_name") or "Unknown Plan"
+            if plan_name not in plan_map:
+                plan_map[plan_name] = {"name": plan_name, "count": 0, "fee": 0, "account_size": row.get("account_size") or 0}
+            plan_map[plan_name]["count"] += 1
+            plan_map[plan_name]["fee"] += amount
+
+            if dt:
+                month_key = dt.strftime("%b %Y")
+                if month_key not in month_map:
+                    month_map[month_key] = {"month": month_key, "sales": 0, "count": 0, "sort": dt.strftime("%Y-%m")}
+                month_map[month_key]["sales"] += amount
+                month_map[month_key]["count"] += 1
+
+        for row, dt in counted_payouts:
+            amount = clean(row.get("amount"))
+            flags = _revenue_period_flags(dt)
+            summary["paid_payouts"] += amount
+            summary["range_payouts"] += amount
+            if flags["week"]: summary["weekly_payouts"] += amount
+            if flags["month"]: summary["monthly_payouts"] += amount
+            if flags["year"]: summary["yearly_payouts"] += amount
+
+        for row in payout_rows:
+            status = str(row.get("status") or "").lower()
+            if status == "approved" and not live_excluded(row):
+                summary["approved_payouts"] += clean(row.get("amount"))
+            if status == "pending" and not live_excluded(row):
+                summary["pending_payouts"] += clean(row.get("amount"))
+
+        for row in purchase_rows:
+            status = str(row.get("payment_status") or row.get("status") or "").lower()
+            dt = purchase_date(row)
+            if not in_selected_range(dt):
+                continue
+            if status in ["pending", "pending_review"]:
+                summary["pending_sales"] += clean(row.get("fee"))
+            if status == "rejected":
+                summary["rejected_sales"] += clean(row.get("fee"))
+
+        summary["weekly_net"] = summary["weekly_sales"] - summary["weekly_payouts"]
+        summary["monthly_net"] = summary["monthly_sales"] - summary["monthly_payouts"]
+        summary["yearly_net"] = summary["yearly_sales"] - summary["yearly_payouts"]
+        summary["range_net"] = summary["range_sales"] - summary["range_payouts"]
+        summary["net_revenue"] = summary["range_net"]
+        if trader_rows:
+            summary["conversion_rate"] = f"{(summary['counted_purchases'] / len(trader_rows) * 100):.1f}%"
+        summary["plan_rows"] = sorted(plan_map.values(), key=lambda x: x["fee"], reverse=True)
+        summary["month_rows"] = [{k: v for k, v in row.items() if k != "sort"} for row in sorted(month_map.values(), key=lambda x: x["sort"])[-12:]]
+
+        return jsonify({"success": True, "data": summary})
+    except Exception as e:
+        print("REVENUE SUMMARY ERROR:", str(e))
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.get('/revenue_launch_date')
+def get_revenue_launch_date():
+    settings = _load_business_settings()
+    return jsonify({'success': True, 'data': {
+        'revenue_launch_date': settings.get('revenue_launch_date') or '',
+        'launch_date': settings.get('revenue_launch_date') or '',
+        'production_mode': settings.get('production_mode') or 'test'
+    }})
+
+@app.post('/revenue_launch_date')
+def update_revenue_launch_date():
+    data = request.get_json(silent=True) or {}
+    admin = _admin_from_payload(data)
+    updates = {
+        'revenue_launch_date': data.get('revenue_launch_date') if 'revenue_launch_date' in data else data.get('launch_date', '')
     }
-    try{ if(typeof npApplyLiveMetrics === 'function') traders = traders.map(t => npApplyLiveMetrics(t)); }catch(e){}
-    return true;
-  }
-  async function fetchBootstrap(){
-    const controller = new AbortController();
-    const timer = setTimeout(()=>controller.abort(), 45000);
-    try{
-      const res = await fetch(BOOTSTRAP_URL + '?fresh=' + Date.now(), {cache:'no-store', signal:controller.signal});
-      const data = await res.json();
-      if(!res.ok || data.success === false) throw new Error(data.error || ('HTTP ' + res.status));
-      cacheWrite(data);
-      return data;
-    }finally{ clearTimeout(timer); }
-  }
-  window.getJSON = async function(url){
-    try{
-      const res = await fetch(url, {cache:'no-store'});
-      const data = await res.json();
-      if(Array.isArray(data)) return data;
-      return firstArray(data, ['data','rows','items','results','records','traders','accounts','plans','challenge_plans','purchases','challenge_purchases','payouts','tickets','support_tickets','announcements','mt5_pool','available_mt5','assignment_queue','staff_members','audit_logs','affiliate_partners','affiliate_codes','affiliate_commissions','monitoring_snapshots','snapshots','monitoring_events','events','trader_trades','trades']);
-    }catch(e){ return []; }
-  };
-  window.getObject = async function(url, fallback={}){
-    try{ const res = await fetch(url, {cache:'no-store'}); const data = await res.json(); return obj(data) || fallback; }catch(e){ return fallback; }
-  };
-  window.loadData = async function(){
-    isLoading = true;
-    const cached = cacheRead();
-    if(cached){
-      applyBootstrap(cached, false);
-      isLoading = false;
-      try{ applyStaffPermissions(); }catch(e){}
-      try{ render(); }catch(e){}
-    }else{
-      try{ renderLoading('Opening Master Command Center...'); }catch(e){}
+    if 'production_mode' in data:
+        updates['production_mode'] = 'live' if str(data.get('production_mode')).lower() == 'live' else 'test'
+    ok_saved, err = _save_business_settings(updates, admin)
+    if not ok_saved:
+        return jsonify({'success': False, 'error': err or 'Could not save revenue launch date'}), 500
+    _audit_safe('revenue', 'launch_date_set', f'Revenue launch date set to {updates.get("revenue_launch_date") or "cleared"}', admin, 'business_launch_date')
+    return get_revenue_launch_date()
+
+@app.post('/audit_event')
+def audit_event_route():
+    try:
+        data = request.get_json(silent=True) or {}
+        audit_log(
+            _admin_from_payload(data),
+            data.get('module') or 'admin',
+            data.get('action') or 'activity',
+            data.get('details') or data.get('record') or '',
+            data.get('record_affected') or data.get('record_id') or '',
+            data.get('created_at') or now_iso()
+        )
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.post('/mark_record_test')
+def mark_record_test():
+    try:
+        data = request.get_json(silent=True) or {}
+        table = str(data.get('table') or '').strip()
+        record_id = data.get('id')
+        if table not in SAFE_FLAG_TABLES:
+            return bad('Unsupported table for test/revenue flagging')
+        if not record_id:
+            return bad('Record id is required')
+
+        payload = {'updated_at': now_iso()}
+        if 'mark_as_test' in data:
+            payload['mark_as_test'] = bool(data.get('mark_as_test'))
+        if 'excluded_from_revenue' in data:
+            payload['excluded_from_revenue'] = bool(data.get('excluded_from_revenue'))
+        if len(payload) == 1:
+            return bad('Nothing to update')
+
+        try:
+            res = supabase.table(table).update(payload).eq('id', record_id).execute()
+        except Exception as e:
+            print('SAFE FLAG UPDATE FAILED:', table, record_id, e)
+            return jsonify({'success': False, 'fallback': 'local', 'error': str(e)}), 200
+
+        _audit_safe(table, 'mark_test_or_revenue_flag', f"{table}:{record_id} {payload}", _admin_from_payload(data))
+        return ok(getattr(res, 'data', []) or [], 'Record flag updated')
+    except Exception as e:
+        return bad(e)
+
+@app.post('/delete_payout')
+def delete_payout_protected():
+    return bad('Payout records cannot be deleted in production. Mark as test or exclude from revenue instead.', 403)
+
+@app.post('/delete_payment')
+def delete_payment_protected():
+    return bad('Approved payment records cannot be deleted in production. Mark as test or exclude from revenue instead.', 403)
+
+@app.post('/delete_challenge_purchase')
+def delete_challenge_purchase_protected():
+    try:
+        data = request.get_json(silent=True) or {}
+        pid = data.get('id')
+        purchase = get_purchase_by_id(pid) if pid else {}
+        if _has_approved_payment([purchase]):
+            return bad('Approved challenge purchases cannot be deleted in production. Mark as test or exclude from revenue instead.', 403)
+        return bad('Challenge purchase deletion is disabled in production. Mark as test or exclude from revenue instead.', 403)
+    except Exception as e:
+        return bad(e)
+
+# ===== NAIRAPIPS PAYMENT ACCOUNTS ROUTES =====
+# Paste above: if __name__ == "__main__":
+
+@app.get('/payment_accounts')
+def payment_accounts():
+    try:
+        res = supabase.table('payment_accounts').select('*').order('display_order', desc=False).execute()
+        return jsonify(res.data or [])
+    except Exception as e:
+        return jsonify([])
+
+@app.post('/save_payment_accounts')
+def save_payment_accounts():
+    try:
+        body = request.get_json(silent=True) or {}
+        accounts = body.get('accounts', []) or []
+
+        clean_rows = []
+        for idx, account in enumerate(accounts, start=1):
+            row = {
+                'label': str(account.get('label') or f'Payment Account {idx}').strip(),
+                'bank_name': str(account.get('bank_name') or '').strip(),
+                'account_name': str(account.get('account_name') or '').strip(),
+                'account_number': str(account.get('account_number') or '').strip(),
+                'account_type': str(account.get('account_type') or 'Bank Transfer').strip(),
+                'instructions': str(account.get('instructions') or 'Upload your proof of payment after transfer so admin can verify and activate your challenge.').strip(),
+                'status': str(account.get('status') or 'active').strip(),
+                'display_order': int(account.get('display_order') or idx)
+            }
+            clean_rows.append(row)
+
+        supabase.table('payment_accounts').delete().neq('id', -1).execute()
+        if clean_rows:
+            supabase.table('payment_accounts').insert(clean_rows).execute()
+
+        return jsonify({'success': True, 'data': clean_rows})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+@app.route("/test_email")
+def test_email():
+    try:
+        recipient = ADMIN_ALERT_EMAIL or FROM_EMAIL
+        sent = send_email_brevo(
+            recipient,
+            "NairaPips Email Test",
+            "<p>NairaPips email system is working.</p><p>This confirms Brevo HTTP email sending works from Render.</p><p>NairaPips Team</p>"
+        )
+        if sent:
+            return {"success": True, "message": "Test email sent"}
+        return {"success": False, "error": "Brevo email send failed. Check Render logs."}
+
+    except Exception as e:
+        print("BREVO EMAIL ERROR:", str(e))
+        return {"success": False, "error": str(e)}
+
+
+# ================================
+# NAIRAPIPS RANGE REPORTING: SALES + PAYOUTS
+# ================================
+def _np_range_params():
+    requested_mode = str(request.args.get("mode") or "test").lower()
+    mode = "live" if requested_mode == "live" else "test"
+    from_iso = _normalize_launch_date(request.args.get("from_date") or "")
+    to_iso = _normalize_launch_date(request.args.get("to_date") or "")
+    from_dt = _revenue_date(from_iso) if from_iso else None
+    to_dt = _revenue_date(to_iso) if to_iso else None
+    if to_dt:
+        to_dt = to_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return mode, from_iso, to_iso, from_dt, to_dt
+
+def _np_in_range(dt, from_dt=None, to_dt=None):
+    if not dt:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if from_dt and dt < from_dt:
+        return False
+    if to_dt and dt > to_dt:
+        return False
+    return True
+
+def _np_report_excluded(row, mode="test"):
+    if mode != "live":
+        return False
+    return _revenue_bool(row.get("excluded_from_revenue")) or _revenue_bool(row.get("mark_as_test"))
+
+def _np_purchase_report_date(row):
+    return _revenue_date(row.get("approved_at") or row.get("assigned_at") or row.get("created_at"))
+
+def _np_payout_report_date(row):
+    status = str(row.get("status") or "").strip().lower()
+    if status == "paid":
+        return _revenue_date(row.get("paid_at") or row.get("approved_at") or row.get("requested_at") or row.get("created_at"))
+    if status == "approved":
+        return _revenue_date(row.get("approved_at") or row.get("requested_at") or row.get("created_at"))
+    return _revenue_date(row.get("requested_at") or row.get("created_at") or row.get("approved_at") or row.get("paid_at"))
+
+@app.get('/sales_summary')
+def sales_summary():
+    try:
+        mode, from_iso, to_iso, from_dt, to_dt = _np_range_params()
+        rows = supabase.table("challenge_purchases").select("*").execute().data or []
+        total_loaded = len(rows)
+        counted = []
+        excluded = 0
+        pending_amount = rejected_amount = 0
+        pending_count = rejected_count = 0
+        plan_map = {}
+        day_map = {}
+        for row in rows:
+            dt = _np_purchase_report_date(row)
+            if not _np_in_range(dt, from_dt, to_dt) or _np_report_excluded(row, mode):
+                excluded += 1
+                continue
+            payment_status = str(row.get("payment_status") or "").strip().lower()
+            status = str(row.get("status") or "").strip().lower()
+            amount = clean(row.get("fee"))
+            if payment_status == "approved" or status in ["approved", "approved_active", "active"]:
+                counted.append(row)
+                plan = row.get("plan_name") or "Unknown Plan"
+                if plan not in plan_map:
+                    plan_map[plan] = {"plan_name": plan, "count": 0, "amount": 0, "account_size": row.get("account_size") or 0}
+                plan_map[plan]["count"] += 1
+                plan_map[plan]["amount"] += amount
+                if dt:
+                    day = dt.date().isoformat()
+                    if day not in day_map:
+                        day_map[day] = {"date": day, "count": 0, "amount": 0}
+                    day_map[day]["count"] += 1
+                    day_map[day]["amount"] += amount
+            elif payment_status in ["pending", "pending_review"] or status in ["pending", "pending_review"]:
+                pending_count += 1; pending_amount += amount
+            elif payment_status == "rejected" or status == "rejected":
+                rejected_count += 1; rejected_amount += amount
+        approved_amount = sum(clean(r.get("fee")) for r in counted)
+        return jsonify({"success": True, "data": {
+            "mode_used": mode, "from_date_used": from_iso, "to_date_used": to_iso,
+            "total_sales_loaded": total_loaded, "counted_sales": len(counted), "excluded_sales": excluded,
+            "approved_sales_amount": approved_amount, "pending_sales_amount": pending_amount, "rejected_sales_amount": rejected_amount,
+            "pending_sales_count": pending_count, "rejected_sales_count": rejected_count,
+            "average_sale": (approved_amount / len(counted)) if counted else 0,
+            "plan_rows": sorted(plan_map.values(), key=lambda x: x["amount"], reverse=True),
+            "day_rows": [day_map[k] for k in sorted(day_map.keys())]
+        }})
+    except Exception as e:
+        print("SALES SUMMARY ERROR:", str(e))
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.get('/payout_summary')
+def payout_summary():
+    try:
+        mode, from_iso, to_iso, from_dt, to_dt = _np_range_params()
+        rows = supabase.table("payouts").select("*").execute().data or []
+        total_loaded = len(rows)
+        excluded = 0
+        status_counts = {"pending": 0, "approved": 0, "paid": 0, "rejected": 0}
+        status_amounts = {"pending": 0, "approved": 0, "paid": 0, "rejected": 0}
+        bank_map = {}; day_map = {}; counted_rows = 0
+        for row in rows:
+            dt = _np_payout_report_date(row)
+            if not _np_in_range(dt, from_dt, to_dt) or _np_report_excluded(row, mode):
+                excluded += 1
+                continue
+            status = str(row.get("status") or "pending").strip().lower()
+            if status not in status_counts: status = "pending"
+            amount = clean(row.get("amount"))
+            status_counts[status] += 1; status_amounts[status] += amount; counted_rows += 1
+            if status == "paid":
+                bank = row.get("bank_name") or "Unknown Bank"
+                if bank not in bank_map: bank_map[bank] = {"bank_name": bank, "count": 0, "amount": 0}
+                bank_map[bank]["count"] += 1; bank_map[bank]["amount"] += amount
+                if dt:
+                    day = dt.date().isoformat()
+                    if day not in day_map: day_map[day] = {"date": day, "count": 0, "amount": 0}
+                    day_map[day]["count"] += 1; day_map[day]["amount"] += amount
+        return jsonify({"success": True, "data": {
+            "mode_used": mode, "from_date_used": from_iso, "to_date_used": to_iso,
+            "total_payouts_loaded": total_loaded, "counted_payouts": counted_rows, "excluded_payouts": excluded,
+            "pending_count": status_counts["pending"], "approved_count": status_counts["approved"], "paid_count": status_counts["paid"], "rejected_count": status_counts["rejected"],
+            "pending_amount": status_amounts["pending"], "approved_amount": status_amounts["approved"], "paid_amount": status_amounts["paid"], "rejected_amount": status_amounts["rejected"],
+            "liability_amount": status_amounts["pending"] + status_amounts["approved"],
+            "bank_rows": sorted(bank_map.values(), key=lambda x: x["amount"], reverse=True),
+            "day_rows": [day_map[k] for k in sorted(day_map.keys())]
+        }})
+    except Exception as e:
+        print("PAYOUT SUMMARY ERROR:", str(e))
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ================================
+# NAIRAPIPS AFFILIATE & PARTNER MANAGER - PRODUCTION READY
+# ================================
+def _aff_code(value):
+    return re.sub(r"[^A-Z0-9_-]", "", str(value or "").strip().upper())[:40]
+
+def _aff_status_active(row):
+    status = str((row or {}).get("status") or "active").strip().lower()
+    return status in {"active", "live", "enabled"}
+
+def _aff_parse_date(value):
+    """Parse Supabase date/timestamp values and always return timezone-aware UTC datetime.
+    This prevents Python errors when comparing date-only values like 2026-06-02
+    with timezone-aware current time values.
+    """
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        # Supabase often returns either YYYY-MM-DD or ISO timestamp ending in Z.
+        if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+            dt = datetime.fromisoformat(raw + "T00:00:00+00:00")
+        else:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            dt = datetime.fromisoformat(raw[:10] + "T00:00:00+00:00")
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _aff_today_utc():
+    return datetime.now(timezone.utc)
+
+def _aff_code_valid_window(row):
+    now = _aff_today_utc()
+    start = _aff_parse_date((row or {}).get("start_date"))
+    end = _aff_parse_date((row or {}).get("end_date"))
+    if start and now < start:
+        return False, "Code is not active yet"
+    if end:
+        end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
+    if end and now > end:
+        return False, "Code has expired"
+    limit = int(clean((row or {}).get("usage_limit")) or 0)
+    uses = int(clean((row or {}).get("total_uses")) or 0)
+    if limit > 0 and uses >= limit:
+        return False, "Code usage limit reached"
+    return True, "Code is valid"
+
+def _aff_get_code(code):
+    code = _aff_code(code)
+    if not code:
+        return None
+    try:
+        rows = supabase.table("affiliate_codes").select("*").eq("code", code).limit(1).execute().data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        print("AFFILIATE CODE FETCH ERROR:", str(e))
+        return None
+
+def _aff_get_partner_by_code(code):
+    code = _aff_code(code)
+    if not code:
+        return None
+    try:
+        rows = supabase.table("affiliate_partners").select("*").eq("code", code).limit(1).execute().data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        print("AFFILIATE PARTNER FETCH ERROR:", str(e))
+        return None
+
+def _affiliate_quote_details(d, base_fee):
+    """Return production-safe quote details for promo / affiliate / partner codes.
+    Discount reduces customer price. Commission is calculated on the final paid fee.
+    """
+    base_fee = clean(base_fee)
+    raw_code = (d or {}).get("affiliate_code") or (d or {}).get("referral_code") or (d or {}).get("ref_code") or (d or {}).get("partner_code") or (d or {}).get("promo_code") or (d or {}).get("code")
+    code = _aff_code(raw_code)
+    result = {
+        "valid": False if code else True,
+        "code": code,
+        "message": "No code applied" if not code else "Code pending validation",
+        "original_fee": base_fee,
+        "discount_percent": 0,
+        "discount_amount": 0,
+        "final_fee": base_fee,
+        "fee": base_fee,
+        "commission_percent": 0,
+        "commission_amount": 0,
+        "affiliate_owner": "",
+        "campaign_type": "",
+        "source": None,
     }
-    try{
-      const fresh = await fetchBootstrap();
-      applyBootstrap(fresh, true);
-      isLoading = false;
-      try{ applyStaffPermissions(); }catch(e){}
-      try{ render(); }catch(e){}
-    }catch(e){
-      console.warn('admin_bootstrap failed; keeping cached/current admin data', e);
-      isLoading = false;
-      if(!cached){
-        document.getElementById('content').innerHTML = `<div class="card p-8 rounded-3xl"><h3 class="text-2xl font-black text-red-400">Could not load admin feed</h3><p class="text-gray-400">${String(e.message || e)}</p><button onclick="loadData()" class="btn btn-gold mt-5">Try Again</button></div>`;
-      }else{
-        try{ render(); }catch(err){}
-      }
+    if not code:
+        return result
+
+    source = _aff_get_code(code) or _aff_get_partner_by_code(code)
+    if not source:
+        result.update({"valid": False, "message": "Code not found"})
+        return result
+
+    ok_window, reason = _aff_code_valid_window(source)
+    if not _aff_status_active(source) or not ok_window:
+        result.update({"valid": False, "message": reason or "Code is not active"})
+        return result
+
+    # Self-referral protection by email/phone when partner identity exists.
+    buyer_email = str((d or {}).get("email") or (d or {}).get("customer_email") or "").strip().lower()
+    buyer_phone = re.sub(r"\D", "", str((d or {}).get("phone") or (d or {}).get("customer_phone") or ""))
+    owner_email = str(source.get("email") or source.get("owner_email") or "").strip().lower()
+    owner_phone = re.sub(r"\D", "", str(source.get("phone") or source.get("owner_phone") or ""))
+    if buyer_email and owner_email and buyer_email == owner_email:
+        result.update({"valid": False, "message": "Self-referral is not allowed"})
+        return result
+    if buyer_phone and owner_phone and buyer_phone == owner_phone:
+        result.update({"valid": False, "message": "Self-referral is not allowed"})
+        return result
+
+    discount_pct = max(0, min(100, clean(source.get("discount_percent"))))
+    commission_pct = max(0, min(100, clean(source.get("commission_percent"))))
+    discount_amount = round(base_fee * discount_pct / 100, 2) if discount_pct > 0 else 0
+    final_fee = max(0, round(base_fee - discount_amount, 2))
+    commission_amount = round(final_fee * commission_pct / 100, 2) if commission_pct > 0 else 0
+    campaign_type = str(source.get("code_type") or source.get("partner_type") or "affiliate").strip().lower() or "affiliate"
+    owner = source.get("owner_name") or source.get("name") or source.get("partner_name") or ""
+
+    result.update({
+        "valid": True,
+        "message": "Code applied successfully",
+        "discount_percent": discount_pct,
+        "discount_amount": discount_amount,
+        "final_fee": final_fee,
+        "fee": final_fee,
+        "commission_percent": commission_pct,
+        "commission_amount": commission_amount,
+        "affiliate_owner": owner,
+        "campaign_type": campaign_type,
+        "source": source,
+    })
+    return result
+
+
+def _affiliate_purchase_fields(d, base_fee):
+    quote = _affiliate_quote_details(d, base_fee)
+    fields = {
+        "original_fee": quote.get("original_fee", clean(base_fee)),
+        "discount_percent": quote.get("discount_percent", 0),
+        "discount_amount": quote.get("discount_amount", 0),
+        "final_fee": quote.get("final_fee", clean(base_fee)),
+        "amount_due": quote.get("final_fee", clean(base_fee)),
+        "commission_percent": quote.get("commission_percent", 0),
+        "commission_amount": quote.get("commission_amount", 0),
+        "affiliate_status": "valid" if quote.get("valid") and quote.get("code") else ("none" if not quote.get("code") else quote.get("message")),
     }
-  };
-})();
-</script>
+    code = quote.get("code")
+    if code:
+        fields.update({
+            "affiliate_code": code,
+            "referral_code": code,
+            "partner_code": code,
+            "promo_code": code,
+            "affiliate_owner": quote.get("affiliate_owner") or "",
+            "campaign_type": quote.get("campaign_type") or "affiliate",
+            "fee": quote.get("final_fee", clean(base_fee)),
+        })
+    return fields
 
 
+def _affiliate_record_code_usage(purchase):
+    """Increment usage only once when an approved purchase carries a valid code."""
+    try:
+        p = purchase or {}
+        if _is_truthy(p.get("affiliate_usage_recorded")):
+            return False
+        code = _aff_code(p.get("affiliate_code") or p.get("referral_code") or p.get("ref_code") or p.get("partner_code") or p.get("promo_code"))
+        if not code:
+            return False
+        source = _aff_get_code(code)
+        if source:
+            try:
+                supabase.table("affiliate_codes").update({
+                    "total_uses": int(clean(source.get("total_uses")) or 0) + 1,
+                    "updated_at": now_iso()
+                }).eq("code", code).execute()
+            except Exception as e:
+                print("AFFILIATE USAGE UPDATE ERROR:", str(e))
+        pid = p.get("id")
+        if pid:
+            try:
+                supabase.table("challenge_purchases").update({"affiliate_usage_recorded": True, "updated_at": now_iso()}).eq("id", pid).execute()
+            except Exception as e:
+                print("AFFILIATE PURCHASE USAGE FLAG ERROR:", str(e))
+        return True
+    except Exception as e:
+        print("AFFILIATE USAGE RECORD ERROR:", str(e))
+        return False
 
-<script>
-/* NAIRAPIPS ADMIN LIVE MT5 SYNC ENFORCER
-   Purpose: make Admin read the same live feed the VPS MT5 engine writes.
-   Safe rule: refresh monitoring/trader displays every few seconds, but never
-   redraw while staff is typing in forms so MT5 Pool/Add Trader forms are safe. */
-(function(){
-  'use strict';
-  if(window.__NAIRAPIPS_ADMIN_LIVE_MT5_SYNC_ENFORCER__) return;
-  window.__NAIRAPIPS_ADMIN_LIVE_MT5_SYNC_ENFORCER__ = true;
+@app.route("/quote_challenge_price", methods=["POST", "GET"])
+def quote_challenge_price():
+    try:
+        if request.method == "GET":
+            d = dict(request.args)
+        else:
+            d = request.json or {}
+        base_fee = clean(d.get("fee") or d.get("challenge_fee") or d.get("amount"))
+        if base_fee <= 0:
+            return bad("Challenge fee is required")
+        quote = _affiliate_quote_details(d, base_fee)
+        quote.pop("source", None)
+        return jsonify({"success": True, "data": quote, "valid": quote.get("valid"), "message": quote.get("message")})
+    except Exception as e:
+        return bad(e, 500)
 
-  const FAST_REFRESH_MS = 5000;
-  const FULL_RENDER_MODULES = new Set([
-    'overview','customerOS','traders','traderManagement','monitoring','funded','phaseAssignment'
-  ]);
+def _affiliate_create_commission_from_purchase(purchase, admin_payload=None):
+    try:
+        p = purchase or {}
+        _affiliate_record_code_usage(p)
+        code = _aff_code(p.get("affiliate_code") or p.get("referral_code") or p.get("ref_code") or p.get("partner_code") or p.get("promo_code"))
+        if not code:
+            return None
+        source = _aff_get_code(code) or _aff_get_partner_by_code(code)
+        if not source:
+            return None
+        commission_pct = clean(p.get("commission_percent") or source.get("commission_percent"))
+        sale_amount = clean(p.get("fee"))
+        if commission_pct <= 0 or sale_amount <= 0:
+            return None
+        commission_amount = clean(p.get("commission_amount")) or round(sale_amount * commission_pct / 100, 2)
+        existing = supabase.table("affiliate_commissions").select("id").eq("purchase_id", p.get("id")).limit(1).execute().data or []
+        if existing:
+            return existing[0]
+        row = {
+            "partner_code": code,
+            "partner_name": source.get("owner_name") or source.get("name") or source.get("partner_name") or "",
+            "purchase_id": p.get("id"),
+            "customer_name": p.get("trader_name") or p.get("name") or "",
+            "customer_email": p.get("email") or "",
+            "sale_amount": sale_amount,
+            "commission_percent": commission_pct,
+            "commission_amount": commission_amount,
+            "status": "pending",
+            "created_at": now_iso(),
+        }
+        created = supabase.table("affiliate_commissions").insert(row).execute().data
+        _audit_safe("affiliates", "commission_created", f"Affiliate commission created for code {code}", _admin_from_payload(admin_payload or {}))
+        return created[0] if created else row
+    except Exception as e:
+        print("AFFILIATE COMMISSION CREATE ERROR:", str(e))
+        return None
 
-  function activeModule(){
-    try{return String(window.currentModule || currentModule || '').trim();}catch(e){return '';}
-  }
-  function isTyping(){
-    const el = document.activeElement;
-    if(!el) return false;
-    const tag = String(el.tagName || '').toLowerCase();
-    return ['input','textarea','select'].includes(tag) || el.isContentEditable;
-  }
-  function canRenderNow(){
-    if(document.hidden) return false;
-    if(isTyping()) return false;
-    return FULL_RENDER_MODULES.has(activeModule());
-  }
-  async function tickLiveMt5Feed(){
-    if(window.__npAdminLiveMt5RefreshRunning) return;
-    if(typeof window.npRefreshAdminGlobalFeed !== 'function') return;
-    window.__npAdminLiveMt5RefreshRunning = true;
-    try{
-      await window.npRefreshAdminGlobalFeed(canRenderNow());
-      window.__npAdminLastLiveMt5SyncAt = new Date().toISOString();
-    }catch(e){
-      console.warn('NairaPips admin live MT5 sync skipped:', e && (e.message || e));
-    }finally{
-      window.__npAdminLiveMt5RefreshRunning = false;
+@app.route("/affiliate_partners", methods=["GET"])
+def affiliate_partners():
+    try:
+        return jsonify(supabase.table("affiliate_partners").select("*").order("created_at", desc=True).execute().data or [])
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/create_affiliate_partner", methods=["POST"])
+def create_affiliate_partner():
+    try:
+        d = request.json or {}
+        name = str(d.get("name") or d.get("partner_name") or "").strip()
+        code = _aff_code(d.get("code") or name)
+        if not name: return bad("Partner name is required")
+        if not code: return bad("Affiliate code is required")
+        existing = supabase.table("affiliate_partners").select("id").eq("code", code).limit(1).execute().data or []
+        if existing: return bad("Affiliate partner code already exists", 409)
+        row = {
+            "name": name,
+            "email": d.get("email") or "",
+            "phone": d.get("phone") or "",
+            "company": d.get("company") or "",
+            "partner_type": d.get("partner_type") or "affiliate",
+            "code": code,
+            "affiliate_link": d.get("affiliate_link") or f"https://nairapips.com/?ref={code}",
+            "commission_percent": clean(d.get("commission_percent") or 20),
+            "discount_percent": clean(d.get("discount_percent") or 0),
+            "status": d.get("status") or "active",
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        created = supabase.table("affiliate_partners").insert(row).execute().data
+        _audit_safe("affiliates", "partner_created", f"Affiliate partner created: {code}", _admin_from_payload(d))
+        return ok(created, "Affiliate partner created")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/update_affiliate_partner", methods=["POST"])
+def update_affiliate_partner():
+    try:
+        d = request.json or {}; pid = d.get("id")
+        if not pid: return bad("Missing partner id")
+        upd = {"updated_at": now_iso()}
+        for k in ["name", "email", "phone", "company", "partner_type", "status", "affiliate_link"]:
+            if k in d: upd[k] = d[k]
+        if "code" in d: upd["code"] = _aff_code(d.get("code"))
+        for k in ["commission_percent", "discount_percent"]:
+            if k in d: upd[k] = clean(d.get(k))
+        result = supabase.table("affiliate_partners").update(upd).eq("id", pid).execute().data
+        return ok(result, "Affiliate partner updated")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/delete_affiliate_partner", methods=["POST"])
+def delete_affiliate_partner():
+    try:
+        d = request.json or {}; pid = d.get("id")
+        if not pid: return bad("Missing partner id")
+        result = supabase.table("affiliate_partners").update({"status":"inactive", "updated_at": now_iso()}).eq("id", pid).execute().data
+        return ok(result, "Affiliate partner deactivated")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/affiliate_codes", methods=["GET"])
+def affiliate_codes():
+    try:
+        return jsonify(supabase.table("affiliate_codes").select("*").order("created_at", desc=True).execute().data or [])
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/create_affiliate_code", methods=["POST"])
+def create_affiliate_code():
+    try:
+        d = request.json or {}
+        code = _aff_code(d.get("code"))
+        if not code: return bad("Code is required")
+        existing = supabase.table("affiliate_codes").select("id").eq("code", code).limit(1).execute().data or []
+        if existing: return bad("Affiliate/promo code already exists", 409)
+        row = {
+            "code": code,
+            "owner_name": d.get("owner_name") or d.get("name") or "",
+            "code_type": d.get("code_type") or "affiliate",
+            "commission_percent": clean(d.get("commission_percent") or 0),
+            "discount_percent": clean(d.get("discount_percent") or 0),
+            "start_date": d.get("start_date") or None,
+            "end_date": d.get("end_date") or None,
+            "usage_limit": int(clean(d.get("usage_limit") or 0)),
+            "total_uses": 0,
+            "status": d.get("status") or "active",
+            "affiliate_link": d.get("affiliate_link") or f"https://nairapips.com/?ref={code}",
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        created = supabase.table("affiliate_codes").insert(row).execute().data
+        return ok(created, "Affiliate code created")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/update_affiliate_code", methods=["POST"])
+def update_affiliate_code():
+    try:
+        d = request.json or {}; cid = d.get("id")
+        if not cid: return bad("Missing code id")
+        upd = {"updated_at": now_iso()}
+        for k in ["owner_name", "code_type", "start_date", "end_date", "status", "affiliate_link"]:
+            if k in d: upd[k] = d[k] or None if k in {"start_date", "end_date"} else d[k]
+        if "code" in d: upd["code"] = _aff_code(d.get("code"))
+        for k in ["commission_percent", "discount_percent", "usage_limit", "total_uses"]:
+            if k in d: upd[k] = clean(d.get(k))
+        result = supabase.table("affiliate_codes").update(upd).eq("id", cid).execute().data
+        return ok(result, "Affiliate code updated")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/delete_affiliate_code", methods=["POST"])
+def delete_affiliate_code():
+    try:
+        d = request.json or {}; cid = d.get("id")
+        if not cid: return bad("Missing code id")
+        result = supabase.table("affiliate_codes").update({"status":"inactive", "updated_at": now_iso()}).eq("id", cid).execute().data
+        return ok(result, "Affiliate code deactivated")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/validate_affiliate_code", methods=["POST", "GET"])
+def validate_affiliate_code():
+    try:
+        payload = (request.json or {}) if request.method == "POST" else dict(request.args)
+        code = _aff_code(payload.get("code"))
+        if not code: return bad("Code is required")
+        row = _aff_get_code(code) or _aff_get_partner_by_code(code)
+        if not row: return jsonify({"success": False, "valid": False, "error": "Code not found"}), 404
+        ok_window, reason = _aff_code_valid_window(row)
+        valid = _aff_status_active(row) and ok_window
+        quote = None
+        if clean(payload.get("fee") or payload.get("amount") or 0) > 0:
+            quote = _affiliate_quote_details(payload, clean(payload.get("fee") or payload.get("amount")))
+            quote.pop("source", None)
+        return jsonify({"success": True, "valid": bool(valid), "message": reason if valid else reason, "data": row, "quote": quote})
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/affiliate_commissions", methods=["GET"])
+def affiliate_commissions():
+    try:
+        return jsonify(supabase.table("affiliate_commissions").select("*").order("created_at", desc=True).execute().data or [])
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/create_affiliate_commission", methods=["POST"])
+def create_affiliate_commission():
+    try:
+        d = request.json or {}
+        sale_amount = clean(d.get("sale_amount"))
+        pct = clean(d.get("commission_percent"))
+        amount = clean(d.get("commission_amount")) or round(sale_amount * pct / 100, 2)
+        row = {
+            "partner_code": _aff_code(d.get("partner_code")),
+            "partner_name": d.get("partner_name") or "",
+            "purchase_id": d.get("purchase_id"),
+            "customer_name": d.get("customer_name") or "",
+            "customer_email": d.get("customer_email") or "",
+            "sale_amount": sale_amount,
+            "commission_percent": pct,
+            "commission_amount": amount,
+            "status": d.get("status") or "pending",
+            "created_at": now_iso(),
+        }
+        if not row["partner_code"]: return bad("Partner code is required")
+        created = supabase.table("affiliate_commissions").insert(row).execute().data
+        return ok(created, "Affiliate commission created")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/update_affiliate_commission", methods=["POST"])
+def update_affiliate_commission():
+    try:
+        d = request.json or {}; cid = d.get("id")
+        if not cid: return bad("Missing commission id")
+        status = str(d.get("status") or "").strip().lower()
+        if status not in {"pending", "approved", "paid", "rejected"}: return bad("Invalid commission status")
+        upd = {"status": status, "admin_note": d.get("admin_note") or "", "updated_at": now_iso()}
+        if status == "paid": upd["paid_at"] = now_iso()
+        result = supabase.table("affiliate_commissions").update(upd).eq("id", cid).execute().data
+        return ok(result, "Affiliate commission updated")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/affiliate_summary", methods=["GET"])
+def affiliate_summary():
+    try:
+        partners = supabase.table("affiliate_partners").select("*").execute().data or []
+        codes = supabase.table("affiliate_codes").select("*").execute().data or []
+        comms = supabase.table("affiliate_commissions").select("*").execute().data or []
+        total_sales = sum(clean(c.get("sale_amount")) for c in comms)
+        pending = sum(clean(c.get("commission_amount")) for c in comms if str(c.get("status") or "pending").lower()=="pending")
+        approved = sum(clean(c.get("commission_amount")) for c in comms if str(c.get("status") or "").lower()=="approved")
+        paid = sum(clean(c.get("commission_amount")) for c in comms if str(c.get("status") or "").lower()=="paid")
+        top = None
+        by_partner = {}
+        for c in comms:
+            code = _aff_code(c.get("partner_code")) or "UNKNOWN"
+            by_partner.setdefault(code, {"code": code, "sales": 0, "commission": 0, "count": 0})
+            by_partner[code]["sales"] += clean(c.get("sale_amount"))
+            by_partner[code]["commission"] += clean(c.get("commission_amount"))
+            by_partner[code]["count"] += 1
+        rows = sorted(by_partner.values(), key=lambda x: x["sales"], reverse=True)
+        top = rows[0] if rows else None
+        return jsonify({"success": True, "data": {
+            "total_partners": len(partners), "active_partners": len([p for p in partners if _aff_status_active(p)]),
+            "total_codes": len(codes), "active_codes": len([c for c in codes if _aff_status_active(c)]),
+            "total_sales": total_sales, "pending_commissions": pending, "approved_commissions": approved, "paid_commissions": paid,
+            "top_partner": top, "partner_rows": rows
+        }})
+    except Exception as e:
+        return bad(e, 500)
+
+
+# ================================
+# EMAIL LOG BANK + MANUAL RESEND
+# ================================
+@app.route("/email_logs", methods=["GET"])
+def email_logs():
+    try:
+        limit = int(request.args.get("limit", 100))
+        rows = supabase.table("email_logs").select("*").order("created_at", desc=True).limit(limit).execute().data or []
+        return jsonify(rows)
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/resend_phase_pass_email", methods=["POST", "OPTIONS"])
+def resend_phase_pass_email():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        lookup = d.get("trader_id") or d.get("id") or d.get("email") or d.get("mt5_login")
+        if not lookup:
+            return bad("Send trader_id, id, email, or mt5_login", 400)
+
+        trader = None
+        if d.get("trader_id") or d.get("id"):
+            trader = get_trader_by_id(d.get("trader_id") or d.get("id"))
+        if not trader:
+            trader = _latest_trader_for_lookup(lookup)
+        if not trader:
+            return bad("Trader not found", 404)
+
+        pass_status = str(d.get("pass_status") or trader.get("phase_pass_status") or trader.get("status") or trader.get("phase") or "").lower().strip()
+        if pass_status not in ["phase1_passed", "phase2_passed"]:
+            phase_label = str(trader.get("phase_label") or trader.get("phase") or "phase1").lower()
+            pass_status = "phase2_passed" if "2" in phase_label else "phase1_passed"
+
+        payload = {
+            "target_equity": trader.get("target_equity"),
+            "highest_equity": trader.get("highest_equity"),
+            "highest_profit_percent": trader.get("highest_profit_percent"),
+            "mt5_login": trader.get("mt5_login"),
+        }
+        sent = _send_phase_pass_email_once(trader, pass_status, payload, old_status="", force=True)
+        return jsonify({"success": bool(sent), "sent": bool(sent), "pass_status": pass_status, "trader": trader})
+    except Exception as e:
+        return bad(e, 500)
+
+
+# ================================
+# NAIRAPIPS MT5 ENGINE BRIDGE ENDPOINTS
+# Production-safe add-on: lets the MT5 engine talk to the stable main API
+# without touching admin/dashboard logic or existing business routes.
+# ================================
+
+def _np_bridge_clean(v):
+    return str(v or "").strip()
+
+def _np_bridge_lower(v):
+    return _np_bridge_clean(v).lower()
+
+def _np_bridge_num(v, default=0):
+    try:
+        if v is None or v == "":
+            return default
+        return float(str(v).replace("₦", "").replace(",", "").replace("%", "").strip())
+    except Exception:
+        return default
+
+def _np_bridge_valid_login(v):
+    value = _np_bridge_clean(v)
+    return bool(value and value.isdigit())
+
+def _np_bridge_stage(row):
+    phase = _np_bridge_lower(row.get("phase"))
+    status = _np_bridge_lower(row.get("status"))
+    if "funded" in phase or status in {"funded", "live"}:
+        return "funded"
+    if "phase2" in phase or "phase_2" in phase or "phase 2" in phase:
+        return "phase2"
+    return "phase1"
+
+def _np_bridge_monitorable(row):
+    login = _np_bridge_clean(row.get("mt5_login"))
+    server = _np_bridge_clean(row.get("mt5_server") or row.get("server"))
+    if not _np_bridge_valid_login(login) or not server:
+        return False
+
+    status = _np_bridge_lower(row.get("status"))
+    phase = _np_bridge_lower(row.get("phase"))
+    payment = _np_bridge_lower(row.get("payment_status"))
+
+    if status in {"breached", "locked", "profit_protected"} or phase in {"breached", "locked", "profit_protected"}:
+        return True
+    if payment == "approved" and (status in {"active", "funded", "live", "target_hit"} or phase in {"phase1", "phase2", "funded", "live"}):
+        return True
+    if _is_truthy(row.get("monitoring_enabled")):
+        return True
+    return False
+
+def _np_bridge_latest_snapshot(login="", trader_id=""):
+    try:
+        query = supabase.table("monitoring_snapshots").select("*")
+        if trader_id:
+            query = query.eq("trader_id", trader_id)
+        elif login:
+            query = query.eq("mt5_login", str(login))
+        else:
+            return {}
+        rows = query.order("created_at", desc=True).limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print("MT5 BRIDGE SNAPSHOT SKIPPED:", e)
+        return {}
+
+def _np_bridge_latest_event(login="", trader_id=""):
+    try:
+        query = supabase.table("monitoring_events").select("*")
+        if trader_id:
+            query = query.eq("trader_id", trader_id)
+        elif login:
+            query = query.eq("mt5_login", str(login))
+        else:
+            return {}
+        rows = query.order("created_at", desc=True).limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print("MT5 BRIDGE EVENT SKIPPED:", e)
+        return {}
+
+def _np_bridge_account_from_trader(row):
+    """Create the account-level object the dashboard and MT5 engine expect.
+    This works with the restored 08/06 production schema where the live account
+    still sits on the traders row, and enriches it with latest monitoring when available.
+    """
+    if not row:
+        return {}
+    login = _np_bridge_clean(row.get("mt5_login"))
+    trader_id = row.get("id")
+    snap = _np_bridge_latest_snapshot(login, trader_id)
+    event = _np_bridge_latest_event(login, trader_id)
+
+    account_size = _np_bridge_num(row.get("account_size") or row.get("balance") or snap.get("balance"), 0)
+    equity = _np_bridge_num(snap.get("equity") if snap else row.get("equity"), _np_bridge_num(row.get("equity") or row.get("balance") or account_size, account_size))
+    balance = _np_bridge_num(snap.get("balance") if snap else row.get("balance"), _np_bridge_num(row.get("balance") or account_size, account_size))
+    highest = _np_bridge_num(snap.get("highest_equity") or row.get("highest_equity") or row.get("peak_equity"), max(equity, account_size))
+    lowest = _np_bridge_num(snap.get("lowest_equity") or row.get("lowest_equity"), equity or account_size)
+    drawdown = _np_bridge_num(snap.get("drawdown_percent") or snap.get("actual_drawdown_percent") or row.get("drawdown_percent"), 0)
+    dd_used = _np_bridge_num(snap.get("dd_used_percent") or snap.get("max_drawdown_used") or row.get("max_drawdown_used"), drawdown * 5)
+    stage = _np_bridge_stage(row)
+    target = 10 if stage == "phase1" else (8 if stage == "phase2" else None)
+
+    return {
+        "id": row.get("current_account_id") or row.get("trader_account_id") or f"legacy:{row.get('id')}:{login}",
+        "trader_id": row.get("id"),
+        "trader_account_id": row.get("current_account_id") or row.get("trader_account_id") or None,
+        "current_account_id": row.get("current_account_id") or row.get("trader_account_id") or None,
+        "account_status": "assigned_active" if _np_bridge_lower(row.get("status")) not in {"breached", "locked", "profit_protected"} else _np_bridge_lower(row.get("status")),
+        "stage": stage,
+        "phase": stage,
+        "mt5_login": login,
+        "mt5_server": row.get("mt5_server") or row.get("server") or "",
+        "mt5_master_password": row.get("mt5_master_password") or row.get("mt5_password") or row.get("master_password") or "",
+        "mt5_password": row.get("mt5_password") or row.get("mt5_master_password") or row.get("master_password") or "",
+        "master_password": row.get("master_password") or row.get("mt5_master_password") or row.get("mt5_password") or "",
+        "mt5_investor_password": row.get("mt5_investor_password") or row.get("investor_password") or "",
+        "investor_password": row.get("investor_password") or row.get("mt5_investor_password") or "",
+        "account_size": account_size,
+        "start_balance": account_size,
+        "current_balance": balance,
+        "current_equity": equity,
+        "equity": equity,
+        "profit": _np_bridge_num(snap.get("profit") or row.get("profit"), max(0, highest - account_size) if account_size else 0),
+        "profit_percent": _np_bridge_num(snap.get("profit_percent") or row.get("profit_percent"), ((highest - account_size) / account_size * 100) if account_size else 0),
+        "current_profit": _np_bridge_num(snap.get("current_profit"), equity - account_size if account_size else 0),
+        "current_profit_percent": _np_bridge_num(snap.get("current_profit_percent"), ((equity - account_size) / account_size * 100) if account_size else 0),
+        "highest_equity": highest,
+        "lowest_equity": lowest,
+        "absolute_drawdown_percent": drawdown,
+        "drawdown_percent": drawdown,
+        "dd_used_percent": dd_used,
+        "max_drawdown_used": dd_used,
+        "dd_limit_percent": 20,
+        "target_percent": target,
+        "profit_target": target,
+        "phase_pass_status": snap.get("phase_pass_status") or row.get("phase_pass_status") or "",
+        "risk_zone": snap.get("zone") or snap.get("risk_zone") or row.get("risk_zone") or "safe",
+        "display_risk_zone": snap.get("zone") or snap.get("risk_zone") or row.get("risk_zone") or "safe",
+        "latest_monitoring_snapshot": snap,
+        "latest_monitoring_event": event,
+        "started_at": row.get("challenge_started_at") or row.get("approved_at") or row.get("created_at"),
+        "assigned_at": row.get("assigned_at") or row.get("mt5_updated_at") or row.get("approved_at") or row.get("created_at"),
+        "display_assigned_at": row.get("assigned_at") or row.get("mt5_updated_at") or row.get("approved_at") or row.get("created_at"),
+        "updated_at": snap.get("created_at") or snap.get("timestamp") or row.get("updated_at"),
+        "_source_of_truth": "monitoring_api",
     }
-  }
 
-  // Make the manual Refresh button pull the live MT5 feed too.
-  const oldLoadData = (typeof window.loadData === 'function') ? window.loadData : null;
-  if(oldLoadData && !oldLoadData.__npLiveMt5SyncWrapped){
-    window.loadData = async function(){
-      const r = await oldLoadData.apply(this, arguments);
-      setTimeout(tickLiveMt5Feed, 300);
-      setTimeout(tickLiveMt5Feed, 1800);
-      return r;
-    };
-    window.loadData.__npLiveMt5SyncWrapped = true;
-    try{ loadData = window.loadData; }catch(e){}
-  }
+@app.route("/monitorable_accounts", methods=["GET"])
+def monitorable_accounts():
+    try:
+        rows = supabase.table("traders").select("*").execute().data or []
+        rows = _dedupe_traders(rows)
+        accounts = []
+        for row in rows:
+            if _np_bridge_monitorable(row):
+                acc = _np_bridge_account_from_trader(row)
+                merged = dict(row)
+                merged.update(acc)
+                merged["id"] = row.get("id")
+                merged["trader_id"] = row.get("id")
+                merged["current_account"] = acc
+                merged["active_accounts"] = [acc]
+                merged["source_of_truth"] = "legacy_traders_row_with_mt5_bridge"
+                merged["_source_of_truth"] = "monitoring_api"
+                accounts.append(merged)
+        return jsonify({
+            "success": True,
+            "source": "main_api_mt5_bridge",
+            "count": len(accounts),
+            "data": accounts,
+            "accounts": accounts,
+            "sample": accounts[:20],
+        })
+    except Exception as e:
+        return bad(e, 500)
 
-  window.npForceAdminLiveMt5Sync = tickLiveMt5Feed;
-  setTimeout(tickLiveMt5Feed, 1000);
-  setTimeout(tickLiveMt5Feed, 4000);
-  setInterval(tickLiveMt5Feed, FAST_REFRESH_MS);
-  document.addEventListener('visibilitychange', function(){ if(!document.hidden) tickLiveMt5Feed(); });
-})();
-</script>
+@app.route("/trader_current_account/<path:lookup>", methods=["GET"])
+@app.route("/current_account/<path:lookup>", methods=["GET"])
+def trader_current_account_bridge(lookup):
+    try:
+        trader = _latest_trader_for_lookup(lookup)
+        if not trader:
+            return bad("Trader not found", 404)
+        account = _np_bridge_account_from_trader(trader) if _np_bridge_valid_login(trader.get("mt5_login")) else {}
+        active_accounts = [account] if account and account.get("mt5_login") else []
+        history = []
+        try:
+            history = _account_history_for_trader(trader.get("id"), trader.get("email"), trader.get("phone")) if "_account_history_for_trader" in globals() else []
+        except Exception:
+            history = []
+        return jsonify({
+            "success": True,
+            "source": "main_api_mt5_bridge",
+            "source_of_truth": "legacy_traders_row_with_archive_history",
+            "data": {
+                "trader": trader,
+                "current_account": account,
+                "account": account,
+                "active_accounts": active_accounts,
+                "accounts": active_accounts,
+                "account_history": history,
+            },
+            "trader": trader,
+            "current_account": account,
+            "account": account,
+            "active_accounts": active_accounts,
+            "accounts": active_accounts,
+            "account_history": history,
+        })
+    except Exception as e:
+        return bad(e, 500)
 
-</body>
-</html>
+
+if __name__ == "__main__":
+    port=int(os.environ.get("PORT",10000))
+    app.run(host="0.0.0.0", port=port)
