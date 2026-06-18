@@ -5721,6 +5721,194 @@ def np_final_business_graph_route():
     except Exception as e:
         return bad(e, 500)
 
+
+# ==========================================================
+# NAIRAPIPS ASSIGNMENT CENTER - SINGLE BUSINESS QUEUE FIX
+# ==========================================================
+# This route is intentionally independent of stale frontend filters.
+# It returns every business record that can require MT5 assignment:
+# 1) challenge purchases that are approved/pending and have no MT5 yet
+# 2) trader_accounts that are phase-passed/waiting for next MT5
+# 3) legacy trader rows that are approved/active but missing MT5
+# Already active funded/live accounts with a valid MT5 are excluded.
+
+def _np_ac_s(v):
+    return str(v or "").strip()
+
+def _np_ac_l(v):
+    return _np_ac_s(v).lower()
+
+def _np_ac_num(v, default=0.0):
+    try:
+        if v is None or v == "": return default
+        return float(str(v).replace("₦", "").replace(",", "").replace("%", "").strip() or default)
+    except Exception:
+        return default
+
+def _np_ac_valid_login(v):
+    x=_np_ac_s(v)
+    return bool(x and x.isdigit() and x.lower() not in {"0","none","null","undefined","new","login","test_login"})
+
+def _np_ac_status_blob(row):
+    return " ".join([
+        _np_ac_l((row or {}).get("status")), _np_ac_l((row or {}).get("account_status")),
+        _np_ac_l((row or {}).get("payment_status")), _np_ac_l((row or {}).get("phase")),
+        _np_ac_l((row or {}).get("stage")), _np_ac_l((row or {}).get("phase_pass_status")),
+        _np_ac_l((row or {}).get("challenge_state")), _np_ac_l((row or {}).get("admin_note")),
+    ]).replace("-", "_")
+
+def _np_ac_terminal(row):
+    b=_np_ac_status_blob(row)
+    return any(x in b for x in ["breached", "archived", "disabled", "locked", "deleted", "rejected"])
+
+def _np_ac_funded_live_with_mt5(row):
+    b=_np_ac_status_blob(row).replace("_", "")
+    return _np_ac_valid_login((row or {}).get("mt5_login")) and any(x in b for x in ["fundedactive", "liveactive", "funded", "live"])
+
+def _np_ac_target_from_row(row, default="phase1"):
+    b=_np_ac_status_blob(row).replace("_", "")
+    if any(x in b for x in ["phase2passed", "fundedwaiting", "awaitingfunded"]):
+        return "funded"
+    if any(x in b for x in ["phase1passed", "phase2waiting", "awaitingphase2"]):
+        return "phase2"
+    ph=_np_ac_l((row or {}).get("phase") or (row or {}).get("stage"))
+    if ph in {"phase2", "phase_2"}: return "phase2"
+    if ph in {"funded", "live"}: return "funded"
+    return default
+
+def _np_ac_fetch(table, order_col="created_at", desc=True, limit=5000):
+    try:
+        q=supabase.table(table).select("*")
+        if order_col:
+            q=q.order(order_col, desc=desc)
+        return q.limit(limit).execute().data or []
+    except Exception as e:
+        print("ASSIGNMENT_CENTER_FETCH_FAILED", table, e)
+        return []
+
+def _np_ac_identity(row):
+    return _np_ac_l((row or {}).get("trader_id") or (row or {}).get("id")) or _np_ac_l((row or {}).get("email")) or _np_ac_l((row or {}).get("phone"))
+
+def _np_ac_best_trader(p, traders):
+    tid=_np_ac_s((p or {}).get("trader_id"))
+    email=_np_ac_l((p or {}).get("email"))
+    phone=_np_ac_s((p or {}).get("phone"))
+    for t in traders:
+        if tid and _np_ac_s(t.get("id")) == tid: return t
+    for t in traders:
+        if email and _np_ac_l(t.get("email")) == email: return t
+    for t in traders:
+        if phone and _np_ac_s(t.get("phone")) == phone: return t
+    return {}
+
+def _np_ac_row(kind, source, trader=None, purchase=None, account=None, target=None):
+    trader=trader or {}; purchase=purchase or {}; account=account or {}; source=source or {}
+    target=target or _np_ac_target_from_row(source, "phase1")
+    size=_np_ac_num(source.get("account_size") or source.get("balance") or source.get("start_balance") or purchase.get("account_size") or trader.get("account_size"), 0)
+    stage_label = {"phase1":"PHASE 1 MT5 ASSIGNMENT", "phase2":"PHASE 2 MT5 ASSIGNMENT", "funded":"FUNDED / LIVE MT5 ASSIGNMENT"}.get(target, "MT5 ASSIGNMENT")
+    return {
+        "source_type": kind,
+        "id": _np_ac_s(source.get("id")) or _np_ac_s(purchase.get("id")) or _np_ac_s(account.get("id")) or _np_ac_s(trader.get("id")),
+        "purchase_id": _np_ac_s(purchase.get("id")) if purchase else "",
+        "trader_id": _np_ac_s(trader.get("id") or source.get("trader_id") or purchase.get("trader_id") or account.get("trader_id")),
+        "trader_account_id": _np_ac_s(account.get("id") or source.get("trader_account_id") or source.get("current_account_id")),
+        "name": _np_ac_s(trader.get("name") or trader.get("trader_name") or purchase.get("trader_name") or purchase.get("name") or source.get("name") or source.get("trader_name") or "Unnamed Trader"),
+        "email": _np_ac_s(trader.get("email") or purchase.get("email") or source.get("email")),
+        "phone": _np_ac_s(trader.get("phone") or purchase.get("phone") or source.get("phone")),
+        "account_reference": _np_ac_s(source.get("account_reference") or purchase.get("account_reference") or trader.get("account_reference")),
+        "account_size": size,
+        "plan_name": _np_ac_s(source.get("plan_name") or source.get("selected_plan") or purchase.get("plan_name") or purchase.get("selected_plan")),
+        "target_phase": target,
+        "stage_label": stage_label,
+        "current_status": _np_ac_s(source.get("status") or source.get("account_status") or purchase.get("status") or trader.get("status")),
+        "payment_status": _np_ac_s(purchase.get("payment_status") or source.get("payment_status") or trader.get("payment_status")),
+        "old_mt5_login": _np_ac_s(source.get("mt5_login") or account.get("mt5_login") or trader.get("mt5_login")),
+        "old_mt5_server": _np_ac_s(source.get("mt5_server") or account.get("mt5_server") or trader.get("mt5_server")),
+        "profit_percent": _np_ac_num(source.get("profit_percent") or account.get("profit_percent") or trader.get("profit_percent"), 0),
+        "last_sync_at": _np_ac_s(source.get("updated_at") or source.get("created_at") or purchase.get("created_at") or trader.get("updated_at") or trader.get("created_at")),
+    }
+
+def _np_assignment_center_payload():
+    traders=_np_ac_fetch("traders", "created_at", True)
+    purchases=_np_ac_fetch("challenge_purchases", "created_at", True)
+    accounts=_np_ac_fetch("trader_accounts", "updated_at", True)
+    if not accounts:
+        accounts=_np_ac_fetch("trader_accounts", "created_at", True)
+    mt5=_np_ac_fetch("mt5_pool", "created_at", True)
+    rows=[]; seen=set()
+
+    # Purchases are the operating order queue: pending/approved purchases with no assigned MT5 must appear for assignment.
+    for p in purchases:
+        if _np_ac_terminal(p):
+            continue
+        st=_np_ac_l(p.get("status")); pay=_np_ac_l(p.get("payment_status"))
+        purchase_live = any(x in st for x in ["pending", "review", "approved", "paid"]) or any(x in pay for x in ["pending", "review", "approved", "paid"])
+        if not purchase_live:
+            continue
+        if _np_ac_valid_login(p.get("mt5_login")) or _np_ac_s(p.get("current_account_id") or p.get("trader_account_id")):
+            continue
+        t=_np_ac_best_trader(p, traders)
+        row=_np_ac_row("purchase", p, trader=t, purchase=p, target="phase1")
+        key="purchase:" + row.get("purchase_id", row.get("id",""))
+        if key not in seen:
+            seen.add(key); rows.append(row)
+
+    # Account lifecycle queue: passed phase/waiting next MT5 accounts.
+    for a in accounts:
+        if _np_ac_terminal(a) or _np_ac_funded_live_with_mt5(a):
+            continue
+        b=_np_ac_status_blob(a).replace("_", "")
+        needs = any(x in b for x in ["phase1passed", "phase2waiting", "awaitingphase2", "phase2passed", "fundedwaiting", "awaitingfunded"])
+        if not needs:
+            continue
+        t=_np_ac_best_trader(a, traders)
+        target=_np_ac_target_from_row(a, "phase2")
+        row=_np_ac_row("account", a, trader=t, account=a, target=target)
+        key="account:" + (row.get("trader_account_id") or row.get("id") or row.get("trader_id")) + ":" + target
+        if key not in seen:
+            seen.add(key); rows.append(row)
+
+    # Legacy approved trader row with missing MT5: still show so admin can repair quickly.
+    for t in traders:
+        if _np_ac_terminal(t) or _np_ac_funded_live_with_mt5(t):
+            continue
+        b=_np_ac_status_blob(t)
+        approved = "approved" in b or "active" in b
+        if not approved:
+            continue
+        if _np_ac_valid_login(t.get("mt5_login")):
+            continue
+        target=_np_ac_target_from_row(t, "phase1")
+        row=_np_ac_row("trader", t, trader=t, target=target)
+        key="trader:" + (row.get("trader_id") or row.get("email") or row.get("phone")) + ":" + target
+        if key not in seen:
+            seen.add(key); rows.append(row)
+
+    rows.sort(key=lambda r: (0 if r.get("target_phase")=="phase1" else 1 if r.get("target_phase")=="phase2" else 2, r.get("last_sync_at") or ""), reverse=True)
+    return {
+        "success": True,
+        "source_of_truth": "np_assignment_center_v1",
+        "generated_at": now_iso() if "now_iso" in globals() else datetime.now(timezone.utc).isoformat(),
+        "assignment_queue": rows,
+        "phase_assignment_queue": rows,
+        "mt5_pool": mt5,
+        "mt5pool": mt5,
+        "summary": {
+            "waiting": len(rows),
+            "phase1": len([r for r in rows if r.get("target_phase")=="phase1"]),
+            "phase2": len([r for r in rows if r.get("target_phase")=="phase2"]),
+            "funded": len([r for r in rows if r.get("target_phase")=="funded"]),
+            "available_mt5": len([m for m in mt5 if _np_ac_l(m.get("status") or "available") == "available"]),
+        }
+    }
+
+@app.route("/np_assignment_center", methods=["GET"])
+def np_assignment_center_route():
+    try:
+        return jsonify(_np_assignment_center_payload())
+    except Exception as e:
+        return bad(e, 500)
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
