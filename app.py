@@ -2174,26 +2174,30 @@ def account_history():
 @app.route("/assign_phase_mt5", methods=["POST"])
 def assign_phase_mt5():
     """
-    Production phase MT5 assignment.
+    Production MT5 assignment for all stages.
 
-    Purpose:
-    - Assign fresh MT5 account from mt5_pool to a trader for Phase 2 or Funded/Live.
-    - Reset phase-specific tracking so old Phase 1 equity/profit cannot contaminate Phase 2.
-    - Mark MT5 pool row as assigned so it cannot be reused.
+    This is the missing bridge fix:
+    - Phase 1, Phase 2 and Funded/Live assignments are all written to traders.
+    - The same assignment is also written/created in trader_accounts.
+    - challenge_purchases is synced for first Phase 1 approvals when possible.
+    - mt5_pool is marked assigned.
+    - Monitoring API/VPS can immediately discover the new MT5 through trader_accounts.
     """
     try:
         d = request.json or {}
         trader_id = d.get("trader_id") or d.get("id")
-        mt5_id = d.get("mt5_id")
-        phase = str(d.get("phase") or "phase2").lower().strip()
+        mt5_id = d.get("mt5_id") or d.get("assigned_mt5_id")
+        phase = str(d.get("phase") or d.get("target_phase") or "phase1").lower().strip().replace(" ", "")
         admin_name = d.get("admin_name") or d.get("approved_by") or "admin"
 
+        if phase in {"funded/live", "funded_live"}:
+            phase = "funded"
+        if phase not in ["phase1", "phase2", "funded", "live"]:
+            return bad("Phase must be phase1, phase2, funded or live")
         if not trader_id:
             return bad("Missing trader_id")
         if not mt5_id:
             return bad("Choose an MT5 account from the pool")
-        if phase not in ["phase2", "funded", "live"]:
-            return bad("Phase must be phase2, funded or live")
 
         trader_rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
         if not trader_rows:
@@ -2205,13 +2209,14 @@ def assign_phase_mt5():
             return bad("MT5 account not found in pool", 404)
         mt5_acc = pool_rows[0]
 
-        if str(mt5_acc.get("status") or "available").lower().strip() != "available":
+        pool_status = str(mt5_acc.get("status") or "available").lower().strip()
+        if pool_status != "available":
             return bad("This MT5 account is not available. Choose another one.", 409)
 
         login = str(mt5_acc.get("mt5_login") or "").strip()
         server = str(mt5_acc.get("mt5_server") or "").strip()
-        master = str(mt5_acc.get("mt5_master_password") or "").strip()
-        investor = str(mt5_acc.get("mt5_investor_password") or "").strip()
+        master = str(mt5_acc.get("mt5_master_password") or mt5_acc.get("mt5_password") or mt5_acc.get("master_password") or "").strip()
+        investor = str(mt5_acc.get("mt5_investor_password") or mt5_acc.get("investor_password") or "").strip()
         if not login or not server or not master or not investor:
             return bad("Selected MT5 pool account is incomplete. Login, server, master and investor passwords are required.")
 
@@ -2220,29 +2225,41 @@ def assign_phase_mt5():
             return bad("Account size missing. Set account_size on the MT5 pool record or trader record.")
 
         now = now_iso()
-        target_percent = 8 if phase == "phase2" else 0
         if phase == "phase2":
             new_phase = "phase2"
             new_status = "phase2_active"
+            target_percent = 8
             note = "Fresh Phase 2 MT5 assigned. Phase 2 tracking starts from zero."
-        else:
+            try:
+                _phase_archive_snapshot(trader, next_phase=new_phase, reason="phase2_fresh_mt5_assignment", admin_name=admin_name)
+            except Exception as archive_error:
+                print("PHASE2 ARCHIVE SNAPSHOT SKIPPED:", archive_error)
+        elif phase in ["funded", "live"]:
             new_phase = "funded"
             new_status = "funded_active"
+            target_percent = 0
             note = "Funded/Live MT5 assigned. Funded risk monitoring starts."
-
-        # Archive the completed current phase BEFORE replacing it with the new MT5 account.
-        # This prevents old Phase 1/purchase state from colliding with Phase 2/Funded dashboard display.
-        _phase_archive_snapshot(trader, next_phase=new_phase, reason=f"{new_phase}_fresh_mt5_assignment", admin_name=admin_name)
+            try:
+                _phase_archive_snapshot(trader, next_phase=new_phase, reason="funded_fresh_mt5_assignment", admin_name=admin_name)
+            except Exception as archive_error:
+                print("FUNDED ARCHIVE SNAPSHOT SKIPPED:", archive_error)
+        else:
+            new_phase = "phase1"
+            new_status = "assigned_active"
+            target_percent = 10
+            note = "Phase 1 MT5 assigned. Monitoring starts immediately."
 
         current_journey_id = _current_journey_key(trader) or ref()
-
         trader_update = {
             "phase": new_phase,
             "status": new_status,
             "mt5_login": login,
             "mt5_server": server,
             "mt5_master_password": master,
+            "mt5_password": master,
+            "master_password": master,
             "mt5_investor_password": investor,
+            "investor_password": investor,
             "account_size": account_size,
             "balance": account_size,
             "equity": account_size,
@@ -2262,6 +2279,7 @@ def assign_phase_mt5():
             "mt5_account_active": True,
             "mt5_access_disabled": False,
             "payout_blocked": False,
+            "payment_status": "approved",
             "admin_note": note,
             "approved_by": admin_name,
             "updated_at": now,
@@ -2276,30 +2294,88 @@ def assign_phase_mt5():
             "archived_at": None,
             "archive_reason": "",
         }
-        if phase == "phase2":
+        if new_phase == "phase1":
+            trader_update["challenge_started_at"] = now
+            trader_update["approved_at"] = trader.get("approved_at") or now
+        elif new_phase == "phase2":
             trader_update["phase2_started_at"] = now
         else:
             trader_update["funded_at"] = now
 
-        # Use safe updater because some deployments may not have every optional column.
         _safe_traders_update(trader_id, trader_update)
 
-        # Critical production sync: assign fresh phase/funded MT5 into trader_accounts too.
-        # Without this, VPS/Admin/Dashboard may not see the new account.
+        synced_trader = dict(trader)
+        synced_trader.update(trader_update)
+        synced_trader["id"] = trader_id
+        account_row = None
         try:
-            synced_trader = dict(trader)
-            synced_trader.update(trader_update)
-            synced_trader["id"] = trader_id
-            _np_sync_trader_account_assignment(
+            account_row = _np_sync_trader_account_assignment(
                 trader=synced_trader,
                 purchase={},
                 mt5=mt5_acc,
                 stage=new_phase,
                 admin_name=admin_name,
                 note=note
-            )
+            ) or {}
         except Exception as sync_error:
-            print("PHASE MT5 TRADER_ACCOUNT_SYNC ERROR:", sync_error)
+            print("MT5 ASSIGNMENT TRADER_ACCOUNT_SYNC ERROR:", sync_error)
+
+        account_id = (account_row or {}).get("id")
+        if account_id:
+            _np_safe_table_update("traders", {"current_account_id": account_id, "trader_account_id": account_id, "updated_at": now}, "id", trader_id)
+
+        # Sync the matching challenge purchase, especially Phase 1 approvals from Assignment Center.
+        purchase_update = {
+            "trader_id": trader_id,
+            "mt5_login": login,
+            "mt5_server": server,
+            "mt5_master_password": master,
+            "mt5_password": master,
+            "master_password": master,
+            "mt5_investor_password": investor,
+            "investor_password": investor,
+            "payment_status": "approved",
+            "status": "approved_active" if new_phase == "phase1" else new_status,
+            "assigned_phase": new_phase,
+            "assigned_at": now,
+            "approved_at": now,
+            "updated_at": now,
+            "admin_note": note,
+        }
+        if account_id:
+            purchase_update.update({"current_account_id": account_id, "trader_account_id": account_id})
+
+        purchase_id = d.get("purchase_id") or d.get("challenge_purchase_id") or d.get("completed_purchase_id")
+        try:
+            updated_purchase = []
+            if purchase_id:
+                updated_purchase = _np_safe_table_update("challenge_purchases", purchase_update, "id", purchase_id) or []
+            if not updated_purchase and new_phase == "phase1":
+                # Pick the newest matching purchase with no MT5 yet.
+                candidates = []
+                try:
+                    candidates = supabase.table("challenge_purchases").select("*").eq("trader_id", trader_id).order("created_at", desc=True).limit(20).execute().data or []
+                except Exception:
+                    candidates = []
+                if not candidates and trader.get("email"):
+                    try:
+                        candidates = supabase.table("challenge_purchases").select("*").eq("email", trader.get("email")).order("created_at", desc=True).limit(20).execute().data or []
+                    except Exception:
+                        candidates = []
+                chosen = None
+                for p in candidates:
+                    p_size = clean(p.get("account_size") or 0)
+                    p_login = str(p.get("mt5_login") or "").strip()
+                    p_status = str(p.get("payment_status") or p.get("status") or "").lower()
+                    if p_size == account_size and not p_login and ("pending" in p_status or "approved" in p_status or "review" in p_status or not p_status):
+                        chosen = p
+                        break
+                if not chosen and candidates:
+                    chosen = candidates[0]
+                if chosen and chosen.get("id"):
+                    _np_safe_table_update("challenge_purchases", purchase_update, "id", chosen.get("id"))
+        except Exception as purchase_sync_error:
+            print("ASSIGNMENT PURCHASE SYNC ERROR:", purchase_sync_error)
 
         pool_update = {
             "status": "assigned",
@@ -2315,12 +2391,7 @@ def assign_phase_mt5():
             supabase.table("mt5_pool").update(pool_update).eq("id", mt5_id).execute()
         except Exception as pool_error:
             print("MT5 POOL ASSIGN UPDATE FAILED:", pool_error)
-            fallback_pool = {
-                "status": "assigned",
-                "assigned_trader_name": trader.get("name") or trader.get("full_name") or "",
-                "assigned_email": trader.get("email") or "",
-                "updated_at": now,
-            }
+            fallback_pool = {"status": "assigned", "assigned_trader_name": trader.get("name") or trader.get("full_name") or "", "assigned_email": trader.get("email") or "", "updated_at": now}
             supabase.table("mt5_pool").update(fallback_pool).eq("id", mt5_id).execute()
 
         send_email_safe(
@@ -2328,7 +2399,7 @@ def assign_phase_mt5():
             f"NairaPips {new_phase.upper()} MT5 account assigned",
             f"""Hello {trader.get("name") or "Trader"},
 
-Your fresh {new_phase.upper()} MT5 account has been assigned.
+Your {new_phase.upper()} MT5 account has been assigned.
 
 MT5 Login: {login}
 Server: {server}
@@ -2340,10 +2411,9 @@ Your {new_phase.upper()} tracking starts fresh from {email_money(account_size)}.
 NairaPips Team"""
         )
 
-        _audit_safe("mt5_pool", "phase_mt5_assigned", f"{new_phase} MT5 assigned to trader {trader_id}", _admin_from_payload(d))
-
-        updated_trader = _get_trader_by_id(trader_id) or {}
-        return ok(updated_trader, f"{new_phase.upper()} MT5 assigned successfully")
+        _audit_safe("mt5_pool", "mt5_assigned_all_stage_sync", f"{new_phase} MT5 {login} assigned to trader {trader_id} and synced to trader_accounts", _admin_from_payload(d))
+        updated_trader = _get_trader_by_id(trader_id) or synced_trader
+        return ok({"trader": updated_trader, "trader_account": account_row, "mt5_login": login, "phase": new_phase}, f"{new_phase.upper()} MT5 assigned and synced to monitoring engine")
 
     except Exception as e:
         return bad(e)
