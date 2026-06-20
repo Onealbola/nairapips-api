@@ -7350,6 +7350,87 @@ def admin_trader_accounts_feed():
         return _np_fail(e, 500)
 
 
+@app.route("/np_assignment_center", methods=["GET", "OPTIONS"])
+def np_assignment_center():
+    """Unified MT5 assignment desk feed for first assignment, Phase 2, and Funded."""
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    try:
+        phase_rows = _fetch_phase_assignment_queue()
+        purchase_rows = []
+        try:
+            purchases = supabase.table("challenge_purchases").select("*").order("created_at", desc=True).limit(1500).execute().data or []
+        except Exception as e:
+            print("ASSIGNMENT CENTER PURCHASE FETCH ERROR:", e)
+            purchases = []
+
+        seen = set()
+        for p in purchases:
+            status_blob = f"{p.get('payment_status') or ''} {p.get('status') or ''}".lower()
+            has_mt5 = str(p.get("mt5_login") or p.get("current_mt5_login") or p.get("assigned_mt5_login") or "").strip()
+            if has_mt5 or "reject" in status_blob or "cancel" in status_blob:
+                continue
+            if not any(x in status_blob for x in ["approved", "paid", "pending", "review"]):
+                continue
+            pid = str(p.get("id") or "").strip()
+            if pid and pid in seen:
+                continue
+            if pid:
+                seen.add(pid)
+            purchase_rows.append({
+                "id": p.get("trader_id") or p.get("id"),
+                "trader_id": p.get("trader_id") or "",
+                "purchase_id": p.get("id"),
+                "source_type": "purchase",
+                "source": "challenge_purchases",
+                "target_phase": "phase1",
+                "target_stage": "phase1",
+                "stage_label": "PHASE 1 MT5 ASSIGNMENT",
+                "assignment_label": "Assign Phase 1 MT5",
+                "name": p.get("trader_name") or p.get("name") or p.get("full_name") or "Trader",
+                "email": p.get("email") or "",
+                "phone": p.get("phone") or "",
+                "account_reference": p.get("account_reference") or p.get("reference") or "",
+                "plan_name": p.get("plan_name") or p.get("selected_plan") or "",
+                "account_size": p.get("account_size") or p.get("challenge_amount") or 0,
+                "payment_status": p.get("payment_status") or "pending",
+                "current_status": p.get("status") or p.get("payment_status") or "pending_review",
+                "created_at": p.get("created_at") or p.get("paid_at") or p.get("updated_at") or "",
+            })
+
+        available_mt5 = []
+        try:
+            mt5_rows = supabase.table("mt5_pool").select("*").order("created_at", desc=True).limit(1500).execute().data or []
+            available_mt5 = _quick_available_mt5(mt5_rows) if "_quick_available_mt5" in globals() else [
+                m for m in mt5_rows
+                if str(m.get("status") or "available").strip().lower() in {"available", "unused", "free", ""}
+            ]
+        except Exception as e:
+            print("ASSIGNMENT CENTER MT5 FETCH ERROR:", e)
+
+        queue = purchase_rows + phase_rows
+        return _np_ok({
+            "success": True,
+            "rows": queue,
+            "data": queue,
+            "assignment_queue": queue,
+            "phase_assignment_queue": phase_rows,
+            "purchase_assignment_queue": purchase_rows,
+            "mt5_pool": available_mt5,
+            "available_mt5": available_mt5,
+            "summary": {
+                "total": len(queue),
+                "phase1": len([r for r in queue if str(r.get("target_phase") or "").lower() == "phase1"]),
+                "phase2": len([r for r in queue if str(r.get("target_phase") or "").lower() == "phase2"]),
+                "funded": len([r for r in queue if str(r.get("target_phase") or "").lower() == "funded"]),
+                "available_mt5": len(available_mt5),
+            },
+            "message": f"{len(queue)} assignment record(s)",
+        })
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
 @app.route("/admin_v2/phase1", methods=["GET", "OPTIONS"])
 def admin_v2_phase1():
     if request.method == "OPTIONS":
