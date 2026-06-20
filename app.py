@@ -7358,6 +7358,11 @@ def np_assignment_center():
     try:
         phase_rows = _fetch_phase_assignment_queue()
         purchase_rows = []
+        active_accounts = []
+        try:
+            active_accounts = supabase.table("trader_accounts").select("id,trader_id,purchase_id,challenge_purchase_id,account_size,start_balance,account_status,mt5_login").in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"]).limit(5000).execute().data or []
+        except Exception as e:
+            print("ASSIGNMENT CENTER ACTIVE ACCOUNT FETCH ERROR:", e)
         try:
             purchases = supabase.table("challenge_purchases").select("*").order("created_at", desc=True).limit(1500).execute().data or []
         except Exception as e:
@@ -7367,12 +7372,28 @@ def np_assignment_center():
         seen = set()
         for p in purchases:
             status_blob = f"{p.get('payment_status') or ''} {p.get('status') or ''}".lower()
+            payment_status = str(p.get("payment_status") or "").strip().lower()
             has_mt5 = str(p.get("mt5_login") or p.get("current_mt5_login") or p.get("assigned_mt5_login") or "").strip()
             if has_mt5 or "reject" in status_blob or "cancel" in status_blob:
                 continue
-            if not any(x in status_blob for x in ["approved", "paid", "pending", "review"]):
+            if not any(x in payment_status for x in ["approved", "paid"]):
                 continue
             pid = str(p.get("id") or "").strip()
+            trader_id = str(p.get("trader_id") or "").strip()
+            p_size = _np_number(p.get("account_size") or p.get("challenge_amount") or 0)
+            already_assigned = False
+            for a in active_accounts:
+                a_pid = str(a.get("purchase_id") or a.get("challenge_purchase_id") or "").strip()
+                a_trader_id = str(a.get("trader_id") or "").strip()
+                a_size = _np_number(a.get("account_size") or a.get("start_balance") or 0)
+                if pid and a_pid and pid == a_pid:
+                    already_assigned = True
+                    break
+                if trader_id and a_trader_id and trader_id == a_trader_id and p_size and a_size and int(p_size) == int(a_size):
+                    already_assigned = True
+                    break
+            if already_assigned:
+                continue
             if pid and pid in seen:
                 continue
             if pid:
