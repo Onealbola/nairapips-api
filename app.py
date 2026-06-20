@@ -1804,6 +1804,7 @@ def admin_bootstrap():
     traders_rows = _admin_rest_rows("traders", "created_at", True, 1200)
     plan_rows = _admin_rest_rows("challenge_plans", "created_at", True, 500)
     purchase_rows = _admin_rest_rows("challenge_purchases", "created_at", True, 1200)
+    account_rows = _admin_rest_rows("trader_accounts", "updated_at", True, 2500)
     payout_rows = _admin_rest_rows("payouts", "created_at", True, 800)
     mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 1200)
     ticket_rows = _admin_rest_rows("support_tickets", "created_at", True, 500)
@@ -1834,6 +1835,8 @@ def admin_bootstrap():
         "challenge_plans": plan_rows,
         "purchases": purchase_rows,
         "challenge_purchases": purchase_rows,
+        "accounts": account_rows,
+        "trader_accounts": account_rows,
         "mt5_pool": mt5_rows,
         "available_mt5": available_mt5_rows,
         "phase_assignment_queue": phase_queue_rows,
@@ -7323,6 +7326,28 @@ def admin_v2_accounts():
             out.append(row)
     payload["data"] = out
     return _np_ok(payload)
+
+
+@app.route("/trader_accounts", methods=["GET", "OPTIONS"])
+@app.route("/trader_lifecycle_accounts", methods=["GET", "OPTIONS"])
+def admin_trader_accounts_feed():
+    """Compatibility account feed for admin/trader dashboard source-of-truth reads."""
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    try:
+        limit = min(int(request.args.get("limit") or 5000), 10000)
+    except Exception:
+        limit = 5000
+    view = str(request.args.get("view") or "all").strip().lower()
+    try:
+        query = supabase.table("trader_accounts").select("*").order("updated_at", desc=True).limit(limit)
+        if view == "active":
+            query = query.in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"])
+        rows = query.execute().data or []
+        rows = [_decorate_account_for_api(r) if "_decorate_account_for_api" in globals() else r for r in rows]
+        return _np_ok({"success": True, "data": rows, "accounts": rows, "trader_accounts": rows, "count": len(rows)})
+    except Exception as e:
+        return _np_fail(e, 500)
 
 
 @app.route("/admin_v2/phase1", methods=["GET", "OPTIONS"])
