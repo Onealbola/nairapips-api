@@ -1659,10 +1659,25 @@ def _np_number(value, default=0):
     except Exception:
         return default
 
-def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None):
+def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_accounts_by_trader=None):
     rows = []
     traders_by_id = traders_by_id or {}
+    active_accounts_by_trader = active_accounts_by_trader or {}
     seen = set()
+    active_statuses = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"}
+    def has_target_active(trader_id, target_stage):
+        active_rows = active_accounts_by_trader.get(str(trader_id or "").strip(), [])
+        for row in active_rows:
+            status = str(row.get("account_status") or row.get("status") or "").strip().lower()
+            stage = str(row.get("stage") or row.get("phase") or "").strip().lower()
+            login = str(row.get("mt5_login") or "").strip()
+            if status not in active_statuses or not login:
+                continue
+            if target_stage == "phase2" and stage in {"phase2", "funded", "live"}:
+                return True
+            if target_stage == "funded" and (stage in {"funded", "live"} or status in {"funded_active", "funded", "live"}):
+                return True
+        return False
     for acc in accounts or []:
         try:
             status = str(acc.get("account_status") or "").strip().lower()
@@ -1683,6 +1698,8 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None):
             trader_id = str(acc.get("trader_id") or "").strip()
             trader = traders_by_id.get(trader_id) or {}
             target_stage = "funded" if phase2_passed else "phase2"
+            if has_target_active(trader_id, target_stage):
+                continue
             rows.append({
                 "id": trader.get("id") or trader_id,
                 "trader_id": trader.get("id") or trader_id,
@@ -1718,13 +1735,43 @@ def _fetch_phase_assignment_queue():
     account_rows = supabase.table("trader_accounts").select("*").in_("account_status", ["archived_phase1", "archived_phase2"]).order("updated_at", desc=True).limit(1000).execute().data or []
     trader_ids = list({str(a.get("trader_id") or "").strip() for a in account_rows if str(a.get("trader_id") or "").strip()})
     traders_by_id = {}
+    active_accounts_by_trader = {}
     if trader_ids:
         try:
             trader_rows = supabase.table("traders").select("*").in_("id", trader_ids).limit(1000).execute().data or []
             traders_by_id = {str(t.get("id") or ""): t for t in trader_rows}
         except Exception as e:
             print("PHASE QUEUE TRADER FETCH ERROR:", e)
-    return _phase_assignment_rows_from_accounts(account_rows, traders_by_id)
+        try:
+            active_rows = supabase.table("trader_accounts").select("id,trader_id,stage,phase,account_status,status,mt5_login").in_("trader_id", trader_ids).in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"]).limit(3000).execute().data or []
+            for row in active_rows:
+                tid = str(row.get("trader_id") or "").strip()
+                if tid:
+                    active_accounts_by_trader.setdefault(tid, []).append(row)
+        except Exception as e:
+            print("PHASE QUEUE ACTIVE ACCOUNT FETCH ERROR:", e)
+    return _phase_assignment_rows_from_accounts(account_rows, traders_by_id, active_accounts_by_trader)
+
+def _active_account_mt5_logins(limit=5000):
+    try:
+        rows = supabase.table("trader_accounts").select("mt5_login,account_status").in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"]).limit(limit).execute().data or []
+        return {str(r.get("mt5_login") or "").strip() for r in rows if str(r.get("mt5_login") or "").strip()}
+    except Exception as e:
+        print("ACTIVE ACCOUNT MT5 LOGIN FETCH ERROR:", e)
+        return set()
+
+def _available_mt5_not_used(limit=1500):
+    try:
+        mt5_rows = supabase.table("mt5_pool").select("*").order("created_at", desc=True).limit(limit).execute().data or []
+    except Exception as e:
+        print("AVAILABLE MT5 FETCH ERROR:", e)
+        mt5_rows = []
+    used_logins = _active_account_mt5_logins()
+    available = _quick_available_mt5(mt5_rows) if "_quick_available_mt5" in globals() else [
+        m for m in mt5_rows
+        if str(m.get("status") or "available").strip().lower() in {"available", "unused", "free", ""}
+    ]
+    return [m for m in available if str(m.get("mt5_login") or "").strip() and str(m.get("mt5_login") or "").strip() not in used_logins]
 
 @app.route("/phase_assignment_queue", methods=["GET", "OPTIONS"])
 def phase_assignment_queue():
@@ -1732,11 +1779,7 @@ def phase_assignment_queue():
         return _np_ok({"success": True})
     try:
         queue = _fetch_phase_assignment_queue()
-        available_mt5 = []
-        try:
-            available_mt5 = supabase.table("mt5_pool").select("*").eq("status", "available").order("created_at", desc=True).limit(1000).execute().data or []
-        except Exception as e:
-            print("PHASE QUEUE MT5 FETCH ERROR:", e)
+        available_mt5 = _available_mt5_not_used(1000)
         return _np_ok({
             "success": True,
             "rows": queue,
@@ -7419,15 +7462,7 @@ def np_assignment_center():
                 "created_at": p.get("created_at") or p.get("paid_at") or p.get("updated_at") or "",
             })
 
-        available_mt5 = []
-        try:
-            mt5_rows = supabase.table("mt5_pool").select("*").order("created_at", desc=True).limit(1500).execute().data or []
-            available_mt5 = _quick_available_mt5(mt5_rows) if "_quick_available_mt5" in globals() else [
-                m for m in mt5_rows
-                if str(m.get("status") or "available").strip().lower() in {"available", "unused", "free", ""}
-            ]
-        except Exception as e:
-            print("ASSIGNMENT CENTER MT5 FETCH ERROR:", e)
+        available_mt5 = _available_mt5_not_used(1500)
 
         queue = purchase_rows + phase_rows
         return _np_ok({
