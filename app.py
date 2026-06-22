@@ -349,7 +349,13 @@ def _decorate_account_for_api(account):
         or phase_pass_status in {"phase1_passed", "phase2_passed"}
         or ((event_matches_account or legacy_event_matches_account or legacy_snapshot_matches_account) and event_pass_belongs_to_stage)
     )
-    if "breach" in status_blob or "locked" in status_blob or dd_used >= 100:
+    if (
+        "breach" in status_blob
+        or "locked" in status_blob
+        or "disabled" in status_blob
+        or bool(row.get("mt5_access_disabled"))
+        or dd_used >= 100
+    ):
         zone = "breached"
     elif explicit_pass:
         zone = "passed"
@@ -7238,16 +7244,30 @@ def _v2_is_breached(row):
     blob = " ".join([
         str((row or {}).get("account_status") or ""),
         str((row or {}).get("status") or ""),
+        str((row or {}).get("stage") or ""),
+        str((row or {}).get("phase") or ""),
         str((row or {}).get("risk_zone") or ""),
         str((row or {}).get("display_risk_zone") or ""),
         str((row or {}).get("latest_monitoring_event") or ""),
+        str((row or {}).get("latest_monitoring_snapshot") or ""),
     ]).lower()
+    if bool((row or {}).get("mt5_access_disabled")):
+        return True
     try:
         if float((row or {}).get("dd_used_percent") or 0) >= 100:
             return True
     except Exception:
         pass
-    return "breach" in blob or "locked" in blob
+    try:
+        snap = (row or {}).get("latest_monitoring_snapshot") or {}
+        if isinstance(snap, dict):
+            if bool(snap.get("breached")):
+                return True
+            if float(snap.get("dd_used_percent") or snap.get("max_drawdown_used") or 0) >= 100:
+                return True
+    except Exception:
+        pass
+    return "breach" in blob or "locked" in blob or "disabled" in blob or "mt5_access_disabled" in blob
 
 
 def _v2_public_trader(row):
@@ -7275,13 +7295,13 @@ def _v2_summary_counts():
     }
 
     try:
-        accounts = supabase.table("trader_accounts").select("id,stage,account_status,risk_zone,dd_used_percent").limit(5000).execute().data or []
+        accounts = supabase.table("trader_accounts").select("id,stage,phase,account_status,status,risk_zone,display_risk_zone,dd_used_percent,mt5_access_disabled").limit(5000).execute().data or []
     except Exception:
         accounts = []
-    counts["active_accounts"] = len([a for a in accounts if _v2_account_status(a) in {"assigned_active", "active", "current_active"}])
-    counts["phase1"] = len([a for a in accounts if _v2_stage(a) == "phase1" and _v2_account_status(a) in {"assigned_active", "active", "current_active"}])
-    counts["phase2"] = len([a for a in accounts if _v2_stage(a) == "phase2" and _v2_account_status(a) in {"assigned_active", "active", "current_active"}])
-    counts["funded"] = len([a for a in accounts if _v2_stage(a) in {"funded", "live"} and _v2_account_status(a) in {"assigned_active", "active", "current_active", "funded_active", "live", "funded"}])
+    counts["active_accounts"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_account_status(a) in {"assigned_active", "active", "current_active"}])
+    counts["phase1"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_stage(a) == "phase1" and _v2_account_status(a) in {"assigned_active", "active", "current_active"}])
+    counts["phase2"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_stage(a) == "phase2" and _v2_account_status(a) in {"assigned_active", "active", "current_active"}])
+    counts["funded"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_stage(a) in {"funded", "live"} and _v2_account_status(a) in {"assigned_active", "active", "current_active", "funded_active", "live", "funded"}])
     counts["breached"] = len([a for a in accounts if _v2_is_breached(a)])
 
     try:
@@ -7504,6 +7524,7 @@ def admin_v2_accounts_stage(stage):
     if q:
         rows = [r for r in rows if q in " ".join(str(r.get(k) or "") for k in ["mt5_login", "mt5_server", "trader_id", "purchase_id", "stage", "account_status"]).lower()]
     rows = [_decorate_account_for_api(r) if "_decorate_account_for_api" in globals() else r for r in rows]
+    rows = [r for r in rows if not _v2_is_breached(r)]
     return _np_ok({"success": True, "data": rows, "page": page, "limit": limit, "has_more": len(rows) == limit})
 
 
