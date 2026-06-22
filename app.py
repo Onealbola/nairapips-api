@@ -1675,7 +1675,7 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
                 continue
             if target_stage == "phase2" and stage in {"phase2", "funded", "live"}:
                 return True
-            if target_stage == "funded" and (stage in {"funded", "live"} or status in {"funded_active", "funded", "live"}):
+            if target_stage == "funded" and stage in {"funded", "live"}:
                 return True
         return False
     for acc in accounts or []:
@@ -7281,7 +7281,7 @@ def _v2_summary_counts():
     counts["active_accounts"] = len([a for a in accounts if _v2_account_status(a) in {"assigned_active", "active", "current_active"}])
     counts["phase1"] = len([a for a in accounts if _v2_stage(a) == "phase1" and _v2_account_status(a) in {"assigned_active", "active", "current_active"}])
     counts["phase2"] = len([a for a in accounts if _v2_stage(a) == "phase2" and _v2_account_status(a) in {"assigned_active", "active", "current_active"}])
-    counts["funded"] = len([a for a in accounts if _v2_stage(a) == "funded" or _v2_account_status(a) in {"funded_active", "live", "funded"}])
+    counts["funded"] = len([a for a in accounts if _v2_stage(a) in {"funded", "live"} and _v2_account_status(a) in {"assigned_active", "active", "current_active", "funded_active", "live", "funded"}])
     counts["breached"] = len([a for a in accounts if _v2_is_breached(a)])
 
     try:
