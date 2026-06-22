@@ -1858,6 +1858,8 @@ def admin_bootstrap():
     mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 1200)
     ticket_rows = _admin_rest_rows("support_tickets", "created_at", True, 500)
     announcement_rows = _admin_rest_rows("announcements", "created_at", True, 300)
+    snapshot_rows = _admin_rest_rows("monitoring_snapshots", "created_at", True, 2500)
+    event_rows = _admin_rest_rows("monitoring_events", "created_at", True, 1200)
 
     # This queue was already proven working. If it ever fails, admin still loads.
     try:
@@ -1891,14 +1893,14 @@ def admin_bootstrap():
         "phase_assignment_queue": phase_queue_rows,
         "assignment_queue": phase_queue_rows,
 
-        # Heavy/non-critical feeds stay empty on bootstrap to make admin instant.
-        # Their modules can still call their dedicated endpoints when opened.
+        # Breach monitoring evidence is business-critical. Keep trades empty on bootstrap,
+        # but include recent monitoring rows so breached accounts cannot render as funded.
         "trader_trades": [],
         "trades": [],
-        "monitoring_snapshots": [],
-        "snapshots": [],
-        "monitoring_events": [],
-        "events": [],
+        "monitoring_snapshots": snapshot_rows,
+        "snapshots": snapshot_rows,
+        "monitoring_events": event_rows,
+        "events": event_rows,
         "marketing_deleted_contacts": [],
         "staff_members": [],
         "audit_logs": [],
@@ -5952,6 +5954,17 @@ def revenue_summary():
                 continue
             counted_payouts.append((row, dt))
 
+        try:
+            revenue_accounts = supabase.table("trader_accounts").select("id,stage,phase,account_status,status,risk_zone,display_risk_zone,dd_used_percent,mt5_access_disabled").limit(5000).execute().data or []
+        except Exception:
+            revenue_accounts = []
+        active_account_statuses = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"}
+        active_trader_count = len([a for a in revenue_accounts if not _v2_is_breached(a) and _v2_account_status(a) in active_account_statuses])
+        funded_trader_count = len([a for a in revenue_accounts if not _v2_is_breached(a) and _v2_stage(a) in {"funded", "live"} and _v2_account_status(a) in active_account_statuses])
+        if not revenue_accounts:
+            active_trader_count = len([t for t in trader_rows if str(t.get("status") or "").lower() == "active"])
+            funded_trader_count = len([t for t in trader_rows if str(t.get("status") or "").lower() in ["funded", "live"] or str(t.get("phase") or "").lower() in ["funded", "live"]])
+
         summary = {
             "weekly_sales": 0,
             "monthly_sales": 0,
@@ -5983,8 +5996,8 @@ def revenue_summary():
             "to_date_used": to_iso,
             "date_filter_used": {"from_date": from_iso, "to_date": to_iso},
             "production_mode_used": mode,
-            "active_traders": len([t for t in trader_rows if str(t.get("status") or "").lower() == "active"]),
-            "funded_traders": len([t for t in trader_rows if str(t.get("status") or "").lower() in ["funded", "live"] or str(t.get("phase") or "").lower() in ["funded", "live"]]),
+            "active_traders": active_trader_count,
+            "funded_traders": funded_trader_count,
             "conversion_rate": "0%",
             "plan_rows": [],
             "month_rows": []
