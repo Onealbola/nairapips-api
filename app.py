@@ -4880,6 +4880,215 @@ Max DD Used: {round(max_dd_used, 1)}%"""
         "phase_pass_status": update_data.get("phase_pass_status", trader.get("phase_pass_status"))
     }
 
+# ================================
+# NAIRAPIPS PRIVATE TRADER OFFERS
+# Dashboard targeting + email delivery support for retention offers.
+# Uses existing Brevo/email setup already used by OTP emails.
+# Safe fallback: if optional announcement columns do not exist yet, the route
+# still sends email but will not leak a private message publicly.
+# ================================
+def _np_offer_clean_str(v, max_len=2000):
+    return str(v or "").strip()[:max_len]
+
+
+def _np_offer_bool(v, default=False):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _np_private_offer_html(title, message, offer_code="", expires_at="", cta_url=""):
+    title = _np_offer_clean_str(title or "Private NairaPips Offer", 250)
+    message = _np_offer_clean_str(message, 5000)
+    try:
+        body = text_to_html_content(message)
+    except Exception:
+        body = "<p>" + html.escape(message).replace("\n", "<br>") + "</p>"
+    parts = [
+        f"<h2>{html.escape(title)}</h2>",
+        body,
+    ]
+    if offer_code:
+        parts.append(f"<p><strong>Offer Code:</strong> {html.escape(str(offer_code))}</p>")
+    if expires_at:
+        parts.append(f"<p><strong>Expires:</strong> {html.escape(str(expires_at))}</p>")
+    if cta_url:
+        safe_url = html.escape(str(cta_url), quote=True)
+        parts.append(f'<p><a href="{safe_url}">Open NairaPips Dashboard</a></p>')
+    parts.append("<p>NairaPips Team</p>")
+    return "\n".join(parts)
+
+
+def _np_find_offer_trader(target_trader_id="", target_email=""):
+    target_trader_id = _np_offer_clean_str(target_trader_id, 120)
+    target_email = _np_offer_clean_str(target_email, 250).lower()
+    try:
+        if target_trader_id:
+            rows = supabase.table("traders").select("*").eq("id", target_trader_id).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+        if target_email:
+            rows = supabase.table("traders").select("*").eq("email", target_email).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+            rows = supabase.table("traders").select("*").eq("canonical_email", target_email).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+    except Exception as e:
+        print("PRIVATE OFFER TRADER LOOKUP ERROR:", e)
+    return None
+
+
+@app.route("/create_private_offer", methods=["POST", "OPTIONS"])
+def create_private_offer():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        title = _np_offer_clean_str(d.get("title"), 250)
+        message = _np_offer_clean_str(d.get("message"), 5000)
+        target_email = _np_offer_clean_str(d.get("target_email"), 250).lower()
+        target_trader_id = _np_offer_clean_str(d.get("target_trader_id"), 120)
+
+        trader = _np_find_offer_trader(target_trader_id, target_email)
+        if trader:
+            target_trader_id = str(trader.get("id") or target_trader_id or "")
+            target_email = str(trader.get("email") or target_email or "").strip().lower()
+
+        if not title or not message:
+            return bad("Title and message are required")
+        if not target_email and not target_trader_id:
+            return bad("Choose a target trader for a private offer")
+
+        delivery_dashboard = _np_offer_bool(d.get("delivery_dashboard"), True)
+        delivery_email = _np_offer_bool(d.get("delivery_email"), False)
+        delivery_whatsapp = _np_offer_bool(d.get("delivery_whatsapp"), False)
+        subject = _np_offer_clean_str(d.get("subject") or title, 250)
+        cta_url = _np_offer_clean_str(d.get("cta_url") or "https://nairapips.com/dashboard/", 500)
+
+        row = {
+            "title": title,
+            "message": message,
+            "type": "private_offer",
+            "status": "active",
+            "show_on_landing": False,
+            "show_on_dashboard": delivery_dashboard,
+            "created_by": _np_offer_clean_str(d.get("created_by") or "admin", 120),
+            "created_at": now_iso(),
+            "target_trader_id": target_trader_id or None,
+            "target_email": target_email or None,
+            "target_name": _np_offer_clean_str(d.get("target_name") or (trader or {}).get("name"), 250) or None,
+            "target_phone": _np_offer_clean_str(d.get("target_phone") or (trader or {}).get("phone"), 80) or None,
+            "target_account_reference": _np_offer_clean_str(d.get("target_account_reference") or (trader or {}).get("account_reference"), 120) or None,
+            "subject": subject,
+            "offer_code": _np_offer_clean_str(d.get("offer_code"), 120) or None,
+            "expires_at": _np_offer_clean_str(d.get("expires_at"), 120) or None,
+            "cta_label": _np_offer_clean_str(d.get("cta_label") or "Contact Support", 120),
+            "cta_url": cta_url,
+            "priority": _np_offer_clean_str(d.get("priority") or "normal", 40),
+            "require_ack": _np_offer_bool(d.get("require_ack"), True),
+            "delivery_dashboard": delivery_dashboard,
+            "delivery_email": delivery_email,
+            "delivery_whatsapp": delivery_whatsapp,
+            "read_at": None,
+        }
+
+        dashboard_saved = True
+        created = []
+        try:
+            created = supabase.table("announcements").insert(row).execute().data or []
+        except Exception as schema_error:
+            print("PRIVATE OFFER ANNOUNCEMENT SCHEMA FALLBACK:", schema_error)
+            dashboard_saved = False
+            # Insert a non-public audit placeholder only. This prevents private offers
+            # from leaking globally if the optional targeting columns have not been added.
+            safe_row = {
+                "title": title,
+                "message": "Private offer created. Target columns missing; dashboard delivery disabled until schema is updated.",
+                "type": "private_offer",
+                "status": "active",
+                "show_on_landing": False,
+                "show_on_dashboard": False,
+                "created_by": _np_offer_clean_str(d.get("created_by") or "admin", 120),
+                "created_at": now_iso(),
+            }
+            try:
+                created = supabase.table("announcements").insert(safe_row).execute().data or []
+            except Exception as e2:
+                print("PRIVATE OFFER FALLBACK INSERT ERROR:", e2)
+
+        email_sent = False
+        email_error = ""
+        if delivery_email:
+            if not target_email:
+                email_error = "Target trader has no email"
+            else:
+                html_body = _np_private_offer_html(
+                    subject,
+                    d.get("email_body") or message,
+                    d.get("offer_code") or "",
+                    d.get("expires_at") or "",
+                    cta_url,
+                )
+                try:
+                    email_sent = bool(send_email_brevo(target_email, subject, html_body))
+                    if not email_sent:
+                        email_error = "Email service rejected the message"
+                except Exception as email_exc:
+                    email_error = str(email_exc)
+
+        _audit_safe(
+            "announcements",
+            "create_private_offer",
+            f"Private offer created for {target_email or target_trader_id}; dashboard={dashboard_saved}; email_sent={email_sent}",
+            _admin_from_payload(d),
+            target_trader_id or target_email,
+        )
+
+        return ok({
+            "announcement": created,
+            "dashboard_target_saved": dashboard_saved,
+            "email_sent": email_sent,
+            "email_error": email_error,
+            "whatsapp_manual": delivery_whatsapp,
+            "target_email": target_email,
+            "target_trader_id": target_trader_id,
+        }, "Private offer created")
+    except Exception as e:
+        return bad(e)
+
+
+@app.route("/send_private_offer_email", methods=["POST", "OPTIONS"])
+def send_private_offer_email():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        to_email = _np_offer_clean_str(d.get("target_email") or d.get("email"), 250).lower()
+        subject = _np_offer_clean_str(d.get("subject") or d.get("title") or "Private Offer From NairaPips", 250)
+        message = _np_offer_clean_str(d.get("email_body") or d.get("message"), 5000)
+        if not to_email:
+            return bad("Missing target email")
+        if not message:
+            return bad("Missing email message")
+        html_body = _np_private_offer_html(
+            subject,
+            message,
+            d.get("offer_code") or "",
+            d.get("expires_at") or "",
+            d.get("cta_url") or "https://nairapips.com/dashboard/",
+        )
+        sent = bool(send_email_brevo(to_email, subject, html_body))
+        if sent:
+            return ok({"email_sent": True}, "Private offer email sent")
+        return bad("Email service rejected the message. Check Render/Brevo logs.")
+    except Exception as e:
+        return bad(e)
+
+
+
 @app.route("/register_fxblue", methods=["POST"])
 def register_fxblue():
     data = request.get_json(force=True) or {}
