@@ -5,7 +5,7 @@ from supabase import create_client
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timezone
-import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json
+import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json, json
 import html
 import requests
 app = Flask(__name__)
@@ -5113,6 +5113,141 @@ def _np_offer_merge_meta(row):
             row["delivery_dashboard"] = True
     return row
 
+
+
+# ================================
+# TRADER RECOVERY CENTER API
+# ================================
+def _np_recovery_num(v):
+    try:
+        return float(v or 0)
+    except Exception:
+        return 0.0
+
+def _np_recovery_date_score(v):
+    try:
+        if not v:
+            return 0
+        return int(datetime.fromisoformat(str(v).replace('Z','+00:00')).timestamp())
+    except Exception:
+        return 0
+
+def _np_recovery_days_since(v):
+    s = _np_recovery_date_score(v)
+    if not s:
+        return 999
+    return max(0, int((time.time() - s) // 86400))
+
+def _np_recovery_is_breached(row):
+    blob = ' '.join(str(row.get(k) or '').lower() for k in ['status','account_status','phase','challenge_state','risk_zone','display_risk_zone'])
+    return ('breach' in blob) or ('locked' in blob) or ('disabled' in blob) or _is_truthy(row.get('mt5_access_disabled'))
+
+def _np_recovery_dd_used(row):
+    return max(
+        _np_recovery_num(row.get('dd_used_percent')),
+        _np_recovery_num(row.get('max_drawdown_used')),
+        _np_recovery_num(row.get('current_dd_limit_used')),
+        _np_recovery_num(row.get('absolute_drawdown_percent')) * 5,
+        _np_recovery_num(row.get('drawdown_percent')) * 5,
+    )
+
+@app.route('/trader_recovery_candidates', methods=['GET','OPTIONS'])
+def trader_recovery_candidates():
+    if request.method == 'OPTIONS':
+        return _np_ok({})
+    try:
+        rows = []
+        try:
+            rows = supabase.table('traders').select('*').limit(2000).execute().data or []
+        except Exception as e:
+            print('RECOVERY TRADERS FETCH ERROR:', e)
+            rows = []
+
+        accounts_by_trader = {}
+        try:
+            accs = supabase.table('trader_accounts').select('*').limit(4000).execute().data or []
+            for a in accs:
+                tid = str(a.get('trader_id') or '')
+                if tid:
+                    accounts_by_trader.setdefault(tid, []).append(a)
+        except Exception as e:
+            print('RECOVERY ACCOUNTS FETCH ERROR:', e)
+
+        trades_by_key = {}
+        try:
+            trades = supabase.table('trader_trades').select('*').order('synced_at', desc=True).limit(5000).execute().data or []
+            for tr in trades:
+                keys = [str(tr.get('trader_id') or '').lower(), str(tr.get('email') or '').lower(), str(tr.get('mt5_login') or '').lower()]
+                dt = tr.get('opened_at') or tr.get('closed_at') or tr.get('synced_at') or tr.get('updated_at') or tr.get('created_at')
+                score = _np_recovery_date_score(dt)
+                for k in keys:
+                    if k:
+                        trades_by_key[k] = max(trades_by_key.get(k,0), score)
+        except Exception as e:
+            print('RECOVERY TRADES FETCH ERROR:', e)
+
+        buckets = {k: [] for k in ['near_breach','breached','inactive','funded_danger','phase1_stuck']}
+        seen = {k:set() for k in buckets}
+
+        for t in rows:
+            tid = str(t.get('id') or '')
+            accounts = accounts_by_trader.get(tid, [])
+            current = None
+            if accounts:
+                accounts.sort(key=lambda a: _np_recovery_date_score(a.get('updated_at') or a.get('started_at') or a.get('created_at')), reverse=True)
+                current = accounts[0]
+            merged = dict(t)
+            if current:
+                for k,v in current.items():
+                    merged.setdefault('account_'+k, v)
+                merged.update({
+                    'account_status': current.get('account_status') or merged.get('status'),
+                    'stage': current.get('stage') or merged.get('phase'),
+                    'mt5_login': current.get('mt5_login') or merged.get('mt5_login'),
+                    'dd_used_percent': current.get('dd_used_percent') or merged.get('dd_used_percent'),
+                    'absolute_drawdown_percent': current.get('absolute_drawdown_percent') or merged.get('drawdown_percent'),
+                    'account_size': current.get('account_size') or merged.get('account_size'),
+                    'started_at': current.get('started_at') or merged.get('challenge_started_at'),
+                    'mt5_access_disabled': current.get('mt5_access_disabled') or merged.get('mt5_access_disabled'),
+                })
+            key = tid or str(t.get('email') or t.get('phone') or uuid.uuid4())
+            status_blob = ' '.join(str(merged.get(k) or '').lower() for k in ['status','account_status','phase','stage','challenge_state'])
+            dd = _np_recovery_dd_used(merged)
+            breached = _np_recovery_is_breached(merged)
+            login = str(merged.get('mt5_login') or '').strip()
+            last_trade_score = max(trades_by_key.get(tid.lower(),0), trades_by_key.get(str(t.get('email') or '').lower(),0), trades_by_key.get(login.lower(),0))
+            last_trade_iso = datetime.fromtimestamp(last_trade_score, timezone.utc).isoformat() if last_trade_score else None
+            days_inactive = _np_recovery_days_since(last_trade_iso)
+            days_stage = _np_recovery_days_since(merged.get('started_at') or merged.get('challenge_started_at') or merged.get('approved_at') or merged.get('created_at'))
+
+            def add(bucket, reason):
+                if key in seen[bucket]:
+                    return
+                seen[bucket].add(key)
+                item = {
+                    'trader_id': tid, 'name': t.get('name') or t.get('full_name'), 'email': t.get('email'), 'phone': t.get('phone'),
+                    'account_reference': t.get('account_reference'), 'mt5_login': login, 'account_size': merged.get('account_size'),
+                    'dd_used_percent': dd, 'stage': merged.get('stage') or merged.get('phase'), 'status': merged.get('account_status') or merged.get('status'),
+                    'last_trade_at': last_trade_iso, 'reason': reason
+                }
+                buckets[bucket].append(item)
+
+            if breached:
+                add('breached', 'Breached/locked/disabled evidence found')
+            if (not breached) and 70 <= dd < 100:
+                add('near_breach', f'DD used around {dd:.1f}%')
+            if (not breached) and ('funded' in status_blob or 'live' in status_blob) and dd >= 50:
+                add('funded_danger', f'Funded/live risk: {dd:.1f}% DD used')
+            if (not breached) and login and days_inactive >= 7:
+                add('inactive', f'No recent trade for {days_inactive} day(s)')
+            if (not breached) and 'phase1' in status_blob and days_stage >= 20:
+                add('phase1_stuck', f'Phase 1 active for {days_stage} day(s)')
+
+        return ok({'buckets': buckets, 'summary': {k: len(v) for k,v in buckets.items()}})
+    except Exception as e:
+        print('TRADER RECOVERY CANDIDATES ERROR:', e)
+        return bad(e)
+
 @app.route("/create_private_offer", methods=["POST", "OPTIONS"])
 def create_private_offer():
     if request.method == "OPTIONS":
@@ -5229,7 +5364,7 @@ def create_private_offer():
                 try:
                     email_sent = bool(send_email_brevo(target_email, subject, html_body))
                     if not email_sent:
-                        email_error = "Email service rejected the message"
+                        email_error = "Email service rejected the message. Check Render logs for BREVO EMAIL ERROR."
                 except Exception as email_exc:
                     email_error = str(email_exc)
 
