@@ -5,7 +5,7 @@ from supabase import create_client
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timezone
-import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string
+import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json
 import html
 import requests
 app = Flask(__name__)
@@ -5067,6 +5067,41 @@ def _np_find_offer_trader(target_trader_id="", target_email=""):
     return None
 
 
+
+# ================================
+# PRIVATE OFFER SCHEMA-FREE FALLBACK
+# ================================
+def _np_offer_meta_pack(meta):
+    try:
+        raw = json.dumps(meta or {}, separators=(",", ":"), ensure_ascii=False)
+        return "NP_PRIVATE_OFFER_META:" + base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+    except Exception:
+        return "NP_PRIVATE_OFFER_META:e30="
+
+
+def _np_offer_meta_unpack(value):
+    try:
+        text = str(value or "")
+        if not text.startswith("NP_PRIVATE_OFFER_META:"):
+            return {}
+        b64 = text.split(":", 1)[1]
+        return json.loads(base64.urlsafe_b64decode(b64.encode("ascii")).decode("utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def _np_offer_merge_meta(row):
+    row = dict(row or {})
+    meta = _np_offer_meta_unpack(row.get("created_by"))
+    if meta:
+        for k, v in meta.items():
+            if row.get(k) in [None, "", False]:
+                row[k] = v
+        # Keep admin display clean; don't expose encoded metadata.
+        row["created_by"] = meta.get("created_by") or "admin"
+        row["_schema_fallback"] = True
+    return row
+
 @app.route("/create_private_offer", methods=["POST", "OPTIONS"])
 def create_private_offer():
     if request.method == "OPTIONS":
@@ -5128,18 +5163,39 @@ def create_private_offer():
         except Exception as schema_error:
             print("PRIVATE OFFER ANNOUNCEMENT SCHEMA FALLBACK:", schema_error)
             dashboard_saved = False
-            # Insert a non-public audit placeholder only. This prevents private offers
-            # from leaking globally if the optional targeting columns have not been added.
+            # Schema-free fallback: store targeting metadata in created_by so private
+            # dashboard delivery still works even before optional DB columns exist.
+            # show_on_dashboard stays false so it never leaks as a public announcement.
+            meta = {
+                "private_offer": True,
+                "target_trader_id": target_trader_id or "",
+                "target_email": target_email or "",
+                "target_name": _np_offer_clean_str(d.get("target_name") or (trader or {}).get("name"), 250),
+                "target_phone": _np_offer_clean_str(d.get("target_phone") or (trader or {}).get("phone"), 80),
+                "target_account_reference": _np_offer_clean_str(d.get("target_account_reference") or (trader or {}).get("account_reference"), 120),
+                "subject": subject,
+                "offer_code": _np_offer_clean_str(d.get("offer_code"), 120),
+                "expires_at": _np_offer_clean_str(d.get("expires_at"), 120),
+                "cta_label": _np_offer_clean_str(d.get("cta_label") or "Contact Support", 120),
+                "cta_url": cta_url,
+                "priority": _np_offer_clean_str(d.get("priority") or "normal", 40),
+                "require_ack": _np_offer_bool(d.get("require_ack"), True),
+                "delivery_dashboard": delivery_dashboard,
+                "delivery_email": delivery_email,
+                "delivery_whatsapp": delivery_whatsapp,
+                "created_by": _np_offer_clean_str(d.get("created_by") or "admin", 120),
+            }
             safe_row = {
                 "title": title,
-                "message": "Private offer created. Target columns missing; dashboard delivery disabled until schema is updated.",
+                "message": message,
                 "type": "private_offer",
                 "status": "active",
                 "show_on_landing": False,
                 "show_on_dashboard": False,
-                "created_by": _np_offer_clean_str(d.get("created_by") or "admin", 120),
+                "created_by": _np_offer_meta_pack(meta),
                 "created_at": now_iso(),
             }
+            dashboard_saved = bool(delivery_dashboard)
             try:
                 created = supabase.table("announcements").insert(safe_row).execute().data or []
             except Exception as e2:
@@ -8305,7 +8361,8 @@ def private_offers_for_trader():
             rows = supabase.table("announcements").select("*").eq("type", "private_offer").order("created_at", desc=True).limit(100).execute().data or []
 
         visible = []
-        for row in rows:
+        for raw_row in rows:
+            row = _np_offer_merge_meta(raw_row)
             if not _np_offer_bool(row.get("delivery_dashboard"), _np_offer_bool(row.get("show_on_dashboard"), False)):
                 continue
             if _np_private_offer_expired(row):
