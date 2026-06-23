@@ -4236,7 +4236,15 @@ def close_ticket():
 
 @app.route("/announcements", methods=["GET"])
 def announcements():
-    try: return jsonify(supabase.table("announcements").select("*").eq("status","active").order("created_at", desc=True).execute().data)
+    try:
+        rows = supabase.table("announcements").select("*").eq("status","active").order("created_at", desc=True).execute().data or []
+        # Merge schema-free private-offer metadata so admin and dashboard can see
+        # target/delivery fields even when optional Supabase columns are missing.
+        try:
+            rows = [_np_offer_merge_meta(r) for r in rows]
+        except Exception:
+            pass
+        return jsonify(rows)
     except Exception as e: return bad(e)
 
 @app.route("/create_announcement", methods=["POST"])
@@ -5100,6 +5108,9 @@ def _np_offer_merge_meta(row):
         # Keep admin display clean; don't expose encoded metadata.
         row["created_by"] = meta.get("created_by") or "admin"
         row["_schema_fallback"] = True
+        # Do not lose dashboard intent when the DB had no delivery columns.
+        if _np_offer_bool(meta.get("delivery_dashboard"), False):
+            row["delivery_dashboard"] = True
     return row
 
 @app.route("/create_private_offer", methods=["POST", "OPTIONS"])
@@ -5181,6 +5192,7 @@ def create_private_offer():
                 "priority": _np_offer_clean_str(d.get("priority") or "normal", 40),
                 "require_ack": _np_offer_bool(d.get("require_ack"), True),
                 "delivery_dashboard": delivery_dashboard,
+                "show_on_dashboard": delivery_dashboard,
                 "delivery_email": delivery_email,
                 "delivery_whatsapp": delivery_whatsapp,
                 "created_by": _np_offer_clean_str(d.get("created_by") or "admin", 120),
@@ -8371,7 +8383,8 @@ def private_offers_for_trader():
                 continue
             visible.append(row)
 
-        return ok({"offers": visible, "data": visible}, "Private offers loaded")
+        # Return a plain array because older dashboard getJSON() only accepts arrays.
+        return jsonify(visible)
     except Exception as e:
         return bad(e)
 
