@@ -4900,26 +4900,115 @@ def _np_offer_bool(v, default=False):
 
 
 def _np_private_offer_html(title, message, offer_code="", expires_at="", cta_url=""):
+    """Luxury black/gold NairaPips private-offer email template.
+
+    Keep this function self-contained because Brevo receives raw HTML content.
+    It is used by /create_private_offer and /send_private_offer_email.
+    """
     title = _np_offer_clean_str(title or "Private NairaPips Offer", 250)
     message = _np_offer_clean_str(message, 5000)
+    offer_code = _np_offer_clean_str(offer_code, 120)
+    expires_at = _np_offer_clean_str(expires_at, 120)
+    cta_url = _np_offer_clean_str(cta_url or "https://nairapips.com/dashboard/", 500)
+
     try:
         body = text_to_html_content(message)
     except Exception:
         body = "<p>" + html.escape(message).replace("\n", "<br>") + "</p>"
-    parts = [
-        f"<h2>{html.escape(title)}</h2>",
-        body,
-    ]
-    if offer_code:
-        parts.append(f"<p><strong>Offer Code:</strong> {html.escape(str(offer_code))}</p>")
-    if expires_at:
-        parts.append(f"<p><strong>Expires:</strong> {html.escape(str(expires_at))}</p>")
-    if cta_url:
-        safe_url = html.escape(str(cta_url), quote=True)
-        parts.append(f'<p><a href="{safe_url}">Open NairaPips Dashboard</a></p>')
-    parts.append("<p>NairaPips Team</p>")
-    return "\n".join(parts)
 
+    safe_title = html.escape(title)
+    safe_offer_code = html.escape(str(offer_code))
+    safe_expires = html.escape(str(expires_at))
+    safe_url = html.escape(str(cta_url), quote=True)
+
+    offer_block = ""
+    if offer_code:
+        offer_block = f"""
+          <tr>
+            <td style="padding:0 32px 22px 32px;">
+              <div style="background:#050505;border:1px solid #d4af37;border-radius:18px;padding:18px;text-align:center;box-shadow:0 0 22px rgba(212,175,55,.18);">
+                <div style="font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:#b8b8b8;font-weight:800;margin-bottom:8px;">Exclusive Offer Code</div>
+                <div style="font-size:30px;line-height:1.1;color:#f5d76e;font-weight:900;letter-spacing:.08em;">{safe_offer_code}</div>
+              </div>
+            </td>
+          </tr>"""
+
+    expiry_block = ""
+    if expires_at:
+        expiry_block = f"""
+          <tr>
+            <td style="padding:0 32px 22px 32px;">
+              <div style="background:rgba(212,175,55,.08);border:1px solid rgba(212,175,55,.35);border-radius:16px;padding:14px 16px;color:#f5d76e;font-size:14px;font-weight:800;text-align:center;">
+                Offer expires: <span style="color:#ffffff;">{safe_expires}</span>
+              </div>
+            </td>
+          </tr>"""
+
+    cta_block = ""
+    if cta_url:
+        cta_block = f"""
+          <tr>
+            <td style="padding:4px 32px 34px 32px;text-align:center;">
+              <a href="{safe_url}" style="display:inline-block;background:linear-gradient(135deg,#d4af37,#f8df75);color:#050505;text-decoration:none;font-weight:900;font-size:16px;padding:16px 30px;border-radius:999px;box-shadow:0 12px 30px rgba(212,175,55,.25);">
+                Open NairaPips Dashboard
+              </a>
+              <div style="font-size:12px;color:#8f8f8f;margin-top:14px;line-height:1.5;">Log in to your dashboard to view or claim this private offer.</div>
+            </td>
+          </tr>"""
+
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{safe_title}</title>
+</head>
+<body style="margin:0;padding:0;background:#050505;font-family:Arial,Helvetica,sans-serif;color:#ffffff;">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+    A private NairaPips offer has been unlocked for your trading account.
+  </div>
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#050505;margin:0;padding:28px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:650px;background:#0a0a0a;border:1px solid rgba(212,175,55,.45);border-radius:26px;overflow:hidden;box-shadow:0 0 42px rgba(212,175,55,.14);">
+          <tr>
+            <td style="background:linear-gradient(135deg,#111111,#050505 60%,#211a07);padding:30px 32px 24px 32px;border-bottom:1px solid rgba(212,175,55,.28);">
+              <div style="font-size:30px;line-height:1;font-weight:900;letter-spacing:.02em;color:#ffffff;">
+                Naira<span style="color:#d4af37;">Pips</span>
+              </div>
+              <div style="font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:#d4af37;font-weight:800;margin-top:8px;">Private Trader Opportunity</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:32px 32px 12px 32px;">
+              <div style="display:inline-block;background:rgba(212,175,55,.1);border:1px solid rgba(212,175,55,.4);border-radius:999px;padding:8px 13px;color:#f5d76e;font-size:12px;font-weight:900;letter-spacing:.06em;text-transform:uppercase;">
+                Exclusive Message
+              </div>
+              <h1 style="margin:20px 0 14px 0;color:#f5d76e;font-size:34px;line-height:1.05;font-weight:900;letter-spacing:-.03em;">{safe_title}</h1>
+              <div style="color:#f1f1f1;font-size:16px;line-height:1.75;">
+                {body}
+              </div>
+            </td>
+          </tr>
+          {offer_block}
+          {expiry_block}
+          {cta_block}
+          <tr>
+            <td style="padding:0 32px 30px 32px;">
+              <div style="border-top:1px solid rgba(255,255,255,.08);padding-top:22px;color:#b8b8b8;font-size:13px;line-height:1.65;">
+                This offer was sent privately to your NairaPips trader account. Do not share your dashboard password, MT5 password, or verification codes with anyone.
+                <br><br>
+                <strong style="color:#ffffff;">NairaPips Team</strong><br>
+                <span style="color:#d4af37;">Empowering disciplined traders.</span>
+              </div>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
 
 def _np_find_offer_trader(target_trader_id="", target_email=""):
     target_trader_id = _np_offer_clean_str(target_trader_id, 120)
