@@ -8230,6 +8230,94 @@ def np_unified_mt5_sync_route():
     except Exception as e:
         return _np_fail(e, 500) if "_np_fail" in globals() else bad(e, 500)
 
+
+# ================================
+# NAIRAPIPS PRIVATE OFFER DASHBOARD FETCH
+# ================================
+def _np_private_offer_expired(row):
+    try:
+        exp = row.get("offer_expires_at") or row.get("expires_at") or row.get("expiry_date") or row.get("expires") or ""
+        if not exp:
+            return False
+        dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt < now
+    except Exception:
+        return False
+
+
+def _np_private_offer_matches(row, trader_id="", email="", phone="", account_reference=""):
+    def c(v):
+        return str(v or "").strip().lower()
+    def digits(v):
+        return re.sub(r"\D", "", str(v or ""))
+    keys = {c(trader_id), c(email), c(account_reference)}
+    ph = digits(phone)
+    if ph:
+        keys.add(ph)
+        if ph.startswith("234"):
+            keys.add("0" + ph[3:])
+        if ph.startswith("0"):
+            keys.add("234" + ph[1:])
+    keys = {x for x in keys if x}
+    targets = {
+        c(row.get("target_trader_id")),
+        c(row.get("target_email")),
+        c(row.get("target_account_reference")),
+        c(row.get("target_phone")),
+        c(row.get("target_name")),
+    }
+    tph = digits(row.get("target_phone"))
+    if tph:
+        targets.add(tph)
+        if tph.startswith("234"):
+            targets.add("0" + tph[3:])
+        if tph.startswith("0"):
+            targets.add("234" + tph[1:])
+    targets = {x for x in targets if x}
+    if not keys or not targets:
+        return False
+    for k in keys:
+        for t in targets:
+            if k == t or (len(k) >= 5 and k in t) or (len(t) >= 5 and t in k):
+                return True
+    return False
+
+
+@app.route("/private_offers_for_trader", methods=["GET", "OPTIONS"])
+def private_offers_for_trader():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        trader_id = _np_offer_clean_str(request.args.get("trader_id"), 120)
+        email = _np_offer_clean_str(request.args.get("email"), 250).lower()
+        phone = _np_offer_clean_str(request.args.get("phone"), 80)
+        account_reference = _np_offer_clean_str(request.args.get("account_reference"), 120)
+
+        rows = []
+        try:
+            # Fetch recent active private offers; filter in Python because some
+            # Supabase schemas differ and OR filters can miss older rows.
+            rows = supabase.table("announcements").select("*").eq("status", "active").eq("type", "private_offer").order("created_at", desc=True).limit(100).execute().data or []
+        except Exception:
+            rows = supabase.table("announcements").select("*").eq("type", "private_offer").order("created_at", desc=True).limit(100).execute().data or []
+
+        visible = []
+        for row in rows:
+            if not _np_offer_bool(row.get("delivery_dashboard"), _np_offer_bool(row.get("show_on_dashboard"), False)):
+                continue
+            if _np_private_offer_expired(row):
+                continue
+            if not _np_private_offer_matches(row, trader_id, email, phone, account_reference):
+                continue
+            visible.append(row)
+
+        return ok({"offers": visible, "data": visible}, "Private offers loaded")
+    except Exception as e:
+        return bad(e)
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
