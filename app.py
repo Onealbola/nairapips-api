@@ -4911,6 +4911,43 @@ def _np_private_offer_html(title, message, offer_code="", expires_at="", cta_url
     expires_at = _np_offer_clean_str(expires_at, 120)
     cta_url = _np_offer_clean_str(cta_url or "https://nairapips.com/dashboard/", 500)
 
+    # Clean accidental duplicated admin preview lines before rendering the email.
+    # This removes text like "NairaPips Logo", duplicate title, offer code, expiry, and footer lines
+    # from the message body because those are rendered cleanly by the template below.
+    clean_lines = []
+    seen_lines = set()
+    for line in str(message or "").replace("\r", "").split("\n"):
+        s = line.strip()
+        low = s.lower()
+        if not s:
+            if clean_lines and clean_lines[-1] != "":
+                clean_lines.append("")
+            continue
+        if low in {"nairapips logo", "logo", "nairapips team"}:
+            continue
+        if low.startswith("offer code:") or low.startswith("expires:"):
+            continue
+        if low == title.strip().lower():
+            continue
+        key = low[:180]
+        if key in seen_lines:
+            continue
+        seen_lines.add(key)
+        clean_lines.append(s)
+    while clean_lines and clean_lines[-1] == "":
+        clean_lines.pop()
+    message = "\n".join(clean_lines).strip() or "You have received a private NairaPips offer. Log in to your dashboard or contact support to activate it."
+
+    def _format_offer_expiry(value):
+        value = str(value or "").strip()
+        if not value:
+            return ""
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt.strftime("%d %b %Y, %H:%M")
+        except Exception:
+            return value
+
     try:
         body = text_to_html_content(message)
     except Exception:
@@ -4918,7 +4955,7 @@ def _np_private_offer_html(title, message, offer_code="", expires_at="", cta_url
 
     safe_title = html.escape(title)
     safe_offer_code = html.escape(str(offer_code))
-    safe_expires = html.escape(str(expires_at))
+    safe_expires = html.escape(_format_offer_expiry(expires_at))
     safe_url = html.escape(str(cta_url), quote=True)
 
     offer_block = ""
