@@ -7100,6 +7100,38 @@ def claim_private_offer():
     except Exception as e:
         return bad(e, 500)
 
+@app.route("/mark_private_offer_read", methods=["POST", "OPTIONS"])
+def mark_private_offer_read():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        offer_id = _np_offer_clean_str(d.get("offer_id") or d.get("id"), 120)
+        trader_id = _np_offer_clean_str(d.get("trader_id"), 120)
+        email = _np_offer_clean_str(d.get("email"), 250).lower()
+        phone = _np_offer_clean_str(d.get("phone"), 80)
+        account_reference = _np_offer_clean_str(d.get("account_reference"), 120)
+        if not offer_id:
+            return bad("offer_id is required", 400)
+        rows = []
+        try:
+            rows = supabase.table("announcements").select("*").eq("id", offer_id).limit(1).execute().data or []
+        except Exception:
+            rows = []
+        if not rows:
+            return bad("Offer not found", 404)
+        row = _np_offer_merge_meta(rows[0])
+        if not _np_private_offer_matches(row, trader_id, email, phone, account_reference):
+            return bad("Offer is not assigned to this trader", 403)
+        try:
+            supabase.table("announcements").update({"read_at": now_iso()}).eq("id", offer_id).execute()
+        except Exception as e:
+            # Schema-free/private fallback rows may not have read_at. Do not block UI.
+            print("PRIVATE OFFER READ AUDIT SKIPPED:", e)
+        return ok({"read": True, "offer_id": offer_id}, "Private offer marked as read")
+    except Exception as e:
+        return bad(e, 500)
+
 def _affiliate_quote_details(d, base_fee):
     """Return production-safe quote details for promo / affiliate / partner codes.
     Discount reduces customer price. Commission is calculated on the final paid fee.
