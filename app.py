@@ -5290,7 +5290,7 @@ def create_private_offer():
             "target_phone": _np_offer_clean_str(d.get("target_phone") or (trader or {}).get("phone"), 80) or None,
             "target_account_reference": _np_offer_clean_str(d.get("target_account_reference") or (trader or {}).get("account_reference"), 120) or None,
             "subject": subject,
-            "offer_code": _np_offer_clean_str(d.get("offer_code"), 120) or None,
+            "offer_code": _np_offer_clean_str(d.get("offer_code") or "PHASEHELP", 120) or "PHASEHELP",
             "expires_at": _np_offer_clean_str(d.get("expires_at"), 120) or None,
             "cta_label": _np_offer_clean_str(d.get("cta_label") or "Contact Support", 120),
             "cta_url": cta_url,
@@ -5320,7 +5320,7 @@ def create_private_offer():
                 "target_phone": _np_offer_clean_str(d.get("target_phone") or (trader or {}).get("phone"), 80),
                 "target_account_reference": _np_offer_clean_str(d.get("target_account_reference") or (trader or {}).get("account_reference"), 120),
                 "subject": subject,
-                "offer_code": _np_offer_clean_str(d.get("offer_code"), 120),
+                "offer_code": _np_offer_clean_str(d.get("offer_code") or "PHASEHELP", 120),
                 "expires_at": _np_offer_clean_str(d.get("expires_at"), 120),
                 "cta_label": _np_offer_clean_str(d.get("cta_label") or "Contact Support", 120),
                 "cta_url": cta_url,
@@ -5357,7 +5357,7 @@ def create_private_offer():
                 html_body = _np_private_offer_html(
                     subject,
                     d.get("email_body") or message,
-                    d.get("offer_code") or "",
+                    d.get("offer_code") or "PHASEHELP",
                     d.get("expires_at") or "",
                     cta_url,
                 )
@@ -6963,6 +6963,143 @@ def _aff_get_partner_by_code(code):
         print("AFFILIATE PARTNER FETCH ERROR:", str(e))
         return None
 
+
+# ================================
+# PRIVATE OFFER CLAIM + PHASEHELP DISCOUNT ENGINE
+# ================================
+def _np_offer_discount_percent(row, code=""):
+    """Return private-offer discount percent. Defaults to 50% for recovery offers."""
+    try:
+        row = _np_offer_merge_meta(row or {})
+    except Exception:
+        row = row or {}
+    direct = clean(row.get("discount_percent") or row.get("discount") or row.get("discount_pct"))
+    if direct > 0:
+        return max(0, min(100, direct))
+    text = " ".join([str(code or ""), str(row.get("offer_code") or ""), str(row.get("title") or ""), str(row.get("message") or "")]).upper()
+    m = re.search(r"(\d{1,2})\s*%", text)
+    if m:
+        return max(0, min(100, clean(m.group(1))))
+    m = re.search(r"(?:COMEBACK|RECOVERY|PHASEHELP|HELP|SAVE|RESTART)(\d{1,2})", text)
+    if m:
+        return max(0, min(100, clean(m.group(1))))
+    return 50 if ("PHASEHELP" in text or "COMEBACK" in text or "RECOVERY" in text or "SECOND CHANCE" in text) else 0
+
+
+def _np_offer_active_for_quote(d, code):
+    """Find a valid targeted private offer for this trader and code."""
+    code = _aff_code(code)
+    if not code:
+        return None
+    trader_id = _np_offer_clean_str((d or {}).get("trader_id") or (d or {}).get("target_trader_id"), 120)
+    email = _np_offer_clean_str((d or {}).get("email") or (d or {}).get("customer_email") or (d or {}).get("target_email"), 250).lower()
+    phone = _np_offer_clean_str((d or {}).get("phone") or (d or {}).get("customer_phone") or (d or {}).get("target_phone"), 80)
+    account_reference = _np_offer_clean_str((d or {}).get("account_reference") or (d or {}).get("target_account_reference"), 120)
+    try:
+        rows = supabase.table("announcements").select("*").eq("status", "active").eq("type", "private_offer").order("created_at", desc=True).limit(150).execute().data or []
+    except Exception:
+        try:
+            rows = supabase.table("announcements").select("*").eq("type", "private_offer").order("created_at", desc=True).limit(150).execute().data or []
+        except Exception:
+            rows = []
+    for raw in rows:
+        row = _np_offer_merge_meta(raw)
+        if _np_private_offer_expired(row):
+            continue
+        if not _np_private_offer_matches(row, trader_id, email, phone, account_reference):
+            continue
+        offer_code = _aff_code(row.get("offer_code") or "PHASEHELP")
+        if code == offer_code or (code == "PHASEHELP" and offer_code in {"", "PHASEHELP", "COMEBACK50", "RECOVERY50"}):
+            pct = _np_offer_discount_percent(row, code)
+            if pct > 0:
+                row["_discount_percent"] = pct
+                row["_resolved_offer_code"] = code
+                return row
+    return None
+
+
+def _np_private_offer_quote(d, base_fee, code):
+    row = _np_offer_active_for_quote(d, code)
+    if not row:
+        return None
+    pct = max(0, min(100, clean(row.get("_discount_percent") or 0)))
+    discount_amount = round(clean(base_fee) * pct / 100, 2)
+    final_fee = max(0, round(clean(base_fee) - discount_amount, 2))
+    return {
+        "valid": True,
+        "code": _aff_code(code),
+        "message": f"Private recovery offer activated: {pct:g}% discount applied",
+        "original_fee": clean(base_fee),
+        "discount_percent": pct,
+        "discount_amount": discount_amount,
+        "final_fee": final_fee,
+        "fee": final_fee,
+        "commission_percent": 0,
+        "commission_amount": 0,
+        "affiliate_owner": "NairaPips Private Offer",
+        "campaign_type": "private_recovery_offer",
+        "offer_id": row.get("id"),
+        "expires_at": row.get("offer_expires_at") or row.get("expires_at") or row.get("expiry_date") or row.get("expires"),
+        "source": row,
+    }
+
+
+@app.route("/claim_private_offer", methods=["POST", "OPTIONS"])
+def claim_private_offer():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        offer_id = _np_offer_clean_str(d.get("offer_id") or d.get("id"), 120)
+        trader_id = _np_offer_clean_str(d.get("trader_id"), 120)
+        email = _np_offer_clean_str(d.get("email"), 250).lower()
+        phone = _np_offer_clean_str(d.get("phone"), 80)
+        account_reference = _np_offer_clean_str(d.get("account_reference"), 120)
+        rows = []
+        if offer_id:
+            try:
+                rows = supabase.table("announcements").select("*").eq("id", offer_id).limit(1).execute().data or []
+            except Exception:
+                rows = []
+        if not rows:
+            try:
+                rows = supabase.table("announcements").select("*").eq("status", "active").eq("type", "private_offer").order("created_at", desc=True).limit(150).execute().data or []
+            except Exception:
+                rows = supabase.table("announcements").select("*").eq("type", "private_offer").order("created_at", desc=True).limit(150).execute().data or []
+        chosen = None
+        for raw in rows:
+            row = _np_offer_merge_meta(raw)
+            if offer_id and str(row.get("id") or "") != offer_id:
+                continue
+            if _np_private_offer_expired(row):
+                continue
+            if not _np_private_offer_matches(row, trader_id, email, phone, account_reference):
+                continue
+            chosen = row
+            break
+        if not chosen:
+            return bad("Offer not found, expired, or not assigned to this trader", 404)
+        code = _aff_code(chosen.get("offer_code") or "PHASEHELP") or "PHASEHELP"
+        pct = _np_offer_discount_percent(chosen, code)
+        expires = chosen.get("offer_expires_at") or chosen.get("expires_at") or chosen.get("expiry_date") or chosen.get("expires")
+        # Best-effort claim audit. Do not fail the trader if optional columns are missing.
+        try:
+            claimed_payload = {"claimed_at": now_iso(), "read_at": now_iso()}
+            supabase.table("announcements").update(claimed_payload).eq("id", chosen.get("id")).execute()
+        except Exception as e:
+            print("PRIVATE OFFER CLAIM AUDIT SKIPPED:", e)
+        return ok({
+            "claimed": True,
+            "offer_id": chosen.get("id"),
+            "offer_code": code,
+            "promo_code": code,
+            "discount_percent": pct,
+            "expires_at": expires,
+            "redirect": "plans",
+        }, "Private offer claimed")
+    except Exception as e:
+        return bad(e, 500)
+
 def _affiliate_quote_details(d, base_fee):
     """Return production-safe quote details for promo / affiliate / partner codes.
     Discount reduces customer price. Commission is calculated on the final paid fee.
@@ -6987,6 +7124,10 @@ def _affiliate_quote_details(d, base_fee):
     }
     if not code:
         return result
+
+    private_quote = _np_private_offer_quote(d or {}, base_fee, code)
+    if private_quote:
+        return private_quote
 
     source = _aff_get_code(code) or _aff_get_partner_by_code(code)
     if not source:
