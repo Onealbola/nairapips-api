@@ -1847,6 +1847,12 @@ def _quick_available_mt5(rows):
 def admin_bootstrap():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    force = str(request.args.get("force") or request.args.get("fresh") or "").lower() in {"1", "true", "yes", "manual"}
+    cached_payload = _ADMIN_BOOTSTRAP_CACHE.get("payload") if isinstance(_ADMIN_BOOTSTRAP_CACHE, dict) else None
+    cached_ts = float(_ADMIN_BOOTSTRAP_CACHE.get("ts") or 0) if isinstance(_ADMIN_BOOTSTRAP_CACHE, dict) else 0
+    if cached_payload and not force and (time.time() - cached_ts) <= ADMIN_BOOTSTRAP_TTL_SECONDS:
+        cached_payload["cached"] = True
+        return _np_ok(cached_payload)
     started = time.time()
 
     # Keep this intentionally LIGHT. The old version loaded 18 large endpoints and could hang Render.
@@ -1921,6 +1927,11 @@ def admin_bootstrap():
             "phase_assignment_queue": len(phase_queue_rows),
         }
     }
+    try:
+        _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
+        _ADMIN_BOOTSTRAP_CACHE["payload"] = payload
+    except Exception:
+        pass
     return _np_ok(payload)
 
 @app.route("/trader_current_account/<path:lookup>", methods=["GET"])
@@ -3253,12 +3264,147 @@ def delete_trader():
 
     except Exception as e:
         return bad(e)
+
+# ================================
+# NAIRAPIPS SPEED / BANDWIDTH CONTROL LAYER
+# ================================
+_TRADER_BOOTSTRAP_CACHE = {}
+_ADMIN_BOOTSTRAP_CACHE = {"ts": 0, "payload": None}
+TRADER_BOOTSTRAP_TTL_SECONDS = 20
+ADMIN_BOOTSTRAP_TTL_SECONDS = 25
+
+_PUBLIC_TRADER_FIELDS = [
+    "id", "name", "email", "phone", "status", "role", "created_at", "last_login_at",
+    "phase", "challenge_state", "account_size", "mt5_login", "mt5_server",
+    "current_account_id", "trader_account_id", "plan_name", "plan_id"
+]
+
+
+def _public_trader_payload(trader):
+    row = trader or {}
+    return {k: row.get(k) for k in _PUBLIC_TRADER_FIELDS if k in row}
+
+
+def _cache_key(*parts):
+    return "|".join(str(p or "").strip().lower() for p in parts)
+
+
+def _cache_get(store, key, ttl):
+    try:
+        item = store.get(key)
+        if not item:
+            return None
+        ts, payload = item
+        if time.time() - ts <= ttl:
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def _cache_set(store, key, payload):
+    try:
+        store[key] = (time.time(), payload)
+    except Exception:
+        pass
+    return payload
+
+
+def _safe_latest_rows(table, filters=None, order_col="created_at", limit=100):
+    try:
+        q = supabase.table(table).select("*")
+        for col, val in (filters or []):
+            if val not in (None, ""):
+                q = q.eq(col, val)
+        if order_col:
+            q = q.order(order_col, desc=True)
+        return q.limit(limit).execute().data or []
+    except Exception as e:
+        print(f"SAFE LATEST ROWS ERROR {table}:", e)
+        return []
+
+
+def _latest_purchase_for_trader(trader):
+    if not trader:
+        return None
+    seen = {}
+    probes = []
+    if trader.get("id"):
+        probes.append(("trader_id", trader.get("id")))
+    if trader.get("email"):
+        probes.append(("email", trader.get("email")))
+    if trader.get("phone"):
+        probes.append(("phone", trader.get("phone")))
+    for col, val in probes:
+        for row in _safe_latest_rows("challenge_purchases", [(col, val)], "created_at", 20):
+            rid = str(row.get("id") or row.get("purchase_id") or id(row))
+            seen[rid] = row
+    rows = list(seen.values())
+    rows.sort(key=lambda r: str(r.get("approved_at") or r.get("created_at") or r.get("updated_at") or ""), reverse=True)
+    return rows[0] if rows else None
+
+
+@app.route("/trader_bootstrap", methods=["GET", "OPTIONS"])
+def trader_bootstrap():
+    """One lightweight trader dashboard feed.
+    This replaces frontend fetching of /traders and direct monitoring API calls.
+    """
+    if request.method == "OPTIONS":
+        return ok({"success": True})
+    started = time.time()
+    try:
+        lookup = str(request.args.get("lookup") or request.args.get("email") or request.args.get("phone") or request.args.get("id") or "").strip().lower()
+        trader_id = str(request.args.get("trader_id") or "").strip()
+        if trader_id:
+            rows = _safe_latest_rows("traders", [("id", trader_id)], "created_at", 1)
+            trader = rows[0] if rows else None
+        else:
+            trader = _latest_trader_for_lookup(lookup) if lookup else None
+        if not trader:
+            return bad("Trader not found", 404)
+
+        key = _cache_key("trader_bootstrap", trader.get("id"), lookup)
+        cached = _cache_get(_TRADER_BOOTSTRAP_CACHE, key, TRADER_BOOTSTRAP_TTL_SECONDS)
+        if cached:
+            cached["cached"] = True
+            return ok(cached, "Trader bootstrap cached")
+
+        account = _get_active_account(trader.get("id"), trader)
+        purchase = _latest_purchase_for_trader(trader)
+        payload = {
+            "success": True,
+            "source": "trader_bootstrap_light",
+            "generated_at": now_iso(),
+            "duration_ms": int((time.time() - started) * 1000),
+            "trader": _public_trader_payload(trader),
+            "current_account": account,
+            "active_purchase": purchase,
+            "payout_eligibility": {
+                "eligible": bool(account and str(account.get("stage") or account.get("phase") or "").lower() in {"funded", "live", "funded_live"}),
+                "reason": "Funded/live account required" if not account else "Check payout rules from admin"
+            }
+        }
+        if account:
+            payload["trader"].update({
+                "current_account_id": account.get("id"),
+                "trader_account_id": account.get("id"),
+                "phase": account.get("stage") or account.get("phase") or payload["trader"].get("phase"),
+                "mt5_login": account.get("mt5_login"),
+                "mt5_server": account.get("mt5_server"),
+                "account_size": account.get("account_size") or account.get("start_balance"),
+                "profit_percent": account.get("profit_percent") or account.get("current_profit_percent") or 0,
+                "drawdown_percent": account.get("absolute_drawdown_percent") or account.get("drawdown_percent") or 0,
+                "max_drawdown_used": account.get("dd_used_percent") or account.get("max_drawdown_used") or 0,
+            })
+        return ok(_cache_set(_TRADER_BOOTSTRAP_CACHE, key, payload), "Trader bootstrap loaded")
+    except Exception as e:
+        return bad(e)
+
 @app.route("/login_trader", methods=["POST"])
 def login_trader():
-    """FAST LOGIN GATE.
-    Login must never wait for MT5/account intelligence. It only verifies identity
-    and password, returns a small session payload, then dashboards load accounts
-    asynchronously after entry.
+    """FAST AUTH ONLY.
+    Login must never wait for MT5/account intelligence. The dashboard opens from
+    this lightweight response, then calls /trader_bootstrap in the background.
     """
     try:
         data = request.json or {}
@@ -3269,37 +3415,9 @@ def login_trader():
         if not password:
             return bad("Password is required", 401)
 
-        phone = lookup
-        try:
-            phone = _normalize_phone_value(lookup)
-        except Exception:
-            pass
-
-        matches = []
-        for column, value in [
-            ("canonical_email", lookup),
-            ("email", lookup),
-            ("canonical_phone", phone),
-            ("phone", lookup),
-            ("account_reference", lookup),
-            ("id", lookup),
-        ]:
-            if not value:
-                continue
-            try:
-                rows = supabase.table("traders").select("*").eq(column, value).limit(3).execute().data or []
-                matches.extend(rows)
-            except Exception as qerr:
-                print("FAST LOGIN LOOKUP SKIP", column, qerr)
-
-        if not matches:
+        trader = _latest_trader_for_lookup(lookup)
+        if not trader:
             return bad("Invalid email/phone or password", 401)
-
-        try:
-            trader = sorted(_dedupe_by_id(matches), key=_row_score, reverse=True)[0]
-        except Exception:
-            trader = matches[0]
-
         if not (trader.get("password_hash") or trader.get("password")):
             return bad("Password not set. Please verify your email and create a password.", 403)
         if not _check_trader_password(trader, password):
@@ -3308,27 +3426,16 @@ def login_trader():
         t = now_iso()
         try:
             supabase.table("traders").update({"last_login_at": t}).eq("id", trader["id"]).execute()
-        except Exception as upd_err:
-            print("FAST LOGIN last_login_at update skipped:", upd_err)
+        except Exception as e:
+            print("LOGIN LAST_LOGIN UPDATE SKIPPED:", e)
 
-        safe = {
-            "id": trader.get("id"),
-            "name": trader.get("name") or trader.get("full_name") or "Trader",
-            "full_name": trader.get("full_name") or trader.get("name") or "Trader",
-            "email": trader.get("email") or "",
-            "phone": trader.get("phone") or "",
-            "status": trader.get("status") or "registered",
-            "phase": trader.get("phase") or "",
-            "payment_status": trader.get("payment_status") or "",
-            "account_reference": trader.get("account_reference") or "",
-            "last_login_at": t,
-            "auth_token": _make_trader_auth_token(trader.get("id")),
-            "login_fast": True,
-        }
-        return ok(safe, "Login successful")
+        public = _public_trader_payload(trader)
+        public["last_login_at"] = t
+        public["auth_token"] = _make_trader_auth_token(trader.get("id"))
+        public["bootstrap_url"] = f"/trader_bootstrap?lookup={lookup}"
+        return ok(public, "Login successful")
     except Exception as e:
-        print("FAST LOGIN ERROR:", e)
-        return bad("Connection error. Please try again.", 500)
+        return bad(e)
 
 @app.route("/approve_payment", methods=["POST"])
 def approve_payment():
