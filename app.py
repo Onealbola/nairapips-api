@@ -3255,9 +3255,10 @@ def delete_trader():
         return bad(e)
 @app.route("/login_trader", methods=["POST"])
 def login_trader():
-    """FAST LOGIN ONLY.
-    Production rule: login must not wait for MT5/account intelligence.
-    Heavy account lookup, monitoring, trades and purchases load after the dashboard opens.
+    """FAST LOGIN GATE.
+    Login must never wait for MT5/account intelligence. It only verifies identity
+    and password, returns a small session payload, then dashboards load accounts
+    asynchronously after entry.
     """
     try:
         data = request.json or {}
@@ -3268,32 +3269,66 @@ def login_trader():
         if not password:
             return bad("Password is required", 401)
 
-        trader = _latest_trader_for_lookup(lookup)
-        if not trader:
+        phone = lookup
+        try:
+            phone = _normalize_phone_value(lookup)
+        except Exception:
+            pass
+
+        matches = []
+        for column, value in [
+            ("canonical_email", lookup),
+            ("email", lookup),
+            ("canonical_phone", phone),
+            ("phone", lookup),
+            ("account_reference", lookup),
+            ("id", lookup),
+        ]:
+            if not value:
+                continue
+            try:
+                rows = supabase.table("traders").select("*").eq(column, value).limit(3).execute().data or []
+                matches.extend(rows)
+            except Exception as qerr:
+                print("FAST LOGIN LOOKUP SKIP", column, qerr)
+
+        if not matches:
             return bad("Invalid email/phone or password", 401)
+
+        try:
+            trader = sorted(_dedupe_by_id(matches), key=_row_score, reverse=True)[0]
+        except Exception:
+            trader = matches[0]
+
         if not (trader.get("password_hash") or trader.get("password")):
             return bad("Password not set. Please verify your email and create a password.", 403)
         if not _check_trader_password(trader, password):
             return bad("Invalid email/phone or password", 401)
 
-        # Do NOT call _get_active_account() here. It can touch multiple Supabase
-        # tables and monitoring records, which causes trader login timeouts.
-        # The dashboard already has authenticated background endpoints for that.
-        trader["auth_token"] = _make_trader_auth_token(trader.get("id"))
-        trader["login_mode"] = "fast"
-        trader["account_intelligence_pending"] = True
-
-        # Best-effort login timestamp update. Never block customer entry.
+        t = now_iso()
         try:
-            t = now_iso()
-            _safe_update_table("traders", {"last_login_at": t}, "id", trader.get("id"))
-            trader["last_login_at"] = t
-        except Exception as log_err:
-            print("FAST LOGIN last_login_at skipped:", log_err)
+            supabase.table("traders").update({"last_login_at": t}).eq("id", trader["id"]).execute()
+        except Exception as upd_err:
+            print("FAST LOGIN last_login_at update skipped:", upd_err)
 
-        return ok(trader, "Login successful")
+        safe = {
+            "id": trader.get("id"),
+            "name": trader.get("name") or trader.get("full_name") or "Trader",
+            "full_name": trader.get("full_name") or trader.get("name") or "Trader",
+            "email": trader.get("email") or "",
+            "phone": trader.get("phone") or "",
+            "status": trader.get("status") or "registered",
+            "phase": trader.get("phase") or "",
+            "payment_status": trader.get("payment_status") or "",
+            "account_reference": trader.get("account_reference") or "",
+            "last_login_at": t,
+            "auth_token": _make_trader_auth_token(trader.get("id")),
+            "login_fast": True,
+        }
+        return ok(safe, "Login successful")
     except Exception as e:
-        return bad(e)
+        print("FAST LOGIN ERROR:", e)
+        return bad("Connection error. Please try again.", 500)
 
 @app.route("/approve_payment", methods=["POST"])
 def approve_payment():
