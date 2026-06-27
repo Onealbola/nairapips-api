@@ -3255,6 +3255,10 @@ def delete_trader():
         return bad(e)
 @app.route("/login_trader", methods=["POST"])
 def login_trader():
+    """FAST LOGIN ONLY.
+    Production rule: login must not wait for MT5/account intelligence.
+    Heavy account lookup, monitoring, trades and purchases load after the dashboard opens.
+    """
     try:
         data = request.json or {}
         lookup = str(data.get("lookup", "")).strip().lower()
@@ -3263,6 +3267,7 @@ def login_trader():
             return bad("Missing lookup")
         if not password:
             return bad("Password is required", 401)
+
         trader = _latest_trader_for_lookup(lookup)
         if not trader:
             return bad("Invalid email/phone or password", 401)
@@ -3270,22 +3275,22 @@ def login_trader():
             return bad("Password not set. Please verify your email and create a password.", 403)
         if not _check_trader_password(trader, password):
             return bad("Invalid email/phone or password", 401)
-        t = now_iso()
-        supabase.table("traders").update({"last_login_at": t}).eq("id", trader["id"]).execute()
-        trader["last_login_at"] = t
+
+        # Do NOT call _get_active_account() here. It can touch multiple Supabase
+        # tables and monitoring records, which causes trader login timeouts.
+        # The dashboard already has authenticated background endpoints for that.
         trader["auth_token"] = _make_trader_auth_token(trader.get("id"))
-        account = _get_active_account(trader.get("id"), trader)
-        if account:
-            trader["current_account"] = account
-            trader["current_account_id"] = account.get("id")
-            trader["challenge_state"] = trader.get("challenge_state") or _active_state_for_stage(account.get("stage"))
-            trader["phase"] = account.get("stage") or trader.get("phase")
-            trader["mt5_login"] = account.get("mt5_login") or trader.get("mt5_login")
-            trader["mt5_server"] = account.get("mt5_server") or trader.get("mt5_server")
-            trader["profit"] = account.get("profit") or 0
-            trader["profit_percent"] = account.get("profit_percent") or 0
-            trader["drawdown_percent"] = account.get("absolute_drawdown_percent") or 0
-            trader["max_drawdown_used"] = account.get("dd_used_percent") or 0
+        trader["login_mode"] = "fast"
+        trader["account_intelligence_pending"] = True
+
+        # Best-effort login timestamp update. Never block customer entry.
+        try:
+            t = now_iso()
+            _safe_update_table("traders", {"last_login_at": t}, "id", trader.get("id"))
+            trader["last_login_at"] = t
+        except Exception as log_err:
+            print("FAST LOGIN last_login_at skipped:", log_err)
+
         return ok(trader, "Login successful")
     except Exception as e:
         return bad(e)
