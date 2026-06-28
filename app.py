@@ -1853,7 +1853,11 @@ def _quick_available_mt5(rows):
     for m in rows or []:
         st = str(m.get("status") or "available").strip().lower()
         assigned = str(m.get("assigned_trader_id") or m.get("trader_id") or "").strip()
-        if st in {"available", "unused", "free", ""} and not assigned:
+        # PATCH_PR_FIX_2026_06_28: accept any open/unassigned status; only exclude if
+        # status explicitly says assigned/breached/archived/etc.
+        if st in {"assigned", "inactive", "expired", "archived", "deleted", "disabled", "locked", "breached"}:
+            continue
+        if st in {"available", "unused", "free", "new", "ready", "open", "unassigned", "pending", "created", "stock"} or not st:
             out.append(m)
     return out
 
