@@ -198,6 +198,21 @@ def _has_approved_payment(rows):
 # NAIRAPIPS PRODUCTION LIFECYCLE CORE
 # traders = identity, trader_accounts = trading source of truth
 # ================================
+# NAIRAPIPS SOURCE-OF-TRUTH: active vs terminal account statuses
+# All admin + trader + monitoring filters MUST use these sets.
+# Patch PR1 (2026-06-28): unifies filter sets across /admin_v2/phase1/2/funded/breached,
+# /admin_v2/summary, /trader_accounts, and _get_active_account().
+# Do NOT add breach/archived/locked/passed statuses to ACTIVE_ACCOUNT_STATUSES.
+ACTIVE_ACCOUNT_STATUSES = {
+    "assigned_active", "active", "current_active",
+    "phase1_active", "phase2_active", "funded_active",
+    "live_active", "approved_active",
+}
+TERMINAL_ACCOUNT_STATUSES = {
+    "archived", "archived_phase1", "archived_phase2",
+    "breached", "breached_archived", "passed",
+    "locked", "disabled", "profit_protected",
+}
 ACCOUNT_STAGES = {"phase1", "phase2", "funded"}
 
 
@@ -447,19 +462,19 @@ def _get_active_account(trader_id, trader=None):
             except Exception:
                 trader = None
 
-        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("account_status", "assigned_active").order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
+        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
 
         current_account_id = (trader or {}).get("current_account_id")
         if current_account_id:
             for row in rows:
                 if str(row.get("id") or "") == str(current_account_id):
                     status = str(row.get("account_status") or "").strip().lower()
-                    if status in {"assigned_active", "active", "current_active"}:
+                    if status in ACTIVE_ACCOUNT_STATUSES:
                         return _decorate_account_for_api(row)
             direct_rows = supabase.table("trader_accounts").select("*").eq("id", current_account_id).limit(1).execute().data or []
             if direct_rows:
                 status = str(direct_rows[0].get("account_status") or "").strip().lower()
-                if status in {"assigned_active", "active", "current_active"}:
+                if status in ACTIVE_ACCOUNT_STATUSES:
                     return _decorate_account_for_api(direct_rows[0])
 
         if rows:
@@ -3211,7 +3226,7 @@ Reference: {trader_row.get("account_reference", "Not generated")}"""
 
     except Exception as e:
         return bad(e)
-              
+
 @app.route("/delete_trader", methods=["POST"])
 def delete_trader():
     try:
@@ -5839,7 +5854,7 @@ def users_database_export():
         })
 
     except Exception as e:
-        return bad(e)       
+        return bad(e)
 @app.route("/trader_trades", methods=["GET"])
 def get_trader_trades():
     try:
@@ -6255,7 +6270,7 @@ def reset_referral_settings():
     return jsonify({'success': True, 'data': default})
 
 # ===== NAIRAPIPS STAFF RBAC ROUTES =====
-# Paste above: 
+# Paste above:
 
 
 @app.get('/staff_members')
@@ -6844,7 +6859,7 @@ def delete_challenge_purchase_protected():
         return bad(e)
 
 # ===== NAIRAPIPS PAYMENT ACCOUNTS ROUTES =====
-# Paste above: 
+# Paste above:
 
 
 
@@ -8018,7 +8033,7 @@ def list_routes():
 
 
 # ============================================================
-# NAIRAPIPS ADMIN V2 API LAYER — CLEAN REBUILD CONTRACT
+# NAIRAPIPS ADMIN V2 API LAYER - CLEAN REBUILD CONTRACT
 # Purpose: stop V1 all-at-once loading and data mismatch.
 # Rules:
 #  - Each endpoint is module-specific and paginated.
@@ -8169,10 +8184,10 @@ def _v2_summary_counts():
         accounts = supabase.table("trader_accounts").select("id,stage,phase,account_status,status,risk_zone,display_risk_zone,dd_used_percent,mt5_access_disabled").limit(5000).execute().data or []
     except Exception:
         accounts = []
-    counts["active_accounts"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_account_status(a) in {"assigned_active", "active", "current_active"}])
-    counts["phase1"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_stage(a) == "phase1" and _v2_account_status(a) in {"assigned_active", "active", "current_active"}])
-    counts["phase2"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_stage(a) == "phase2" and _v2_account_status(a) in {"assigned_active", "active", "current_active"}])
-    counts["funded"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_stage(a) in {"funded", "live"} and _v2_account_status(a) in {"assigned_active", "active", "current_active", "funded_active", "live", "funded"}])
+    counts["active_accounts"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_account_status(a) in ACTIVE_ACCOUNT_STATUSES])
+    counts["phase1"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_stage(a) == "phase1" and _v2_account_status(a) in ACTIVE_ACCOUNT_STATUSES])
+    counts["phase2"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_stage(a) == "phase2" and _v2_account_status(a) in ACTIVE_ACCOUNT_STATUSES])
+    counts["funded"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_stage(a) in {"funded", "live"} and _v2_account_status(a) in ACTIVE_ACCOUNT_STATUSES])
     counts["breached"] = len([a for a in accounts if _v2_is_breached(a)])
 
     try:
@@ -8242,7 +8257,7 @@ def admin_v2_accounts():
         filters["stage"] = stage
     if view == "active":
         # Supabase py cannot combine in_ through our generic dict easily? yes list supported.
-        filters["account_status"] = ["assigned_active", "active", "current_active", "funded_active"]
+        filters["account_status"] = list(ACTIVE_ACCOUNT_STATUSES)
     payload = _v2_table_page(
         "trader_accounts",
         "*",
@@ -8276,7 +8291,7 @@ def admin_trader_accounts_feed():
     try:
         query = supabase.table("trader_accounts").select("*").order("updated_at", desc=True).limit(limit)
         if view == "active":
-            query = query.in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"])
+            query = query.in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
         rows = query.execute().data or []
         rows = [_decorate_account_for_api(r) if "_decorate_account_for_api" in globals() else r for r in rows]
         return _np_ok({"success": True, "data": rows, "accounts": rows, "trader_accounts": rows, "count": len(rows)})
@@ -8389,7 +8404,7 @@ def admin_v2_accounts_stage(stage):
     page = _v2_page(); limit = _v2_limit(); start = _v2_offset(page, limit); end = start + limit - 1
     q = _v2_q().lower()
     try:
-        rows = supabase.table("trader_accounts").select("*").eq("stage", stage).in_("account_status", ["assigned_active", "active", "current_active", "funded_active"]).order("updated_at", desc=True).range(start, end).execute().data or []
+        rows = supabase.table("trader_accounts").select("*").eq("stage", stage).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).order("updated_at", desc=True).range(start, end).execute().data or []
     except Exception as e:
         return _np_ok({"success": False, "error": str(e), "data": [], "page": page, "limit": limit, "has_more": False}, 500)
     if q:
