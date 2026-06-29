@@ -6288,6 +6288,250 @@ def staff_members():
     except Exception as e:
         return jsonify([])
 
+
+
+# ============================================================================
+# PATCHED 2026-06-29 — 10 routes for admin v4 + trader v3
+# (audit_event, staff CRUD, revenue/payout/sales summaries, payment_accounts)
+# ============================================================================
+@app.post('/audit_event')
+def audit_event():
+    """Records every admin action into admin_audit_logs (or whatever table the backend uses)."""
+    try:
+        data = request.get_json() or {}
+        payload = {
+            'module': (data.get('module') or 'unknown')[:64],
+            'action': (data.get('action') or 'unknown')[:64],
+            'details': (data.get('details') or '')[:1000],
+            'record_affected': (data.get('record_affected') or '')[:128] or None,
+            'admin_name': (data.get('admin_name') or 'admin')[:128],
+            'admin_username': (data.get('admin_username') or data.get('admin_name') or 'admin')[:128],
+            'admin_role': (data.get('admin_role') or 'admin')[:64],
+            'created_at': data.get('created_at') or now_iso(),
+        }
+        try:
+            res = supabase.table('admin_audit_logs').insert(payload).execute()
+            return jsonify({'success': True, 'data': res.data})
+        except Exception as inner:
+            # Fallback — write to legacy audit_logs if present
+            try:
+                res = supabase.table('audit_logs').insert(payload).execute()
+                return jsonify({'success': True, 'data': res.data})
+            except Exception:
+                # If neither table exists, log to stdout and succeed so admin UI isn't blocked
+                print('AUDIT:', payload)
+                return jsonify({'success': True, 'data': [], 'warning': 'no audit table found'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============================================================
+# 2-6. STAFF SUBDOMAINS — update, password, status, delete
+# (POST /staff_members already exists in app.py as create_staff_member)
+# ============================================================
+@app.post('/staff_members/update')
+def update_staff_member():
+    """Update staff profile fields (name/email/role/permissions)."""
+    try:
+        data = request.get_json() or {}
+        staff_id = (data.get('id') or '').strip()
+        if not staff_id:
+            return jsonify({'success': False, 'error': 'id required'}), 400
+        update = {}
+        for k in ('name', 'email', 'username', 'role'):
+            if k in data and data.get(k) is not None:
+                update[k] = str(data.get(k)).strip()[:128]
+        if 'permissions' in data:
+            update['permissions'] = data.get('permissions') or {}
+        if not update:
+            return jsonify({'success': False, 'error': 'no fields to update'}), 400
+        update['updated_at'] = now_iso()
+        res = supabase.table('admin_staff_members').update(update).eq('id', staff_id).execute()
+        if not res.data:
+            return jsonify({'success': False, 'error': 'staff not found'}), 404
+        row = (res.data or [{}])[0]
+        row.pop('password', None)
+        return jsonify({'success': True, 'staff': row})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.post('/staff_members/password')
+def update_staff_password():
+    """Reset a staff member's password."""
+    try:
+        data = request.get_json() or {}
+        staff_id = (data.get('id') or '').strip()
+        new_pwd = (data.get('new_password') or '').strip()
+        if not staff_id or not new_pwd:
+            return jsonify({'success': False, 'error': 'id and new_password required'}), 400
+        if len(new_pwd) < 6:
+            return jsonify({'success': False, 'error': 'password must be >= 6 chars'}), 400
+        res = supabase.table('admin_staff_members').update({
+            'password': new_pwd,
+            'password_set_at': now_iso(),
+            'updated_at': now_iso(),
+        }).eq('id', staff_id).execute()
+        if not res.data:
+            return jsonify({'success': False, 'error': 'staff not found'}), 404
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.post('/staff_members/status')
+def update_staff_status():
+    """Enable or disable a staff account."""
+    try:
+        data = request.get_json() or {}
+        staff_id = (data.get('id') or '').strip()
+        status = (data.get('status') or '').strip().lower()
+        if not staff_id or status not in ('active', 'inactive', 'suspended', 'pending'):
+            return jsonify({'success': False, 'error': 'id and valid status required'}), 400
+        res = supabase.table('admin_staff_members').update({
+            'status': status,
+            'updated_at': now_iso(),
+        }).eq('id', staff_id).execute()
+        if not res.data:
+            return jsonify({'success': False, 'error': 'staff not found'}), 404
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.post('/staff_members/delete')
+def delete_staff_member():
+    """Permanently delete a staff account."""
+    try:
+        data = request.get_json() or {}
+        staff_id = (data.get('id') or '').strip()
+        if not staff_id:
+            return jsonify({'success': False, 'error': 'id required'}), 400
+        res = supabase.table('admin_staff_members').delete().eq('id', staff_id).execute()
+        if not res.data and not getattr(res, 'status_code', 200) in (200, 204):
+            return jsonify({'success': False, 'error': 'staff not found'}), 404
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ============================================================
+# 7-9. REVENUE / PAYOUT / SALES SUMMARIES
+# ============================================================
+def _sum_rows(rows, money_field, filter_fn=None):
+    """Sum a numeric field across rows, optionally filtered."""
+    total = 0.0
+    count = 0
+    for r in rows or []:
+        if filter_fn and not filter_fn(r):
+            continue
+        try:
+            total += float(r.get(money_field) or 0)
+        except (TypeError, ValueError):
+            pass
+        count += 1
+    return {'total': total, 'count': count}
+
+
+@app.get('/revenue_summary')
+def revenue_summary():
+    """Total revenue from approved purchases minus payouts paid."""
+    try:
+        purchases = (supabase.table('challenge_purchases').select('*').execute()).data or []
+        payouts = (supabase.table('payouts').select('*').execute()).data or []
+        approved_p = [p for p in purchases if str(p.get('payment_status') or p.get('status') or '').lower() == 'approved']
+        paid_out = [p for p in payouts if str(p.get('status') or '').lower() == 'paid']
+        gross = _sum_rows(approved_p, 'fee')['total']
+        liability = _sum_rows(paid_out, 'amount')['total']
+        return jsonify({
+            'success': True,
+            'gross_revenue': gross,
+            'payouts_paid': liability,
+            'net_revenue': gross - liability,
+            'approved_purchases': len(approved_p),
+            'paid_payouts': len(paid_out),
+            'pending_purchases': len([p for p in purchases if str(p.get('payment_status') or '').lower() in ('pending', 'review', 'awaiting_review')]),
+            'pending_payouts': len([p for p in payouts if str(p.get('status') or '').lower() in ('pending', 'approved')]),
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.get('/payout_summary')
+def payout_summary():
+    """Payout breakdown by status and method."""
+    try:
+        rows = (supabase.table('payouts').select('*').execute()).data or []
+        by_status = {}
+        by_method = {}
+        total = 0.0
+        for r in rows:
+            s = str(r.get('status') or 'unknown').lower()
+            by_status[s] = by_status.get(s, 0) + 1
+            m = str(r.get('method') or r.get('payment_method') or 'unknown').lower()
+            try:
+                amt = float(r.get('amount') or 0)
+            except (TypeError, ValueError):
+                amt = 0
+            by_method[m] = by_method.get(m, 0) + amt
+            total += amt
+        return jsonify({
+            'success': True,
+            'total': total,
+            'count': len(rows),
+            'by_status': by_status,
+            'by_method': by_method,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.get('/sales_summary')
+def sales_summary():
+    """Sales breakdown by plan / month / status."""
+    try:
+        rows = (supabase.table('challenge_purchases').select('*').execute()).data or []
+        by_plan = {}
+        by_status = {}
+        by_month = {}
+        total = 0.0
+        for r in rows:
+            plan = r.get('plan_name') or r.get('selected_plan') or 'unknown'
+            by_plan[plan] = by_plan.get(plan, 0) + 1
+            s = str(r.get('payment_status') or r.get('status') or 'unknown').lower()
+            by_status[s] = by_status.get(s, 0) + 1
+            mo = str(r.get('created_at') or '')[:7]  # YYYY-MM
+            if mo:
+                by_month[mo] = by_month.get(mo, 0) + 1
+            try:
+                total += float(r.get('fee') or r.get('amount') or 0)
+            except (TypeError, ValueError):
+                pass
+        return jsonify({
+            'success': True,
+            'total_revenue': total,
+            'count': len(rows),
+            'by_plan': by_plan,
+            'by_status': by_status,
+            'by_month': by_month,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================
+# 10. PAYMENT ACCOUNTS — for trader purchase module
+# ============================================================
+@app.get('/payment_accounts')
+def list_payment_accounts():
+    """Returns active payment accounts that traders pay into when buying a challenge."""
+    try:
+        rows = (supabase.table('payment_accounts').select('*').order('created_at', desc=True).execute()).data or []
+        active = [r for r in rows if str(r.get('status') or r.get('active') or 'active').lower() in ('active', '1', 'true', '')]
+        return jsonify(active or rows)
+    except Exception as e:
+        return jsonify([])
+
+
 @app.post('/staff_login')
 def staff_login():
     try:
