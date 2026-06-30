@@ -1099,6 +1099,34 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         staff,
         f"assign_{stage}_mt5"
     )
+    # CRITICAL: Email trader their new MT5 credentials (production must notify)
+    try:
+        stage_label = stage.upper().replace('_', ' ')
+        trader_email = trader.get('email')
+        trader_name = trader.get('name') or 'Trader'
+        if trader_email:
+            details = (
+                f'Your {stage_label} MT5 account has been assigned:\n\n'
+                f'MT5 Login: {mt5.get("mt5_login")}\n'
+                f'MT5 Server: {mt5.get("mt5_server")}\n'
+                f'Master Password: {mt5.get("mt5_master_password")}\n'
+                f'Investor Password: {mt5.get("mt5_investor_password")}\n'
+                f'Account Size: {account_size:,.0f}\n\n'
+                f'You can now download MT5, log in with these credentials, and start trading.\n\n'
+                f'Your dashboard: https://nairapips.com/dashboard/trader_clean.html'
+            )
+            send_account_status_email(
+                trader,
+                f'NairaPips — Your {stage_label} MT5 credentials',
+                f'Hello {trader_name}, your {stage_label} MT5 account has been assigned by NairaPips.',
+                details
+            )
+            send_admin_alert(
+                f'NairaPips {stage_label} MT5 assigned',
+                f'MT5 {mt5.get("mt5_login")} assigned to {trader_name} ({trader_email}) for {stage_label}. Emailed credentials to trader.'
+            )
+    except Exception as _email_err:
+        print('MT5 ASSIGN EMAIL ERROR:', str(_email_err))
     return account, trader_row
 
 
@@ -1361,6 +1389,25 @@ def _breach_trader_account(trader_id, reason, staff=None):
         staff,
         "breach_account"
     )
+    # Send breach notification email + admin alert (CRITICAL — production must email trader)
+    try:
+        send_account_status_email(
+            updated,
+            "NairaPips account breached",
+            "Your NairaPips account has been breached and locked.",
+            reason or "Maximum drawdown violation recorded by NairaPips monitoring engine."
+        )
+        send_admin_alert(
+            "NairaPips account breached",
+            f"""A trader account has breached and has been locked.
+
+Trader: {updated.get('name') or 'Trader'}
+Email: {updated.get('email') or 'Not provided'}
+MT5 Login: {updated.get('mt5_login') or 'Not provided'}
+Reason: {reason}"""
+        )
+    except Exception as _email_err:
+        print("BREACH EMAIL ERROR:", str(_email_err))
     return updated, account
 
 
@@ -1539,6 +1586,10 @@ def update_trader_mt5():
             mirror_update.get("mt5_master_password") or account.get("mt5_master_password") or "",
             mirror_update.get("mt5_investor_password") or account.get("mt5_investor_password") or "",
             data.get("mt5_reset_reason") or data.get("admin_note") or "Current active MT5 credentials updated"
+        )
+        send_admin_alert(
+            "NairaPips MT5 login reset (active account)",
+            f"Trader {updated.get('name') or trader_id} ({updated.get('email')}) active MT5 credentials updated. MT5 login: {account.get('mt5_login')}. Email sent to trader."
         )
         _audit_safe("mt5", "active_mt5_credentials_update", f"Trader {trader_id} active account {account.get('id')} credentials updated", _admin_from_payload(data))
         return _np_ok({"success": True, "message": "Current active MT5 credentials updated", "data": updated, "current_account": account})
@@ -2978,6 +3029,19 @@ def admin_reset_trader_password():
         updated = supabase.table('traders').update(payload).eq('id', trader.get('id')).execute().data or []
         admin = _admin_from_payload(d)
         _audit_safe('traders', 'admin_password_reset', f"Admin reset trader password for {trader.get('id')}", admin, trader.get('id'))
+        # CRITICAL: Email the trader their new login password (production must notify)
+        try:
+            trader_name = trader.get('name') or 'Trader'
+            trader_email = trader.get('email')
+            if trader_email and d.get('notify') != False:
+                send_account_status_email(
+                    trader,
+                    'NairaPips — Your dashboard password has been reset',
+                    f'Hello {trader_name}, your NairaPips dashboard password has been reset by an administrator.',
+                    f'Your new login password is: {temp_password}\n\nYou can log in at https://nairapips.com/dashboard/trader_clean.html using your email and this password.\n\nFor security, please change your password after logging in.\n\nNairaPips Team'
+                )
+        except Exception as _email_err:
+            print('PASSWORD RESET EMAIL ERROR:', str(_email_err))
 
         row = updated[0] if updated else get_trader_by_id(trader.get('id'))
         safe_trader = {
@@ -3949,17 +4013,143 @@ def lifecycle_assign_funded_mt5():
 
 
 @app.post("/lifecycle/breach_account")
-def lifecycle_breach_account():
+
+
+@app.route("/resend_breach_email", methods=["POST", "OPTIONS"])
+def resend_breach_email():
+    if request.method == "OPTIONS":
+        return _np_ok({})
     try:
         d = request.get_json(silent=True) or {}
-        trader_id = d.get("trader_id") or d.get("id")
-        if not trader_id:
-            return bad("trader_id is required")
-        reason = d.get("reason") or d.get("admin_note") or "Maximum drawdown or rule breach."
-        trader, account = _breach_trader_account(trader_id, reason, _admin_from_payload(d))
-        return ok({"trader": trader, "archived_account": account}, "Trader breached and active account archived")
+        lookup = d.get("trader_id") or d.get("id") or d.get("email") or d.get("mt5_login")
+        if not lookup:
+            return bad("Send trader_id, id, email, or mt5_login", 400)
+        trader = None
+        if d.get("trader_id") or d.get("id"):
+            trader = get_trader_by_id(lookup)
+        elif d.get("email"):
+            trader = _find_existing_trader(lookup.lower(), None)
+        elif d.get("mt5_login"):
+            accs = supabase.table("trader_accounts").select("trader_id").eq("mt5_login", str(lookup)).limit(1).execute().data or []
+            if accs:
+                trader = get_trader_by_id(accs[0].get("trader_id"))
+        if not trader:
+            return bad("Trader not found", 404)
+        if str(trader.get("status") or "").lower() != "breached":
+            return bad(f"Trader status is '{trader.get('status')}', not breached. Cannot send breach email.", 400)
+        reason = trader.get("breach_reason") or trader.get("admin_note") or "Maximum drawdown violation recorded by NairaPips monitoring engine."
+        sent = send_account_status_email(
+            trader,
+            "NairaPips account breached — Notification",
+            "Your NairaPips account has been breached and locked.",
+            reason
+        )
+        admin_sent = send_admin_alert(
+            "NairaPips breach email resent",
+            f"Breach email resent for {trader.get('name') or 'trader'} ({trader.get('email')})"
+        )
+        return ok({"trader_email_sent": bool(sent), "admin_email_sent": bool(admin_sent)}, "Breach email resent")
     except Exception as e:
         return bad(e)
+
+@app.route("/admin_email_status", methods=["GET"])
+def admin_email_status():
+    """List traders by status (breached/passed) with email-sent status."""
+    try:
+        status = str(request.args.get("status") or "breached").lower()
+        limit = int(request.args.get("limit", 100))
+        # Fetch traders with the given status
+        rows = supabase.table("traders").select("id,name,email,status,phase,phase_pass_status,breach_time,breach_reason,last_breach_email_sent_at,last_phase_pass_email_sent_at,created_at,updated_at").eq("status", status).order("updated_at", desc=True).limit(limit).execute().data or []
+        # Also fetch email_logs to know which ones got emails
+        logs = supabase.table("email_logs").select("recipient_email,subject,email_type,status,created_at,error").order("created_at", desc=True).limit(1000).execute().data or []
+        # Group logs by recipient + email_type
+        from collections import defaultdict
+        sent_map = {}  # email -> {email_type: last_status}
+        for log in logs:
+            email = str(log.get("recipient_email") or "").lower()
+            etype = str(log.get("email_type") or "").lower()
+            if not email or not etype: continue
+            key = (email, etype)
+            if key not in sent_map or str(log.get("created_at","")) > str(sent_map[key].get("created_at","")):
+                sent_map[key] = log
+        # Augment each trader with email status
+        for r in rows:
+            email = str(r.get("email") or "").lower()
+            if status == "breached":
+                breach_log = sent_map.get((email, "breach")) or sent_map.get((email, "breached"))
+                r["breach_email_sent"] = bool(breach_log and breach_log.get("status") == "sent")
+                r["breach_email_log"] = breach_log
+            elif status in ["phase1_passed", "phase2_passed", "passed"]:
+                pass_log = sent_map.get((email, r.get("phase_pass_status") or "phase_pass"))
+                r["phase_pass_email_sent"] = bool(pass_log and pass_log.get("status") == "sent")
+                r["phase_pass_email_log"] = pass_log
+        return ok({"traders": rows, "total": len(rows), "status": status, "logs_total": len(logs)}, "Email status fetched")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/admin_bulk_resend_breach_emails", methods=["POST", "OPTIONS"])
+def admin_bulk_resend_breach_emails():
+    """Bulk resend breach emails to all breached traders who haven't received one."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        rows = supabase.table("traders").select("id,name,email,breach_reason,admin_note").eq("status", "breached").execute().data or []
+        sent_count = 0
+        failed_count = 0
+        skipped_count = 0
+        results = []
+        for r in rows:
+            email = (r.get("email") or "").lower().strip()
+            if not email:
+                skipped_count += 1
+                continue
+            reason = r.get("breach_reason") or r.get("admin_note") or "Maximum drawdown violation recorded by NairaPips monitoring engine."
+            sent = send_account_status_email(
+                r,
+                "NairaPips account breached",
+                "Your NairaPips account has been breached and locked.",
+                reason
+            )
+            if sent:
+                sent_count += 1
+                results.append({"email": email, "name": r.get("name"), "status": "sent"})
+            else:
+                failed_count += 1
+                results.append({"email": email, "name": r.get("name"), "status": "failed"})
+        return ok({"total": len(rows), "sent": sent_count, "failed": failed_count, "skipped": skipped_count, "results": results}, f"Bulk resend complete: {sent_count} sent, {failed_count} failed, {skipped_count} skipped")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/admin_bulk_resend_pass_emails", methods=["POST", "OPTIONS"])
+def admin_bulk_resend_pass_emails():
+    """Bulk resend phase pass emails to all passed traders."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        # Find traders with phase_pass_status set
+        rows1 = supabase.table("traders").select("id,name,email,phase_pass_status").in_("phase_pass_status", ["phase1_passed", "phase2_passed"]).execute().data or []
+        sent_count = 0; failed_count = 0; skipped_count = 0
+        results = []
+        for r in rows1:
+            email = (r.get("email") or "").lower().strip()
+            if not email:
+                skipped_count += 1; continue
+            pass_status = r.get("phase_pass_status") or ""
+            phase_name = "Phase 2" if pass_status == "phase2_passed" else "Phase 1"
+            sent = send_account_status_email(
+                r,
+                f"Congratulations - You passed {phase_name}",
+                f"You have passed {phase_name}.",
+                f"Congratulations. You have successfully passed {phase_name} of the NairaPips Challenge.\n\nYour dashboard has been updated and the account has been locked for admin review / next stage processing.\n\nNairaPips Team"
+            )
+            if sent: sent_count += 1
+            else: failed_count += 1
+            results.append({"email": email, "phase": phase_name, "status": "sent" if sent else "failed"})
+        return ok({"total": len(rows1), "sent": sent_count, "failed": failed_count, "skipped": skipped_count, "results": results}, f"Bulk resend complete: {sent_count} sent")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/resend_phase_pass_email", methods=["POST", "OPTIONS"])
 
 @app.route("/mt5_pool", methods=["GET"])
 def mt5_pool():
@@ -3987,11 +4177,57 @@ def update_mt5():
     try:
         d=request.json or {}; mid=d.get("id")
         if not mid: return bad("Missing MT5 account id")
+        # Get the existing row first so we can detect which fields changed and email the trader
+        existing = supabase.table("mt5_pool").select("*").eq("id", mid).limit(1).execute().data or []
         upd={"updated_at":now_iso()}
         for k in ["plan_name","mt5_login","mt5_server","mt5_master_password","mt5_investor_password","status","admin_note"]:
             if k in d: upd[k]=d[k]
         if "account_size" in d: upd["account_size"]=clean(d.get("account_size"))
-        return ok(supabase.table("mt5_pool").update(upd).eq("id",mid).execute().data, "MT5 account updated")
+        result = supabase.table("mt5_pool").update(upd).eq("id",mid).execute().data
+        # CRITICAL: Notify trader when their MT5 login credentials change (production must notify)
+        try:
+            if existing and result:
+                old_row = existing[0]
+                new_row = result[0] if isinstance(result, list) else result
+                creds_changed = []
+                for cred_field in ['mt5_login', 'mt5_server', 'mt5_master_password', 'mt5_investor_password']:
+                    if str(old_row.get(cred_field) or '') != str(new_row.get(cred_field) or ''):
+                        creds_changed.append(cred_field)
+                if creds_changed:
+                    # Find the trader assigned to this MT5
+                    trader_id = new_row.get('assigned_trader_id') or new_row.get('trader_id')
+                    trader_email = new_row.get('trader_email')
+                    if not trader_email and trader_id:
+                        tr = supabase.table('traders').select('id,name,email').eq('id', trader_id).limit(1).execute().data or []
+                        if tr: trader_email = tr[0].get('email'); trader_name = tr[0].get('name') or 'Trader'
+                    if not trader_email:
+                        # Try via trader_accounts
+                        accs = supabase.table('trader_accounts').select('trader_id').eq('mt5_login', str(new_row.get('mt5_login') or '')).limit(1).execute().data or []
+                        if accs:
+                            tr = supabase.table('traders').select('id,name,email').eq('id', accs[0].get('trader_id')).limit(1).execute().data or []
+                            if tr:
+                                trader_email = tr[0].get('email'); trader_name = tr[0].get('name') or 'Trader'
+                    if trader_email:
+                        # Build email body listing new credentials (don't leak in logs)
+                        creds_lines = []
+                        if 'mt5_login' in creds_changed: creds_lines.append(f'MT5 Login: {new_row.get("mt5_login")}')
+                        if 'mt5_server' in creds_changed: creds_lines.append(f'MT5 Server: {new_row.get("mt5_server")}')
+                        if 'mt5_master_password' in creds_changed: creds_lines.append(f'Master Password: {new_row.get("mt5_master_password")}')
+                        if 'mt5_investor_password' in creds_changed: creds_lines.append(f'Investor Password: {new_row.get("mt5_investor_password")}')
+                        details = 'Your MT5 trading credentials have been updated:\n\n' + '\n'.join(creds_lines) + '\n\nYou can log in to MT5 with these new details. Your dashboard remains at https://nairapips.com/dashboard/trader_clean.html'
+                        send_account_status_email(
+                            {'email': trader_email, 'name': trader_name or 'Trader'},
+                            'NairaPips — Your MT5 credentials have been updated',
+                            'Your MT5 account credentials have been updated by NairaPips.',
+                            details
+                        )
+                        send_admin_alert(
+                            'NairaPips MT5 credentials updated',
+                            f'MT5 account {new_row.get("mt5_login")} credentials updated and emailed to {trader_email}. Changed fields: {", ".join(creds_changed)}'
+                        )
+        except Exception as _email_err:
+            print('MT5 UPDATE EMAIL ERROR:', str(_email_err))
+        return ok(result, "MT5 account updated")
     except Exception as e: return bad(e)
 
 @app.route("/delete_mt5_account", methods=["POST"])
