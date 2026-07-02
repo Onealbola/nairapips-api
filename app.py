@@ -9255,10 +9255,11 @@ def _np_run_single_rule(rule):
                     "type": "private_offer",
                     "status": "active",
                     "show_on_dashboard": True,
+                    "delivery_dashboard": True,
                     "private_offer": True,
                     "target_trader_id": tid,
-                    "subject": rule.get("offer_subject", "Special Offer"),
-                    "body": rule.get("offer_body", ""),
+                    "title": rule.get("offer_subject", "Special Offer"),
+                    "message": rule.get("offer_body", ""),
                     "offer_code": (rule.get("promo_code") or "").strip(),
                     "auto_trigger_id": rule.get("id"),
                     "auto_trigger_name": rule.get("name"),
@@ -9463,10 +9464,11 @@ def _np_breach_recovery_check():
                         "type": "private_offer",
                         "status": "active",
                         "show_on_dashboard": True,
+                        "delivery_dashboard": True,
                         "private_offer": True,
                         "target_trader_id": breach.get("id"),
-                        "subject": rule.get("offer_subject", "Recovery Offer"),
-                        "body": rule.get("offer_body", ""),
+                        "title": rule.get("offer_subject", "Recovery Offer"),
+                        "message": rule.get("offer_body", ""),
                         "offer_code": rule.get("promo_code", ""),
                         "auto_trigger_id": rule.get("id"),
                         "auto_trigger_name": rule.get("name"),
@@ -10404,6 +10406,47 @@ try:
     start_scheduler()
 except Exception as e:
     print("[BOOT] Scheduler start failed:", e)
+
+
+# ============================================================
+# ONE-TIME MIGRATION — auto-creates tables via Supabase REST
+# ============================================================
+
+@app.route("/admin/run_migration", methods=["POST", "OPTIONS"])
+def admin_run_migration():
+    """One-time setup: create promo_codes, promo_redemptions, auto_trigger_rules tables
+    via direct postgres connection. Requires DATABASE_URL env var."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        database_url = os.environ.get("DATABASE_URL") or os.environ.get("SUPABASE_DB_URL")
+        if not database_url:
+            return _np_ok({
+                "success": False,
+                "warning": "No DATABASE_URL configured — using REST fallback",
+                "tables_created": [],
+                "instructions": "Run /workspace/nairapips/supabase_migration.sql in Supabase SQL editor manually"
+            })
+        # Try direct postgres connection
+        try:
+            import psycopg2
+            conn = psycopg2.connect(database_url, connect_timeout=10)
+            cur = conn.cursor()
+            sql = open("/workspace/nairapips/supabase_migration.sql").read() if os.path.exists("/workspace/nairapips/supabase_migration.sql") else ""
+            if sql:
+                cur.execute(sql)
+                conn.commit()
+                cur.close()
+                conn.close()
+                return _np_ok({"success": True, "method": "direct postgres", "tables_created": ["promo_codes", "promo_redemptions", "auto_trigger_rules", "trader_behavior_log"]})
+            return _np_ok({"success": False, "warning": "no SQL file found"})
+        except ImportError:
+            return _np_ok({"success": False, "warning": "psycopg2 not installed"})
+        except Exception as e:
+            return _np_ok({"success": False, "warning": f"postgres failed: {e}"})
+    except Exception as e:
+        return _np_fail(e, 500)
+
 
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
