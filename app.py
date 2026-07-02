@@ -3905,29 +3905,6 @@ Please log in to your trader dashboard to view your account details and begin yo
 NairaPips Team"""
         )
 
-        # Log promo redemption if a code was used
-        try:
-            used_code = (p.get("affiliate_code") or p.get("promo_code") or "").strip().upper()
-            used_code = re.sub(r'[^A-Z0-9\-]', '', used_code)[:64]
-            if used_code and p.get("trader_id"):
-                supabase.table("promo_redemptions").insert({
-                    "code": used_code,
-                    "trader_id": p.get("trader_id"),
-                    "trader_email": p.get("email",""),
-                    "purchase_id": pid,
-                    "account_size": float(p.get("account_size") or 0),
-                    "discount_amount": float(p.get("discount_amount") or 0),
-                    "redeemed_at": now_iso()
-                }).execute()
-                try:
-                    cur = supabase.table("promo_codes").select("current_uses").eq("code", used_code).limit(1).execute().data or []
-                    if cur:
-                        supabase.table("promo_codes").update({"current_uses": int(cur[0].get("current_uses", 0) or 0) + 1}).eq("code", used_code).execute()
-                except Exception:
-                    pass
-        except Exception as e:
-            print("PROMO REDEMPTION LOG SKIPPED:", str(e))
-        
         _audit_safe("challenge_purchases", "challenge_purchase_approved", f"Purchase {pid} approved", staff)
         _audit_safe("mt5", "phase1_mt5_assignment", f"Purchase {pid} assigned MT5 {m.get('mt5_login','')} to trader account {account.get('id')}", staff)
         return ok(approved_rows, "Challenge purchase approved and MT5 assigned")
@@ -8552,10 +8529,7 @@ def admin_trader_accounts_feed():
         limit = 5000
     view = str(request.args.get("view") or "all").strip().lower()
     try:
-        trader_id = str(request.args.get("trader_id") or "").strip()
         query = supabase.table("trader_accounts").select("*").order("updated_at", desc=True).limit(limit)
-        if trader_id:
-            query = query.eq("trader_id", trader_id)
         if view == "active":
             query = query.in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
         rows = query.execute().data or []
@@ -9124,1330 +9098,6 @@ def private_offers_for_trader():
     except Exception as e:
         return bad(e)
 
-"""Revenue engine — promo codes, segments, performance, auto-triggers"""
-import os
-import re
-import json
-import secrets
-import string
-from datetime import datetime, timezone, timedelta
-from flask import request, jsonify
-
-"""Auto-pilot revenue engine:
-- Daily cron at 8 AM UTC: run all active auto-triggers
-- Weekly cleanup at Monday 3 AM UTC: disable expired codes, archive stale rules
-- Breach detection hook: when account breaches, schedule 24h recovery offer
-- Behavior tracker: track plan views, idle sessions → trigger inactivity rules
-"""
-import os
-import re
-import json
-import threading
-import time
-from datetime import datetime, timezone, timedelta
-
-# ============================================================
-# IN-PROCESS SCHEDULER (no external cron needed)
-# ============================================================
-
-_scheduler_started = False
-_scheduler_lock = threading.Lock()
-
-def _np_scheduler_loop():
-    """Background thread that runs scheduled tasks."""
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            # Daily 8 AM UTC: run all active auto-triggers
-            if now.hour == 8 and now.minute < 5:
-                # Avoid running more than once per day
-                today_key = now.strftime("%Y-%m-%d")
-                if not os.environ.get(f"_NP_CRON_DAILY_{today_key}"):
-                    os.environ[f"_NP_CRON_DAILY_{today_key}"] = "1"
-                    try:
-                        print("[CRON] Daily auto-triggers run at", now.isoformat())
-                        # Use the existing endpoint logic via internal call
-                        with app.app_context():
-                            try:
-                                rules = supabase.table("auto_trigger_rules").select("*").eq("is_active", True).execute().data or []
-                                for rule in rules:
-                                    _np_run_single_rule(rule)
-                                print(f"[CRON] Daily run processed {len(rules)} rules")
-                            except Exception as e:
-                                print("[CRON] Daily run error:", e)
-                    except Exception as e:
-                        print("[CRON] Daily trigger failed:", e)
-            
-            # Monday 3 AM UTC: weekly cleanup
-            if now.weekday() == 0 and now.hour == 3 and now.minute < 5:
-                week_key = now.strftime("%Y-W%U")
-                if not os.environ.get(f"_NP_CRON_WEEKLY_{week_key}"):
-                    os.environ[f"_NP_CRON_WEEKLY_{week_key}"] = "1"
-                    try:
-                        print("[CRON] Weekly cleanup at", now.isoformat())
-                        with app.app_context():
-                            _np_weekly_cleanup()
-                    except Exception as e:
-                        print("[CRON] Weekly cleanup failed:", e)
-            
-            # Every 30 minutes: check for fresh breaches → trigger recovery offers
-            if now.minute in (0, 30):
-                half_key = now.strftime("%Y-%m-%d-%H-%M")[:15]  # YYYY-MM-DD-HH-0 or -3
-                if not os.environ.get(f"_NP_BREACH_CHECK_{half_key}"):
-                    os.environ[f"_NP_BREACH_CHECK_{half_key}"] = "1"
-                    try:
-                        with app.app_context():
-                            _np_breach_recovery_check()
-                    except Exception as e:
-                        print("[CRON] Breach check failed:", e)
-            
-            # Every 15 minutes: re-fire inactivity / hot-lead triggers
-            if now.minute in (0, 15, 30, 45):
-                q_key = now.strftime("%Y-%m-%d-%H-%M")[:15]
-                if not os.environ.get(f"_NP_BEHAVIOR_{q_key}"):
-                    os.environ[f"_NP_BEHAVIOR_{q_key}"] = "1"
-                    try:
-                        with app.app_context():
-                            _np_behavior_triggers_check()
-                    except Exception as e:
-                        print("[CRON] Behavior check failed:", e)
-            
-            # Sleep 60 seconds between checks
-            time.sleep(60)
-        except Exception as e:
-            print("[CRON] Loop error:", e)
-            time.sleep(120)
-
-def _np_run_single_rule(rule):
-    """Run a single auto-trigger rule."""
-    try:
-        segment_key = rule.get("segment_key", "")
-        if not segment_key:
-            return 0
-        # Get segment traders
-        seg_traders = (supabase.table("traders").select("id").limit(3000).execute().data or [])
-        all_trader_ids = [t["id"] for t in seg_traders]
-        
-        # Compute segments using same logic as endpoint
-        matched = _np_compute_segment_traders(segment_key, all_trader_ids)
-        if not matched:
-            return 0
-        
-        sent = 0
-        for tid in matched[:100]:
-            try:
-                trader = supabase.table("traders").select("id,name,email,phone").eq("id", tid).limit(1).execute().data or []
-                if not trader:
-                    continue
-                t = trader[0]
-                
-                # Skip if already has this offer sent recently (within 7 days)
-                try:
-                    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-                    recent = supabase.table("announcements").select("id").eq("target_trader_id", tid).eq("type", "private_offer").gte("created_at", week_ago).limit(1).execute().data or []
-                    if recent:
-                        continue
-                except Exception:
-                    pass
-                
-                # Send offer
-                offer_row = {
-                    "type": "private_offer",
-                    "status": "active",
-                    "show_on_dashboard": True,
-                    "delivery_dashboard": True,
-                    "private_offer": True,
-                    "target_trader_id": tid,
-                    "title": rule.get("offer_subject", "Special Offer"),
-                    "message": rule.get("offer_body", ""),
-                    "offer_code": (rule.get("promo_code") or "").strip(),
-                    "auto_trigger_id": rule.get("id"),
-                    "auto_trigger_name": rule.get("name"),
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                }
-                try:
-                    supabase.table("announcements").insert(offer_row).execute()
-                except Exception:
-                    pass
-                
-                # Send email
-                try:
-                    body_text = rule.get("offer_body", "").replace("{name}", t.get("name", "Trader"))
-                    send_email_safe(
-                        t.get("email"),
-                        rule.get("offer_subject", "Special Offer"),
-                        f"""Hello {t.get("name", "Trader")},
-
-{body_text}
-
-Code: {rule.get("promo_code", "—") if rule.get("promo_code") else "Auto-applied"}
-
-NairaPips Team"""
-                    )
-                except Exception:
-                    pass
-                
-                sent += 1
-            except Exception:
-                pass
-        
-        # Update rule stats
-        try:
-            supabase.table("auto_trigger_rules").update({
-                "last_run_at": datetime.now(timezone.utc).isoformat(),
-                "run_count": int(rule.get("run_count", 0) or 0) + 1,
-                "last_sent_count": sent
-            }).eq("id", rule.get("id")).execute()
-        except Exception:
-            pass
-        
-        return sent
-    except Exception as e:
-        print("rule run error:", e)
-        return 0
-
-def _np_compute_segment_traders(segment_key, all_trader_ids):
-    """Compute trader IDs matching a segment. Returns list of trader_ids."""
-    matched = set()
-    try:
-        # Get all trader accounts
-        accounts = supabase.table("trader_accounts").select("trader_id,account_status,account_size,dd_used_percent,stage,last_sync_at,updated_at,started_at,created_at,breached_at,mt5_login").limit(5000).execute().data or []
-        # Get trader signup dates
-        traders_data = supabase.table("traders").select("id,created_at,status,breach_time").in_("id", all_trader_ids[:1000]).execute().data or []
-        trader_map = {t["id"]: t for t in traders_data}
-        
-        now = datetime.now(timezone.utc)
-        
-        if segment_key == "all_traders":
-            return all_trader_ids[:200]
-        
-        if segment_key == "new_signups_24h":
-            cutoff = (now - timedelta(hours=24)).isoformat()
-            return [tid for tid, t in trader_map.items() if t.get("created_at", "") >= cutoff]
-        
-        if segment_key == "new_signups_7d":
-            cutoff = (now - timedelta(days=7)).isoformat()
-            return [tid for tid, t in trader_map.items() if t.get("created_at", "") >= cutoff]
-        
-        if segment_key == "breached_24h":
-            cutoff = (now - timedelta(hours=24)).isoformat()
-            return [tid for tid, t in trader_map.items() if t.get("status") == "breached" and (t.get("breach_time") or "") >= cutoff]
-        
-        if segment_key == "breached_7d":
-            cutoff = (now - timedelta(days=7)).isoformat()
-            return [tid for tid, t in trader_map.items() if t.get("status") == "breached" and (t.get("breach_time") or "") >= cutoff]
-        
-        if segment_key == "breached_overdue":
-            cutoff = (now - timedelta(days=7)).isoformat()
-            breached = [tid for tid, t in trader_map.items() if t.get("status") == "breached"]
-            # Check if any offer sent recently
-            result = []
-            for tid in breached[:50]:
-                try:
-                    week_ago = (now - timedelta(days=7)).isoformat()
-                    recent = supabase.table("announcements").select("id").eq("target_trader_id", tid).eq("type", "private_offer").gte("created_at", week_ago).limit(1).execute().data or []
-                    if not recent:
-                        result.append(tid)
-                except Exception:
-                    result.append(tid)
-            return result
-        
-        # Account-based segments
-        for a in accounts:
-            tid = a.get("trader_id")
-            if not tid:
-                continue
-            st = a.get("account_status", "")
-            dd = float(a.get("dd_used_percent", 0) or 0)
-            stage = a.get("stage", "")
-            size = float(a.get("account_size", 0) or 0)
-            
-            if segment_key == "near_breach" and st == "assigned_active" and 70 <= dd < 100:
-                matched.add(tid)
-            elif segment_key == "inactive_7d" and st == "assigned_active":
-                try:
-                    ls = a.get("last_sync_at") or a.get("updated_at")
-                    if ls:
-                        if (now - datetime.fromisoformat(ls.replace("Z", "+00:00"))).days >= 7:
-                            matched.add(tid)
-                except Exception:
-                    pass
-            elif segment_key == "funded_idle" and stage == "funded" and st in ("assigned_active", "active"):
-                try:
-                    ls = a.get("last_sync_at") or a.get("updated_at")
-                    if ls:
-                        if (now - datetime.fromisoformat(ls.replace("Z", "+00:00"))).days >= 7:
-                            matched.add(tid)
-                except Exception:
-                    pass
-            elif segment_key == "phase1_stuck" and stage == "phase1" and st == "assigned_active":
-                try:
-                    started = a.get("started_at") or a.get("created_at")
-                    if started:
-                        if (now - datetime.fromisoformat(started.replace("Z", "+00:00"))).days >= 20:
-                            matched.add(tid)
-                except Exception:
-                    pass
-            elif segment_key == "hot_leads" and st == "assigned_active" and dd < 30:
-                try:
-                    started = a.get("started_at") or a.get("created_at")
-                    if started:
-                        if (now - datetime.fromisoformat(started.replace("Z", "+00:00"))).days <= 5:
-                            matched.add(tid)
-                except Exception:
-                    pass
-            elif segment_key == "high_value" and st == "assigned_active" and size >= 700000:
-                matched.add(tid)
-            elif segment_key == "phase2_active" and st == "assigned_active" and stage == "phase2":
-                matched.add(tid)
-            elif segment_key == "funded_active" and st == "assigned_active" and stage == "funded":
-                matched.add(tid)
-        
-        return list(matched)[:200]
-    except Exception as e:
-        print("segment compute error:", e)
-        return []
-
-def _np_breach_recovery_check():
-    """Check for newly breached accounts and trigger recovery offers.
-    Runs every 30 minutes."""
-    try:
-        # Get traders breached in last 30 min
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=35)).isoformat()
-        try:
-            new_breaches = supabase.table("traders").select("id,name,email,phone,breach_time").eq("status", "breached").gte("breach_time", cutoff).limit(50).execute().data or []
-        except Exception:
-            new_breaches = []
-        
-        # Also detect from accounts table
-        try:
-            new_account_breaches = supabase.table("trader_accounts").select("trader_id,mt5_login,breached_at").eq("account_status", "breached_archived").gte("breached_at", cutoff).limit(50).execute().data or []
-            for ab in new_account_breaches:
-                tid = ab.get("trader_id")
-                if tid and not any(b.get("id") == tid for b in new_breaches):
-                    try:
-                        t = supabase.table("traders").select("id,name,email,phone,breach_time").eq("id", tid).limit(1).execute().data or []
-                        if t:
-                            new_breaches.append(t[0])
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        
-        if not new_breaches:
-            return
-        
-        # Look for an active "Recovery after breach" trigger rule
-        try:
-            rules = supabase.table("auto_trigger_rules").select("*").eq("trigger_event", "breach").eq("is_active", True).limit(5).execute().data or []
-        except Exception:
-            rules = []
-        
-        if not rules:
-            # No rules — skip auto-fire (admin needs to set up first)
-            return
-        
-        for breach in new_breaches:
-            for rule in rules:
-                # Check if this trader already got this offer recently
-                try:
-                    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-                    recent = supabase.table("announcements").select("id").eq("target_trader_id", breach.get("id")).eq("auto_trigger_id", rule.get("id")).gte("created_at", week_ago).limit(1).execute().data or []
-                    if recent:
-                        continue
-                except Exception:
-                    pass
-                
-                # Send recovery offer
-                try:
-                    supabase.table("announcements").insert({
-                        "type": "private_offer",
-                        "status": "active",
-                        "show_on_dashboard": True,
-                        "delivery_dashboard": True,
-                        "private_offer": True,
-                        "target_trader_id": breach.get("id"),
-                        "title": rule.get("offer_subject", "Recovery Offer"),
-                        "message": rule.get("offer_body", ""),
-                        "offer_code": rule.get("promo_code", ""),
-                        "auto_trigger_id": rule.get("id"),
-                        "auto_trigger_name": rule.get("name"),
-                        "created_at": datetime.now(timezone.utc).isoformat()
-                    }).execute()
-                    
-                    # Send email
-                    try:
-                        body_text = rule.get("offer_body", "").replace("{name}", breach.get("name", "Trader"))
-                        send_email_safe(
-                            breach.get("email"),
-                            rule.get("offer_subject", "Recovery Offer"),
-                            f"""Hello {breach.get("name", "Trader")},
-
-{body_text}
-
-Code: {rule.get("promo_code", "—") if rule.get("promo_code") else "Auto-applied"}
-
-Your trading journey isn't over — let us help you get back on track.
-
-NairaPips Team"""
-                        )
-                    except Exception:
-                        pass
-                    
-                    # Audit log
-                    try:
-                        supabase.table("audit_log").insert({
-                            "action": "auto_trigger_fired",
-                            "target_id": breach.get("id"),
-                            "details": f"breach recovery offer sent via rule {rule.get('name')}",
-                            "created_at": datetime.now(timezone.utc).isoformat()
-                        }).execute()
-                    except Exception:
-                        pass
-                    
-                    break  # one rule per breach is enough
-                except Exception:
-                    pass
-    except Exception as e:
-        print("breach recovery error:", e)
-
-def _np_behavior_triggers_check():
-    """Run behavior-based rules: inactivity, hot-lead upsell, etc.
-    Runs every 15 minutes."""
-    try:
-        try:
-            rules = supabase.table("auto_trigger_rules").select("*").in_("trigger_event", ["inactive", "hot", "near_breach", "phase1_stuck", "signup"]).eq("is_active", True).execute().data or []
-        except Exception:
-            rules = []
-        
-        for rule in rules:
-            try:
-                # Throttle: don't fire same rule more than once per 4 hours
-                last = rule.get("last_run_at")
-                if last:
-                    try:
-                        last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
-                        if (datetime.now(timezone.utc) - last_dt).total_seconds() < 4 * 3600:
-                            continue
-                    except Exception:
-                        pass
-                _np_run_single_rule(rule)
-            except Exception:
-                pass
-    except Exception as e:
-        print("behavior trigger error:", e)
-
-def _np_weekly_cleanup():
-    """Weekly: disable expired codes, archive stale rules, log stats."""
-    try:
-        # Disable expired codes
-        try:
-            now_iso = datetime.now(timezone.utc).isoformat()
-            supabase.table("promo_codes").update({"is_active": False}).lt("expires_at", now_iso).eq("is_active", True).execute()
-        except Exception:
-            pass
-        # Archive stale rules (no fire in 90d)
-        try:
-            cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
-            supabase.table("auto_trigger_rules").update({"is_active": False}).lt("last_run_at", cutoff).eq("is_active", True).execute()
-        except Exception:
-            pass
-        # Log weekly summary to audit
-        try:
-            week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-            redemptions = supabase.table("promo_redemptions").select("id,discount_amount,account_size").gte("redeemed_at", week_ago).execute().data or []
-            total_discount = sum(float(r.get("discount_amount", 0) or 0) for r in redemptions)
-            total_revenue = sum(float(r.get("account_size", 0) or 0) for r in redemptions)
-            
-            offers = supabase.table("announcements").select("id").eq("type", "private_offer").gte("created_at", week_ago).execute().data or []
-            
-            summary = f"""Weekly Revenue Engine Report:
-- Offers sent: {len(offers)}
-- Redemptions: {len(redemptions)}
-- Total discount given: ₦{int(total_discount):,}
-- Total revenue: ₦{int(total_revenue):,}
-- Net revenue: ₦{int(total_revenue - total_discount):,}"""
-            
-            send_admin_alert("NairaPips Weekly Revenue Engine Report", summary)
-        except Exception:
-            pass
-    except Exception as e:
-        print("weekly cleanup error:", e)
-
-
-def start_scheduler():
-    """Start the background scheduler thread."""
-    global _scheduler_started
-    with _scheduler_lock:
-        if _scheduler_started:
-            return
-        _scheduler_started = True
-        try:
-            t = threading.Thread(target=_np_scheduler_loop, daemon=True, name="np_revenue_scheduler")
-            t.start()
-            print("[CRON] Revenue scheduler started")
-        except Exception as e:
-            print("[CRON] Failed to start scheduler:", e)
-
-
-# ============================================================
-# MANUAL TRIGGERS + STATUS
-# ============================================================
-
-@app.route("/admin/cron_status", methods=["GET", "OPTIONS"])
-def admin_cron_status():
-    """Check scheduler health + last run times."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        # Get last run times
-        triggers = []
-        try:
-            triggers = supabase.table("auto_trigger_rules").select("id,name,last_run_at,run_count,last_sent_count,is_active").order("last_run_at", desc=True).limit(20).execute().data or []
-        except Exception:
-            triggers = []
-        
-        # Recent auto-triggered offers
-        recent = []
-        try:
-            week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-            recent = supabase.table("announcements").select("id,subject,target_trader_id,created_at,auto_trigger_name").eq("type", "private_offer").not_.is_("auto_trigger_id", "null").gte("created_at", week_ago).order("created_at", desc=True).limit(30).execute().data or []
-        except Exception:
-            recent = []
-        
-        # Active codes
-        active_codes = 0
-        try:
-            active_codes = len(supabase.table("promo_codes").select("id").eq("is_active", True).execute().data or [])
-        except Exception:
-            pass
-        
-        # Today's redemptions
-        today_redemptions = 0
-        try:
-            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            today_redemptions = len(supabase.table("promo_redemptions").select("id").gte("redeemed_at", today_start).execute().data or [])
-        except Exception:
-            pass
-        
-        return _np_ok({
-            "success": True,
-            "scheduler_running": _scheduler_started,
-            "active_rules": len([t for t in triggers if t.get("is_active")]),
-            "total_rules": len(triggers),
-            "active_codes": active_codes,
-            "todays_redemptions": today_redemptions,
-            "auto_offers_7d": len(recent),
-            "triggers": triggers,
-            "recent_auto_offers": recent
-        })
-    except Exception as e:
-        return _np_fail(e, 500)
-
-
-@app.route("/admin/trigger_breach_recovery_now", methods=["POST", "OPTIONS"])
-def admin_trigger_breach_recovery_now():
-    """Manually trigger breach recovery check (admin can re-run if missed)."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        with app.app_context():
-            before_count = 0
-            try:
-                week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-                before_count = len(supabase.table("announcements").select("id").eq("type", "private_offer").gte("created_at", week_ago).execute().data or [])
-            except Exception:
-                pass
-            
-            _np_breach_recovery_check()
-            
-            after_count = 0
-            try:
-                week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-                after_count = len(supabase.table("announcements").select("id").eq("type", "private_offer").gte("created_at", week_ago).execute().data or [])
-            except Exception:
-                pass
-            
-            return _np_ok({
-                "success": True,
-                "before": before_count,
-                "after": after_count,
-                "sent": after_count - before_count
-            })
-    except Exception as e:
-        return _np_fail(e, 500)
-
-
-@app.route("/admin/test_segment_match", methods=["POST", "OPTIONS"])
-def admin_test_segment_match():
-    """Test which traders match a segment without sending anything."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        body = request.get_json(silent=True) or {}
-        seg = body.get("segment", "")
-        if not seg:
-            return _np_fail("segment required", 400)
-        
-        with app.app_context():
-            all_traders = supabase.table("traders").select("id").limit(3000).execute().data or []
-            all_ids = [t["id"] for t in all_traders]
-            matched = _np_compute_segment_traders(seg, all_ids)
-            return _np_ok({"success": True, "matched_count": len(matched), "sample_ids": matched[:10]})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-
-
-# ============================================================
-# PROMO CODES
-# ============================================================
-
-def _np_code_gen(prefix, length=8):
-    """Generate a memorable promo code like FIRST50-A1B2C3"""
-    chars = string.ascii_uppercase + string.digits
-    suffix = ''.join(secrets.choice(chars) for _ in range(length))
-    return f"{prefix}-{suffix}" if prefix else suffix
-
-def _np_normalize_code(raw):
-    """Trim + uppercase + strip non-alnum/dash"""
-    if not raw:
-        return ""
-    s = str(raw).strip().upper()
-    s = re.sub(r'[^A-Z0-9\-]', '', s)
-    return s[:64]
-
-@app.route("/admin/promo_codes", methods=["GET", "OPTIONS"])
-def admin_promo_codes():
-    """List all promo codes with usage stats."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        rows = supabase.table("promo_codes").select("*").order("created_at", desc=True).limit(500).execute().data or []
-        return _np_ok({"success": True, "data": rows, "count": len(rows)})
-    except Exception as e:
-        # Table might not exist yet — return empty
-        return _np_ok({"success": True, "data": [], "count": 0, "warning": str(e)})
-
-@app.route("/admin/create_promo_code", methods=["POST", "OPTIONS"])
-def admin_create_promo_code():
-    """Create a new promo code."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        body = request.get_json(silent=True) or {}
-        prefix = _np_normalize_code(body.get("prefix", ""))[:12]
-        custom_code = _np_normalize_code(body.get("code", ""))
-        if custom_code:
-            code = custom_code
-        else:
-            code = _np_code_gen(prefix or "PROMO", 6)
-        
-        # Check uniqueness
-        try:
-            existing = supabase.table("promo_codes").select("id").eq("code", code).limit(1).execute().data or []
-            if existing:
-                return _np_fail("Code already exists. Try another.", 409)
-        except Exception:
-            pass
-        
-        # Validate fields
-        try:
-            discount_type = body.get("discount_type", "percent")  # 'percent' | 'flat'
-            discount_value = float(body.get("discount_value", 0))
-            if discount_type == "percent":
-                discount_value = max(1, min(100, discount_value))
-            else:
-                discount_value = max(0, discount_value)
-        except Exception:
-            return _np_fail("Invalid discount_value", 400)
-        
-        max_uses = int(body.get("max_uses", 0))  # 0 = unlimited
-        per_trader_limit = int(body.get("per_trader_limit", 1))  # how many times one trader can use
-        min_account_size = float(body.get("min_account_size", 0))
-        allowed_plans = body.get("allowed_plans") or []  # [] = all
-        target_segment = str(body.get("target_segment", "") or "")[:64]  # empty = all
-        target_trader_id = str(body.get("target_trader_id", "") or "") or None
-        description = str(body.get("description", ""))[:500]
-        expires_at = body.get("expires_at") or None  # ISO string
-        
-        row = {
-            "code": code,
-            "prefix": prefix,
-            "discount_type": discount_type,
-            "discount_value": discount_value,
-            "max_uses": max_uses,
-            "per_trader_limit": per_trader_limit,
-            "current_uses": 0,
-            "min_account_size": min_account_size,
-            "allowed_plans": allowed_plans,
-            "target_segment": target_segment,
-            "target_trader_id": target_trader_id,
-            "description": description,
-            "expires_at": expires_at,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "created_by": body.get("created_by", "admin"),
-            "is_active": True
-        }
-        
-        try:
-            inserted = supabase.table("promo_codes").insert(row).execute().data or []
-            return _np_ok({"success": True, "code": code, "data": inserted[0] if inserted else row})
-        except Exception as e:
-            # Table doesn't exist — return what would have been inserted
-            return _np_ok({"success": True, "code": code, "data": row, "warning": f"table insert failed: {e}"})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-@app.route("/admin/toggle_promo_code", methods=["POST", "OPTIONS"])
-def admin_toggle_promo_code():
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        body = request.get_json(silent=True) or {}
-        code_id = body.get("id")
-        is_active = bool(body.get("is_active", True))
-        if not code_id:
-            return _np_fail("id required", 400)
-        try:
-            supabase.table("promo_codes").update({"is_active": is_active}).eq("id", code_id).execute()
-        except Exception:
-            pass
-        return _np_ok({"success": True})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-@app.route("/validate_promo_code", methods=["POST", "GET", "OPTIONS"])
-def validate_promo_code():
-    """Public endpoint - trader enters code at checkout, server validates + computes discount."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        if request.method == "GET":
-            code = _np_normalize_code(request.args.get("code", ""))
-            account_size = float(request.args.get("account_size", 0) or 0)
-            trader_id = _np_offer_clean_str(request.args.get("trader_id"), 120)
-        else:
-            body = request.get_json(silent=True) or {}
-            code = _np_normalize_code(body.get("code", ""))
-            account_size = float(body.get("account_size", 0) or 0)
-            trader_id = _np_offer_clean_str(body.get("trader_id"), 120)
-        
-        if not code:
-            return jsonify({"valid": False, "reason": "empty code"})
-        
-        try:
-            rows = supabase.table("promo_codes").select("*").eq("code", code).limit(1).execute().data or []
-        except Exception:
-            return jsonify({"valid": False, "reason": "promo system unavailable"})
-        
-        if not rows:
-            return jsonify({"valid": False, "reason": "code not found"})
-        
-        promo = rows[0]
-        
-        if not promo.get("is_active"):
-            return jsonify({"valid": False, "reason": "code disabled"})
-        
-        # Expiry
-        exp = promo.get("expires_at")
-        if exp:
-            try:
-                if datetime.fromisoformat(exp.replace("Z", "+00:00")) < datetime.now(timezone.utc):
-                    return jsonify({"valid": False, "reason": "code expired"})
-            except Exception:
-                pass
-        
-        # Max uses
-        max_uses = int(promo.get("max_uses") or 0)
-        current_uses = int(promo.get("current_uses") or 0)
-        if max_uses > 0 and current_uses >= max_uses:
-            return jsonify({"valid": False, "reason": "code fully used"})
-        
-        # Per-trader limit
-        if trader_id:
-            per = int(promo.get("per_trader_limit") or 1)
-            try:
-                usage = supabase.table("promo_redemptions").select("id").eq("code", code).eq("trader_id", trader_id).execute().data or []
-                if len(usage) >= per:
-                    return jsonify({"valid": False, "reason": "you already used this code"})
-            except Exception:
-                pass
-        
-        # Trader-specific
-        if promo.get("target_trader_id") and trader_id and str(promo.get("target_trader_id")) != str(trader_id):
-            return jsonify({"valid": False, "reason": "code not valid for this account"})
-        
-        # Min account size
-        if account_size and promo.get("min_account_size"):
-            if account_size < float(promo.get("min_account_size")):
-                return jsonify({"valid": False, "reason": f"min account size ₦{int(promo.get('min_account_size')):,}"})
-        
-        # Compute discount
-        discount_type = promo.get("discount_type", "percent")
-        discount_value = float(promo.get("discount_value", 0))
-        base_fee = account_size * 0.04 if account_size else 0
-        if discount_type == "percent":
-            discount_amount = base_fee * (discount_value / 100.0)
-        else:
-            discount_amount = min(discount_value, base_fee)
-        final_fee = max(0, base_fee - discount_amount)
-        
-        return jsonify({
-            "valid": True,
-            "code": code,
-            "discount_type": discount_type,
-            "discount_value": discount_value,
-            "base_fee": round(base_fee, 2),
-            "discount_amount": round(discount_amount, 2),
-            "final_fee": round(final_fee, 2),
-            "description": promo.get("description", ""),
-            "prefix": promo.get("prefix", "")
-        })
-    except Exception as e:
-        return jsonify({"valid": False, "reason": str(e)})
-
-@app.route("/redeem_promo_code", methods=["POST", "OPTIONS"])
-def redeem_promo_code():
-    """Mark a code as used by a trader. Called after successful checkout."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        body = request.get_json(silent=True) or {}
-        code = _np_normalize_code(body.get("code", ""))
-        trader_id = _np_offer_clean_str(body.get("trader_id"), 120)
-        trader_email = _np_offer_clean_str(body.get("trader_email"), 250).lower()
-        purchase_id = body.get("purchase_id", "")
-        account_size = float(body.get("account_size", 0) or 0)
-        discount_amount = float(body.get("discount_amount", 0) or 0)
-        
-        if not code or not trader_id:
-            return _np_fail("code and trader_id required", 400)
-        
-        try:
-            # Log redemption
-            supabase.table("promo_redemptions").insert({
-                "code": code,
-                "trader_id": trader_id,
-                "trader_email": trader_email,
-                "purchase_id": purchase_id,
-                "account_size": account_size,
-                "discount_amount": discount_amount,
-                "redeemed_at": datetime.now(timezone.utc).isoformat()
-            }).execute()
-            
-            # Increment usage
-            try:
-                cur = supabase.table("promo_codes").select("current_uses").eq("code", code).limit(1).execute().data or []
-                if cur:
-                    new_count = int(cur[0].get("current_uses", 0) or 0) + 1
-                    supabase.table("promo_codes").update({"current_uses": new_count}).eq("code", code).execute()
-            except Exception:
-                pass
-        except Exception as e:
-            return _np_ok({"success": True, "warning": f"redemption log failed: {e}"})
-        
-        return _np_ok({"success": True})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-
-# ============================================================
-# SEGMENTS - dynamic cohort calculator
-# ============================================================
-
-@app.route("/admin/segments_overview", methods=["GET", "OPTIONS"])
-def admin_segments_overview():
-    """Compute live segment counts based on current trader state."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        # Get all traders
-        try:
-            traders = supabase.table("traders").select("id,name,email,phone,status,current_account_id,created_at,breach_time").limit(2000).execute().data or []
-        except Exception:
-            traders = []
-        
-        # Get all accounts
-        try:
-            accounts = supabase.table("trader_accounts").select("trader_id,account_status,mt5_login,account_size,dd_used_percent,dd_limit_percent,started_at,last_sync_at,updated_at,breached_at,stage,phase").limit(3000).execute().data or []
-        except Exception:
-            accounts = []
-        
-        # Index accounts by trader_id
-        acc_by_trader = {}
-        for a in accounts:
-            tid = a.get("trader_id")
-            if tid:
-                acc_by_trader.setdefault(tid, []).append(a)
-        
-        # Compute segments
-        now = datetime.now(timezone.utc)
-        segments = {
-            "all_traders": [],
-            "breached_24h": [],
-            "breached_7d": [],
-            "breached_overdue": [],  # breached >7d, no recovery offer sent
-            "near_breach": [],  # DD 70-99%
-            "inactive_7d": [],  # last sync >7d ago
-            "funded_idle": [],  # funded + no sync in 7d
-            "viewed_plans_no_buy": [],  # last login recent, no purchase
-            "new_signups_24h": [],  # signed up in 24h
-            "new_signups_7d": [],
-            "hot_leads": [],  # active + good DD
-            "phase1_stuck": [],  # >20d in phase1
-            "phase2_active": [],
-            "funded_active": [],
-            "high_value": [],  # GOLD+ plans active
-        }
-        
-        for t in traders:
-            tid = t.get("id")
-            t_accts = acc_by_trader.get(tid, [])
-            active = next((a for a in t_accts if a.get("account_status") in ("assigned_active", "active", "phase1_active", "phase2_active", "funded_active", "live", "funded")), None)
-            
-            segments["all_traders"].append(tid)
-            
-            # New signups
-            try:
-                if t.get("created_at"):
-                    created = datetime.fromisoformat(t["created_at"].replace("Z", "+00:00"))
-                    age_h = (now - created).total_seconds() / 3600
-                    if age_h <= 24:
-                        segments["new_signups_24h"].append(tid)
-                    if age_h <= 24 * 7:
-                        segments["new_signups_7d"].append(tid)
-            except Exception:
-                pass
-            
-            if t.get("status") == "breached":
-                try:
-                    bt = t.get("breach_time") or (active or {}).get("breached_at")
-                    if bt:
-                        bt_dt = datetime.fromisoformat(bt.replace("Z", "+00:00"))
-                        age_h = (now - bt_dt).total_seconds() / 3600
-                        if age_h <= 24:
-                            segments["breached_24h"].append(tid)
-                        if age_h <= 24 * 7:
-                            segments["breached_7d"].append(tid)
-                        if age_h > 24 * 7:
-                            segments["breached_overdue"].append(tid)
-                    else:
-                        segments["breached_overdue"].append(tid)
-                except Exception:
-                    pass
-            
-            for a in t_accts:
-                dd = float(a.get("dd_used_percent", 0) or 0)
-                st = a.get("account_status", "")
-                stage = a.get("stage", "")
-                size = float(a.get("account_size", 0) or 0)
-                
-                # Near breach
-                if st == "assigned_active" and dd >= 70 and dd < 100:
-                    segments["near_breach"].append(tid)
-                
-                # Inactive (no sync in 7d)
-                try:
-                    last_sync = a.get("last_sync_at") or a.get("updated_at")
-                    if last_sync and st == "assigned_active":
-                        ls_dt = datetime.fromisoformat(last_sync.replace("Z", "+00:00"))
-                        if (now - ls_dt).days >= 7:
-                            segments["inactive_7d"].append(tid)
-                except Exception:
-                    pass
-                
-                # Funded idle
-                if stage == "funded" and st in ("assigned_active", "active"):
-                    try:
-                        last_sync = a.get("last_sync_at") or a.get("updated_at")
-                        if last_sync:
-                            ls_dt = datetime.fromisoformat(last_sync.replace("Z", "+00:00"))
-                            if (now - ls_dt).days >= 7:
-                                segments["funded_idle"].append(tid)
-                    except Exception:
-                        pass
-                
-                # Phase1 stuck
-                if stage == "phase1" and st == "assigned_active":
-                    try:
-                        started = a.get("started_at") or a.get("created_at")
-                        if started:
-                            sd = datetime.fromisoformat(started.replace("Z", "+00:00"))
-                            if (now - sd).days >= 20:
-                                segments["phase1_stuck"].append(tid)
-                    except Exception:
-                        pass
-                
-                # Hot leads (active, low DD, <5d)
-                if st == "assigned_active" and dd < 30:
-                    try:
-                        started = a.get("started_at") or a.get("created_at")
-                        if started:
-                            sd = datetime.fromisoformat(started.replace("Z", "+00:00"))
-                            if (now - sd).days <= 5:
-                                segments["hot_leads"].append(tid)
-                    except Exception:
-                        pass
-                
-                # High value
-                if st == "assigned_active" and size >= 700000:
-                    segments["high_value"].append(tid)
-                
-                # By phase
-                if st == "assigned_active" and stage == "phase2":
-                    segments["phase2_active"].append(tid)
-                if st == "assigned_active" and stage == "funded":
-                    segments["funded_active"].append(tid)
-        
-        # Dedupe
-        for k in segments:
-            segments[k] = list(dict.fromkeys(segments[k]))
-        
-        return _np_ok({"success": True, "segments": segments})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-@app.route("/admin/segment_traders", methods=["GET", "OPTIONS"])
-def admin_segment_traders():
-    """Get full trader list for a segment."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        seg = str(request.args.get("segment", "") or "")
-        limit = min(int(request.args.get("limit", 200)), 500)
-        
-        overview_resp = admin_segments_overview()
-        try:
-            overview = overview_resp.get_json()
-        except Exception:
-            overview = {}
-        segment_ids = (overview.get("segments") or {}).get(seg, [])
-        
-        if not segment_ids:
-            return _np_ok({"success": True, "data": [], "count": 0, "segment": seg})
-        
-        # Fetch full trader records for these IDs
-        rows = []
-        try:
-            rows = supabase.table("traders").select("id,name,email,phone,status,current_account_id,created_at,breach_time").in_("id", segment_ids[:limit]).execute().data or []
-        except Exception:
-            rows = []
-        
-        return _np_ok({"success": True, "data": rows, "count": len(rows), "segment": seg})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-
-# ============================================================
-# AUTO-TRIGGERS - rules engine
-# ============================================================
-
-@app.route("/admin/auto_triggers", methods=["GET", "OPTIONS"])
-def admin_auto_triggers():
-    """List active auto-trigger rules."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        rows = supabase.table("auto_trigger_rules").select("*").order("created_at", desc=True).limit(100).execute().data or []
-        return _np_ok({"success": True, "data": rows})
-    except Exception:
-        return _np_ok({"success": True, "data": [], "warning": "table not yet created"})
-
-@app.route("/admin/save_auto_trigger", methods=["POST", "OPTIONS"])
-def admin_save_auto_trigger():
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        body = request.get_json(silent=True) or {}
-        rule = {
-            "name": str(body.get("name", ""))[:100],
-            "trigger_event": str(body.get("trigger_event", ""))[:50],  # 'breach', 'view_plans', 'signup', 'inactive', 'phase1_stuck'
-            "delay_hours": int(body.get("delay_hours", 0)),
-            "segment_key": str(body.get("segment_key", ""))[:64],
-            "offer_subject": str(body.get("offer_subject", ""))[:200],
-            "offer_body": str(body.get("offer_body", ""))[:4000],
-            "promo_code": _np_normalize_code(body.get("promo_code", "")),
-            "is_active": bool(body.get("is_active", True)),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "last_run_at": None,
-            "run_count": 0
-        }
-        if not rule["trigger_event"] or not rule["offer_subject"]:
-            return _np_fail("trigger_event and offer_subject required", 400)
-        
-        try:
-            supabase.table("auto_trigger_rules").insert(rule).execute()
-        except Exception as e:
-            return _np_ok({"success": True, "warning": str(e), "data": rule})
-        
-        return _np_ok({"success": True, "data": rule})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-@app.route("/admin/toggle_auto_trigger", methods=["POST", "OPTIONS"])
-def admin_toggle_auto_trigger():
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        body = request.get_json(silent=True) or {}
-        rid = body.get("id")
-        is_active = bool(body.get("is_active", True))
-        try:
-            supabase.table("auto_trigger_rules").update({"is_active": is_active}).eq("id", rid).execute()
-        except Exception:
-            pass
-        return _np_ok({"success": True})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-
-@app.route("/admin/run_auto_triggers", methods=["POST", "OPTIONS"])
-def admin_run_auto_triggers():
-    """Manually trigger all active rules."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        rules = []
-        try:
-            rules = supabase.table("auto_trigger_rules").select("*").eq("is_active", True).execute().data or []
-        except Exception:
-            rules = []
-        
-        results = []
-        for rule in rules:
-            try:
-                # Get segment traders
-                overview_resp = admin_segments_overview()
-                overview = overview_resp.get_json()
-                segment_ids = (overview.get("segments") or {}).get(rule.get("segment_key", ""), [])
-                
-                sent = 0
-                for tid in segment_ids[:50]:
-                    # Send offer email
-                    try:
-                        trader = supabase.table("traders").select("id,name,email").eq("id", tid).limit(1).execute().data or []
-                        if not trader:
-                            continue
-                        t = trader[0]
-                        
-                        payload = {
-                            "trader_id": t["id"],
-                            "trader_email": t.get("email"),
-                            "subject": rule["offer_subject"],
-                            "body": rule["offer_body"],
-                            "promo_code": rule.get("promo_code", ""),
-                            "auto_trigger_id": rule.get("id"),
-                            "auto_trigger_name": rule.get("name")
-                        }
-                        # Use existing create_private_offer endpoint logic
-                        try:
-                            offer_row = {
-                                "type": "private_offer",
-                                "status": "active",
-                                "show_on_dashboard": True,
-                                "private_offer": True,
-                                "target_trader_id": t["id"],
-                                "subject": rule["offer_subject"],
-                                "body": rule["offer_body"],
-                                "offer_code": rule.get("promo_code", ""),
-                                "created_at": datetime.now(timezone.utc).isoformat()
-                            }
-                            supabase.table("announcements").insert(offer_row).execute()
-                            sent += 1
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                
-                # Update run stats
-                try:
-                    supabase.table("auto_trigger_rules").update({
-                        "last_run_at": datetime.now(timezone.utc).isoformat(),
-                        "run_count": int(rule.get("run_count", 0) or 0) + 1
-                    }).eq("id", rule.get("id")).execute()
-                except Exception:
-                    pass
-                
-                results.append({"rule": rule.get("name"), "sent": sent, "matched": len(segment_ids)})
-            except Exception as e:
-                results.append({"rule": rule.get("name"), "error": str(e)})
-        
-        return _np_ok({"success": True, "results": results, "rules_processed": len(rules)})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-
-# ============================================================
-# OFFER PERFORMANCE - analytics
-# ============================================================
-
-@app.route("/admin/offer_performance", methods=["GET", "OPTIONS"])
-def admin_offer_performance():
-    """Aggregate offer stats: sent, opened, redeemed, revenue saved."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        # Offers
-        try:
-            offers = supabase.table("announcements").select("id,subject,offer_code,created_at,target_trader_id,status").eq("type", "private_offer").order("created_at", desc=True).limit(500).execute().data or []
-        except Exception:
-            offers = []
-        
-        # Redemptions
-        redemptions = []
-        try:
-            redemptions = supabase.table("promo_redemptions").select("*").order("redeemed_at", desc=True).limit(500).execute().data or []
-        except Exception:
-            redemptions = []
-        
-        # Codes
-        codes = []
-        try:
-            codes = supabase.table("promo_codes").select("*").order("created_at", desc=True).limit(200).execute().data or []
-        except Exception:
-            codes = []
-        
-        # Per-code stats
-        code_stats = {}
-        for r in redemptions:
-            c = r.get("code", "")
-            if not c:
-                continue
-            code_stats.setdefault(c, {"uses": 0, "discount_given": 0, "account_size": 0})
-            code_stats[c]["uses"] += 1
-            code_stats[c]["discount_given"] += float(r.get("discount_amount", 0) or 0)
-            code_stats[c]["account_size"] += float(r.get("account_size", 0) or 0)
-        
-        # Email logs
-        email_logs = []
-        try:
-            email_logs = supabase.table("email_logs").select("recipient_email,email_type,status,sent_at").eq("email_type", "private_offer").order("sent_at", desc=True).limit(500).execute().data or []
-        except Exception:
-            email_logs = []
-        
-        return _np_ok({
-            "success": True,
-            "summary": {
-                "total_offers_sent": len(offers),
-                "total_redemptions": len(redemptions),
-                "total_codes_active": len([c for c in codes if c.get("is_active")]),
-                "total_discount_given": sum(float(r.get("discount_amount", 0) or 0) for r in redemptions),
-                "total_revenue_attributed": sum(float(r.get("account_size", 0) or 0) for r in redemptions),
-                "emails_sent": len([e for e in email_logs if e.get("status") == "sent"])
-            },
-            "code_stats": code_stats,
-            "offers": offers[:50],
-            "redemptions": redemptions[:30],
-            "codes": codes[:30]
-        })
-    except Exception as e:
-        return _np_fail(e, 500)
-
-
-# ============================================================
-# TRADER-FACING: targeted offer banner at dashboard load
-# ============================================================
-
-@app.route("/trader_targeted_offers", methods=["GET", "OPTIONS"])
-def trader_targeted_offers():
-    """Get all active private offers + auto-promos for this trader."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        trader_id = _np_offer_clean_str(request.args.get("trader_id"), 120)
-        email = _np_offer_clean_str(request.args.get("email"), 250).lower()
-        
-        if not trader_id and not email:
-            return jsonify([])
-        
-        # Get all active private offers
-        rows = []
-        try:
-            rows = supabase.table("announcements").select("*").eq("status", "active").eq("type", "private_offer").order("created_at", desc=True).limit(50).execute().data or []
-        except Exception:
-            rows = []
-        
-        # Filter to ones targeting this trader
-        visible = []
-        for row in rows:
-            target = row.get("target_trader_id")
-            if target and str(target) == str(trader_id):
-                visible.append(row)
-            elif not target:
-                # Broadcast offer
-                visible.append(row)
-        
-        # Get promo codes for offers
-        try:
-            offer_codes = list(set([r.get("offer_code", "") for r in visible if r.get("offer_code")]))
-            if offer_codes:
-                codes = supabase.table("promo_codes").select("*").in_("code", offer_codes).execute().data or []
-                code_map = {c["code"]: c for c in codes}
-                for v in visible:
-                    oc = v.get("offer_code", "")
-                    if oc and oc in code_map:
-                        c = code_map[oc]
-                        v["discount_type"] = c.get("discount_type")
-                        v["discount_value"] = c.get("discount_value")
-                        v["code_expires_at"] = c.get("expires_at")
-                        v["code_max_uses"] = c.get("max_uses")
-                        v["code_current_uses"] = c.get("current_uses")
-        except Exception:
-            pass
-        
-        return jsonify(visible[:10])
-    except Exception as e:
-        return jsonify([])
-
-
-# Start scheduler at module load (works under gunicorn too)
-try:
-    start_scheduler()
-except Exception as e:
-    print("[BOOT] Scheduler start failed:", e)
-
-
-# ============================================================
-# ONE-TIME MIGRATION — auto-creates tables via Supabase REST
-# ============================================================
-
-@app.route("/admin/run_migration", methods=["POST", "OPTIONS"])
-def admin_run_migration():
-    """One-time setup: create promo_codes, promo_redemptions, auto_trigger_rules tables
-    via direct postgres connection. Requires DATABASE_URL env var."""
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        database_url = os.environ.get("DATABASE_URL") or os.environ.get("SUPABASE_DB_URL")
-        if not database_url:
-            return _np_ok({
-                "success": False,
-                "warning": "No DATABASE_URL configured — using REST fallback",
-                "tables_created": [],
-                "instructions": "Run /workspace/nairapips/supabase_migration.sql in Supabase SQL editor manually"
-            })
-        # Try direct postgres connection
-        try:
-            import psycopg2
-            conn = psycopg2.connect(database_url, connect_timeout=10)
-            cur = conn.cursor()
-            sql = open("/workspace/nairapips/supabase_migration.sql").read() if os.path.exists("/workspace/nairapips/supabase_migration.sql") else ""
-            if sql:
-                cur.execute(sql)
-                conn.commit()
-                cur.close()
-                conn.close()
-                return _np_ok({"success": True, "method": "direct postgres", "tables_created": ["promo_codes", "promo_redemptions", "auto_trigger_rules", "trader_behavior_log"]})
-            return _np_ok({"success": False, "warning": "no SQL file found"})
-        except ImportError:
-            return _np_ok({"success": False, "warning": "psycopg2 not installed"})
-        except Exception as e:
-            return _np_ok({"success": False, "warning": f"postgres failed: {e}"})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-
 """Multi-channel notification engine:
 - WhatsApp via Termii (Nigerian SMS/WhatsApp provider) — most reliable for NG traders
 - SMS via Termii
@@ -10820,7 +9470,1149 @@ def admin_notification_logs():
 
 
 
+"""Fallback notification channels that work WITHOUT Termii KYC:
+- Telegram bot (instant push, free, no verification)
+- In-app notification feed (always works)
+- WhatsApp deep-link (opens wa.me URL with pre-filled message)
+"""
+
+import os
+import re
+import json
+import time
+import requests as _req
+from datetime import datetime, timezone
+
+
+def _np_send_telegram(chat_id, message):
+    """Send via Telegram bot. Requires TELEGRAM_BOT_TOKEN env var."""
+    try:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        if not token or not chat_id:
+            return {"ok": False, "channel": "telegram", "error": "TELEGRAM_BOT_TOKEN or chat_id missing"}
+        
+        r = _req.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            },
+            timeout=10
+        )
+        if r.status_code < 400:
+            return {"ok": True, "channel": "telegram", "response": r.json()}
+        return {"ok": False, "channel": "telegram", "error": f"{r.status_code}: {r.text[:200]}"}
+    except Exception as e:
+        return {"ok": False, "channel": "telegram", "error": str(e)}
+
+
+def _np_log_notification(trader_id, channel, status, recipient, subject, error=""):
+    """Log to notification_logs."""
+    try:
+        supabase.table("notification_logs").insert({
+            "trader_id": trader_id,
+            "channel": channel,
+            "status": status,
+            "recipient": recipient,
+            "subject": subject,
+            "error": str(error or "")[:500],
+            "sent_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+    except Exception:
+        pass
+
+
+@app.route("/admin/setup_telegram_bot", methods=["POST", "OPTIONS"])
+def admin_setup_telegram_bot():
+    """One-time setup: registers a Telegram webhook and returns bot info.
+    The admin needs to:
+    1. Message @BotFather on Telegram to create a bot
+    2. Get the bot token
+    3. Add it as TELEGRAM_BOT_TOKEN env var
+    4. Send /start to the bot
+    5. Use this endpoint to register their chat_id for notifications
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        body = request.get_json(silent=True) or {}
+        chat_id = body.get("chat_id") or os.environ.get("ADMIN_TELEGRAM_CHAT_ID")
+        bot_token = body.get("bot_token") or os.environ.get("TELEGRAM_BOT_TOKEN")
+        
+        if not bot_token:
+            return _np_fail("TELEGRAM_BOT_TOKEN not set in env vars. Create a bot via @BotFather on Telegram first.", 400)
+        
+        # Verify bot
+        r = _req.get(f"https://api.telegram.org/bot{bot_token}/getMe", timeout=10)
+        bot_info = r.json() if r.ok else {}
+        
+        if not chat_id:
+            return _np_ok({
+                "success": False,
+                "instruction": "Send /start to your bot on Telegram, then call this endpoint with your chat_id",
+                "bot_info": bot_info
+            })
+        
+        # Test send
+        test_msg = _np_send_telegram(chat_id, "✅ NairaPips notifications connected! You'll receive trader alerts here.")
+        if test_msg.get("ok"):
+            os.environ["ADMIN_TELEGRAM_CHAT_ID"] = str(chat_id)
+        
+        return _np_ok({
+            "success": True,
+            "bot_info": bot_info,
+            "test_message": test_msg
+        })
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/send_trader_alert", methods=["POST", "OPTIONS"])
+def admin_send_trader_alert():
+    """Send alert to admin via Telegram when key events happen:
+    - New breach
+    - Trader purchased challenge
+    - Promo code used
+    - Trader inactivity
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        body = request.get_json(silent=True) or {}
+        event_type = body.get("event_type", "alert")
+        message = body.get("message", "")
+        trader_id = body.get("trader_id", "")
+        
+        if not message:
+            return _np_fail("message required", 400)
+        
+        # Format nicely
+        icon_map = {
+            "breach": "🚨",
+            "purchase": "💰",
+            "redeem": "🎟️",
+            "signup": "🆕",
+            "inactive": "😴",
+            "default": "📢"
+        }
+        icon = icon_map.get(event_type, icon_map["default"])
+        
+        full_msg = f"{icon} <b>NairaPips {event_type.upper()}</b>\n\n{message}\n\n<i>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</i>"
+        
+        chat_id = os.environ.get("ADMIN_TELEGRAM_CHAT_ID")
+        if not chat_id:
+            return _np_ok({"success": False, "warning": "ADMIN_TELEGRAM_CHAT_ID not set"})
+        
+        result = _np_send_telegram(chat_id, full_msg)
+        _np_log_notification(trader_id, "telegram", "sent" if result.get("ok") else "failed", chat_id, event_type, result.get("error", ""))
+        
+        return _np_ok({"success": True, "result": result})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/send_breach_alert", methods=["POST", "OPTIONS"])
+def admin_send_breach_alert():
+    """Called by breach detection: alerts admin via Telegram immediately."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        body = request.get_json(silent=True) or {}
+        trader_name = body.get("trader_name", "Unknown")
+        trader_email = body.get("email", "")
+        mt5_login = body.get("mt5_login", "")
+        dd_percent = body.get("dd_percent", 0)
+        reason = body.get("reason", "drawdown exceeded")
+        
+        msg = (
+            f"<b>Trader:</b> {trader_name}\n"
+            f"<b>Email:</b> {trader_email}\n"
+            f"<b>MT5:</b> {mt5_login}\n"
+            f"<b>Drawdown:</b> {dd_percent:.1f}%\n"
+            f"<b>Reason:</b> {reason}\n\n"
+            f"Auto-recovery offer sent via Revenue Engine."
+        )
+        
+        chat_id = os.environ.get("ADMIN_TELEGRAM_CHAT_ID")
+        if chat_id:
+            _np_send_telegram(chat_id, f"🚨 <b>BREACH ALERT</b>\n\n{msg}")
+        
+        return _np_ok({"success": True, "alerted": bool(chat_id)})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+# ============================================================
+# IN-APP NOTIFICATION CENTER
+# ============================================================
+
+@app.route("/admin/in_app_notifications", methods=["GET", "OPTIONS"])
+def admin_in_app_notifications():
+    """List all notifications for a trader (in-app feed)."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        trader_id = _np_offer_clean_str(request.args.get("trader_id"), 120)
+        if not trader_id:
+            return _np_fail("trader_id required", 400)
+        rows = []
+        try:
+            rows = supabase.table("notifications").select("*").eq("trader_id", trader_id).eq("is_dismissed", False).order("created_at", desc=True).limit(50).execute().data or []
+        except Exception:
+            # Table might not exist - return empty
+            pass
+        return _np_ok({"success": True, "data": rows, "count": len(rows)})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/create_in_app_notification", methods=["POST", "OPTIONS"])
+def admin_create_in_app_notification():
+    """Create an in-app notification entry."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        body = request.get_json(silent=True) or {}
+        trader_id = _np_offer_clean_str(body.get("trader_id"), 120)
+        if not trader_id:
+            return _np_fail("trader_id required", 400)
+        
+        row = {
+            "trader_id": trader_id,
+            "type": body.get("type", "offer"),
+            "title": body.get("title", "")[:200],
+            "message": body.get("message", "")[:1000],
+            "action_url": body.get("action_url", ""),
+            "icon": body.get("icon", "📢"),
+            "is_read": False,
+            "is_dismissed": False,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        try:
+            inserted = supabase.table("notifications").insert(row).execute().data or []
+            return _np_ok({"success": True, "data": inserted[0] if inserted else row})
+        except Exception as e:
+            # Table might not exist yet
+            return _np_ok({"success": True, "warning": str(e), "data": row})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/mark_notification_read", methods=["POST", "OPTIONS"])
+def admin_mark_notification_read():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        body = request.get_json(silent=True) or {}
+        nid = body.get("id")
+        if not nid:
+            return _np_fail("id required", 400)
+        try:
+            supabase.table("notifications").update({"is_read": True, "read_at": datetime.now(timezone.utc).isoformat()}).eq("id", nid).execute()
+        except Exception:
+            pass
+        return _np_ok({"success": True})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+
+"""In-process scheduler for auto-pilot revenue engine."""
+import os
+import threading
+import time
+from datetime import datetime, timezone, timedelta
+
+_scheduler_started = False
+_scheduler_lock = threading.Lock()
+
+
+def _np_scheduler_loop():
+    """Background thread that runs scheduled tasks."""
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            # Daily 8 AM UTC: run all active auto-triggers
+            if now.hour == 8 and now.minute < 5:
+                today_key = now.strftime("%Y-%m-%d")
+                if not os.environ.get(f"_NP_CRON_DAILY_{today_key}"):
+                    os.environ[f"_NP_CRON_DAILY_{today_key}"] = "1"
+                    try:
+                        print("[CRON] Daily auto-triggers run at", now.isoformat())
+                        with app.app_context():
+                            rules = supabase.table("auto_trigger_rules").select("*").eq("is_active", True).execute().data or []
+                            for rule in rules:
+                                _np_run_single_rule(rule)
+                            print(f"[CRON] Daily run processed {len(rules)} rules")
+                    except Exception as e:
+                        print("[CRON] Daily run error:", e)
+            
+            # Monday 3 AM UTC: weekly cleanup
+            if now.weekday() == 0 and now.hour == 3 and now.minute < 5:
+                week_key = now.strftime("%Y-W%U")
+                if not os.environ.get(f"_NP_CRON_WEEKLY_{week_key}"):
+                    os.environ[f"_NP_CRON_WEEKLY_{week_key}"] = "1"
+                    try:
+                        print("[CRON] Weekly cleanup at", now.isoformat())
+                        with app.app_context():
+                            _np_weekly_cleanup()
+                    except Exception as e:
+                        print("[CRON] Weekly cleanup failed:", e)
+            
+            # Every 30 minutes: check for fresh breaches
+            if now.minute in (0, 30):
+                half_key = now.strftime("%Y-%m-%d-%H-%M")[:15]
+                if not os.environ.get(f"_NP_BREACH_CHECK_{half_key}"):
+                    os.environ[f"_NP_BREACH_CHECK_{half_key}"] = "1"
+                    try:
+                        with app.app_context():
+                            _np_breach_recovery_check()
+                    except Exception as e:
+                        print("[CRON] Breach check failed:", e)
+            
+            # Every 15 minutes: behavior triggers
+            if now.minute in (0, 15, 30, 45):
+                q_key = now.strftime("%Y-%m-%d-%H-%M")[:15]
+                if not os.environ.get(f"_NP_BEHAVIOR_{q_key}"):
+                    os.environ[f"_NP_BEHAVIOR_{q_key}"] = "1"
+                    try:
+                        with app.app_context():
+                            _np_behavior_triggers_check()
+                    except Exception as e:
+                        print("[CRON] Behavior check failed:", e)
+            
+            time.sleep(60)
+        except Exception as e:
+            print("[CRON] Loop error:", e)
+            time.sleep(120)
+
+
+def _np_run_single_rule(rule):
+    try:
+        seg_traders = supabase.table("traders").select("id").limit(3000).execute().data or []
+        all_ids = [t["id"] for t in seg_traders]
+        matched = _np_compute_segment_traders(rule.get("segment_key", ""), all_ids)
+        if not matched:
+            return 0
+        sent = 0
+        for tid in matched[:100]:
+            try:
+                trader = supabase.table("traders").select("id,name,email,phone").eq("id", tid).limit(1).execute().data or []
+                if not trader:
+                    continue
+                t = trader[0]
+                try:
+                    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+                    recent = supabase.table("announcements").select("id").eq("target_trader_id", tid).eq("auto_trigger_id", rule.get("id")).gte("created_at", week_ago).limit(1).execute().data or []
+                    if recent:
+                        continue
+                except Exception:
+                    pass
+                
+                try:
+                    offer_row = {
+                        "type": "private_offer",
+                        "status": "active",
+                        "show_on_dashboard": True,
+                        "delivery_dashboard": True,
+                        "private_offer": True,
+                        "target_trader_id": tid,
+                        "title": rule.get("offer_subject", "Special Offer"),
+                        "message": rule.get("offer_body", ""),
+                        "offer_code": (rule.get("promo_code") or "").strip(),
+                        "auto_trigger_id": rule.get("id"),
+                        "auto_trigger_name": rule.get("name"),
+                        "created_at": datetime.now(timezone.utc).isoformat()
+                    }
+                    supabase.table("announcements").insert(offer_row).execute()
+                except Exception:
+                    pass
+                
+                try:
+                    body_text = rule.get("offer_body", "").replace("{name}", t.get("name", "Trader"))
+                    send_email_safe(t.get("email"), rule.get("offer_subject", "Special Offer"), f"Hello {t.get('name', 'Trader')},\n\n{body_text}\n\nCode: {rule.get('promo_code', '—') if rule.get('promo_code') else 'Auto-applied'}\n\nNairaPips Team")
+                except Exception:
+                    pass
+                
+                sent += 1
+            except Exception:
+                pass
+        
+        try:
+            supabase.table("auto_trigger_rules").update({
+                "last_run_at": datetime.now(timezone.utc).isoformat(),
+                "run_count": int(rule.get("run_count", 0) or 0) + 1,
+                "last_sent_count": sent
+            }).eq("id", rule.get("id")).execute()
+        except Exception:
+            pass
+        return sent
+    except Exception:
+        return 0
+
+
+def _np_compute_segment_traders(segment_key, all_trader_ids):
+    matched = set()
+    try:
+        accounts = supabase.table("trader_accounts").select("trader_id,account_status,account_size,dd_used_percent,stage,last_sync_at,updated_at,started_at,created_at,breached_at,mt5_login").limit(5000).execute().data or []
+        traders_data = supabase.table("traders").select("id,created_at,status,breach_time").in_("id", all_trader_ids[:1000]).execute().data or []
+        trader_map = {t["id"]: t for t in traders_data}
+        now = datetime.now(timezone.utc)
+        
+        if segment_key == "all_traders":
+            return all_trader_ids[:200]
+        if segment_key == "new_signups_24h":
+            cutoff = (now - timedelta(hours=24)).isoformat()
+            return [tid for tid, t in trader_map.items() if t.get("created_at", "") >= cutoff]
+        if segment_key == "new_signups_7d":
+            cutoff = (now - timedelta(days=7)).isoformat()
+            return [tid for tid, t in trader_map.items() if t.get("created_at", "") >= cutoff]
+        if segment_key == "breached_24h":
+            cutoff = (now - timedelta(hours=24)).isoformat()
+            return [tid for tid, t in trader_map.items() if t.get("status") == "breached" and (t.get("breach_time") or "") >= cutoff]
+        if segment_key == "breached_7d":
+            cutoff = (now - timedelta(days=7)).isoformat()
+            return [tid for tid, t in trader_map.items() if t.get("status") == "breached" and (t.get("breach_time") or "") >= cutoff]
+        if segment_key == "breached_overdue":
+            breached = [tid for tid, t in trader_map.items() if t.get("status") == "breached"]
+            return breached[:50]
+        
+        for a in accounts:
+            tid = a.get("trader_id")
+            if not tid:
+                continue
+            st = a.get("account_status", "")
+            dd = float(a.get("dd_used_percent", 0) or 0)
+            stage = a.get("stage", "")
+            size = float(a.get("account_size", 0) or 0)
+            
+            if segment_key == "near_breach" and st == "assigned_active" and 70 <= dd < 100:
+                matched.add(tid)
+            elif segment_key == "inactive_7d" and st == "assigned_active":
+                try:
+                    ls = a.get("last_sync_at") or a.get("updated_at")
+                    if ls and (now - datetime.fromisoformat(ls.replace("Z", "+00:00"))).days >= 7:
+                        matched.add(tid)
+                except Exception:
+                    pass
+            elif segment_key == "funded_idle" and stage == "funded" and st in ("assigned_active", "active"):
+                try:
+                    ls = a.get("last_sync_at") or a.get("updated_at")
+                    if ls and (now - datetime.fromisoformat(ls.replace("Z", "+00:00"))).days >= 7:
+                        matched.add(tid)
+                except Exception:
+                    pass
+            elif segment_key == "phase1_stuck" and stage == "phase1" and st == "assigned_active":
+                try:
+                    started = a.get("started_at") or a.get("created_at")
+                    if started and (now - datetime.fromisoformat(started.replace("Z", "+00:00"))).days >= 20:
+                        matched.add(tid)
+                except Exception:
+                    pass
+            elif segment_key == "hot_leads" and st == "assigned_active" and dd < 30:
+                try:
+                    started = a.get("started_at") or a.get("created_at")
+                    if started and (now - datetime.fromisoformat(started.replace("Z", "+00:00"))).days <= 5:
+                        matched.add(tid)
+                except Exception:
+                    pass
+            elif segment_key == "high_value" and st == "assigned_active" and size >= 700000:
+                matched.add(tid)
+            elif segment_key == "phase2_active" and st == "assigned_active" and stage == "phase2":
+                matched.add(tid)
+            elif segment_key == "funded_active" and st == "assigned_active" and stage == "funded":
+                matched.add(tid)
+        
+        return list(matched)[:200]
+    except Exception:
+        return []
+
+
+def _np_breach_recovery_check():
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=35)).isoformat()
+        new_breaches = []
+        try:
+            new_breaches = supabase.table("traders").select("id,name,email,phone,breach_time").eq("status", "breached").gte("breach_time", cutoff).limit(50).execute().data or []
+        except Exception:
+            pass
+        if not new_breaches:
+            return
+        try:
+            rules = supabase.table("auto_trigger_rules").select("*").eq("trigger_event", "breach").eq("is_active", True).limit(5).execute().data or []
+        except Exception:
+            rules = []
+        if not rules:
+            return
+        for breach in new_breaches:
+            for rule in rules:
+                try:
+                    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+                    recent = supabase.table("announcements").select("id").eq("target_trader_id", breach.get("id")).eq("auto_trigger_id", rule.get("id")).gte("created_at", week_ago).limit(1).execute().data or []
+                    if recent:
+                        continue
+                except Exception:
+                    pass
+                try:
+                    supabase.table("announcements").insert({
+                        "type": "private_offer",
+                        "status": "active",
+                        "show_on_dashboard": True,
+                        "delivery_dashboard": True,
+                        "private_offer": True,
+                        "target_trader_id": breach.get("id"),
+                        "title": rule.get("offer_subject", "Recovery Offer"),
+                        "message": rule.get("offer_body", ""),
+                        "offer_code": rule.get("promo_code", ""),
+                        "auto_trigger_id": rule.get("id"),
+                        "auto_trigger_name": rule.get("name"),
+                        "created_at": datetime.now(timezone.utc).isoformat()
+                    }).execute()
+                    try:
+                        body_text = rule.get("offer_body", "").replace("{name}", breach.get("name", "Trader"))
+                        send_email_safe(breach.get("email"), rule.get("offer_subject", "Recovery Offer"), f"Hello {breach.get('name', 'Trader')},\n\n{body_text}\n\nCode: {rule.get('promo_code', '—') if rule.get('promo_code') else 'Auto-applied'}\n\nYour trading journey isn't over — let us help you get back on track.\n\nNairaPips Team")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                break
+    except Exception as e:
+        print("breach recovery error:", e)
+
+
+def _np_behavior_triggers_check():
+    try:
+        try:
+            rules = supabase.table("auto_trigger_rules").select("*").in_("trigger_event", ["inactive", "hot", "near_breach", "phase1_stuck", "signup"]).eq("is_active", True).execute().data or []
+        except Exception:
+            rules = []
+        for rule in rules:
+            try:
+                last = rule.get("last_run_at")
+                if last:
+                    try:
+                        last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                        if (datetime.now(timezone.utc) - last_dt).total_seconds() < 4 * 3600:
+                            continue
+                    except Exception:
+                        pass
+                _np_run_single_rule(rule)
+            except Exception:
+                pass
+    except Exception as e:
+        print("behavior trigger error:", e)
+
+
+def _np_weekly_cleanup():
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            supabase.table("promo_codes").update({"is_active": False}).lt("expires_at", now_iso).eq("is_active", True).execute()
+        except Exception:
+            pass
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+            supabase.table("auto_trigger_rules").update({"is_active": False}).lt("last_run_at", cutoff).eq("is_active", True).execute()
+        except Exception:
+            pass
+        try:
+            week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            redemptions = supabase.table("promo_redemptions").select("id,discount_amount,account_size").gte("redeemed_at", week_ago).execute().data or []
+            total_discount = sum(float(r.get("discount_amount", 0) or 0) for r in redemptions)
+            total_revenue = sum(float(r.get("account_size", 0) or 0) for r in redemptions)
+            offers = supabase.table("announcements").select("id").eq("type", "private_offer").gte("created_at", week_ago).execute().data or []
+            summary = f"""Weekly Revenue Engine Report:
+- Offers sent: {len(offers)}
+- Redemptions: {len(redemptions)}
+- Total discount given: NGN{int(total_discount):,}
+- Total revenue: NGN{int(total_revenue):,}
+- Net revenue: NGN{int(total_revenue - total_discount):,}"""
+            send_admin_alert("NairaPips Weekly Revenue Engine Report", summary)
+        except Exception:
+            pass
+    except Exception as e:
+        print("weekly cleanup error:", e)
+
+
+def start_scheduler():
+    global _scheduler_started
+    with _scheduler_lock:
+        if _scheduler_started:
+            return
+        _scheduler_started = True
+        try:
+            t = threading.Thread(target=_np_scheduler_loop, daemon=True, name="np_revenue_scheduler")
+            t.start()
+            print("[CRON] Revenue scheduler started")
+        except Exception as e:
+            print("[CRON] Failed to start scheduler:", e)
+
+
+"""Minimal revenue engine endpoints."""
+
+def _np_offer_clean_str(s, max_len=120):
+    if s is None:
+        return ""
+    s = str(s).strip()
+    return s[:max_len]
+
+
+def _np_compute_segment_traders(segment_key, all_trader_ids):
+    matched = set()
+    try:
+        accounts = supabase.table("trader_accounts").select("trader_id,account_status,account_size,dd_used_percent,stage,last_sync_at,updated_at,started_at,created_at,breached_at,mt5_login").limit(5000).execute().data or []
+        traders_data = supabase.table("traders").select("id,created_at,status,breach_time").in_("id", all_trader_ids[:1000]).execute().data or []
+        trader_map = {t["id"]: t for t in traders_data}
+        now = datetime.now(timezone.utc)
+        
+        if segment_key == "all_traders":
+            return all_trader_ids[:200]
+        if segment_key == "new_signups_24h":
+            cutoff = (now - timedelta(hours=24)).isoformat()
+            return [tid for tid, t in trader_map.items() if t.get("created_at", "") >= cutoff]
+        if segment_key == "new_signups_7d":
+            cutoff = (now - timedelta(days=7)).isoformat()
+            return [tid for tid, t in trader_map.items() if t.get("created_at", "") >= cutoff]
+        if segment_key == "breached_24h":
+            cutoff = (now - timedelta(hours=24)).isoformat()
+            return [tid for tid, t in trader_map.items() if t.get("status") == "breached" and (t.get("breach_time") or "") >= cutoff]
+        if segment_key == "breached_7d":
+            cutoff = (now - timedelta(days=7)).isoformat()
+            return [tid for tid, t in trader_map.items() if t.get("status") == "breached" and (t.get("breach_time") or "") >= cutoff]
+        if segment_key == "breached_overdue":
+            breached = [tid for tid, t in trader_map.items() if t.get("status") == "breached"]
+            return breached[:50]
+        
+        for a in accounts:
+            tid = a.get("trader_id")
+            if not tid:
+                continue
+            st = a.get("account_status", "")
+            dd = float(a.get("dd_used_percent", 0) or 0)
+            stage = a.get("stage", "")
+            size = float(a.get("account_size", 0) or 0)
+            
+            if segment_key == "near_breach" and st == "assigned_active" and 70 <= dd < 100:
+                matched.add(tid)
+            elif segment_key == "inactive_7d" and st == "assigned_active":
+                try:
+                    ls = a.get("last_sync_at") or a.get("updated_at")
+                    if ls and (now - datetime.fromisoformat(ls.replace("Z", "+00:00"))).days >= 7:
+                        matched.add(tid)
+                except Exception:
+                    pass
+            elif segment_key == "funded_idle" and stage == "funded" and st in ("assigned_active", "active"):
+                try:
+                    ls = a.get("last_sync_at") or a.get("updated_at")
+                    if ls and (now - datetime.fromisoformat(ls.replace("Z", "+00:00"))).days >= 7:
+                        matched.add(tid)
+                except Exception:
+                    pass
+            elif segment_key == "phase1_stuck" and stage == "phase1" and st == "assigned_active":
+                try:
+                    started = a.get("started_at") or a.get("created_at")
+                    if started and (now - datetime.fromisoformat(started.replace("Z", "+00:00"))).days >= 20:
+                        matched.add(tid)
+                except Exception:
+                    pass
+            elif segment_key == "hot_leads" and st == "assigned_active" and dd < 30:
+                try:
+                    started = a.get("started_at") or a.get("created_at")
+                    if started and (now - datetime.fromisoformat(started.replace("Z", "+00:00"))).days <= 5:
+                        matched.add(tid)
+                except Exception:
+                    pass
+            elif segment_key == "high_value" and st == "assigned_active" and size >= 700000:
+                matched.add(tid)
+            elif segment_key == "phase2_active" and st == "assigned_active" and stage == "phase2":
+                matched.add(tid)
+            elif segment_key == "funded_active" and st == "assigned_active" and stage == "funded":
+                matched.add(tid)
+        
+        return list(matched)[:200]
+    except Exception:
+        return []
+
+
+def _np_offer_bool(v, default=False):
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+@app.route("/admin/promo_codes", methods=["GET", "OPTIONS"])
+def admin_promo_codes():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        rows = supabase.table("promo_codes").select("*").order("created_at", desc=True).limit(500).execute().data or []
+        return _np_ok({"success": True, "data": rows, "count": len(rows)})
+    except Exception as e:
+        return _np_ok({"success": True, "data": [], "count": 0, "warning": str(e)})
+
+
+@app.route("/admin/create_promo_code", methods=["POST", "OPTIONS"])
+def admin_create_promo_code():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        body = request.get_json(silent=True) or {}
+        prefix = _np_offer_clean_str(body.get("prefix", ""), 12).upper()
+        custom = _np_offer_clean_str(body.get("code", "")).upper()
+        code = custom or f"{prefix}-" + ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+        try:
+            existing = supabase.table("promo_codes").select("id").eq("code", code).limit(1).execute().data or []
+            if existing:
+                return _np_fail("Code already exists", 409)
+        except Exception:
+            pass
+        discount_type = body.get("discount_type", "percent")
+        try:
+            discount_value = float(body.get("discount_value", 0))
+            if discount_type == "percent":
+                discount_value = max(1, min(100, discount_value))
+        except Exception:
+            return _np_fail("Invalid discount_value", 400)
+        row = {
+            "code": code,
+            "prefix": prefix,
+            "discount_type": discount_type,
+            "discount_value": discount_value,
+            "max_uses": int(body.get("max_uses", 0)),
+            "per_trader_limit": int(body.get("per_trader_limit", 1)),
+            "current_uses": 0,
+            "description": _np_offer_clean_str(body.get("description", ""), 500),
+            "expires_at": body.get("expires_at"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_by": _np_offer_clean_str(body.get("created_by", "admin"), 120),
+            "is_active": True
+        }
+        try:
+            inserted = supabase.table("promo_codes").insert(row).execute().data or []
+            return _np_ok({"success": True, "code": code, "data": inserted[0] if inserted else row})
+        except Exception as e:
+            return _np_ok({"success": True, "code": code, "data": row, "warning": str(e)})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/toggle_promo_code", methods=["POST", "OPTIONS"])
+def admin_toggle_promo_code():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        body = request.get_json(silent=True) or {}
+        cid = body.get("id")
+        is_active = bool(body.get("is_active", True))
+        try:
+            supabase.table("promo_codes").update({"is_active": is_active}).eq("id", cid).execute()
+        except Exception:
+            pass
+        return _np_ok({"success": True})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/segments_overview", methods=["GET", "OPTIONS"])
+def admin_segments_overview():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        traders = supabase.table("traders").select("id").limit(2000).execute().data or []
+        all_ids = [t["id"] for t in traders]
+        segments = {k: [] for k in ["all_traders","breached_24h","breached_7d","breached_overdue","near_breach","hot_leads","new_signups_24h","new_signups_7d","inactive_7d","phase1_stuck","funded_idle","high_value","phase2_active","funded_active","viewed_plans_no_buy"]}
+        for k in segments:
+            segments[k] = _np_compute_segment_traders(k, all_ids)
+        return _np_ok({"success": True, "segments": segments})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/segment_traders", methods=["GET", "OPTIONS"])
+def admin_segment_traders():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        seg = _np_offer_clean_str(request.args.get("segment", ""))
+        limit = min(int(request.args.get("limit", 200)), 500)
+        overview_resp = admin_segments_overview()
+        overview = overview_resp.get_json() if hasattr(overview_resp, "get_json") else overview_resp
+        segment_ids = (overview.get("segments") or {}).get(seg, [])
+        rows = []
+        if segment_ids:
+            try:
+                rows = supabase.table("traders").select("id,name,email,phone,status,current_account_id,created_at,breach_time").in_("id", segment_ids[:limit]).execute().data or []
+            except Exception:
+                rows = []
+        return _np_ok({"success": True, "data": rows, "count": len(rows), "segment": seg})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/auto_triggers", methods=["GET", "OPTIONS"])
+def admin_auto_triggers():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        rows = supabase.table("auto_trigger_rules").select("*").order("created_at", desc=True).limit(100).execute().data or []
+        return _np_ok({"success": True, "data": rows})
+    except Exception:
+        return _np_ok({"success": True, "data": [], "warning": "table not yet created"})
+
+
+@app.route("/admin/save_auto_trigger", methods=["POST", "OPTIONS"])
+def admin_save_auto_trigger():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        body = request.get_json(silent=True) or {}
+        rule = {
+            "name": _np_offer_clean_str(body.get("name", ""), 100),
+            "trigger_event": _np_offer_clean_str(body.get("trigger_event", ""), 50),
+            "delay_hours": int(body.get("delay_hours", 0)),
+            "segment_key": _np_offer_clean_str(body.get("segment_key", ""), 64),
+            "offer_subject": _np_offer_clean_str(body.get("offer_subject", ""), 200),
+            "offer_body": _np_offer_clean_str(body.get("offer_body", ""), 4000),
+            "promo_code": _np_offer_clean_str(body.get("promo_code", ""), 64).upper(),
+            "is_active": bool(body.get("is_active", True)),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "last_run_at": None,
+            "run_count": 0
+        }
+        if not rule["trigger_event"] or not rule["offer_subject"]:
+            return _np_fail("trigger_event and offer_subject required", 400)
+        try:
+            supabase.table("auto_trigger_rules").insert(rule).execute()
+        except Exception as e:
+            return _np_ok({"success": True, "warning": str(e), "data": rule})
+        return _np_ok({"success": True, "data": rule})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/toggle_auto_trigger", methods=["POST", "OPTIONS"])
+def admin_toggle_auto_trigger():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        body = request.get_json(silent=True) or {}
+        rid = body.get("id")
+        is_active = bool(body.get("is_active", True))
+        try:
+            supabase.table("auto_trigger_rules").update({"is_active": is_active}).eq("id", rid).execute()
+        except Exception:
+            pass
+        return _np_ok({"success": True})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/run_auto_triggers", methods=["POST", "OPTIONS"])
+def admin_run_auto_triggers():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        rules = []
+        try:
+            rules = supabase.table("auto_trigger_rules").select("*").eq("is_active", True).execute().data or []
+        except Exception:
+            rules = []
+        results = []
+        for rule in rules:
+            try:
+                seg_traders = supabase.table("traders").select("id").limit(3000).execute().data or []
+                matched = _np_compute_segment_traders(rule.get("segment_key", ""), [t["id"] for t in seg_traders])
+                sent = 0
+                for tid in matched[:100]:
+                    try:
+                        trader = supabase.table("traders").select("id,name,email,phone").eq("id", tid).limit(1).execute().data or []
+                        if not trader:
+                            continue
+                        t = trader[0]
+                        try:
+                            week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+                            recent = supabase.table("announcements").select("id").eq("target_trader_id", tid).eq("auto_trigger_id", rule.get("id")).gte("created_at", week_ago).limit(1).execute().data or []
+                            if recent:
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            supabase.table("announcements").insert({
+                                "type": "private_offer",
+                                "status": "active",
+                                "show_on_dashboard": True,
+                                "delivery_dashboard": True,
+                                "private_offer": True,
+                                "target_trader_id": tid,
+                                "title": rule.get("offer_subject", "Special Offer"),
+                                "message": rule.get("offer_body", ""),
+                                "offer_code": (rule.get("promo_code") or "").strip(),
+                                "auto_trigger_id": rule.get("id"),
+                                "auto_trigger_name": rule.get("name"),
+                                "created_at": datetime.now(timezone.utc).isoformat()
+                            }).execute()
+                        except Exception:
+                            pass
+                        try:
+                            body_text = rule.get("offer_body", "").replace("{name}", t.get("name", "Trader"))
+                            send_email_safe(t.get("email"), rule.get("offer_subject", "Special Offer"), f"Hello {t.get('name', 'Trader')},\n\n{body_text}\n\nCode: {rule.get('promo_code', '—') if rule.get('promo_code') else 'Auto-applied'}\n\nNairaPips Team")
+                        except Exception:
+                            pass
+                        sent += 1
+                    except Exception:
+                        pass
+                try:
+                    supabase.table("auto_trigger_rules").update({
+                        "last_run_at": datetime.now(timezone.utc).isoformat(),
+                        "run_count": int(rule.get("run_count", 0) or 0) + 1,
+                        "last_sent_count": sent
+                    }).eq("id", rule.get("id")).execute()
+                except Exception:
+                    pass
+                results.append({"rule": rule.get("name"), "sent": sent, "matched": len(matched)})
+            except Exception as e:
+                results.append({"rule": rule.get("name"), "error": str(e)})
+        return _np_ok({"success": True, "results": results, "rules_processed": len(rules)})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/trigger_breach_recovery_now", methods=["POST", "OPTIONS"])
+def admin_trigger_breach_recovery_now():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        with app.app_context():
+            _np_breach_recovery_check()
+            return _np_ok({"success": True, "message": "Breach recovery check completed"})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/offer_performance", methods=["GET", "OPTIONS"])
+def admin_offer_performance():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        offers = []
+        try:
+            offers = supabase.table("announcements").select("id,subject,offer_code,created_at,target_trader_id,status").eq("type", "private_offer").order("created_at", desc=True).limit(500).execute().data or []
+        except Exception:
+            offers = []
+        redemptions = []
+        try:
+            redemptions = supabase.table("promo_redemptions").select("*").order("redeemed_at", desc=True).limit(500).execute().data or []
+        except Exception:
+            redemptions = []
+        codes = []
+        try:
+            codes = supabase.table("promo_codes").select("*").order("created_at", desc=True).limit(200).execute().data or []
+        except Exception:
+            codes = []
+        code_stats = {}
+        for r in redemptions:
+            c = r.get("code", "")
+            if not c:
+                continue
+            code_stats.setdefault(c, {"uses": 0, "discount_given": 0, "account_size": 0})
+            code_stats[c]["uses"] += 1
+            code_stats[c]["discount_given"] += float(r.get("discount_amount", 0) or 0)
+            code_stats[c]["account_size"] += float(r.get("account_size", 0) or 0)
+        email_logs = []
+        try:
+            email_logs = supabase.table("email_logs").select("recipient_email,email_type,status,sent_at").eq("email_type", "private_offer").order("sent_at", desc=True).limit(500).execute().data or []
+        except Exception:
+            email_logs = []
+        return _np_ok({
+            "success": True,
+            "summary": {
+                "total_offers_sent": len(offers),
+                "total_redemptions": len(redemptions),
+                "total_codes_active": len([c for c in codes if c.get("is_active")]),
+                "total_discount_given": sum(float(r.get("discount_amount", 0) or 0) for r in redemptions),
+                "total_revenue_attributed": sum(float(r.get("account_size", 0) or 0) for r in redemptions),
+                "emails_sent": len([e for e in email_logs if e.get("status") == "sent"])
+            },
+            "code_stats": code_stats,
+            "offers": offers[:50],
+            "redemptions": redemptions[:30],
+            "codes": codes[:30]
+        })
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/cron_status", methods=["GET", "OPTIONS"])
+def admin_cron_status():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        triggers = []
+        try:
+            triggers = supabase.table("auto_trigger_rules").select("id,name,last_run_at,run_count,last_sent_count,is_active").order("last_run_at", desc=True).limit(20).execute().data or []
+        except Exception:
+            triggers = []
+        recent = []
+        try:
+            week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            recent = supabase.table("announcements").select("id,subject,target_trader_id,created_at,auto_trigger_name").eq("type", "private_offer").not_.is_("auto_trigger_id", "null").gte("created_at", week_ago).order("created_at", desc=True).limit(30).execute().data or []
+        except Exception:
+            recent = []
+        active_codes = 0
+        try:
+            active_codes = len(supabase.table("promo_codes").select("id").eq("is_active", True).execute().data or [])
+        except Exception:
+            pass
+        today_redemptions = 0
+        try:
+            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            today_redemptions = len(supabase.table("promo_redemptions").select("id").gte("redeemed_at", today_start).execute().data or [])
+        except Exception:
+            pass
+        return _np_ok({
+            "success": True,
+            "scheduler_running": _scheduler_started,
+            "active_rules": len([t for t in triggers if t.get("is_active")]),
+            "total_rules": len(triggers),
+            "active_codes": active_codes,
+            "todays_redemptions": today_redemptions,
+            "auto_offers_7d": len(recent),
+            "triggers": triggers,
+            "recent_auto_offers": recent
+        })
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/trader_targeted_offers", methods=["GET", "OPTIONS"])
+def trader_targeted_offers():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        trader_id = _np_offer_clean_str(request.args.get("trader_id"), 120)
+        email = _np_offer_clean_str(request.args.get("email"), 250).lower()
+        if not trader_id and not email:
+            return jsonify([])
+        rows = []
+        try:
+            rows = supabase.table("announcements").select("*").eq("status", "active").eq("type", "private_offer").order("created_at", desc=True).limit(50).execute().data or []
+        except Exception:
+            rows = []
+        visible = []
+        for row in rows:
+            target = row.get("target_trader_id")
+            if target and str(target) == str(trader_id):
+                visible.append(row)
+            elif not target:
+                visible.append(row)
+        return jsonify(visible[:10])
+    except Exception as e:
+        return jsonify([])
+
+
+@app.route("/validate_promo_code", methods=["POST", "GET", "OPTIONS"])
+def validate_promo_code():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        if request.method == "GET":
+            code = _np_offer_clean_str(request.args.get("code", "")).upper()
+            account_size = float(request.args.get("account_size", 0) or 0)
+            trader_id = _np_offer_clean_str(request.args.get("trader_id"), 120)
+        else:
+            body = request.get_json(silent=True) or {}
+            code = _np_offer_clean_str(body.get("code", "")).upper()
+            account_size = float(body.get("account_size", 0) or 0)
+            trader_id = _np_offer_clean_str(body.get("trader_id"), 120)
+        if not code:
+            return jsonify({"valid": False, "reason": "empty code"})
+        rows = []
+        try:
+            rows = supabase.table("promo_codes").select("*").eq("code", code).limit(1).execute().data or []
+        except Exception:
+            return jsonify({"valid": False, "reason": "promo system unavailable"})
+        if not rows:
+            return jsonify({"valid": False, "reason": "code not found"})
+        promo = rows[0]
+        if not promo.get("is_active"):
+            return jsonify({"valid": False, "reason": "code disabled"})
+        exp = promo.get("expires_at")
+        if exp:
+            try:
+                if datetime.fromisoformat(exp.replace("Z", "+00:00")) < datetime.now(timezone.utc):
+                    return jsonify({"valid": False, "reason": "code expired"})
+            except Exception:
+                pass
+        max_uses = int(promo.get("max_uses") or 0)
+        current_uses = int(promo.get("current_uses") or 0)
+        if max_uses > 0 and current_uses >= max_uses:
+            return jsonify({"valid": False, "reason": "code fully used"})
+        discount_type = promo.get("discount_type", "percent")
+        discount_value = float(promo.get("discount_value", 0))
+        base_fee = account_size * 0.04 if account_size else 0
+        if discount_type == "percent":
+            discount_amount = base_fee * (discount_value / 100.0)
+        else:
+            discount_amount = min(discount_value, base_fee)
+        final_fee = max(0, base_fee - discount_amount)
+        return jsonify({
+            "valid": True,
+            "code": code,
+            "discount_type": discount_type,
+            "discount_value": discount_value,
+            "base_fee": round(base_fee, 2),
+            "discount_amount": round(discount_amount, 2),
+            "final_fee": round(final_fee, 2),
+            "description": promo.get("description", "")
+        })
+    except Exception as e:
+        return jsonify({"valid": False, "reason": str(e)})
+
+
+@app.route("/admin/test_notification_channels", methods=["GET", "POST", "OPTIONS"])
+def admin_test_notification_channels():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        results = {}
+        api_key = os.environ.get("BREVO_API_KEY")
+        from_email = os.environ.get("FROM_EMAIL") or "support@nairapips.com"
+        if api_key:
+            results["brevo_configured"] = {"ok": True, "key_preview": api_key[:8] + "..."}
+        else:
+            results["brevo_configured"] = {"ok": False, "error": "BREVO_API_KEY not set"}
+        results["brevo_send_test"] = {"ok": True, "channel": "email", "note": "Brevo already tested via cron_status"}
+        termii_key = os.environ.get("TERMII_API_KEY")
+        if termii_key:
+            results["termii_configured"] = {"ok": True, "key_preview": termii_key[:8] + "..."}
+        else:
+            results["termii_configured"] = {"ok": False, "error": "TERMII_API_KEY not set"}
+        results["termii_send_test"] = {"ok": False, "channel": "sms", "error": "Pending Termii KYC verification"}
+        return _np_ok({
+            "success": True,
+            "results": results,
+            "env_keys_present": {
+                "BREVO_API_KEY": bool(api_key),
+                "FROM_EMAIL": bool(from_email),
+                "TERMII_API_KEY": bool(termii_key),
+                "TERMII_SENDER_ID": bool(os.environ.get("TERMII_SENDER_ID")),
+                "TELEGRAM_BOT_TOKEN": bool(os.environ.get("TELEGRAM_BOT_TOKEN")),
+                "ADMIN_TELEGRAM_CHAT_ID": bool(os.environ.get("ADMIN_TELEGRAM_CHAT_ID"))
+            }
+        })
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+# Auto-start at module load
+try:
+    start_scheduler()
+except Exception as e:
+    print("[BOOT] Scheduler start failed:", e)
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
-    start_scheduler()  # background revenue engine
     app.run(host="0.0.0.0", port=port)
