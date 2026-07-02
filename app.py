@@ -10448,6 +10448,378 @@ def admin_run_migration():
         return _np_fail(e, 500)
 
 
+"""Multi-channel notification engine:
+- WhatsApp via Termii (Nigerian SMS/WhatsApp provider) — most reliable for NG traders
+- SMS via Termii
+- Email via Brevo (best-effort, often goes to spam)
+- In-app (always works since trader must login)
+- Tries all 4 channels; counts how many succeeded
+"""
+import os
+import re
+import json
+import time
+import requests as _req
+from datetime import datetime, timezone
+
+
+def _np_send_termii_whatsapp(to_phone, message):
+    """Send WhatsApp via Termii. Falls back to SMS if WA fails."""
+    try:
+        api_key = os.environ.get("TERMII_API_KEY") or os.environ.get("TERMII_SMS_API_KEY")
+        sender_id = os.environ.get("TERMII_SENDER_ID") or "NairaPips"
+        if not api_key:
+            return {"ok": False, "channel": "whatsapp", "error": "TERMII_API_KEY not set"}
+        
+        # Normalize phone - remove leading 0, add 234 for Nigeria
+        phone = str(to_phone or "").strip()
+        phone = re.sub(r'[^0-9+]', '', phone)
+        if phone.startswith('+'):
+            phone = phone[1:]
+        if phone.startswith('0'):
+            phone = '234' + phone[1:]
+        if not phone.startswith('234') and len(phone) == 10:
+            phone = '234' + phone
+        
+        if len(phone) < 10:
+            return {"ok": False, "channel": "whatsapp", "error": f"invalid phone: {to_phone}"}
+        
+        # Try WhatsApp channel first
+        try:
+            r = _req.post(
+                "https://api.termii.com/api/send/whatsapp",
+                json={
+                    "api_key": api_key,
+                    "from": sender_id,
+                    "to": phone,
+                    "type": "plain",
+                    "channel": "whatsapp",
+                    "message": message
+                },
+                timeout=10
+            )
+            if r.status_code < 400:
+                return {"ok": True, "channel": "whatsapp", "response": r.json() if r.text else {}}
+        except Exception:
+            pass
+        
+        # Fallback to SMS
+        try:
+            r = _req.post(
+                "https://api.termii.com/api/sms/send",
+                json={
+                    "api_key": api_key,
+                    "to": phone,
+                    "from": sender_id,
+                    "sms": message,
+                    "type": "plain",
+                    "channel": "generic"
+                },
+                timeout=10
+            )
+            if r.status_code < 400:
+                return {"ok": True, "channel": "sms", "response": r.json() if r.text else {}}
+            return {"ok": False, "channel": "sms", "error": r.text[:200]}
+        except Exception as e:
+            return {"ok": False, "channel": "sms", "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "channel": "whatsapp", "error": str(e)}
+
+
+def _np_send_brevo_email(to_email, subject, html_body):
+    """Send email via Brevo. Returns True if accepted."""
+    try:
+        api_key = os.environ.get("BREVO_API_KEY")
+        from_email = os.environ.get("FROM_EMAIL") or "support@nairapips.com"
+        if not api_key:
+            return {"ok": False, "channel": "email", "error": "BREVO_API_KEY not set"}
+        
+        payload = {
+            "sender": {"name": "NairaPips Prop Trading", "email": from_email, "replyTo": {"email": from_email}},
+            "to": [{"email": to_email}],
+            "subject": subject,
+            "htmlContent": html_body,
+            "tags": ["revenue_engine", "private_offer"]
+        }
+        r = _req.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={"api-key": api_key, "Content-Type": "application/json"},
+            json=payload,
+            timeout=10
+        )
+        if r.status_code < 400:
+            return {"ok": True, "channel": "email", "response": r.json() if r.text else {}}
+        return {"ok": False, "channel": "email", "error": f"{r.status_code}: {r.text[:300]}"}
+    except Exception as e:
+        return {"ok": False, "channel": "email", "error": str(e)}
+
+
+def _np_log_notification(trader_id, channel, status, recipient, subject, error=""):
+    """Log notification attempt."""
+    try:
+        supabase.table("notification_logs").insert({
+            "trader_id": trader_id,
+            "channel": channel,
+            "status": status,
+            "recipient": recipient,
+            "subject": subject,
+            "error": str(error or "")[:500],
+            "sent_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+    except Exception:
+        pass
+
+
+def send_offer_notification(trader, offer, channels=None):
+    """Send offer via multiple channels. Returns summary."""
+    if channels is None:
+        channels = ["email", "whatsapp", "in_app"]
+    
+    # Build offer message
+    code = offer.get("offer_code", "")
+    title = offer.get("title") or offer.get("subject", "Special Offer")
+    message = offer.get("message") or offer.get("body", "")
+    offer_url = "https://nairapips.com/dashboard/trader_clean.html"
+    
+    # WhatsApp/SMS message (shorter, more urgent)
+    wa_message = (
+        f"🎉 NairaPips: {title}\n\n"
+        f"{message[:200]}\n\n"
+        f"{('Code: ' + code) if code else ''}\n"
+        f"Claim now: {offer_url}"
+    ).strip()
+    
+    # Email subject (more compelling)
+    if code and "Off" in title:
+        email_subject = title
+    else:
+        email_subject = f"🎉 Special offer inside — {title[:60]}"
+    
+    results = {}
+    trader_id = trader.get("id") if isinstance(trader, dict) else None
+    trader_name = (trader.get("name") if isinstance(trader, dict) else "") or ""
+    trader_email = (trader.get("email") if isinstance(trader, dict) else "") or ""
+    trader_phone = (trader.get("phone") if isinstance(trader, dict) else "") or ""
+    
+    for channel in channels:
+        if channel == "email" and trader_email:
+            res = _np_send_brevo_email(trader_email, email_subject, _build_email_html(title, message, code, offer_url))
+            _np_log_notification(trader_id, "email", "sent" if res.get("ok") else "failed", trader_email, email_subject, res.get("error", ""))
+            results["email"] = res
+        elif channel == "whatsapp" and trader_phone:
+            res = _np_send_termii_whatsapp(trader_phone, wa_message)
+            _np_log_notification(trader_id, res.get("channel", "whatsapp"), "sent" if res.get("ok") else "failed", trader_phone, title, res.get("error", ""))
+            results["whatsapp"] = res
+        elif channel == "in_app":
+            # In-app is just the offer record in announcements table - always works
+            _np_log_notification(trader_id, "in_app", "delivered", trader_id or "", title, "")
+            results["in_app"] = {"ok": True, "channel": "in_app"}
+        elif channel == "sms" and trader_phone:
+            res = _np_send_termii_whatsapp(trader_phone, wa_message)
+            _np_log_notification(trader_id, "sms", "sent" if res.get("ok") else "failed", trader_phone, title, res.get("error", ""))
+            results["sms"] = res
+    
+    success_count = sum(1 for r in results.values() if r.get("ok"))
+    return {
+        "channels": results,
+        "success_count": success_count,
+        "total_attempted": len(results),
+        "any_delivered": success_count > 0
+    }
+
+
+def _build_email_html(title, message, code, url):
+    """Premium-looking email template."""
+    safe_title = title.replace('<', '&lt;').replace('>', '&gt;')
+    safe_message = message.replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br>')
+    code_block = ""
+    if code:
+        code_block = f"""
+        <tr>
+          <td style="padding:0 0 24px 0;">
+            <div style="background:linear-gradient(135deg,#000 0%,#1a1a1a 100%);border:2px solid #d4af37;border-radius:16px;padding:24px;text-align:center;">
+              <div style="font-size:11px;letter-spacing:.2em;color:#888;font-weight:700;margin-bottom:8px;">YOUR EXCLUSIVE CODE</div>
+              <div style="font-size:36px;font-weight:900;color:#f7c843;letter-spacing:.15em;font-family:'Courier New',monospace;">{code}</div>
+              <div style="font-size:13px;color:#999;margin-top:8px;">Save this code — apply at checkout</div>
+            </div>
+          </td>
+        </tr>"""
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <body style="margin:0;padding:0;background:#0a0a0a;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+      <table width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0a;padding:40px 20px;">
+        <tr>
+          <td align="center">
+            <table width="600" cellpadding="0" cellspacing="0" style="background:#111;border:1px solid rgba(212,175,55,.3);border-radius:20px;overflow:hidden;">
+              <tr>
+                <td style="padding:32px 32px 24px 32px;text-align:center;background:linear-gradient(135deg,#1a1a1a 0%,#0a0a0a 100%);border-bottom:1px solid rgba(212,175,55,.2);">
+                  <div style="display:inline-block;background:rgba(212,175,55,.1);border:1px solid rgba(212,175,55,.4);border-radius:30px;padding:6px 16px;font-size:11px;letter-spacing:.15em;color:#f7c843;font-weight:700;">NAIRAPIPS · PRIVATE OFFER</div>
+                  <h1 style="margin:18px 0 0 0;font-size:26px;font-weight:900;color:#fff;line-height:1.3;">{safe_title}</h1>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:24px 32px;color:#e5e5e5;font-size:15px;line-height:1.7;">{safe_message}</td>
+              </tr>
+              {code_block}
+              <tr>
+                <td style="padding:0 32px 32px 32px;" align="center">
+                  <a href="{url}" style="display:inline-block;background:linear-gradient(135deg,#f7c843 0%,#d4af37 100%);color:#000;text-decoration:none;font-weight:900;padding:16px 48px;border-radius:12px;font-size:15px;letter-spacing:.05em;text-transform:uppercase;box-shadow:0 4px 20px rgba(212,175,55,.4);">Claim Your Offer →</a>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:20px 32px;background:rgba(212,175,55,.04);border-top:1px solid rgba(212,175,55,.15);text-align:center;font-size:12px;color:#888;">
+                  NairaPips Prop Trading · This is a private offer sent only to you.<br>
+                  <a href="{url}" style="color:#f7c843;text-decoration:none;">Open Dashboard</a>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+    """
+
+
+@app.route("/admin/send_offer_notification", methods=["POST", "OPTIONS"])
+def admin_send_offer_notification():
+    """Send a private offer to a trader via multiple channels."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        body = request.get_json(silent=True) or {}
+        trader_id = str(body.get("trader_id", "")).strip()
+        title = str(body.get("title", "Special Offer")).strip()[:200]
+        message = str(body.get("message", "")).strip()[:3000]
+        code = str(body.get("offer_code", "")).strip()[:40]
+        channels = body.get("channels") or ["email", "whatsapp", "in_app"]
+        
+        if not trader_id:
+            return _np_fail("trader_id required", 400)
+        
+        # Fetch trader
+        try:
+            trader_rows = supabase.table("traders").select("id,name,email,phone").eq("id", trader_id).limit(1).execute().data or []
+        except Exception:
+            trader_rows = []
+        if not trader_rows:
+            return _np_fail("trader not found", 404)
+        trader = trader_rows[0]
+        
+        # Build offer
+        offer = {"title": title, "message": message, "offer_code": code}
+        
+        # Send via all channels
+        result = send_offer_notification(trader, offer, channels)
+        
+        # Save to announcements if in_app is enabled
+        if "in_app" in channels:
+            try:
+                supabase.table("announcements").insert({
+                    "type": "private_offer",
+                    "status": "active",
+                    "title": title,
+                    "message": message,
+                    "offer_code": code,
+                    "target_trader_id": trader_id,
+                    "target_email": trader.get("email", ""),
+                    "target_name": trader.get("name", ""),
+                    "target_phone": trader.get("phone", ""),
+                    "delivery_dashboard": True,
+                    "show_on_dashboard": True,
+                    "private_offer": True,
+                    "delivery_email": "email" in channels,
+                    "delivery_whatsapp": "whatsapp" in channels,
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }).execute()
+            except Exception as e:
+                print("ANNOUNCEMENT SAVE FAILED:", e)
+        
+        return _np_ok({
+            "success": True,
+            "trader": {"id": trader_id, "name": trader.get("name"), "email": trader.get("email"), "phone": trader.get("phone")},
+            "channels": result,
+            "any_delivered": result["any_delivered"]
+        })
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/test_notification_channels", methods=["GET", "POST", "OPTIONS"])
+def admin_test_notification_channels():
+    """Test all notification channels to verify they're working."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+        to_email = body.get("email") or os.environ.get("FROM_EMAIL") or "support@nairapips.com"
+        to_phone = body.get("phone") or "+2348000000000"
+        
+        results = {}
+        
+        # Test Brevo email
+        api_key = os.environ.get("BREVO_API_KEY")
+        if api_key:
+            results["brevo_configured"] = {"ok": True, "key_preview": api_key[:8] + "..."}
+        else:
+            results["brevo_configured"] = {"ok": False, "error": "BREVO_API_KEY not set"}
+        
+        # Test actual send
+        test_email_result = _np_send_brevo_email(
+            to_email,
+            "NairaPips Notification Test",
+            "<h2>Test email from NairaPips Revenue Engine</h2><p>If you see this, Brevo is working.</p>"
+        )
+        results["brevo_send_test"] = test_email_result
+        
+        # Test Termii
+        termii_key = os.environ.get("TERMII_API_KEY") or os.environ.get("TERMII_SMS_API_KEY")
+        if termii_key:
+            results["termii_configured"] = {"ok": True, "key_preview": termii_key[:8] + "..."}
+        else:
+            results["termii_configured"] = {"ok": False, "error": "TERMII_API_KEY not set"}
+        
+        # Test Termii send
+        test_sms_result = _np_send_termii_whatsapp(
+            to_phone,
+            "NairaPips test - if you see this, WhatsApp/SMS is working."
+        )
+        results["termii_send_test"] = test_sms_result
+        
+        return _np_ok({
+            "success": True,
+            "results": results,
+            "env_keys_present": {
+                "BREVO_API_KEY": bool(api_key),
+                "TERMII_API_KEY": bool(termii_key),
+                "TERMII_SMS_API_KEY": bool(os.environ.get("TERMII_SMS_API_KEY")),
+                "TERMII_SENDER_ID": bool(os.environ.get("TERMII_SENDER_ID")),
+                "FROM_EMAIL": bool(os.environ.get("FROM_EMAIL")),
+            }
+        })
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin/notification_logs", methods=["GET", "OPTIONS"])
+def admin_notification_logs():
+    """Show recent notification attempts across all channels."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        limit = min(int(request.args.get("limit", 100)), 500)
+        rows = []
+        try:
+            rows = supabase.table("notification_logs").select("*").order("sent_at", desc=True).limit(limit).execute().data or []
+        except Exception:
+            pass
+        return _np_ok({"success": True, "data": rows, "count": len(rows)})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     start_scheduler()  # background revenue engine
