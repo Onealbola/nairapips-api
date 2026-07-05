@@ -10477,6 +10477,124 @@ def register_lead():
         print("REGISTER LEAD ERROR:", str(e))
         return _np_fail(f"Lead registration failed: {str(e)}", 500)
 
+
+@app.route("/golden_ticket_access", methods=["POST", "OPTIONS"])
+def golden_ticket_access():
+    """Allow a Capital Selection lead to open the trader dashboard with a valid Golden Ticket.
+    This connects landing_leads -> traders without exposing Supabase keys in the browser.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    data = request.get_json(silent=True) or {}
+    ticket = _lead_clean(data.get("ticket") or data.get("golden_ticket") or data.get("ticket_code"), 80).upper()
+    lookup = _lead_clean(data.get("lookup") or data.get("email") or data.get("phone") or data.get("whatsapp"), 160).lower()
+    if not ticket:
+        return _np_fail("Golden Ticket code is required.", 400)
+
+    try:
+        q = supabase.table(LEAD_TABLE).select("*")
+        # Accept ticket or referral_code because some users will copy referral code instead of ticket.
+        rows = q.or_(f"golden_ticket.eq.{ticket},referral_code.eq.{ticket}").limit(2).execute().data or []
+        if not rows:
+            return _np_fail("Golden Ticket not found. Please check the code or register again.", 404)
+        lead = rows[0]
+
+        # Optional safety match when email/phone is supplied.
+        if lookup:
+            lookup_digits = re.sub(r"\D", "", lookup)
+            lead_email = str(lead.get("email") or "").strip().lower()
+            lead_phone = str(lead.get("whatsapp") or lead.get("phone") or "").strip().lower()
+            lead_digits = re.sub(r"\D", "", lead_phone)
+            email_match = lookup == lead_email
+            phone_match = bool(lookup_digits and lead_digits and (lookup_digits.endswith(lead_digits[-10:]) or lead_digits.endswith(lookup_digits[-10:])))
+            if ("@" in lookup or lookup_digits) and not (email_match or phone_match):
+                return _np_fail("This Golden Ticket does not match the email/phone entered.", 403)
+
+        email = str(lead.get("email") or "").strip().lower()
+        phone = _lead_phone(lead.get("whatsapp") or lead.get("phone"))
+        full_name = _lead_clean(lead.get("full_name") or lead.get("name") or "Trader", 100)
+        now = now_iso()
+
+        trader_row = None
+        try:
+            if email:
+                found = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
+                if found:
+                    trader_row = found[0]
+            if not trader_row and phone:
+                found = supabase.table("traders").select("*").eq("phone", phone).limit(1).execute().data or []
+                if found:
+                    trader_row = found[0]
+        except Exception as find_error:
+            print("GOLDEN TICKET TRADER FIND ERROR:", find_error)
+
+        gift_payload = {
+            "name": full_name,
+            "email": email,
+            "phone": phone,
+            "status": "new_signup",
+            "payment_status": "none",
+            "source": "golden_ticket_access",
+            "golden_ticket": lead.get("golden_ticket") or ticket,
+            "lead_id": lead.get("id"),
+            "lead_status": lead.get("lead_status") or "golden_ticket_active",
+            "vip_status": bool(lead.get("vip_status")),
+            "referral_count": lead.get("referral_count") or 0,
+            "tickets_count": lead.get("tickets_count") or 1,
+            "gift_account_size": "₦1,000,000",
+            "gift_status": "Awaiting Selection",
+            "updated_at": now,
+        }
+
+        if trader_row:
+            try:
+                updated = supabase.table("traders").update(gift_payload).eq("id", trader_row.get("id")).execute().data or []
+                trader_row = updated[0] if updated else {**trader_row, **gift_payload}
+            except Exception as update_error:
+                print("GOLDEN TICKET TRADER UPDATE ERROR:", update_error)
+                trader_row = {**trader_row, **gift_payload}
+        else:
+            create_payload = dict(gift_payload)
+            create_payload["created_at"] = now
+            try:
+                created = supabase.table("traders").insert(create_payload).execute().data or []
+                trader_row = created[0] if created else create_payload
+            except Exception as create_error:
+                print("GOLDEN TICKET TRADER CREATE ERROR:", create_error)
+                # Return a safe dashboard row even if traders table needs columns added.
+                trader_row = create_payload
+                trader_row["id"] = "lead-" + str(lead.get("id") or ticket)
+
+        try:
+            supabase.table(LEAD_TABLE).update({
+                "lead_status": "dashboard_accessed",
+                "last_seen_at": now,
+                "updated_at": now
+            }).eq("id", lead.get("id")).execute()
+        except Exception as lead_update_error:
+            print("GOLDEN TICKET LEAD UPDATE ERROR:", lead_update_error)
+
+        return _np_ok({
+            "success": True,
+            "message": "Golden Ticket verified. Dashboard access opened.",
+            "data": trader_row,
+            "trader": trader_row,
+            "golden_ticket": lead.get("golden_ticket") or ticket,
+            "lead": {
+                "id": lead.get("id"),
+                "full_name": full_name,
+                "email": email,
+                "whatsapp": phone,
+                "state": lead.get("state"),
+                "vip_status": bool(lead.get("vip_status")),
+                "referral_count": lead.get("referral_count") or 0,
+                "tickets_count": lead.get("tickets_count") or 1,
+            }
+        }, 200)
+    except Exception as e:
+        print("GOLDEN TICKET ACCESS ERROR:", str(e))
+        return _np_fail(f"Golden Ticket access failed: {str(e)}", 500)
+
 @app.route("/lead_campaign_stats", methods=["GET", "OPTIONS"])
 def lead_campaign_stats():
     if request.method == "OPTIONS":
