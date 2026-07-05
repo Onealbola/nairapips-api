@@ -10241,8 +10241,6 @@ def admin_test_notification_channels():
         return _np_fail(e, 500)
 
 
-
-# ============================================================
 # NAIRAPIPS CAPITAL SELECTION LEAD ENGINE
 # Landing page endpoint: /register_lead
 # Purpose: collect Founding Trader leads, issue Golden Tickets,
@@ -10625,6 +10623,7 @@ def lead_campaign_stats():
             "monthly_winners": 10,
             "warning": "Lead stats unavailable until the landing_leads table is created."
         }, 200)
+
 
 # Auto-start at module load
 try:
