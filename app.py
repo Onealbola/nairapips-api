@@ -5850,63 +5850,141 @@ def sync_fxblue_account():
     if not trader:
         return jsonify({"success": False, "error": "Trader not found. Send trader_id or active mt5_login/login."}), 404
     return jsonify({"success": True, "data": _apply_monitoring_snapshot(trader, data, "fxblue")})
-@app.route("/sync_trades", methods=["POST"])
+@app.route("/sync_trades", methods=["POST", "OPTIONS"])
+@app.route("/mt5_sync_trades", methods=["POST", "OPTIONS"])
 def sync_trades():
+    """Production-safe MT5 trade sync.
+
+    The MT5 engine must never receive a raw 500 HTML error here. A bad row,
+    missing optional column, duplicate ticket, or old schema mismatch should be
+    reported inside JSON while the endpoint stays alive for the rest of the
+    production monitoring engine.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
     try:
-        d = request.json or {}
-        trades = d.get("trades", [])
+        d = request.get_json(silent=True) or {}
+        trades = d if isinstance(d, list) else (d.get("trades") or d.get("data") or [])
 
         if not isinstance(trades, list):
-            return bad("trades must be a list")
+            return _np_ok({"success": False, "error": "trades must be a list", "saved": 0, "failed": 0}, 200)
 
         saved = []
+        errors = []
+        now = now_iso()
 
-        for t in trades:
-            trader_account_id = t.get("trader_account_id")
-            if not trader_account_id and t.get("mt5_login"):
+        def _txt(v):
+            return str(v or "").strip()
+
+        def _num_safe(v, default=0):
+            try:
+                if v is None or v == "":
+                    return default
+                return float(v)
+            except Exception:
+                return default
+
+        def _resolve_account(t):
+            trader_account_id = t.get("trader_account_id") or t.get("account_id") or t.get("current_account_id")
+            trader_id = t.get("trader_id")
+            mt5_login = _txt(t.get("mt5_login") or t.get("login") or t.get("account"))
+            if trader_account_id:
+                return trader_account_id, trader_id
+            if mt5_login:
                 try:
-                    acct_rows = supabase.table("trader_accounts").select("id").eq("mt5_login", str(t.get("mt5_login") or "")).eq("account_status", "assigned_active").limit(1).execute().data or []
-                    trader_account_id = acct_rows[0].get("id") if acct_rows else None
-                except Exception:
-                    trader_account_id = None
-            row = {
-                "trader_id": t.get("trader_id"),
-                "trader_account_id": trader_account_id,
-                "trader_name": t.get("trader_name"),
-                "email": t.get("email"),
-                "mt5_login": str(t.get("mt5_login") or ""),
-                "symbol": t.get("symbol"),
-                "ticket": str(t.get("ticket") or ""),
-                "trade_type": t.get("trade_type"),
-                "volume": t.get("volume") or 0,
-                "open_price": t.get("open_price") or 0,
-                "current_price": t.get("current_price") or 0,
-                "sl": t.get("sl") or 0,
-                "tp": t.get("tp") or 0,
-                "profit": t.get("profit") or 0,
-                "swap": t.get("swap") or 0,
-                "commission": t.get("commission") or 0,
-                "status": t.get("status") or "open",
-                "opened_at": t.get("opened_at"),
-                "closed_at": t.get("closed_at"),
-                "synced_at": now_iso()
-            }
+                    acct = _get_account_by_login_any_status(mt5_login, trader_id)
+                    if acct:
+                        return acct.get("id"), acct.get("trader_id") or trader_id
+                except Exception as e:
+                    print("SYNC TRADES ACCOUNT RESOLVE ERROR:", e)
+            return trader_account_id, trader_id
 
-            existing = supabase.table("trader_trades").select("id").eq("ticket", row["ticket"]).limit(1).execute().data
+        def _save_trade(row):
+            ticket = _txt(row.get("ticket"))
+            login = _txt(row.get("mt5_login"))
+            if not ticket:
+                raise ValueError("trade ticket is required")
+
+            existing = []
+            try:
+                q = supabase.table("trader_trades").select("id").eq("ticket", ticket)
+                if login:
+                    q = q.eq("mt5_login", login)
+                existing = q.limit(1).execute().data or []
+            except Exception:
+                # Older deployments may not support the mt5_login filter/index cleanly.
+                existing = supabase.table("trader_trades").select("id").eq("ticket", ticket).limit(1).execute().data or []
 
             if existing:
-                saved.append(
-                    supabase.table("trader_trades").update(row).eq("ticket", row["ticket"]).execute().data
-                )
-            else:
-                saved.append(
-                    supabase.table("trader_trades").insert(row).execute().data
-                )
+                return supabase.table("trader_trades").update(row).eq("id", existing[0].get("id")).execute().data or []
+            return supabase.table("trader_trades").insert(row).execute().data or []
 
-        return ok(saved, "Trades synced")
+        for i, t in enumerate(trades):
+            if not isinstance(t, dict):
+                errors.append({"index": i, "error": "trade row must be an object"})
+                continue
+
+            try:
+                trader_account_id, trader_id = _resolve_account(t)
+                row = {
+                    "trader_id": trader_id,
+                    "trader_account_id": trader_account_id,
+                    "trader_name": t.get("trader_name") or t.get("name"),
+                    "email": t.get("email"),
+                    "mt5_login": _txt(t.get("mt5_login") or t.get("login") or t.get("account")),
+                    "symbol": t.get("symbol"),
+                    "ticket": _txt(t.get("ticket") or t.get("order") or t.get("position_id")),
+                    "trade_type": t.get("trade_type") or t.get("type"),
+                    "volume": _num_safe(t.get("volume") or t.get("lots")),
+                    "open_price": _num_safe(t.get("open_price") or t.get("price_open")),
+                    "current_price": _num_safe(t.get("current_price") or t.get("price_current")),
+                    "sl": _num_safe(t.get("sl")),
+                    "tp": _num_safe(t.get("tp")),
+                    "profit": _num_safe(t.get("profit")),
+                    "swap": _num_safe(t.get("swap")),
+                    "commission": _num_safe(t.get("commission")),
+                    "status": t.get("status") or ("closed" if t.get("closed_at") or t.get("time_close") else "open"),
+                    "opened_at": t.get("opened_at") or t.get("open_time") or t.get("time_open"),
+                    "closed_at": t.get("closed_at") or t.get("close_time") or t.get("time_close"),
+                    "synced_at": now,
+                }
+
+                try:
+                    saved.extend(_save_trade(row))
+                except Exception as full_error:
+                    # Retry with the smallest legacy-safe payload. This protects
+                    # production if trader_trades is missing newer columns such as
+                    # trader_account_id/current_price/sl/tp/swap/commission.
+                    minimal_keys = [
+                        "trader_id", "trader_name", "email", "mt5_login", "symbol",
+                        "ticket", "trade_type", "volume", "open_price", "profit",
+                        "status", "opened_at", "closed_at", "synced_at"
+                    ]
+                    minimal = {k: row.get(k) for k in minimal_keys}
+                    try:
+                        saved.extend(_save_trade(minimal))
+                        errors.append({"index": i, "ticket": row.get("ticket"), "warning": "saved with legacy-safe columns", "detail": str(full_error)[:300]})
+                    except Exception as minimal_error:
+                        errors.append({"index": i, "ticket": row.get("ticket"), "error": str(minimal_error)[:500], "first_error": str(full_error)[:300]})
+                        print("SYNC TRADE ROW FAILED:", errors[-1])
+            except Exception as row_error:
+                errors.append({"index": i, "error": str(row_error)[:500]})
+                print("SYNC TRADE ROW CRASH PREVENTED:", errors[-1])
+
+        return _np_ok({
+            "success": True,
+            "message": "Trades sync endpoint alive",
+            "received": len(trades),
+            "saved": len(saved),
+            "failed": len(errors),
+            "errors": errors[:20],
+            "data": saved[:50],
+        }, 200)
 
     except Exception as e:
-        return bad(e)
+        print("SYNC TRADES ENDPOINT CRASH PREVENTED:", str(e))
+        return _np_ok({"success": False, "error": str(e), "saved": 0, "failed": 1}, 200)
 
 @app.route("/disable_mt5_access", methods=["POST"])
 def disable_mt5_access():
