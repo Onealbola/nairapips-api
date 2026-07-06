@@ -5851,140 +5851,84 @@ def sync_fxblue_account():
         return jsonify({"success": False, "error": "Trader not found. Send trader_id or active mt5_login/login."}), 404
     return jsonify({"success": True, "data": _apply_monitoring_snapshot(trader, data, "fxblue")})
 @app.route("/sync_trades", methods=["POST", "OPTIONS"])
-@app.route("/mt5_sync_trades", methods=["POST", "OPTIONS"])
 def sync_trades():
-    """Production-safe MT5 trade sync.
+    """Receive MT5 trade history without crashing the engine.
 
-    The MT5 engine must never receive a raw 500 HTML error here. A bad row,
-    missing optional column, duplicate ticket, or old schema mismatch should be
-    reported inside JSON while the endpoint stays alive for the rest of the
-    production monitoring engine.
+    Production fix: return HTTP 200 with row-level errors instead of a raw 500,
+    so the MT5 watchdog keeps running even when one trade row or schema field fails.
     """
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
-
     try:
         d = request.get_json(silent=True) or {}
-        trades = d if isinstance(d, list) else (d.get("trades") or d.get("data") or [])
-
+        trades = d.get("trades", [])
         if not isinstance(trades, list):
-            return _np_ok({"success": False, "error": "trades must be a list", "saved": 0, "failed": 0}, 200)
+            return _np_fail("trades must be a list", 400)
 
         saved = []
         errors = []
-        now = now_iso()
-
-        def _txt(v):
-            return str(v or "").strip()
-
-        def _num_safe(v, default=0):
+        for idx, t in enumerate(trades):
             try:
-                if v is None or v == "":
-                    return default
-                return float(v)
-            except Exception:
-                return default
-
-        def _resolve_account(t):
-            trader_account_id = t.get("trader_account_id") or t.get("account_id") or t.get("current_account_id")
-            trader_id = t.get("trader_id")
-            mt5_login = _txt(t.get("mt5_login") or t.get("login") or t.get("account"))
-            if trader_account_id:
-                return trader_account_id, trader_id
-            if mt5_login:
-                try:
-                    acct = _get_account_by_login_any_status(mt5_login, trader_id)
-                    if acct:
-                        return acct.get("id"), acct.get("trader_id") or trader_id
-                except Exception as e:
-                    print("SYNC TRADES ACCOUNT RESOLVE ERROR:", e)
-            return trader_account_id, trader_id
-
-        def _save_trade(row):
-            ticket = _txt(row.get("ticket"))
-            login = _txt(row.get("mt5_login"))
-            if not ticket:
-                raise ValueError("trade ticket is required")
-
-            existing = []
-            try:
-                q = supabase.table("trader_trades").select("id").eq("ticket", ticket)
-                if login:
-                    q = q.eq("mt5_login", login)
-                existing = q.limit(1).execute().data or []
-            except Exception:
-                # Older deployments may not support the mt5_login filter/index cleanly.
-                existing = supabase.table("trader_trades").select("id").eq("ticket", ticket).limit(1).execute().data or []
-
-            if existing:
-                return supabase.table("trader_trades").update(row).eq("id", existing[0].get("id")).execute().data or []
-            return supabase.table("trader_trades").insert(row).execute().data or []
-
-        for i, t in enumerate(trades):
-            if not isinstance(t, dict):
-                errors.append({"index": i, "error": "trade row must be an object"})
-                continue
-
-            try:
-                trader_account_id, trader_id = _resolve_account(t)
-                row = {
-                    "trader_id": trader_id,
-                    "trader_account_id": trader_account_id,
-                    "trader_name": t.get("trader_name") or t.get("name"),
-                    "email": t.get("email"),
-                    "mt5_login": _txt(t.get("mt5_login") or t.get("login") or t.get("account")),
-                    "symbol": t.get("symbol"),
-                    "ticket": _txt(t.get("ticket") or t.get("order") or t.get("position_id")),
-                    "trade_type": t.get("trade_type") or t.get("type"),
-                    "volume": _num_safe(t.get("volume") or t.get("lots")),
-                    "open_price": _num_safe(t.get("open_price") or t.get("price_open")),
-                    "current_price": _num_safe(t.get("current_price") or t.get("price_current")),
-                    "sl": _num_safe(t.get("sl")),
-                    "tp": _num_safe(t.get("tp")),
-                    "profit": _num_safe(t.get("profit")),
-                    "swap": _num_safe(t.get("swap")),
-                    "commission": _num_safe(t.get("commission")),
-                    "status": t.get("status") or ("closed" if t.get("closed_at") or t.get("time_close") else "open"),
-                    "opened_at": t.get("opened_at") or t.get("open_time") or t.get("time_open"),
-                    "closed_at": t.get("closed_at") or t.get("close_time") or t.get("time_close"),
-                    "synced_at": now,
-                }
-
-                try:
-                    saved.extend(_save_trade(row))
-                except Exception as full_error:
-                    # Retry with the smallest legacy-safe payload. This protects
-                    # production if trader_trades is missing newer columns such as
-                    # trader_account_id/current_price/sl/tp/swap/commission.
-                    minimal_keys = [
-                        "trader_id", "trader_name", "email", "mt5_login", "symbol",
-                        "ticket", "trade_type", "volume", "open_price", "profit",
-                        "status", "opened_at", "closed_at", "synced_at"
-                    ]
-                    minimal = {k: row.get(k) for k in minimal_keys}
+                trader_account_id = t.get("trader_account_id")
+                mt5_login = str(t.get("mt5_login") or t.get("login") or "").strip()
+                if not trader_account_id and mt5_login:
                     try:
-                        saved.extend(_save_trade(minimal))
-                        errors.append({"index": i, "ticket": row.get("ticket"), "warning": "saved with legacy-safe columns", "detail": str(full_error)[:300]})
-                    except Exception as minimal_error:
-                        errors.append({"index": i, "ticket": row.get("ticket"), "error": str(minimal_error)[:500], "first_error": str(full_error)[:300]})
-                        print("SYNC TRADE ROW FAILED:", errors[-1])
+                        acct = _get_account_by_login_any_status(mt5_login, t.get("trader_id"))
+                        trader_account_id = (acct or {}).get("id")
+                        if not t.get("trader_id") and acct:
+                            t["trader_id"] = acct.get("trader_id")
+                    except Exception:
+                        trader_account_id = None
+                ticket = str(t.get("ticket") or t.get("order") or t.get("deal") or "").strip()
+                if not ticket:
+                    errors.append({"index": idx, "error": "missing ticket"})
+                    continue
+                row = {
+                    "trader_id": t.get("trader_id"),
+                    "trader_account_id": trader_account_id,
+                    "trader_name": t.get("trader_name"),
+                    "email": t.get("email"),
+                    "mt5_login": mt5_login,
+                    "symbol": t.get("symbol"),
+                    "ticket": ticket,
+                    "trade_type": t.get("trade_type") or t.get("type"),
+                    "volume": t.get("volume") or 0,
+                    "open_price": t.get("open_price") or 0,
+                    "current_price": t.get("current_price") or t.get("close_price") or 0,
+                    "sl": t.get("sl") or 0,
+                    "tp": t.get("tp") or 0,
+                    "profit": t.get("profit") or 0,
+                    "swap": t.get("swap") or 0,
+                    "commission": t.get("commission") or 0,
+                    "status": t.get("status") or ("closed" if t.get("closed_at") else "open"),
+                    "opened_at": t.get("opened_at") or t.get("open_time"),
+                    "closed_at": t.get("closed_at") or t.get("close_time"),
+                    "synced_at": now_iso()
+                }
+                # Drop empty None fields to reduce schema/type conflicts.
+                row = {k: v for k, v in row.items() if v is not None}
+                existing = supabase.table("trader_trades").select("id").eq("ticket", ticket).limit(1).execute().data or []
+                if existing:
+                    res = supabase.table("trader_trades").update(row).eq("ticket", ticket).execute().data or []
+                    saved.append({"ticket": ticket, "action": "updated", "rows": len(res)})
+                else:
+                    res = supabase.table("trader_trades").insert(row).execute().data or []
+                    saved.append({"ticket": ticket, "action": "inserted", "rows": len(res)})
             except Exception as row_error:
-                errors.append({"index": i, "error": str(row_error)[:500]})
-                print("SYNC TRADE ROW CRASH PREVENTED:", errors[-1])
+                print("SYNC TRADES ROW ERROR:", row_error)
+                errors.append({"index": idx, "ticket": str((t or {}).get("ticket") or ""), "error": str(row_error)})
 
         return _np_ok({
             "success": True,
-            "message": "Trades sync endpoint alive",
-            "received": len(trades),
-            "saved": len(saved),
-            "failed": len(errors),
-            "errors": errors[:20],
-            "data": saved[:50],
+            "saved": saved,
+            "saved_count": len(saved),
+            "error_count": len(errors),
+            "errors": errors[:25],
+            "message": f"Trades sync processed. saved={len(saved)} errors={len(errors)}",
         }, 200)
-
     except Exception as e:
-        print("SYNC TRADES ENDPOINT CRASH PREVENTED:", str(e))
-        return _np_ok({"success": False, "error": str(e), "saved": 0, "failed": 1}, 200)
+        print("SYNC TRADES FATAL ERROR:", e)
+        return _np_ok({"success": False, "error": str(e), "saved_count": 0, "error_count": 1}, 200)
 
 @app.route("/disable_mt5_access", methods=["POST"])
 def disable_mt5_access():
@@ -10861,64 +10805,209 @@ def _np_points_total(user_id=None, email=None, ticket=None):
         return 0
 
 def _np_golden_ticket_candidates(limit=1500):
-    """Golden Ticket users waiting for the promised account/opportunity assignment."""
-    try:
-        rows = supabase.table("traders").select("*").order("updated_at", desc=True).limit(limit).execute().data or []
-    except Exception as e:
-        print("GOLDEN TICKET CANDIDATE FETCH ERROR:", e)
-        return []
-    active_accounts = []
+    """Golden Ticket users waiting for the promised account/opportunity assignment.
+
+    Production fix: Golden Ticket registrations are saved first in LEAD_TABLE
+    (default: landing_leads). The old queue only searched traders, so Admin showed
+    Golden Tickets: 0 even when landing registrations existed. This function now
+    reads both traders and landing_leads, then de-duplicates by ticket/email/phone.
+    """
+    out = []
+    seen = set()
+
+    active_trader_ids = set()
+    active_logins = set()
     try:
         active_accounts = supabase.table("trader_accounts").select("id,trader_id,account_status,mt5_login").in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).limit(5000).execute().data or []
+        active_trader_ids = {str(a.get("trader_id") or "") for a in active_accounts if str(a.get("trader_id") or "")}
+        active_logins = {str(a.get("mt5_login") or "").strip() for a in active_accounts if str(a.get("mt5_login") or "").strip()}
     except Exception as e:
         print("GOLDEN TICKET ACTIVE ACCOUNT FETCH ERROR:", e)
 
-    active_trader_ids = {str(a.get("trader_id") or "") for a in active_accounts if str(a.get("trader_id") or "")}
-    out = []
-    seen = set()
-    for t in rows:
-        tid = str(t.get("id") or "").strip()
-        ticket = str(t.get("golden_ticket") or "").strip().upper()
-        source = str(t.get("source") or "").strip().lower()
-        gift_status = str(t.get("gift_status") or "").strip().lower()
-        status_blob = " ".join([str(t.get("status") or ""), str(t.get("challenge_state") or ""), gift_status]).lower()
-        if not ticket and source != "golden_ticket_access":
-            continue
-        if tid and tid in active_trader_ids:
-            continue
-        if str(t.get("mt5_login") or "").strip():
-            continue
-        if any(x in status_blob for x in ["assigned", "active", "completed", "rejected", "cancel", "breach"]):
-            continue
-        key = tid or ticket or str(t.get("email") or "")
-        if key in seen:
-            continue
-        seen.add(key)
-        account_size = _np_number(t.get("gift_account_size") or t.get("account_size") or 1000000) or 1000000
-        out.append({
-            "id": tid or ticket,
-            "trader_id": tid,
-            "lead_id": t.get("lead_id") or "",
-            "source_type": "golden_ticket",
-            "source": "golden_ticket",
-            "target_phase": "phase1",
-            "target_stage": "phase1",
-            "stage_label": "GOLDEN TICKET PROMISE",
-            "assignment_label": "Assign Promised Account",
-            "name": t.get("name") or t.get("full_name") or "Trader",
-            "trader_name": t.get("name") or t.get("full_name") or "Trader",
-            "email": t.get("email") or "",
-            "phone": t.get("phone") or "",
-            "account_reference": t.get("account_reference") or ticket or "",
-            "golden_ticket": ticket,
-            "plan_name": "Golden Ticket N1M Offer",
-            "account_size": account_size,
-            "payment_status": "gift",
-            "current_status": t.get("gift_status") or "awaiting_promise_assignment",
-            "created_at": t.get("created_at") or t.get("updated_at") or "",
-            "founding_points": _np_points_total(tid, t.get("email"), ticket),
-        })
+    def add_candidate(row, source_table="traders"):
+        try:
+            ticket = str(row.get("golden_ticket") or row.get("ticket") or "").strip().upper()
+            email = str(row.get("email") or "").strip().lower()
+            phone = str(row.get("phone") or row.get("whatsapp") or "").strip()
+            tid = str(row.get("id") or "").strip() if source_table == "traders" else str(row.get("trader_id") or "").strip()
+            lead_id = str(row.get("lead_id") or "").strip() if source_table == "traders" else str(row.get("id") or row.get("lead_id") or "").strip()
+            source = str(row.get("source") or "").strip().lower()
+            gift_status = str(row.get("gift_status") or row.get("lead_status") or "").strip().lower()
+            status_blob = " ".join([str(row.get("status") or ""), str(row.get("challenge_state") or ""), gift_status]).lower()
+
+            if not ticket and source not in {"golden_ticket_access", "golden_ticket", "capital_selection", "direct"}:
+                return
+            if tid and tid in active_trader_ids:
+                return
+            if str(row.get("mt5_login") or "").strip() in active_logins:
+                return
+            if str(row.get("mt5_login") or "").strip():
+                return
+            if any(x in status_blob for x in ["assigned", "active", "completed", "rejected", "cancel", "breach"]):
+                # Do not hide normal fresh leads whose lead_status is just "new".
+                return
+
+            key = ticket or email or phone or lead_id or tid
+            if not key or key in seen:
+                return
+            seen.add(key)
+            account_size = _np_number(row.get("gift_account_size") or row.get("account_size") or 1000000) or 1000000
+            name = row.get("name") or row.get("full_name") or row.get("trader_name") or "Trader"
+            out.append({
+                "id": tid or lead_id or ticket,
+                "trader_id": tid,
+                "lead_id": lead_id,
+                "source_type": "golden_ticket",
+                "source": "golden_ticket",
+                "source_table": source_table,
+                "target_phase": "phase1",
+                "target_stage": "phase1",
+                "stage_label": "GOLDEN TICKET PROMISE",
+                "assignment_label": "Assign Promised Account",
+                "name": name,
+                "trader_name": name,
+                "email": email,
+                "phone": phone,
+                "whatsapp": phone,
+                "account_reference": row.get("account_reference") or ticket or "",
+                "golden_ticket": ticket,
+                "plan_name": "Golden Ticket N1M Offer",
+                "account_size": account_size,
+                "payment_status": "gift",
+                "current_status": row.get("gift_status") or row.get("lead_status") or "awaiting_promise_assignment",
+                "created_at": row.get("created_at") or row.get("updated_at") or "",
+                "founding_points": _np_points_total(tid, email, ticket),
+            })
+        except Exception as e:
+            print("GOLDEN TICKET CANDIDATE ROW SKIPPED:", e)
+
+    # 1) Existing trader records that already carry golden_ticket fields.
+    try:
+        trader_rows = supabase.table("traders").select("*").order("updated_at", desc=True).limit(limit).execute().data or []
+        for row in trader_rows:
+            add_candidate(row, "traders")
+    except Exception as e:
+        print("GOLDEN TICKET TRADER CANDIDATE FETCH ERROR:", e)
+
+    # 2) Landing-page Golden Ticket registrations. This is the missing production feed.
+    try:
+        lead_rows = supabase.table(LEAD_TABLE).select("*").order("created_at", desc=True).limit(limit).execute().data or []
+        for row in lead_rows:
+            add_candidate(row, LEAD_TABLE)
+    except Exception as e:
+        print("GOLDEN TICKET LEAD CANDIDATE FETCH ERROR:", e)
+
     return out
+
+def _np_get_or_create_trader_for_golden_ticket(ticket=None, lead_id=None, email=None, phone=None, admin_note="Golden Ticket trader created for MT5 assignment"):
+    """Resolve a Golden Ticket lead into a real traders row so MT5 assignment can use the normal lifecycle system."""
+    ticket = _lead_clean(ticket, 80).upper()
+    email = _lead_email(email) if email else ""
+    phone = _lead_phone(phone) if phone else ""
+    lead = None
+
+    try:
+        if ticket:
+            rows = supabase.table("traders").select("*").eq("golden_ticket", ticket).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+    except Exception as e:
+        print("GOLDEN TICKET TRADER LOOKUP BY TICKET SKIPPED:", e)
+    try:
+        if email:
+            rows = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
+            if rows:
+                tr = rows[0]
+                if ticket and not tr.get("golden_ticket"):
+                    try:
+                        supabase.table("traders").update({"golden_ticket": ticket, "updated_at": now_iso()}).eq("id", tr.get("id")).execute()
+                        tr["golden_ticket"] = ticket
+                    except Exception:
+                        pass
+                return tr
+    except Exception as e:
+        print("GOLDEN TICKET TRADER LOOKUP BY EMAIL SKIPPED:", e)
+
+    # Find lead row.
+    try:
+        q = supabase.table(LEAD_TABLE).select("*")
+        if lead_id:
+            rows = q.eq("id", lead_id).limit(1).execute().data or []
+        elif ticket:
+            rows = q.eq("golden_ticket", ticket).limit(1).execute().data or []
+        elif email:
+            rows = q.eq("email", email).limit(1).execute().data or []
+        else:
+            rows = []
+        lead = rows[0] if rows else None
+    except Exception as e:
+        print("GOLDEN TICKET LEAD LOOKUP SKIPPED:", e)
+        lead = None
+
+    if not lead:
+        return None
+
+    now = now_iso()
+    full_name = lead.get("full_name") or lead.get("name") or "Golden Ticket Trader"
+    lead_email = str(lead.get("email") or email or "").strip().lower()
+    lead_phone = str(lead.get("whatsapp") or lead.get("phone") or phone or "").strip()
+    lead_ticket = str(lead.get("golden_ticket") or ticket or "").strip().upper()
+    account_size = _np_number(lead.get("gift_account_size") or lead.get("account_size") or 1000000) or 1000000
+
+    payload = {
+        "name": full_name,
+        "email": lead_email,
+        "phone": lead_phone,
+        "canonical_email": lead_email,
+        "canonical_phone": _normalize_phone_value(lead_phone),
+        "account_reference": lead_ticket or ref(),
+        "golden_ticket": lead_ticket,
+        "lead_id": lead.get("id"),
+        "source": "golden_ticket",
+        "gift_status": "awaiting_promise_assignment",
+        "payment_status": "gift",
+        "status": "new_signup",
+        "challenge_state": "golden_ticket_registered",
+        "phase": "phase1",
+        "account_size": account_size,
+        "balance": account_size,
+        "equity": account_size,
+        "created_at": now,
+        "updated_at": now,
+        "admin_note": admin_note,
+    }
+
+    # Some older Supabase schemas may not have every new column. Try full insert, then safer fallbacks.
+    insert_attempts = [
+        payload,
+        {k: v for k, v in payload.items() if k not in {"lead_id", "source", "gift_status", "golden_ticket"}},
+        {
+            "name": full_name, "email": lead_email, "phone": lead_phone,
+            "account_reference": lead_ticket or ref(), "payment_status": "gift",
+            "status": "new_signup", "phase": "phase1",
+            "account_size": account_size, "balance": account_size, "equity": account_size,
+            "created_at": now, "updated_at": now,
+        },
+    ]
+    last_error = None
+    for attempt in insert_attempts:
+        try:
+            created = supabase.table("traders").insert(attempt).execute().data or []
+            if created:
+                trader = created[0]
+                try:
+                    supabase.table(LEAD_TABLE).update({
+                        "trader_id": trader.get("id"),
+                        "lead_status": "trader_created",
+                        "updated_at": now_iso(),
+                    }).eq("id", lead.get("id")).execute()
+                except Exception as e:
+                    print("GOLDEN TICKET LEAD BACKLINK SKIPPED:", e)
+                return trader
+        except Exception as e:
+            last_error = e
+            print("GOLDEN TICKET TRADER CREATE ATTEMPT SKIPPED:", e)
+    raise RuntimeError(f"Could not create Golden Ticket trader: {last_error}")
 
 @app.route("/assign_golden_ticket_account", methods=["POST", "OPTIONS"])
 def assign_golden_ticket_account():
@@ -10927,6 +11016,7 @@ def assign_golden_ticket_account():
         return _np_ok({"success": True})
     d = request.get_json(silent=True) or {}
     trader_id = d.get("trader_id") or d.get("id")
+    lead_id = d.get("lead_id")
     ticket = _lead_clean(d.get("golden_ticket") or d.get("ticket"), 80).upper()
     mt5_id = d.get("mt5_id")
     if not mt5_id:
@@ -10936,10 +11026,21 @@ def assign_golden_ticket_account():
         if trader_id:
             trader = get_trader_by_id(trader_id)
         if not trader and ticket:
-            rows = supabase.table("traders").select("*").eq("golden_ticket", ticket).limit(1).execute().data or []
-            trader = rows[0] if rows else None
+            try:
+                rows = supabase.table("traders").select("*").eq("golden_ticket", ticket).limit(1).execute().data or []
+                trader = rows[0] if rows else None
+            except Exception as e:
+                print("GOLDEN TICKET ASSIGN TRADER LOOKUP SKIPPED:", e)
         if not trader:
-            return _np_fail("Golden Ticket trader not found", 404)
+            trader = _np_get_or_create_trader_for_golden_ticket(
+                ticket=ticket,
+                lead_id=lead_id,
+                email=d.get("email"),
+                phone=d.get("phone") or d.get("whatsapp"),
+                admin_note=d.get("admin_note") or "Golden Ticket trader created for promised account assignment"
+            )
+        if not trader:
+            return _np_fail("Golden Ticket lead/trader not found", 404)
         if _get_active_account(trader.get("id"), trader):
             return _np_fail("This Golden Ticket trader already has an active account.", 409)
 
@@ -10954,6 +11055,7 @@ def assign_golden_ticket_account():
                 "balance": account_size,
                 "equity": account_size,
                 "gift_status": "Assigning",
+                "payment_status": "gift",
                 "updated_at": now_iso(),
             }).eq("id", trader.get("id")).execute()
             trader["account_size"] = account_size
@@ -10982,12 +11084,29 @@ def assign_golden_ticket_account():
         except Exception as e:
             print("GOLDEN TICKET POST-ASSIGN UPDATE SKIPPED:", e)
 
+        # Backlink the landing lead so it disappears from the Golden Ticket queue.
+        try:
+            lead_update = {"lead_status": "assigned", "gift_status": "Assigned", "assigned_at": now, "updated_at": now}
+            if trader.get("id"):
+                lead_update["trader_id"] = trader.get("id")
+            if account and account.get("id"):
+                lead_update["trader_account_id"] = account.get("id")
+            if mt5 and mt5.get("mt5_login"):
+                lead_update["mt5_login"] = mt5.get("mt5_login")
+                lead_update["mt5_server"] = mt5.get("mt5_server")
+            if lead_id:
+                supabase.table(LEAD_TABLE).update(lead_update).eq("id", lead_id).execute()
+            elif trader.get("golden_ticket") or ticket:
+                supabase.table(LEAD_TABLE).update(lead_update).eq("golden_ticket", trader.get("golden_ticket") or ticket).execute()
+        except Exception as e:
+            print("GOLDEN TICKET LEAD ASSIGN UPDATE SKIPPED:", e)
+
         _np_safe_points_add(
             "golden_ticket_assigned",
             user_id=trader.get("id"),
             email=trader.get("email"),
             ticket=trader.get("golden_ticket") or ticket,
-            lead_id=trader.get("lead_id"),
+            lead_id=trader.get("lead_id") or lead_id,
             note=f"Golden Ticket account assigned. MT5 {mt5.get('mt5_login')}"
         )
 
