@@ -8608,9 +8608,10 @@ def np_assignment_center():
                 "created_at": p.get("created_at") or p.get("paid_at") or p.get("updated_at") or "",
             })
 
+        golden_rows = _np_golden_ticket_candidates(1500)
         available_mt5 = _available_mt5_not_used(1500)
 
-        queue = purchase_rows + phase_rows
+        queue = golden_rows + purchase_rows + phase_rows
         return _np_ok({
             "success": True,
             "rows": queue,
@@ -8622,6 +8623,7 @@ def np_assignment_center():
             "available_mt5": available_mt5,
             "summary": {
                 "total": len(queue),
+                "golden_ticket": len([r for r in queue if str(r.get("source_type") or "").lower() == "golden_ticket"]),
                 "phase1": len([r for r in queue if str(r.get("target_phase") or "").lower() == "phase1"]),
                 "phase2": len([r for r in queue if str(r.get("target_phase") or "").lower() == "phase2"]),
                 "funded": len([r for r in queue if str(r.get("target_phase") or "").lower() == "funded"]),
@@ -10405,6 +10407,17 @@ def register_lead():
                 update_payload["referred_by_code"] = referred_by_code
             updated = supabase.table(LEAD_TABLE).update(update_payload).eq("id", existing.get("id")).execute().data or []
             row = updated[0] if updated else {**existing, **update_payload}
+            try:
+                _np_safe_points_add(
+                    "golden_ticket_registration",
+                    points=0,
+                    email=row.get("email"),
+                    ticket=row.get("golden_ticket"),
+                    lead_id=row.get("id"),
+                    note="Existing Golden Ticket revisited"
+                )
+            except Exception as points_error:
+                print("GOLDEN TICKET EXISTING POINTS SKIPPED:", points_error)
             return _np_ok(_lead_public_payload(row, created=False), 200)
 
         ticket = _lead_make_ticket()
@@ -10441,6 +10454,17 @@ def register_lead():
             return _np_fail("Lead could not be saved. Please try again.", 500)
         created_row = created[0]
 
+        try:
+            _np_safe_points_add(
+                "golden_ticket_registration",
+                email=created_row.get("email"),
+                ticket=created_row.get("golden_ticket"),
+                lead_id=created_row.get("id"),
+                note="Golden Ticket registration"
+            )
+        except Exception as points_error:
+            print("GOLDEN TICKET REGISTRATION POINTS SKIPPED:", points_error)
+
         # Optional referral credit: inviter gets +3 tickets at 3 invited leads, VIP at 10.
         if referred_by_code:
             try:
@@ -10459,6 +10483,13 @@ def register_lead():
                         "vip_status": vip,
                         "updated_at": now_iso()
                     }).eq("id", inviter.get("id")).execute()
+                    _np_safe_points_add(
+                        "referral_registration",
+                        email=inviter.get("email"),
+                        ticket=inviter.get("golden_ticket"),
+                        lead_id=inviter.get("id"),
+                        note=f"Referral registered: {created_row.get('email') or created_row.get('whatsapp')}"
+                    )
             except Exception as referral_error:
                 print("LEAD REFERRAL CREDIT ERROR:", referral_error)
 
@@ -10572,6 +10603,23 @@ def golden_ticket_access():
         except Exception as lead_update_error:
             print("GOLDEN TICKET LEAD UPDATE ERROR:", lead_update_error)
 
+        try:
+            _np_safe_points_add(
+                "golden_ticket_dashboard_access",
+                user_id=trader_row.get("id"),
+                email=email,
+                ticket=lead.get("golden_ticket") or ticket,
+                lead_id=lead.get("id"),
+                note="Golden Ticket dashboard access"
+            )
+        except Exception as points_error:
+            print("GOLDEN TICKET ACCESS POINTS SKIPPED:", points_error)
+
+        try:
+            trader_row["founding_points"] = _np_points_total(trader_row.get("id"), email, lead.get("golden_ticket") or ticket)
+        except Exception:
+            pass
+
         return _np_ok({
             "success": True,
             "message": "Golden Ticket verified. Dashboard access opened.",
@@ -10624,6 +10672,303 @@ def lead_campaign_stats():
             "warning": "Lead stats unavailable until the landing_leads table is created."
         }, 200)
 
+
+
+# ============================================================
+# NAIRAPIPS GOLDEN TICKET PROMISE + FOUNDING POINTS ENGINE
+# Stage 1: registered Golden Ticket users can be assigned promised MT5 accounts.
+# Stage 2: Founding Trader points accumulate silently from day one.
+# ============================================================
+
+FOUNDING_POINTS = {
+    "golden_ticket_registration": 50,
+    "golden_ticket_dashboard_access": 25,
+    "telegram_click": 10,
+    "x_click": 10,
+    "tiktok_click": 10,
+    "referral_registration": 50,
+    "challenge_purchase": 100,
+    "phase1_pass": 250,
+    "phase2_pass": 500,
+    "funded_account": 1000,
+    "golden_ticket_assigned": 500,
+}
+
+def _np_point_identity(user_id=None, email=None, ticket=None, lead_id=None):
+    return {
+        "user_id": str(user_id or "").strip(),
+        "email": str(email or "").strip().lower(),
+        "golden_ticket": str(ticket or "").strip().upper(),
+        "lead_id": str(lead_id or "").strip(),
+    }
+
+def _np_safe_points_add(action, points=None, user_id=None, email=None, ticket=None, lead_id=None, note=""):
+    """Ledger-first points writer. Safe by design: if points tables are not created yet, it logs and continues."""
+    try:
+        action = str(action or "").strip()
+        if not action:
+            return {"success": False, "skipped": True, "reason": "missing action"}
+        pts = int(points if points is not None else FOUNDING_POINTS.get(action, 0))
+        ident = _np_point_identity(user_id, email, ticket, lead_id)
+        now = now_iso()
+
+        ledger_row = {
+            "user_id": ident["user_id"] or None,
+            "email": ident["email"] or None,
+            "golden_ticket": ident["golden_ticket"] or None,
+            "lead_id": ident["lead_id"] or None,
+            "action": action,
+            "points": pts,
+            "note": str(note or "")[:500],
+            "created_at": now,
+        }
+        try:
+            supabase.table("founding_trader_ledger").insert(ledger_row).execute()
+        except Exception as e:
+            print("FOUNDING POINTS LEDGER SKIPPED:", e)
+            return {"success": False, "skipped": True, "error": str(e)}
+
+        # Aggregate table is best-effort. It is not source of truth.
+        try:
+            rows = []
+            if ident["user_id"]:
+                rows = supabase.table("founding_trader_points").select("*").eq("user_id", ident["user_id"]).limit(1).execute().data or []
+            if not rows and ident["email"]:
+                rows = supabase.table("founding_trader_points").select("*").eq("email", ident["email"]).limit(1).execute().data or []
+            if rows:
+                current = rows[0]
+                new_points = int(current.get("points") or 0) + pts
+                supabase.table("founding_trader_points").update({
+                    "points": new_points,
+                    "last_action": action,
+                    "last_updated": now,
+                    "updated_at": now,
+                }).eq("id", current.get("id")).execute()
+            else:
+                supabase.table("founding_trader_points").insert({
+                    "user_id": ident["user_id"] or None,
+                    "email": ident["email"] or None,
+                    "golden_ticket": ident["golden_ticket"] or None,
+                    "lead_id": ident["lead_id"] or None,
+                    "points": pts,
+                    "referrals": 0,
+                    "challenge_purchases": 0,
+                    "phase_passes": 0,
+                    "community_actions": 0,
+                    "last_action": action,
+                    "created_at": now,
+                    "updated_at": now,
+                    "last_updated": now,
+                }).execute()
+        except Exception as e:
+            print("FOUNDING POINTS AGGREGATE SKIPPED:", e)
+
+        return {"success": True, "points": pts, "action": action}
+    except Exception as e:
+        print("FOUNDING POINTS ERROR:", e)
+        return {"success": False, "error": str(e)}
+
+def _np_points_total(user_id=None, email=None, ticket=None):
+    try:
+        rows = []
+        if user_id:
+            rows = supabase.table("founding_trader_points").select("*").eq("user_id", user_id).limit(1).execute().data or []
+        if not rows and email:
+            rows = supabase.table("founding_trader_points").select("*").eq("email", str(email).strip().lower()).limit(1).execute().data or []
+        if not rows and ticket:
+            rows = supabase.table("founding_trader_points").select("*").eq("golden_ticket", str(ticket).strip().upper()).limit(1).execute().data or []
+        return int((rows[0] if rows else {}).get("points") or 0)
+    except Exception as e:
+        print("FOUNDING POINTS TOTAL ERROR:", e)
+        return 0
+
+def _np_golden_ticket_candidates(limit=1500):
+    """Golden Ticket users waiting for the promised account/opportunity assignment."""
+    try:
+        rows = supabase.table("traders").select("*").order("updated_at", desc=True).limit(limit).execute().data or []
+    except Exception as e:
+        print("GOLDEN TICKET CANDIDATE FETCH ERROR:", e)
+        return []
+    active_accounts = []
+    try:
+        active_accounts = supabase.table("trader_accounts").select("id,trader_id,account_status,mt5_login").in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).limit(5000).execute().data or []
+    except Exception as e:
+        print("GOLDEN TICKET ACTIVE ACCOUNT FETCH ERROR:", e)
+
+    active_trader_ids = {str(a.get("trader_id") or "") for a in active_accounts if str(a.get("trader_id") or "")}
+    out = []
+    seen = set()
+    for t in rows:
+        tid = str(t.get("id") or "").strip()
+        ticket = str(t.get("golden_ticket") or "").strip().upper()
+        source = str(t.get("source") or "").strip().lower()
+        gift_status = str(t.get("gift_status") or "").strip().lower()
+        status_blob = " ".join([str(t.get("status") or ""), str(t.get("challenge_state") or ""), gift_status]).lower()
+        if not ticket and source != "golden_ticket_access":
+            continue
+        if tid and tid in active_trader_ids:
+            continue
+        if str(t.get("mt5_login") or "").strip():
+            continue
+        if any(x in status_blob for x in ["assigned", "active", "completed", "rejected", "cancel", "breach"]):
+            continue
+        key = tid or ticket or str(t.get("email") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        account_size = _np_number(t.get("gift_account_size") or t.get("account_size") or 1000000) or 1000000
+        out.append({
+            "id": tid or ticket,
+            "trader_id": tid,
+            "lead_id": t.get("lead_id") or "",
+            "source_type": "golden_ticket",
+            "source": "golden_ticket",
+            "target_phase": "phase1",
+            "target_stage": "phase1",
+            "stage_label": "GOLDEN TICKET PROMISE",
+            "assignment_label": "Assign Promised Account",
+            "name": t.get("name") or t.get("full_name") or "Trader",
+            "trader_name": t.get("name") or t.get("full_name") or "Trader",
+            "email": t.get("email") or "",
+            "phone": t.get("phone") or "",
+            "account_reference": t.get("account_reference") or ticket or "",
+            "golden_ticket": ticket,
+            "plan_name": "Golden Ticket N1M Offer",
+            "account_size": account_size,
+            "payment_status": "gift",
+            "current_status": t.get("gift_status") or "awaiting_promise_assignment",
+            "created_at": t.get("created_at") or t.get("updated_at") or "",
+            "founding_points": _np_points_total(tid, t.get("email"), ticket),
+        })
+    return out
+
+@app.route("/assign_golden_ticket_account", methods=["POST", "OPTIONS"])
+def assign_golden_ticket_account():
+    """Admin assigns the promised Golden Ticket account using an MT5 pool record."""
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    d = request.get_json(silent=True) or {}
+    trader_id = d.get("trader_id") or d.get("id")
+    ticket = _lead_clean(d.get("golden_ticket") or d.get("ticket"), 80).upper()
+    mt5_id = d.get("mt5_id")
+    if not mt5_id:
+        return _np_fail("mt5_id is required", 400)
+    try:
+        trader = None
+        if trader_id:
+            trader = get_trader_by_id(trader_id)
+        if not trader and ticket:
+            rows = supabase.table("traders").select("*").eq("golden_ticket", ticket).limit(1).execute().data or []
+            trader = rows[0] if rows else None
+        if not trader:
+            return _np_fail("Golden Ticket trader not found", 404)
+        if _get_active_account(trader.get("id"), trader):
+            return _np_fail("This Golden Ticket trader already has an active account.", 409)
+
+        mt5 = _get_mt5_account(mt5_id=mt5_id)
+        if not mt5:
+            return _np_fail("MT5 account not found", 404)
+
+        account_size = clean(mt5.get("account_size") or trader.get("account_size") or 1000000)
+        try:
+            supabase.table("traders").update({
+                "account_size": account_size,
+                "balance": account_size,
+                "equity": account_size,
+                "gift_status": "Assigning",
+                "updated_at": now_iso(),
+            }).eq("id", trader.get("id")).execute()
+            trader["account_size"] = account_size
+        except Exception as e:
+            print("GOLDEN TICKET PRE-ASSIGN UPDATE SKIPPED:", e)
+
+        account, trader_row = _assign_mt5_to_trader(
+            trader,
+            mt5,
+            "phase1",
+            None,
+            _admin_from_payload(d),
+            d.get("admin_note") or "Golden Ticket promised account assigned"
+        )
+        now = now_iso()
+        try:
+            supabase.table("traders").update({
+                "gift_status": "Assigned",
+                "gift_assigned_at": now,
+                "golden_ticket_assigned_at": now,
+                "status": "active",
+                "payment_status": "gift",
+                "challenge_state": "phase1_active",
+                "updated_at": now,
+            }).eq("id", trader.get("id")).execute()
+        except Exception as e:
+            print("GOLDEN TICKET POST-ASSIGN UPDATE SKIPPED:", e)
+
+        _np_safe_points_add(
+            "golden_ticket_assigned",
+            user_id=trader.get("id"),
+            email=trader.get("email"),
+            ticket=trader.get("golden_ticket") or ticket,
+            lead_id=trader.get("lead_id"),
+            note=f"Golden Ticket account assigned. MT5 {mt5.get('mt5_login')}"
+        )
+
+        return _np_ok({
+            "success": True,
+            "message": "Golden Ticket promised account assigned.",
+            "trader": trader_row,
+            "account": account,
+            "points": _np_points_total(trader.get("id"), trader.get("email"), trader.get("golden_ticket") or ticket),
+        }, 200)
+    except Exception as e:
+        print("ASSIGN GOLDEN TICKET ERROR:", e)
+        return _np_fail(e, 500)
+
+@app.route("/founding_points/<path:lookup>", methods=["GET", "OPTIONS"])
+def founding_points_lookup(lookup):
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    lookup = str(lookup or "").strip()
+    try:
+        trader = _latest_trader_for_lookup(lookup)
+    except Exception:
+        trader = None
+    email = (trader or {}).get("email") or (lookup.lower() if "@" in lookup else "")
+    ticket = (trader or {}).get("golden_ticket") or (lookup.upper() if lookup.upper().startswith("NP-") else "")
+    user_id = (trader or {}).get("id")
+    total = _np_points_total(user_id, email, ticket)
+    ledger = []
+    try:
+        q = supabase.table("founding_trader_ledger").select("*").order("created_at", desc=True).limit(100)
+        if user_id:
+            q = q.eq("user_id", user_id)
+        elif email:
+            q = q.eq("email", email)
+        elif ticket:
+            q = q.eq("golden_ticket", ticket)
+        ledger = q.execute().data or []
+    except Exception as e:
+        print("FOUNDING POINTS LEDGER READ SKIPPED:", e)
+    return _np_ok({"success": True, "points": total, "ledger": ledger, "trader": trader or {}})
+
+@app.route("/founding_social_action", methods=["POST", "OPTIONS"])
+def founding_social_action():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    d = request.get_json(silent=True) or {}
+    platform = str(d.get("platform") or "").strip().lower()
+    action_map = {"telegram": "telegram_click", "x": "x_click", "twitter": "x_click", "tiktok": "tiktok_click"}
+    action = action_map.get(platform)
+    if not action:
+        return _np_fail("Unknown social platform", 400)
+    return _np_ok(_np_safe_points_add(
+        action,
+        user_id=d.get("user_id") or d.get("trader_id"),
+        email=d.get("email"),
+        ticket=d.get("golden_ticket") or d.get("ticket"),
+        lead_id=d.get("lead_id"),
+        note=f"{platform} button clicked"
+    ))
 
 # Auto-start at module load
 try:
