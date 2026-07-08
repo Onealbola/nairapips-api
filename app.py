@@ -5872,14 +5872,25 @@ def sync_trades():
             try:
                 trader_account_id = t.get("trader_account_id")
                 mt5_login = str(t.get("mt5_login") or t.get("login") or "").strip()
-                if not trader_account_id and mt5_login:
+                acct = None
+                if mt5_login:
                     try:
                         acct = _get_account_by_login_any_status(mt5_login, t.get("trader_id"))
-                        trader_account_id = (acct or {}).get("id")
+                        if not trader_account_id:
+                            trader_account_id = (acct or {}).get("id")
                         if not t.get("trader_id") and acct:
                             t["trader_id"] = acct.get("trader_id")
                     except Exception:
-                        trader_account_id = None
+                        acct = None
+                # Attach identity where possible so dashboard/admin can show evidence even after archive.
+                if t.get("trader_id") and (not t.get("trader_name") or not t.get("email")):
+                    try:
+                        tr_identity = get_trader_by_id(t.get("trader_id"))
+                        if tr_identity:
+                            t["trader_name"] = t.get("trader_name") or tr_identity.get("name")
+                            t["email"] = t.get("email") or tr_identity.get("email")
+                    except Exception:
+                        pass
                 ticket = str(t.get("ticket") or t.get("order") or t.get("deal") or "").strip()
                 if not ticket:
                     errors.append({"index": idx, "error": "missing ticket"})
@@ -5904,7 +5915,13 @@ def sync_trades():
                     "status": t.get("status") or ("closed" if t.get("closed_at") else "open"),
                     "opened_at": t.get("opened_at") or t.get("open_time"),
                     "closed_at": t.get("closed_at") or t.get("close_time"),
-                    "synced_at": now_iso()
+                    "synced_at": now_iso(),
+                    "updated_at": now_iso(),
+                    "history_entry": {
+                        "source": "mt5_engine_sync",
+                        "phase_label": t.get("phase_label") or t.get("phase") or "",
+                        "sync_reason": t.get("sync_reason") or t.get("reason") or "normal"
+                    }
                 }
                 # Drop empty None fields to reduce schema/type conflicts.
                 row = {k: v for k, v in row.items() if v is not None}
@@ -6199,13 +6216,73 @@ def users_database_export():
         return bad(e)
 @app.route("/trader_trades", methods=["GET"])
 def get_trader_trades():
-    try:
-        q = supabase.table("trader_trades") \
-            .select("*") \
-            .order("synced_at", desc=True) \
-            .execute()
+    """Return trade history for one trader/account without hiding archived passed accounts.
 
-        return jsonify(getattr(q, "data", []) or [])
+    Production safety fix:
+    - Dashboard must not rely on trader_id only because some MT5 history rows can be
+      synced before trader_id is attached, especially around Golden Ticket / phase
+      assignment / archive handoff.
+    - Query by trader_id, trader_account_id and mt5_login, then de-dupe by ticket.
+    - Works for active, passed, archived and breached accounts.
+    """
+    try:
+        trader_id = str(request.args.get("trader_id") or "").strip()
+        trader_account_id = str(request.args.get("trader_account_id") or "").strip()
+        mt5_login_raw = str(request.args.get("mt5_login") or request.args.get("login") or "").strip()
+        try:
+            limit = int(request.args.get("limit", 300))
+        except Exception:
+            limit = 300
+        limit = max(1, min(limit, 1000))
+
+        logins = []
+        if mt5_login_raw:
+            logins = [x.strip() for x in mt5_login_raw.split(",") if x.strip()]
+
+        # If only trader_id is supplied, discover all logins/accounts for this trader
+        # so passed/archived account history still appears.
+        if trader_id:
+            try:
+                acct_rows = supabase.table("trader_accounts").select("id,mt5_login").eq("trader_id", trader_id).limit(200).execute().data or []
+                for a in acct_rows:
+                    if str(a.get("mt5_login") or "").strip():
+                        logins.append(str(a.get("mt5_login")).strip())
+            except Exception as e:
+                print("TRADER TRADES ACCOUNT DISCOVERY ERROR:", e)
+
+        rows = []
+        def add_query(q):
+            try:
+                data = q.order("opened_at", desc=True).limit(limit).execute().data or []
+                rows.extend(data)
+            except Exception as e:
+                print("TRADER TRADES QUERY ERROR:", e)
+
+        if trader_id:
+            add_query(supabase.table("trader_trades").select("*").eq("trader_id", trader_id))
+        if trader_account_id:
+            add_query(supabase.table("trader_trades").select("*").eq("trader_account_id", trader_account_id))
+        for login in sorted(set(logins)):
+            add_query(supabase.table("trader_trades").select("*").eq("mt5_login", login))
+
+        # Fallback only when no filter is provided; do not leak all rows into normal dashboard calls.
+        if not rows and not trader_id and not trader_account_id and not logins:
+            add_query(supabase.table("trader_trades").select("*"))
+
+        seen = set()
+        out = []
+        for r in rows:
+            key = str(r.get("ticket") or r.get("id") or "")
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            out.append(r)
+
+        def _score(row):
+            return str(row.get("closed_at") or row.get("opened_at") or row.get("synced_at") or row.get("created_at") or "")
+        out.sort(key=_score, reverse=True)
+        return jsonify(out[:limit])
 
     except Exception as e:
         return bad(e)
@@ -8635,6 +8712,58 @@ def admin_trader_accounts_feed():
         if view == "active":
             query = query.in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
         rows = query.execute().data or []
+
+        # PRODUCTION SAFETY: Admin must not show stale 0 values when MT5 monitoring
+        # has already synced newer balance/equity/profit evidence. This is read-only
+        # enrichment for the admin/trader account feed; it does not change trading logic.
+        try:
+            logins = []
+            for r in rows:
+                lg = str((r or {}).get("mt5_login") or "").strip()
+                if lg and lg not in logins:
+                    logins.append(lg)
+            latest_by_login = {}
+            for i in range(0, len(logins), 100):
+                batch = logins[i:i+100]
+                if not batch:
+                    continue
+                snaps = supabase.table("monitoring_snapshots").select("*").in_("mt5_login", batch).order("created_at", desc=True).limit(1000).execute().data or []
+                for snap in snaps:
+                    lg = str((snap or {}).get("mt5_login") or "").strip()
+                    if lg and lg not in latest_by_login:
+                        latest_by_login[lg] = snap
+            enriched = []
+            for r in rows:
+                row = dict(r or {})
+                lg = str(row.get("mt5_login") or "").strip()
+                snap = latest_by_login.get(lg)
+                if snap:
+                    # Prefer monitoring truth for live metrics, especially newly-fixed
+                    # accounts like Fatoba where trader_accounts may still show defaults.
+                    bal = snap.get("balance") or snap.get("current_balance")
+                    eq = snap.get("equity") or snap.get("current_equity") or bal
+                    profit = snap.get("profit") or snap.get("current_profit")
+                    profit_pct = snap.get("profit_percent") or snap.get("current_profit_percent")
+                    if bal not in [None, ""]:
+                        row["current_balance"] = bal
+                        row["balance"] = bal
+                    if eq not in [None, ""]:
+                        row["current_equity"] = eq
+                        row["equity"] = eq
+                    if profit not in [None, ""]:
+                        row["profit"] = profit
+                    if profit_pct not in [None, ""]:
+                        row["profit_percent"] = profit_pct
+                    for k in ["dd_used_percent", "max_drawdown_used", "drawdown_percent", "risk_zone", "highest_equity", "lowest_equity", "phase_pass_status", "target_percent", "target_equity"]:
+                        if snap.get(k) not in [None, ""]:
+                            row[k] = snap.get(k)
+                    row["latest_monitoring_snapshot"] = snap
+                    row["last_sync_at"] = snap.get("created_at") or row.get("last_sync_at")
+                enriched.append(row)
+            rows = enriched
+        except Exception as enrich_err:
+            print("ADMIN ACCOUNT FEED MONITORING ENRICH ERROR:", enrich_err)
+
         rows = [_decorate_account_for_api(r) if "_decorate_account_for_api" in globals() else r for r in rows]
         return _np_ok({"success": True, "data": rows, "accounts": rows, "trader_accounts": rows, "count": len(rows)})
     except Exception as e:
