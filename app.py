@@ -3138,7 +3138,7 @@ def register_trader():
             "approved_at": None,
             "funded_at": None,
             "last_login_at": None,
-            "trading_days_left": d.get("trading_days_left", 30),
+            "trading_days_left": d.get("trading_days_left", 0),
             "source": d.get("source", "public_register"),
             "registration_source": d.get("source", "public_register"),
             "user_agent": user_agent[:250],
@@ -3263,7 +3263,7 @@ def add_trader():
             "approved_at": d.get("approved_at"),
             "funded_at": d.get("funded_at"),
             "last_login_at": None,
-            "trading_days_left": d.get("trading_days_left", 30)
+            "trading_days_left": d.get("trading_days_left", 0)
         }
 
         created = supabase.table("traders").insert(row).execute().data
@@ -3727,7 +3727,7 @@ def create_plan():
         mt5_server = d.get("mt5_server") or d.get("default_server") or ""
         row={"name":name,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
              "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":float(d.get("phase2_target") or 8),
-             "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":d.get("daily_drawdown","None"),
+             "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
              "payout_split":d.get("payout_split","80%"),"description":d.get("description",""),
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
              "status":d.get("status","active"),"created_at":now_iso(),"updated_at":now_iso()}
@@ -3742,6 +3742,7 @@ def update_plan():
         upd={"updated_at":now_iso()}
         for k in ["name","daily_drawdown","payout_split","description","status","mt5_server","default_server"]:
             if k in d: upd[k]=d[k]
+        upd["daily_drawdown"] = "None"
         if "mt5_server" in d and "default_server" not in d:
             upd["default_server"] = d.get("mt5_server")
         if "default_server" in d and "mt5_server" not in d:
@@ -5970,8 +5971,87 @@ def disable_mt5_access():
             if stage not in ["phase1", "phase2"]:
                 return bad("Only Phase 1 or Phase 2 accounts can be passed by MT5 lock signal.", 409)
             pass_status = "phase2_passed" if stage == "phase2" else "phase1_passed"
-            updated, archived = _pass_specific_account(trader, account, pass_status, _admin_from_payload(d), reason)
-            return ok({"trader": updated, "archived_account": archived}, "Exact MT5 account passed, archived, and moved to the next waiting state when it is the current account.")
+
+            # CRITICAL PRODUCTION FIX:
+            # A pass/lock signal can arrive even when the normal snapshot call was
+            # suppressed by cooldown or failed earlier. Never archive a passed MT5
+            # account with ₦0 evidence. Preserve MT5 truth from the lock payload
+            # before moving the account to waiting phase.
+            start_balance = _num((account or {}).get("start_balance"), _num((account or {}).get("account_size"), _num(d.get("account_size"), 0)))
+            final_balance = _num(d.get("current_balance"), _num(d.get("mt5_balance"), _num(d.get("balance"), _num((account or {}).get("current_balance"), start_balance))))
+            final_equity = _num(d.get("equity"), final_balance)
+            highest_equity = max(
+                start_balance,
+                final_balance,
+                final_equity,
+                _num(d.get("highest_equity"), 0),
+                _num((account or {}).get("highest_equity"), 0),
+            )
+            profit = _num(d.get("highest_profit"), _num(d.get("profit"), highest_equity - start_balance if start_balance else 0))
+            profit_percent = _num(
+                d.get("highest_profit_percent"),
+                _num(d.get("profit_percent"), (profit / start_balance * 100) if start_balance else 0),
+            )
+            target_percent = _num(d.get("profit_target"), 8 if stage == "phase2" else 10)
+            target_equity = _num(d.get("target_equity"), start_balance * (1 + target_percent / 100) if start_balance else 0)
+            pass_progress = 100 if target_percent and profit_percent >= target_percent else _num(d.get("pass_progress_percent"), 0)
+            now = now_iso()
+
+            evidence_update = {
+                "current_balance": final_balance,
+                "current_equity": final_equity,
+                "profit": profit,
+                "profit_percent": profit_percent,
+                "highest_equity": highest_equity,
+                "lowest_equity": _num(d.get("lowest_equity"), _num((account or {}).get("lowest_equity"), start_balance)),
+                "phase_pass_status": pass_status,
+                "risk_zone": "passed",
+                "monitoring_enabled": False,
+                "updated_at": now,
+            }
+            # Optional columns are attempted, then safely dropped if missing.
+            optional_evidence = {
+                "target_equity": target_equity,
+                "profit_target": target_percent,
+                "pass_progress_percent": max(100, pass_progress),
+                "passed_at": now,
+            }
+            try:
+                supabase.table("trader_accounts").update({**evidence_update, **optional_evidence}).eq("id", account.get("id")).execute()
+            except Exception as e:
+                print("PASS EVIDENCE FULL UPDATE FAILED:", e)
+                try:
+                    supabase.table("trader_accounts").update(evidence_update).eq("id", account.get("id")).execute()
+                except Exception as e2:
+                    print("PASS EVIDENCE CORE UPDATE FAILED:", e2)
+
+            try:
+                supabase.table("monitoring_snapshots").insert({
+                    "trader_id": trader_id,
+                    "trader_account_id": account.get("id") if account else None,
+                    "mt5_login": mt5_login,
+                    "balance": final_balance,
+                    "equity": final_equity,
+                    "profit": profit,
+                    "profit_percent": profit_percent,
+                    "highest_equity": highest_equity,
+                    "target_equity": target_equity,
+                    "target_percent": target_percent,
+                    "pass_progress_percent": max(100, pass_progress),
+                    "risk_zone": "passed",
+                    "phase_label": stage,
+                    "phase_pass_status": pass_status,
+                    "source": "disable_mt5_access_pass_evidence",
+                    "raw_data": d,
+                }).execute()
+            except Exception as e:
+                print("PASS EVIDENCE SNAPSHOT INSERT FAILED:", e)
+
+            enriched_account = dict(account or {})
+            enriched_account.update(evidence_update)
+            enriched_account.update(optional_evidence)
+            updated, archived = _pass_specific_account(trader, enriched_account, pass_status, _admin_from_payload(d), reason)
+            return ok({"trader": updated, "archived_account": archived}, "Exact MT5 account passed, evidence preserved, archived, and moved to the next waiting state.")
 
         if incoming_status == "profit_protected":
             if not account or account.get("stage") != "funded":
@@ -11176,3 +11256,57 @@ except Exception as e:
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
+
+
+# ============================================================
+# NAIRAPIPS GLOBAL PHASE PASS HANDOFF REPAIR
+# Purpose: if MT5 engine detects phase1_passed/phase2_passed but an older
+# dashboard/admin still shows assigned_active, this endpoint reconciles the
+# exact MT5 login into archived_phase1/archived_phase2 and waiting next stage.
+# Safe: no delete, no fresh account creation, no MT5 credential mutation.
+# ============================================================
+@app.route("/repair_phase_pass_handoff", methods=["POST", "GET", "OPTIONS"])
+def repair_phase_pass_handoff():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    try:
+        data = request.get_json(silent=True) or {}
+        mt5_login = str(data.get("mt5_login") or request.args.get("mt5_login") or "").strip()
+        forced_stage = str(data.get("stage") or request.args.get("stage") or "").strip().lower()
+        if not mt5_login:
+            return _np_fail("mt5_login is required", 400)
+
+        account = _get_account_by_login_any_status(mt5_login)
+        if not account:
+            return _np_fail("No trader account found for this MT5 login", 404)
+        trader = get_trader_by_id(account.get("trader_id"))
+        if not trader:
+            return _np_fail("Trader not found for this account", 404)
+
+        stage = forced_stage or str(account.get("stage") or account.get("phase") or "phase1").lower()
+        if "phase2" in stage:
+            pass_status = "phase2_passed"
+        else:
+            pass_status = "phase1_passed"
+
+        # If the account is already archived/passed, keep idempotent result.
+        status = str(account.get("account_status") or "").lower()
+        if status in {"archived_phase1", "archived_phase2"} and str(account.get("phase_pass_status") or "").lower() == pass_status:
+            return _np_ok({"success": True, "message": "Already repaired", "account": account, "trader": trader})
+
+        updated, archived = _pass_specific_account(
+            trader,
+            account,
+            pass_status,
+            {"name": "admin_repair", "username": "admin_repair", "role": "super_admin"},
+            f"{pass_status.upper()} repaired from MT5 engine pass evidence. Waiting for next MT5 assignment."
+        )
+        return _np_ok({
+            "success": True,
+            "message": "Phase pass handoff repaired. Trader is now waiting for next MT5 assignment.",
+            "trader": updated,
+            "archived_account": archived,
+            "next_action": "Assign fresh Phase 2 MT5" if pass_status == "phase1_passed" else "Assign funded/live MT5"
+        })
+    except Exception as e:
+        return _np_fail(e, 500)
