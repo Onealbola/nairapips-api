@@ -1542,6 +1542,7 @@ def _dashboard_payload_for_trader(trader):
 
 @app.route("/admin_reset_trader_account", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_account", methods=["POST", "OPTIONS"])
+@app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
 def admin_reset_trader_account():
     """OPTION 2: Archive old account, lock old MT5, then optionally assign a fresh MT5.
 
@@ -1763,7 +1764,6 @@ def admin_reset_trader_account():
 
 
 @app.route("/update_trader_mt5", methods=["POST", "OPTIONS"])
-@app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
 def update_trader_mt5():
     if request.method == "OPTIONS":
         return _np_ok({})
