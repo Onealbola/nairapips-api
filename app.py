@@ -935,6 +935,74 @@ def _get_mt5_account(mt5_id=None, mt5_login=None):
         return None
 
 
+
+def _mt5_login_has_any_history(mt5_login, exclude_mt5_pool_id=None):
+    """Return True if this MT5 login has ever been used anywhere in NairaPips.
+
+    Option A rule:
+    Fresh MT5 means never used by anybody, not merely available today.
+    This blocks reuse from trader_accounts, archives, purchases, monitoring logs,
+    trader mirror rows, and historical MT5 pool assignment fields.
+    """
+    login = str(mt5_login or "").strip()
+    if not login:
+        return True, "MT5 login is empty"
+
+    checks = [
+        ("trader_accounts", "mt5_login"),
+        ("mt5_account_archives", "mt5_login"),
+        ("challenge_purchases", "mt5_login"),
+        ("challenge_purchases", "current_mt5_login"),
+        ("monitoring_events", "mt5_login"),
+        ("monitoring_snapshots", "mt5_login"),
+        ("traders", "mt5_login"),
+    ]
+
+    for table, column in checks:
+        try:
+            rows = supabase.table(table).select("id").eq(column, login).limit(1).execute().data or []
+            if rows:
+                return True, f"MT5 {login} already exists in {table}.{column}"
+        except Exception as e:
+            # Some deployments may not have every optional column.
+            print(f"MT5 HISTORY CHECK SKIP {table}.{column}:", e)
+
+    # Also protect against mt5_pool rows that were previously assigned but later
+    # manually marked available again. This check ignores the selected row's own id.
+    try:
+        rows = supabase.table("mt5_pool").select("*").eq("mt5_login", login).limit(20).execute().data or []
+        for row in rows:
+            if exclude_mt5_pool_id and str(row.get("id")) == str(exclude_mt5_pool_id):
+                # The selected vault row is allowed only if it has never carried assignment evidence.
+                assigned_evidence = any(str(row.get(k) or "").strip() for k in [
+                    "assigned_trader_id", "assigned_trader_name", "assigned_email",
+                    "trader_account_id", "assigned_at", "archived_at", "archive_reason"
+                ])
+                status = str(row.get("status") or "").strip().lower()
+                if assigned_evidence or status not in {"available", "", "unused", "new", "ready", "open"}:
+                    return True, f"MT5 {login} has prior assignment evidence inside mt5_pool"
+                continue
+            return True, f"MT5 {login} appears more than once in mt5_pool"
+    except Exception as e:
+        print("MT5 HISTORY CHECK SKIP mt5_pool:", e)
+
+    return False, ""
+
+
+def _assert_mt5_never_used(mt5):
+    """Raise ValueError unless selected MT5 is truly fresh across all NairaPips records."""
+    if not mt5:
+        raise ValueError("Fresh MT5 account not found")
+    login = str(mt5.get("mt5_login") or "").strip()
+    status = str(mt5.get("status") or "available").strip().lower()
+    if status not in {"available", "", "unused", "new", "ready", "open"}:
+        raise ValueError(f"Selected MT5 {login or ''} is not available")
+    used, reason = _mt5_login_has_any_history(login, exclude_mt5_pool_id=mt5.get("id"))
+    if used:
+        raise ValueError(reason or f"Selected MT5 {login} has already been used before")
+    return True
+
+
 def _log_lifecycle_event(trader_id, account_id, from_state, to_state, action, details="", staff=None):
     try:
         supabase.table("lifecycle_events").insert({
@@ -1032,8 +1100,9 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         raise ValueError("Trader is required")
     if not mt5:
         raise ValueError("MT5 account is required")
-    if str(mt5.get("status") or "available").lower() != "available":
-        raise ValueError("Selected MT5 account is not available")
+    # Option A production rule: MT5 accounts are single-use.
+    # Fresh means never used anywhere in NairaPips history.
+    _assert_mt5_never_used(mt5)
     account_size = clean((purchase or {}).get("account_size") or mt5.get("account_size") or trader.get("account_size"))
     if clean(mt5.get("account_size")) and clean(mt5.get("account_size")) != account_size:
         raise ValueError("Selected MT5 account size does not match purchase/account size")
@@ -1698,8 +1767,10 @@ def admin_reset_trader_account():
             mt5 = _get_mt5_account(mt5_id=fresh_mt5_id)
             if not mt5:
                 return _np_fail("Fresh MT5 account not found. Old account has been archived and trader is waiting for MT5.", 404)
-            if str(mt5.get("status") or "available").lower() != "available":
-                return _np_fail("Selected fresh MT5 is not available. Old account has been archived and trader is waiting for MT5.", 409)
+            try:
+                _assert_mt5_never_used(mt5)
+            except Exception as used_err:
+                return _np_fail(f"Selected fresh MT5 rejected: {used_err}. Old account has been archived and trader is waiting for MT5.", 409)
 
             # Use a purchase/account_size bridge only if needed. _assign_mt5_to_trader accepts purchase=None.
             new_account, updated_trader = _assign_mt5_to_trader(
