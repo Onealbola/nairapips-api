@@ -22,6 +22,24 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# NairaPips payout safety cap. Keep server-side because frontend/admin values can be stale.
+PAYOUT_PROFIT_SHARE_PERCENT = 50
+
+def _effective_payout_split(*values):
+    """Return the allowed payout share, capped at 50% for business safety.
+    Accepts numeric values or strings with a percent sign. Missing/invalid values default to 50.
+    """
+    for value in values:
+        if value is None or str(value).strip() == "":
+            continue
+        try:
+            n = float(str(value).replace("%", "").replace(",", "").strip())
+            if n > 0:
+                return min(n, PAYOUT_PROFIT_SHARE_PERCENT)
+        except Exception:
+            continue
+    return PAYOUT_PROFIT_SHARE_PERCENT
+
 # ================================
 # NAIRAPIPS MT5 SOURCE-OF-TRUTH CORE
 # ================================
@@ -3712,7 +3730,12 @@ Note: {upd["kyc_note"]}"""
 
 @app.route("/challenge_plans", methods=["GET"])
 def challenge_plans():
-    try: return jsonify(supabase.table("challenge_plans").select("*").order("account_size", desc=False).execute().data)
+    try:
+        rows = supabase.table("challenge_plans").select("*").order("account_size", desc=False).execute().data or []
+        for row in rows:
+            if "payout_split" in row:
+                row["payout_split"] = _effective_payout_split(row.get("payout_split"))
+        return jsonify(rows)
     except Exception as e: return bad(e)
 
 @app.route("/plans", methods=["GET"])
@@ -3728,7 +3751,7 @@ def create_plan():
         row={"name":name,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
              "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":float(d.get("phase2_target") or 8),
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
-             "payout_split":d.get("payout_split","80%"),"description":d.get("description",""),
+             "payout_split":_effective_payout_split(d.get("payout_split")),"description":d.get("description",""),
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
              "status":d.get("status","active"),"created_at":now_iso(),"updated_at":now_iso()}
         return ok(supabase.table("challenge_plans").insert(row).execute().data, "Challenge plan created")
@@ -3740,8 +3763,10 @@ def update_plan():
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing plan id")
         upd={"updated_at":now_iso()}
-        for k in ["name","daily_drawdown","payout_split","description","status","mt5_server","default_server"]:
+        for k in ["name","daily_drawdown","description","status","mt5_server","default_server"]:
             if k in d: upd[k]=d[k]
+        if "payout_split" in d:
+            upd["payout_split"] = _effective_payout_split(d.get("payout_split"))
         upd["daily_drawdown"] = "None"
         if "mt5_server" in d and "default_server" not in d:
             upd["default_server"] = d.get("mt5_server")
@@ -4424,24 +4449,108 @@ NairaPips Team"""
 
 @app.route("/payouts", methods=["GET"])
 def payouts():
-    try: return jsonify(supabase.table("payouts").select("*").order("created_at", desc=True).execute().data)
-    except Exception as e: return bad(e)
+    """Return payouts. Admin gets all; trader dashboard can request only its own payouts.
+    Query filters are optional and preserve the old admin behaviour:
+      /payouts?limit=500              -> all payouts for admin
+      /payouts?trader_id=<id>&limit=100 -> one trader history
+    """
+    try:
+        limit = int(request.args.get("limit") or 500)
+        limit = max(1, min(limit, 1000))
+        trader_id = str(request.args.get("trader_id") or "").strip()
+        email = str(request.args.get("email") or "").strip().lower()
+        q = supabase.table("payouts").select("*")
+        if trader_id:
+            q = q.eq("trader_id", trader_id)
+        elif email:
+            q = q.eq("email", email)
+        rows = q.order("created_at", desc=True).limit(limit).execute().data or []
+        return jsonify(rows)
+    except Exception as e:
+        return bad(e)
 
 @app.route("/create_payout", methods=["POST"])
 def create_payout():
     try:
-        d=request.json or {}; amount=clean(d.get("amount"))
-        if amount<=0: return bad("Invalid payout amount")
+        d=request.json or {}
+        amount=clean(d.get("amount"))
+        if amount<=0:
+            return bad("Invalid payout amount")
 
         trader_row = _resolve_trader_for_money_action(d)
         eligible, reason, account = _payout_eligibility(trader_row)
         if not eligible:
             return bad(reason, 403)
 
-        row={"trader_id":trader_row.get("id"),"trader_account_id":account.get("id"),"trader_name":d.get("trader_name") or trader_row.get("name") or "","email":d.get("email") or trader_row.get("email") or "","phone":d.get("phone") or trader_row.get("phone") or "",
-             "amount":amount,"bank_name":d.get("bank_name",""),"account_number":d.get("account_number",""),"account_name":d.get("account_name",""),
-             "status":"pending","note":d.get("note",""),"admin_note":"","requested_at":now_iso()}
-        created = supabase.table("payouts").insert(row).execute().data
+        start_balance = clean(account.get("start_balance") or account.get("account_size") or 0)
+        current_equity = clean(account.get("current_equity") or account.get("equity") or account.get("current_balance") or account.get("balance") or start_balance)
+        verified_profit = max(0, current_equity - start_balance)
+        split_pct = _effective_payout_split(account.get("payout_split"), trader_row.get("payout_split"), d.get("payout_split"))
+        max_payout = max(0, round((verified_profit * split_pct) / 100, 2))
+        if max_payout <= 0:
+            return bad("No verified withdrawable profit yet.", 403)
+        if amount > max_payout:
+            return bad(f"Requested amount exceeds verified available payout. Available: {email_money(max_payout)}", 403)
+
+        method = str(d.get("payment_method") or d.get("method") or "bank").strip().lower()
+        bank_name = str(d.get("bank_name") or "").strip()
+        account_number = str(d.get("account_number") or "").strip()
+        account_name = str(d.get("account_name") or "").strip()
+        if method == "bank" and (not bank_name or not account_number or not account_name):
+            return bad("Bank name, account number and account name are required for bank payout.", 400)
+        if method in {"usdt", "btc", "crypto"} and (not bank_name or not account_number):
+            return bad("Wallet/network and wallet address are required for crypto payout.", 400)
+
+        now = now_iso()
+        row={
+            "trader_id":trader_row.get("id"),
+            "trader_account_id":account.get("id"),
+            "trader_name":d.get("trader_name") or trader_row.get("name") or trader_row.get("full_name") or "",
+            "email":d.get("email") or trader_row.get("email") or "",
+            "phone":d.get("phone") or trader_row.get("phone") or "",
+            "mt5_login":account.get("mt5_login") or d.get("mt5_login") or "",
+            "mt5_server":account.get("mt5_server") or d.get("mt5_server") or "",
+            "account_size":clean(account.get("account_size") or d.get("account_size") or 0),
+            "start_balance":start_balance,
+            "current_balance":clean(account.get("current_balance") or account.get("balance") or 0),
+            "current_equity":current_equity,
+            "verified_profit":verified_profit,
+            "payout_split":split_pct,
+            "available_payout":max_payout,
+            "amount":amount,
+            "method":method,
+            "payment_method":method,
+            "bank_name":bank_name,
+            "account_number":account_number,
+            "account_name":account_name,
+            "status":"pending",
+            "note":d.get("note", ""),
+            "admin_note":"",
+            "requested_at":now,
+            "created_at":now,
+        }
+        try:
+            created = supabase.table("payouts").insert(row).execute().data
+        except Exception as insert_error:
+            # Backward compatible fallback for older payouts table schemas.
+            fallback={
+                "trader_id":row["trader_id"],
+                "trader_account_id":row["trader_account_id"],
+                "trader_name":row["trader_name"],
+                "email":row["email"],
+                "phone":row["phone"],
+                "amount":row["amount"],
+                "bank_name":row["bank_name"],
+                "account_number":row["account_number"],
+                "account_name":row["account_name"],
+                "status":"pending",
+                "note":row["note"],
+                "admin_note":"",
+                "requested_at":now,
+            }
+            created = supabase.table("payouts").insert(fallback).execute().data
+            row.update(fallback)
+            print("PAYOUT RICH INSERT FALLBACK:", insert_error)
 
         send_email_safe(
             row.get("email"),
@@ -4451,8 +4560,10 @@ def create_payout():
 Your payout request has been received.
 
 Amount: {email_money(amount)}
-Bank: {row.get("bank_name") or "Not provided"}
-Account Number: {row.get("account_number") or "Not provided"}
+Available verified payout before this request ({split_pct}% share cap): {email_money(max_payout)}
+MT5 Login: {row.get("mt5_login") or "Not provided"}
+Bank / Wallet: {row.get("bank_name") or "Not provided"}
+Account / Wallet Address: {row.get("account_number") or "Not provided"}
 
 Admin will review your account and payout request.
 
@@ -4465,13 +4576,18 @@ NairaPips Team"""
 Trader: {row.get("trader_name") or "Trader"}
 Email: {row.get("email") or "Not provided"}
 Phone: {row.get("phone") or "Not provided"}
+MT5 Login: {row.get("mt5_login") or "Not provided"}
 Amount: {email_money(amount)}
-Bank: {row.get("bank_name") or "Not provided"}
-Account Number: {row.get("account_number") or "Not provided"}"""
+Verified Available ({split_pct}% share cap): {email_money(max_payout)}
+Method: {method.upper()}
+Bank / Wallet: {row.get("bank_name") or "Not provided"}
+Account / Wallet Address: {row.get("account_number") or "Not provided"}"""
         )
 
+        _audit_safe("payouts", "payout_requested", f"Payout requested amount={amount} available={max_payout}", {"name":"trader","username":row.get("email")}, (created[0].get("id") if created else ""))
         return ok(created, "Payout request created")
-    except Exception as e: return bad(e)
+    except Exception as e:
+        return bad(e)
 
 @app.route("/approve_payout", methods=["POST"])
 def approve_payout():
