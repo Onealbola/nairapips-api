@@ -1617,19 +1617,21 @@ def admin_reset_trader_account():
         reason = f"RESET OPTION 2 — {reset_type}: {admin_note}"
 
         # 1) Archive exact old account permanently.
+        # Use existing DB-approved archive statuses.
+        # Do not create new account_status values because Supabase has a CHECK constraint.
         archived = _archive_specific_account(
             account,
             reason,
             staff,
             breached=False,
-            archive_status=f"reset_archived_{stage}"
+            archive_status=_archive_status_for_stage(stage, breached=False)
         )
 
         # 2) Lock old MT5 pool row so the same login is not reused accidentally.
         try:
             if account.get("mt5_pool_id"):
                 supabase.table("mt5_pool").update({
-                    "status": "reset_archived",
+                    "status": _archive_status_for_stage(stage, breached=False),
                     "assigned_trader_id": trader_id,
                     "assigned_trader_name": trader.get("name") or trader.get("full_name") or trader.get("email"),
                     "assigned_email": trader.get("email"),
