@@ -3507,6 +3507,61 @@ def update_trader():
         if not tid:
             return bad("Missing trader id")
 
+        # ------------------------------------------------------------------
+        # Backward-compatible lifecycle bridge for existing admin buttons.
+        # The admin UI still calls /update_trader for buttons like:
+        #   Pass Phase 1, Mark Funded, Mark Breached.
+        # Those fields are protected below, so route them through the proper
+        # lifecycle functions instead of failing with the lock message.
+        # ------------------------------------------------------------------
+        lifecycle_keys = {"status", "phase", "challenge_state", "phase_pass_status"}
+        if any(k in d for k in lifecycle_keys):
+            try:
+                staff = _admin_from_payload(d)
+                note = d.get("admin_note") or d.get("note") or "Admin lifecycle action"
+                status_value = str(d.get("status") or "").strip().lower()
+                phase_value = str(d.get("phase") or "").strip().lower()
+                pass_value = str(d.get("phase_pass_status") or "").strip().lower()
+
+                trader = get_trader_by_id(tid)
+                if not trader:
+                    return bad("Trader not found", 404)
+
+                active_account = _get_active_account(tid, trader)
+                active_stage = str((active_account or {}).get("stage") or trader.get("phase") or "").strip().lower()
+                current_state = str(trader.get("challenge_state") or trader.get("status") or "").strip().lower()
+
+                # Mark Breached
+                if status_value == "breached" or phase_value == "breached" or d.get("challenge_state") == "breached":
+                    updated, archived = _breach_specific_account(trader, active_account, note or "Admin marked account breached", staff) if active_account else (_breach_trader_account(tid, note or "Admin marked account breached", staff), None)
+                    return ok({"trader": updated, "archived_account": archived}, "Trader marked breached through lifecycle route")
+
+                # Pass Phase 1 -> Waiting for Phase 2 MT5
+                if pass_value in {"phase1_passed", "passed", "target_hit"}:
+                    if active_account and str(active_account.get("stage") or "").lower() == "phase1":
+                        updated, archived = _pass_specific_account(trader, active_account, "phase1_passed", staff, note or "Phase 1 passed by admin")
+                        return ok({"trader": updated, "archived_account": archived}, "Phase 1 passed through lifecycle route")
+                    if current_state in {"phase2_waiting_mt5", "phase1_passed"}:
+                        return ok({"trader": trader}, "Trader is already waiting for Phase 2 MT5")
+                    return bad("No active Phase 1 account found to pass", 409)
+
+                # Pass Phase 2 / Mark Funded -> Waiting for Funded MT5
+                # The old admin button sends status='funded'. Do not force a funded
+                # live state without assigning funded MT5. If Phase 2 is active, archive
+                # it and move the trader to funded_waiting_mt5.
+                if status_value in {"funded", "live"} or pass_value == "phase2_passed":
+                    if active_account and str(active_account.get("stage") or "").lower() == "phase2":
+                        updated, archived = _pass_specific_account(trader, active_account, "phase2_passed", staff, note or "Phase 2 passed by admin")
+                        return ok({"trader": updated, "archived_account": archived}, "Phase 2 passed. Trader is waiting for Funded MT5")
+                    if current_state in {"funded_waiting_mt5", "phase2_passed"}:
+                        return ok({"trader": trader}, "Trader is already waiting for Funded MT5")
+                    if active_account and str(active_account.get("stage") or "").lower() == "funded":
+                        return ok({"trader": trader, "account": active_account}, "Trader already has an active funded account")
+                    return bad("No active Phase 2 account found. Assign/activate Phase 2 before marking funded.", 409)
+
+            except Exception as lifecycle_error:
+                return bad(lifecycle_error, 500)
+
         blocked = {
             "status", "phase", "challenge_state", "phase_pass_status",
             "balance", "equity", "profit", "drawdown", "profit_percent", "drawdown_percent",
