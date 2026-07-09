@@ -1539,22 +1539,17 @@ def _dashboard_payload_for_trader(trader):
     }
 
 
+
 @app.route("/admin_reset_trader_account", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_account", methods=["POST", "OPTIONS"])
 def admin_reset_trader_account():
-    """Admin-controlled trader account reset.
+    """OPTION 2: Archive old account, lock old MT5, then optionally assign a fresh MT5.
 
-    Purpose:
-    - Near-breach mercy reset
-    - Rule violation reset
-    - Technical issue reset
-    - Approved admin decision reset
-
-    Safety:
-    - Does not delete trader, purchase, payout, or monitoring history.
-    - Resets the selected/current MT5 account metrics back to starting balance.
-    - Reactivates monitoring for the same MT5 account.
-    - Writes lifecycle/audit evidence where available.
+    This is the production-safe reset:
+    - Old account is kept as permanent history.
+    - Old MT5 is NOT reused automatically.
+    - Trader is moved to waiting-for-MT5 if no fresh MT5 is supplied.
+    - If mt5_id is supplied, a fresh MT5 account is assigned immediately.
     """
     if request.method == "OPTIONS":
         return _np_ok({})
@@ -1570,16 +1565,16 @@ def admin_reset_trader_account():
         data.get("admin_note")
         or data.get("reset_reason")
         or data.get("mt5_reset_reason")
-        or "Account reset approved by admin."
+        or "Account archived and reset approved by admin."
     ).strip()
+    fresh_mt5_id = str(data.get("mt5_id") or data.get("fresh_mt5_id") or "").strip()
 
     try:
         trader = get_trader_by_id(trader_id)
         if not trader:
             return _np_fail("Trader not found", 404)
 
-        # Prefer the real current active account. If the trader is already breached/locked,
-        # fall back to current_account_id, then newest MT5 account history for that trader.
+        # Find the exact account to close: active first, current_account_id second, latest account third.
         account = _get_active_account(trader_id, trader)
 
         if not account:
@@ -1590,7 +1585,7 @@ def admin_reset_trader_account():
                     if rows:
                         account = _decorate_account_for_api(rows[0])
                 except Exception as e:
-                    print("RESET CURRENT ACCOUNT FETCH ERROR:", e)
+                    print("OPTION2 RESET CURRENT ACCOUNT FETCH ERROR:", e)
 
         if not account:
             try:
@@ -1608,172 +1603,158 @@ def admin_reset_trader_account():
                 if rows:
                     account = _decorate_account_for_api(rows[0])
             except Exception as e:
-                print("RESET LATEST ACCOUNT FETCH ERROR:", e)
+                print("OPTION2 RESET LATEST ACCOUNT FETCH ERROR:", e)
 
         if not account:
-            return _np_fail("No trader account found to reset. Assign an MT5 account first.", 409)
+            return _np_fail("No trader account found to archive/reset. Assign an MT5 account first.", 409)
 
         now = now_iso()
-        account_size = clean(account.get("account_size") or trader.get("account_size") or 0)
-        start_balance = clean(account.get("start_balance") or account_size or account.get("current_balance") or 0)
-        if not start_balance:
-            start_balance = account_size
-
-        previous_status = str(account.get("account_status") or "").strip()
-        previous_dd = clean(account.get("dd_used_percent") or account.get("max_drawdown_used") or 0)
-        previous_equity = clean(account.get("current_equity") or account.get("current_balance") or start_balance)
-
-        # Permanent history snapshot before reset.
-        try:
-            supabase.table("mt5_account_archives").insert({
-                "trader_id": trader_id,
-                "trader_account_id": account.get("id"),
-                "stage": account.get("stage") or trader.get("phase") or "phase1",
-                "mt5_login": account.get("mt5_login") or trader.get("mt5_login"),
-                "mt5_server": account.get("mt5_server") or trader.get("mt5_server"),
-                "final_balance": account.get("current_balance"),
-                "final_equity": account.get("current_equity"),
-                "final_profit": account.get("profit"),
-                "final_profit_percent": account.get("profit_percent"),
-                "final_dd_used_percent": previous_dd,
-                "archive_reason": f"RESET BEFORE: {reset_type} — {admin_note}",
-                "archived_at": now,
-            }).execute()
-        except Exception as e:
-            print("RESET HISTORY SNAPSHOT ERROR:", e)
-
         stage = str(account.get("stage") or trader.get("phase") or "phase1").strip().lower()
         if stage not in {"phase1", "phase2", "funded"}:
             stage = "phase1"
 
-        account_update = {
-            "account_status": "assigned_active",
-            "current_balance": start_balance,
-            "current_equity": start_balance,
-            "profit": 0,
-            "profit_percent": 0,
-            "absolute_drawdown_percent": 0,
-            "dd_used_percent": 0,
-            "monitoring_enabled": True,
-            "risk_zone": "safe",
-            "updated_at": now,
-            "archive_reason": None,
-            "archived_at": None,
-        }
+        reason = f"RESET OPTION 2 — {reset_type}: {admin_note}"
 
-        # Some deployments have these extra columns. Try them, but if Supabase rejects
-        # unknown columns, retry with the conservative core columns.
-        extended_account_update = dict(account_update)
-        extended_account_update.update({
-            "drawdown_percent": 0,
-            "max_drawdown_used": 0,
-            "lowest_equity": start_balance,
-            "highest_equity": start_balance,
-            "last_sync_at": now,
-            "reset_type": reset_type,
-            "reset_reason": admin_note,
-            "reset_at": now,
-            "reset_by": staff.get("username") or staff.get("name") or "admin",
-        })
+        # 1) Archive exact old account permanently.
+        archived = _archive_specific_account(
+            account,
+            reason,
+            staff,
+            breached=False,
+            archive_status=f"reset_archived_{stage}"
+        )
 
+        # 2) Lock old MT5 pool row so the same login is not reused accidentally.
         try:
-            supabase.table("trader_accounts").update(extended_account_update).eq("id", account.get("id")).execute()
+            if account.get("mt5_pool_id"):
+                supabase.table("mt5_pool").update({
+                    "status": "reset_archived",
+                    "assigned_trader_id": trader_id,
+                    "assigned_trader_name": trader.get("name") or trader.get("full_name") or trader.get("email"),
+                    "assigned_email": trader.get("email"),
+                    "trader_account_id": account.get("id"),
+                    "archived_at": now,
+                    "archive_reason": reason,
+                    "updated_at": now,
+                    "admin_note": reason,
+                }).eq("id", account.get("mt5_pool_id")).execute()
         except Exception as e:
-            print("RESET EXTENDED ACCOUNT UPDATE RETRYING CORE:", e)
-            supabase.table("trader_accounts").update(account_update).eq("id", account.get("id")).execute()
+            print("OPTION2 RESET MT5 LOCK ERROR:", e)
 
-        lifecycle_state = _active_state_for_stage(stage)
-        trader_update = {
-            "current_account_id": account.get("id"),
-            "challenge_state": lifecycle_state,
-            "status": "funded" if stage == "funded" else "active",
+        waiting_state = f"{stage}_waiting_mt5"
+
+        # 3) Move trader away from old MT5 credentials while keeping identity/purchase history.
+        trader_waiting_update = {
+            "current_account_id": None,
+            "challenge_state": waiting_state,
+            "status": "active",
             "phase": stage,
-            "mt5_login": account.get("mt5_login") or trader.get("mt5_login"),
-            "mt5_server": account.get("mt5_server") or trader.get("mt5_server"),
-            "mt5_master_password": account.get("mt5_master_password") or trader.get("mt5_master_password") or trader.get("mt5_password") or "",
-            "mt5_password": account.get("mt5_master_password") or trader.get("mt5_master_password") or trader.get("mt5_password") or "",
-            "master_password": account.get("mt5_master_password") or trader.get("mt5_master_password") or trader.get("master_password") or "",
-            "mt5_investor_password": account.get("mt5_investor_password") or trader.get("mt5_investor_password") or trader.get("investor_password") or "",
-            "investor_password": account.get("mt5_investor_password") or trader.get("mt5_investor_password") or trader.get("investor_password") or "",
-            "balance": start_balance,
-            "equity": start_balance,
+            "mt5_login": "",
+            "mt5_server": "",
+            "mt5_master_password": "",
+            "mt5_password": "",
+            "master_password": "",
+            "mt5_investor_password": "",
+            "investor_password": "",
+            "balance": clean(account.get("start_balance") or account.get("account_size") or trader.get("account_size") or 0),
+            "equity": clean(account.get("start_balance") or account.get("account_size") or trader.get("account_size") or 0),
             "profit": 0,
             "profit_percent": 0,
             "drawdown": 0,
             "drawdown_percent": 0,
             "max_drawdown_used": 0,
-            "risk_zone": "safe",
-            "monitoring_enabled": True,
-            "mt5_account_active": True,
-            "mt5_access_disabled": False,
+            "risk_zone": "waiting_mt5",
+            "monitoring_enabled": False,
+            "mt5_account_active": False,
+            "mt5_access_disabled": True,
             "payout_blocked": False,
-            "admin_note": f"RESET: {reset_type} — {admin_note}",
+            "admin_note": reason,
             "mt5_reset_reason": admin_note,
             "mt5_updated_at": now,
             "mt5_updated_by": staff.get("username") or staff.get("name") or "admin",
             "lifecycle_updated_at": now,
             "updated_at": now,
         }
-
-        result = supabase.table("traders").update(trader_update).eq("id", trader_id).execute().data or []
-        updated = result[0] if result else get_trader_by_id(trader_id)
-
-        # Keep MT5 pool tied to the trader and active for monitoring.
-        try:
-            if account.get("mt5_pool_id"):
-                supabase.table("mt5_pool").update({
-                    "status": "assigned",
-                    "assigned_trader_id": trader_id,
-                    "assigned_trader_name": updated.get("name") or updated.get("full_name") or trader.get("name"),
-                    "assigned_email": updated.get("email") or trader.get("email"),
-                    "trader_account_id": account.get("id"),
-                    "archive_reason": None,
-                    "archived_at": None,
-                    "updated_at": now,
-                    "admin_note": f"RESET: {reset_type} — {admin_note}",
-                }).eq("id", account.get("mt5_pool_id")).execute()
-        except Exception as e:
-            print("RESET MT5 POOL UPDATE ERROR:", e)
-
-        try:
-            supabase.table("monitoring_events").insert({
-                "trader_id": trader_id,
-                "trader_account_id": account.get("id"),
-                "mt5_login": account.get("mt5_login") or trader.get("mt5_login"),
-                "event_type": "admin_account_reset",
-                "risk_zone": "safe",
-                "message": f"Account reset by admin. Type: {reset_type}. Reason: {admin_note}",
-                "dd_used_percent": 0,
-                "max_drawdown_used": 0,
-                "balance": start_balance,
-                "equity": start_balance,
-                "created_at": now,
-            }).execute()
-        except Exception as e:
-            print("RESET MONITORING EVENT ERROR:", e)
+        supabase.table("traders").update(trader_waiting_update).eq("id", trader_id).execute()
 
         _log_lifecycle_event(
             trader_id,
             account.get("id"),
-            previous_status,
-            lifecycle_state,
-            "admin_reset_account",
-            f"{reset_type}: {admin_note}. Previous DD used: {previous_dd}%. Previous equity: {previous_equity}",
+            str(account.get("account_status") or ""),
+            waiting_state,
+            "admin_reset_archive_old_account",
+            reason,
             staff,
         )
+
+        # 4) If admin selected a fresh MT5, assign it immediately using existing lifecycle assignment.
+        new_account = None
+        updated_trader = get_trader_by_id(trader_id)
+
+        if fresh_mt5_id:
+            mt5 = _get_mt5_account(mt5_id=fresh_mt5_id)
+            if not mt5:
+                return _np_fail("Fresh MT5 account not found. Old account has been archived and trader is waiting for MT5.", 404)
+            if str(mt5.get("status") or "available").lower() != "available":
+                return _np_fail("Selected fresh MT5 is not available. Old account has been archived and trader is waiting for MT5.", 409)
+
+            # Use a purchase/account_size bridge only if needed. _assign_mt5_to_trader accepts purchase=None.
+            new_account, updated_trader = _assign_mt5_to_trader(
+                updated_trader or trader,
+                mt5,
+                stage,
+                purchase=None,
+                staff=staff,
+                note=f"Fresh MT5 assigned after reset. {reason}"
+            )
+            _log_lifecycle_event(
+                trader_id,
+                new_account.get("id"),
+                waiting_state,
+                _active_state_for_stage(stage),
+                "admin_reset_assign_fresh_mt5",
+                f"Fresh MT5 {mt5.get('mt5_login')} assigned. {reason}",
+                staff,
+            )
+
+        # 5) Monitoring evidence.
+        try:
+            supabase.table("monitoring_events").insert({
+                "trader_id": trader_id,
+                "trader_account_id": (new_account or archived or account).get("id"),
+                "mt5_login": (new_account or {}).get("mt5_login") or account.get("mt5_login") or trader.get("mt5_login"),
+                "event_type": "admin_reset_option2_archive_fresh_mt5",
+                "risk_zone": "safe" if new_account else "waiting_mt5",
+                "message": (
+                    f"Old account archived. "
+                    f"{'Fresh MT5 assigned: '+str((new_account or {}).get('mt5_login')) if new_account else 'Trader waiting for fresh MT5.'} "
+                    f"Type: {reset_type}. Reason: {admin_note}"
+                ),
+                "dd_used_percent": 0,
+                "max_drawdown_used": 0,
+                "balance": clean((new_account or {}).get("current_balance") or account.get("start_balance") or account.get("account_size") or 0),
+                "equity": clean((new_account or {}).get("current_equity") or account.get("start_balance") or account.get("account_size") or 0),
+                "created_at": now,
+            }).execute()
+        except Exception as e:
+            print("OPTION2 RESET MONITORING EVENT ERROR:", e)
+
         _audit_safe(
             "trader",
-            "admin_reset_account",
-            f"Trader {trader_id} account {account.get('id')} reset. Type={reset_type}. Reason={admin_note}",
+            "admin_reset_option2_archive_fresh_mt5",
+            f"Trader {trader_id}. Old account {account.get('id')} archived. Fresh MT5={fresh_mt5_id or 'none'}. Reason={reason}",
             staff,
             trader_id,
         )
 
+        final_trader = updated_trader or get_trader_by_id(trader_id)
         return _np_ok({
             "success": True,
-            "message": "Trader account reset successfully",
-            "data": updated,
-            "current_account": _get_active_account(trader_id, updated),
+            "message": "Old account archived. Fresh MT5 assigned." if new_account else "Old account archived. Trader is waiting for fresh MT5 assignment.",
+            "data": final_trader,
+            "archived_account": archived,
+            "new_account": new_account,
+            "current_account": _get_active_account(trader_id, final_trader),
         })
 
     except Exception as e:
