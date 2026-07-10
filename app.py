@@ -407,33 +407,9 @@ def _decorate_account_for_api(account):
     return row
 
 
-
-def _trader_is_waiting_for_mt5(trader):
-    """True only when lifecycle says the trader currently has no active MT5."""
-    if not trader:
-        return False
-    state = str(
-        trader.get("challenge_state")
-        or trader.get("status")
-        or ""
-    ).strip().lower().replace(" ", "_")
-    return (
-        "phase1_waiting_mt5" in state
-        or "phase2_waiting_mt5" in state
-        or "funded_waiting_mt5" in state
-        or "waiting_for_fresh_mt5" in state
-        or "waiting_for_phase_1" in state
-        or "waiting_for_phase_2" in state
-        or "waiting_for_funded" in state
-    )
-
-
 def _active_account_from_trader_profile(trader):
     """Compatibility bridge for already-migrated traders whose trader_accounts row is unavailable."""
     if not trader:
-        return None
-    # A reset/waiting lifecycle is authoritative. Never revive old MT5 mirror fields.
-    if _trader_is_waiting_for_mt5(trader):
         return None
     state = str(trader.get("challenge_state") or trader.get("status") or "").strip().lower()
     active_states = {"phase1_active", "phase2_active", "funded_active"}
@@ -504,11 +480,6 @@ def _get_active_account(trader_id, trader=None):
             except Exception:
                 trader = None
 
-        # Reset/waiting lifecycle is the source of truth until a fresh assignment
-        # changes challenge_state back to phase1_active/phase2_active/funded_active.
-        if _trader_is_waiting_for_mt5(trader):
-            return None
-
         rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
 
         current_account_id = (trader or {}).get("current_account_id")
@@ -539,13 +510,10 @@ def _get_active_account(trader_id, trader=None):
 
 def _purchase_accounts_for_trader(trader, purchases=None):
     """Create dashboard account cards from approved purchases with assigned MT5.
-    This keeps newly assigned purchases visible only during an active lifecycle.
+    This keeps newly assigned purchases visible even if their trader_accounts row is
+    missing, archived incorrectly, or not marked assigned_active yet.
     """
     accounts = []
-    # A reset trader may still have historical MT5 values on the purchase row.
-    # Those values are history, not a current account.
-    if _trader_is_waiting_for_mt5(trader):
-        return accounts
     try:
         rows = list(purchases or [])
         if not rows and trader:
@@ -1715,17 +1683,6 @@ def admin_reset_trader_account():
         old_login = str(account.get("mt5_login") or trader.get("mt5_login") or "").strip()
         start_balance = clean(account.get("start_balance") or account.get("account_size") or trader.get("account_size") or 0)
 
-        # Same phase must be preserved throughout reset.
-        if stage == "phase1":
-            waiting_state = "phase1_waiting_mt5"
-            phase_value = "phase1"
-        elif stage == "phase2":
-            waiting_state = "phase2_waiting_mt5"
-            phase_value = "phase2"
-        else:
-            waiting_state = "funded_waiting_mt5"
-            phase_value = "funded_waiting"
-
         # 1. Archive exactly the current account.
         archived = _archive_specific_account(
             account,
@@ -1734,68 +1691,6 @@ def admin_reset_trader_account():
             breached=False,
             archive_status=_archive_status_for_stage(stage, breached=False)
         )
-
-        # Archive duplicate active rows for the same MT5 login only.
-        # Multiple separate challenge accounts remain untouched.
-        if old_login:
-            try:
-                duplicate_rows = (
-                    supabase.table("trader_accounts")
-                    .select("*")
-                    .eq("trader_id", trader_id)
-                    .eq("mt5_login", old_login)
-                    .in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
-                    .limit(50)
-                    .execute()
-                    .data
-                    or []
-                )
-                for duplicate in duplicate_rows:
-                    if str(duplicate.get("id") or "") == str(account.get("id") or ""):
-                        continue
-                    _archive_specific_account(
-                        duplicate,
-                        reason + " — duplicate active row closed",
-                        staff,
-                        breached=False,
-                        archive_status=_archive_status_for_stage(
-                            duplicate.get("stage") or stage,
-                            breached=False
-                        )
-                    )
-            except Exception as e:
-                print("RESET DUPLICATE ACTIVE ACCOUNT CLEANUP ERROR:", e)
-
-        # Neutralise only the purchase linked to this reset account.
-        # Archive history already preserves the old MT5 credentials.
-        purchase_id = account.get("purchase_id")
-        purchase_waiting_update = {
-            "status": "approved",
-            "lifecycle_state": waiting_state if "waiting_state" in locals() else f"{stage}_waiting_mt5",
-            "trader_account_id": None,
-            "assigned_mt5_id": None,
-            "mt5_login": "",
-            "mt5_server": "",
-            "mt5_master_password": "",
-            "mt5_password": "",
-            "master_password": "",
-            "mt5_investor_password": "",
-            "investor_password": "",
-            "updated_at": now,
-            "admin_note": reason,
-        }
-        try:
-            if purchase_id:
-                supabase.table("challenge_purchases").update(
-                    purchase_waiting_update
-                ).eq("id", purchase_id).execute()
-            elif old_login:
-                # Legacy account without purchase_id: constrain by trader and login.
-                supabase.table("challenge_purchases").update(
-                    purchase_waiting_update
-                ).eq("trader_id", trader_id).eq("mt5_login", old_login).execute()
-        except Exception as e:
-            print("RESET PURCHASE MIRROR CLEANUP ERROR:", e)
 
         # 2. Lock old MT5 pool row; never put it back to available.
         try:
@@ -1814,7 +1709,17 @@ def admin_reset_trader_account():
         except Exception as e:
             print("RESET MT5 POOL LOCK ERROR:", e)
 
-        # 3. Clear the trader mirror and keep the same waiting phase.
+        # 3. Keep same stage, but remove active MT5. Do NOT jump to funded and do NOT assign.
+        if stage == "phase1":
+            waiting_state = "phase1_waiting_mt5"
+            phase_value = "phase1"
+        elif stage == "phase2":
+            waiting_state = "phase2_waiting_mt5"
+            phase_value = "phase2"
+        else:
+            waiting_state = "funded_waiting_mt5"
+            phase_value = "funded_waiting"
+
         trader_update = {
             "current_account_id": None,
             "challenge_state": waiting_state,
