@@ -224,7 +224,7 @@ def _has_approved_payment(rows):
 ACTIVE_ACCOUNT_STATUSES = {
     "assigned_active", "active", "current_active",
     "phase1_active", "phase2_active", "funded_active",
-    "live_active", "approved_active",
+    "live_active", "live", "funded", "approved_active",
 }
 TERMINAL_ACCOUNT_STATUSES = {
     "archived", "archived_phase1", "archived_phase2",
@@ -407,9 +407,33 @@ def _decorate_account_for_api(account):
     return row
 
 
+
+def _trader_is_waiting_for_mt5(trader):
+    """True only when lifecycle says the trader currently has no active MT5."""
+    if not trader:
+        return False
+    state = str(
+        trader.get("challenge_state")
+        or trader.get("status")
+        or ""
+    ).strip().lower().replace(" ", "_")
+    return (
+        "phase1_waiting_mt5" in state
+        or "phase2_waiting_mt5" in state
+        or "funded_waiting_mt5" in state
+        or "waiting_for_fresh_mt5" in state
+        or "waiting_for_phase_1" in state
+        or "waiting_for_phase_2" in state
+        or "waiting_for_funded" in state
+    )
+
+
 def _active_account_from_trader_profile(trader):
     """Compatibility bridge for already-migrated traders whose trader_accounts row is unavailable."""
     if not trader:
+        return None
+    # A reset/waiting lifecycle is authoritative. Never revive old MT5 mirror fields.
+    if _trader_is_waiting_for_mt5(trader):
         return None
     state = str(trader.get("challenge_state") or trader.get("status") or "").strip().lower()
     active_states = {"phase1_active", "phase2_active", "funded_active"}
@@ -480,6 +504,11 @@ def _get_active_account(trader_id, trader=None):
             except Exception:
                 trader = None
 
+        # Reset/waiting lifecycle is the source of truth until a fresh assignment
+        # changes challenge_state back to phase1_active/phase2_active/funded_active.
+        if _trader_is_waiting_for_mt5(trader):
+            return None
+
         rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
 
         current_account_id = (trader or {}).get("current_account_id")
@@ -510,10 +539,13 @@ def _get_active_account(trader_id, trader=None):
 
 def _purchase_accounts_for_trader(trader, purchases=None):
     """Create dashboard account cards from approved purchases with assigned MT5.
-    This keeps newly assigned purchases visible even if their trader_accounts row is
-    missing, archived incorrectly, or not marked assigned_active yet.
+    This keeps newly assigned purchases visible only during an active lifecycle.
     """
     accounts = []
+    # A reset trader may still have historical MT5 values on the purchase row.
+    # Those values are history, not a current account.
+    if _trader_is_waiting_for_mt5(trader):
+        return accounts
     try:
         rows = list(purchases or [])
         if not rows and trader:
@@ -1648,20 +1680,84 @@ def admin_reset_trader_account():
         if not trader:
             return _np_fail("Trader not found", 404)
 
-        account = _get_active_account(trader_id, trader)
+        requested_account_id = str(
+            data.get("trader_account_id")
+            or data.get("current_account_id")
+            or data.get("account_id")
+            or ""
+        ).strip()
+        requested_purchase_id = str(data.get("purchase_id") or "").strip()
+
+        if not requested_account_id:
+            return _np_fail("Exact trader_account_id is required for reset. Refusing to guess an account.", 400)
+
+        account_rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("id", requested_account_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        account = account_rows[0] if account_rows else None
 
         # If no active account exists, do not guess from history.
         # This prevents an old archived account from being reset again or moving the trader wrongly.
         if not account:
-            state = str(trader.get("challenge_state") or trader.get("status") or "").strip().lower()
-            if "waiting" in state:
+            return _np_fail("Selected trader_account_id was not found. Reset cancelled.", 404)
+
+        if str(account.get("trader_id") or "") != str(trader_id):
+            return _np_fail("Selected trader_account_id does not belong to this trader. Reset cancelled.", 409)
+
+        account_status_before = str(account.get("account_status") or account.get("status") or "").strip().lower()
+        trader_waiting_state = str(trader.get("challenge_state") or trader.get("status") or "").strip().lower()
+        if account_status_before not in ACTIVE_ACCOUNT_STATUSES:
+            if (
+                account_status_before.startswith("archived_")
+                and "waiting" in trader_waiting_state
+                and not str(trader.get("mt5_login") or "").strip()
+            ):
                 return _np_ok({
                     "success": True,
-                    "message": "Trader already has no active MT5 and is waiting for assignment.",
+                    "message": "Selected account is already archived and trader is already waiting for fresh MT5.",
                     "data": trader,
                     "current_account": None,
+                    "trader_account_id": requested_account_id,
+                    "purchase_id": requested_purchase_id or account.get("purchase_id"),
+                    "idempotent": True,
                 })
-            return _np_fail("No active MT5 account found to reset. Assign an MT5 first.", 409)
+            return _np_fail("Selected trader_account_id is not an active MT5 account. Reset cancelled.", 409)
+
+        account_purchase_id = str(account.get("purchase_id") or "").strip()
+        linked_purchase = None
+        if account_purchase_id:
+            if not requested_purchase_id:
+                return _np_fail("Exact purchase_id is required for this reset. Reset cancelled.", 400)
+            if requested_purchase_id != account_purchase_id:
+                return _np_fail("purchase_id does not match the selected trader_account_id. Reset cancelled.", 409)
+
+            # Validate the linked purchase BEFORE the first database mutation.
+            purchase_rows = (
+                supabase.table("challenge_purchases")
+                .select("*")
+                .eq("id", account_purchase_id)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if not purchase_rows:
+                return _np_fail("Linked purchase was not found. Reset cancelled before any account change.", 409)
+            linked_purchase = purchase_rows[0]
+            purchase_trader_id = str(linked_purchase.get("trader_id") or "").strip()
+            if purchase_trader_id and purchase_trader_id != str(trader_id):
+                return _np_fail("Linked purchase does not belong to this trader. Reset cancelled before any account change.", 409)
+            purchase_account_id = str(linked_purchase.get("trader_account_id") or "").strip()
+            if purchase_account_id and purchase_account_id != requested_account_id:
+                return _np_fail("Linked purchase points to a different trader account. Reset cancelled before any account change.", 409)
+        elif requested_purchase_id:
+            return _np_fail("Selected account has no purchase_id, but a purchase_id was supplied. Reset cancelled before any account change.", 409)
 
         # Preserve the exact phase being reset.
         # Admin sends reset_stage from the visible current account card.
@@ -1683,33 +1779,7 @@ def admin_reset_trader_account():
         old_login = str(account.get("mt5_login") or trader.get("mt5_login") or "").strip()
         start_balance = clean(account.get("start_balance") or account.get("account_size") or trader.get("account_size") or 0)
 
-        # 1. Archive exactly the current account.
-        archived = _archive_specific_account(
-            account,
-            reason,
-            staff,
-            breached=False,
-            archive_status=_archive_status_for_stage(stage, breached=False)
-        )
-
-        # 2. Lock old MT5 pool row; never put it back to available.
-        try:
-            if account.get("mt5_pool_id"):
-                supabase.table("mt5_pool").update({
-                    "status": _archive_status_for_stage(stage, breached=False),
-                    "assigned_trader_id": trader_id,
-                    "assigned_trader_name": trader.get("name") or trader.get("full_name") or trader.get("email"),
-                    "assigned_email": trader.get("email"),
-                    "trader_account_id": account.get("id"),
-                    "archived_at": now,
-                    "archive_reason": reason,
-                    "updated_at": now,
-                    "admin_note": reason,
-                }).eq("id", account.get("mt5_pool_id")).execute()
-        except Exception as e:
-            print("RESET MT5 POOL LOCK ERROR:", e)
-
-        # 3. Keep same stage, but remove active MT5. Do NOT jump to funded and do NOT assign.
+        # Same phase must be preserved throughout reset.
         if stage == "phase1":
             waiting_state = "phase1_waiting_mt5"
             phase_value = "phase1"
@@ -1720,6 +1790,119 @@ def admin_reset_trader_account():
             waiting_state = "funded_waiting_mt5"
             phase_value = "funded_waiting"
 
+        # 1. Archive exactly the current account.
+        archived = _archive_specific_account(
+            account,
+            reason,
+            staff,
+            breached=False,
+            archive_status=_archive_status_for_stage(stage, breached=False)
+        )
+
+        # Archive duplicate active rows for the same MT5 login only.
+        # Multiple separate challenge accounts remain untouched.
+        if old_login:
+            try:
+                duplicate_rows = (
+                    supabase.table("trader_accounts")
+                    .select("*")
+                    .eq("trader_id", trader_id)
+                    .eq("mt5_login", old_login)
+                    .in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
+                    .limit(50)
+                    .execute()
+                    .data
+                    or []
+                )
+                for duplicate in duplicate_rows:
+                    if str(duplicate.get("id") or "") == str(account.get("id") or ""):
+                        continue
+                    _archive_specific_account(
+                        duplicate,
+                        reason + " — duplicate active row closed",
+                        staff,
+                        breached=False,
+                        archive_status=_archive_status_for_stage(
+                            duplicate.get("stage") or stage,
+                            breached=False
+                        )
+                    )
+            except Exception as e:
+                print("RESET DUPLICATE ACTIVE ACCOUNT CLEANUP ERROR:", e)
+
+        # Neutralise only the purchase linked to this reset account.
+        # Archive history already preserves the old MT5 credentials.
+        purchase_id = account.get("purchase_id")
+        purchase_waiting_update = {
+            "status": "approved",
+            "lifecycle_state": waiting_state if "waiting_state" in locals() else f"{stage}_waiting_mt5",
+            "trader_account_id": None,
+            "assigned_mt5_id": None,
+            "mt5_login": "",
+            "mt5_server": "",
+            "mt5_master_password": "",
+            "mt5_password": "",
+            "master_password": "",
+            "mt5_investor_password": "",
+            "investor_password": "",
+            "updated_at": now,
+            "admin_note": reason,
+        }
+        reset_steps = []
+        archived_check = (
+            supabase.table("trader_accounts")
+            .select("id,account_status,archived_at,monitoring_enabled")
+            .eq("id", account.get("id"))
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not archived_check or not str(archived_check[0].get("account_status") or "").startswith("archived_"):
+            print("RESET ACCOUNT ARCHIVE VERIFY FAILED:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login})
+            return _np_fail("Reset failed while archiving the selected account. No success was returned.", 500)
+        reset_steps.append("selected_account_archived")
+
+        # Paid accounts clear only their exact linked purchase. Programme/grant accounts
+        # without purchase_id skip challenge_purchases completely and continue the reset.
+        if purchase_id:
+            try:
+                purchase_rows = supabase.table("challenge_purchases").update(
+                    purchase_waiting_update
+                ).eq("id", purchase_id).execute().data or []
+                if not purchase_rows:
+                    print("RESET PURCHASE MIRROR CLEANUP EMPTY:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login})
+                    return _np_fail("Reset failed while clearing the linked purchase MT5 fields.", 500)
+                reset_steps.append("linked_purchase_cleared")
+            except Exception as e:
+                print("RESET PURCHASE MIRROR CLEANUP ERROR:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login, "error": str(e)})
+                return _np_fail("Reset failed while clearing the linked purchase MT5 fields.", 500)
+        else:
+            reset_steps.append("no_purchase_account_skipped_purchase_cleanup")
+
+        # 2. Lock old MT5 pool row; never put it back to available.
+        try:
+            if account.get("mt5_pool_id"):
+                pool_rows = supabase.table("mt5_pool").update({
+                    "status": _archive_status_for_stage(stage, breached=False),
+                    "assigned_trader_id": trader_id,
+                    "assigned_trader_name": trader.get("name") or trader.get("full_name") or trader.get("email"),
+                    "assigned_email": trader.get("email"),
+                    "trader_account_id": account.get("id"),
+                    "archived_at": now,
+                    "archive_reason": reason,
+                    "updated_at": now,
+                    "admin_note": reason,
+                }).eq("id", account.get("mt5_pool_id")).execute().data or []
+                if not pool_rows:
+                    print("RESET MT5 POOL LOCK EMPTY:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login, "mt5_pool_id": account.get("mt5_pool_id")})
+                    return _np_fail("Reset failed while retiring the old MT5 pool row.", 500)
+                reset_steps.append("old_mt5_pool_retired")
+        except Exception as e:
+            print("RESET MT5 POOL LOCK ERROR:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login, "error": str(e)})
+            return _np_fail("Reset failed while retiring the old MT5 pool row.", 500)
+
+        # 3. Clear the trader mirror and keep the same waiting phase.
         trader_update = {
             "current_account_id": None,
             "challenge_state": waiting_state,
@@ -1754,11 +1937,15 @@ def admin_reset_trader_account():
         }
 
         result = supabase.table("traders").update(trader_update).eq("id", trader_id).execute().data or []
+        if not result:
+            print("RESET TRADER MIRROR CLEAR EMPTY:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login})
+            return _np_fail("Reset failed while clearing the trader MT5 mirror fields.", 500)
         updated = result[0] if result else get_trader_by_id(trader_id)
+        reset_steps.append("trader_mirror_cleared")
 
         # 4. Ledger/audit evidence only. Failure must not block reset.
         try:
-            supabase.table("monitoring_events").insert({
+            event_rows = supabase.table("monitoring_events").insert({
                 "trader_id": trader_id,
                 "trader_account_id": account.get("id"),
                 "mt5_login": old_login,
@@ -1770,9 +1957,14 @@ def admin_reset_trader_account():
                 "balance": start_balance,
                 "equity": start_balance,
                 "created_at": now,
-            }).execute()
+            }).execute().data or []
+            if not event_rows:
+                print("RESET EVENT LOG EMPTY:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login})
+                return _np_fail("Reset failed while writing monitoring reset evidence.", 500)
+            reset_steps.append("monitoring_event_logged")
         except Exception as e:
-            print("RESET EVENT LOG ERROR:", e)
+            print("RESET EVENT LOG ERROR:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login, "error": str(e)})
+            return _np_fail("Reset failed while writing monitoring reset evidence.", 500)
 
         _log_lifecycle_event(
             trader_id,
@@ -1799,8 +1991,117 @@ def admin_reset_trader_account():
             "current_account": None,
             "reset_stage": stage,
             "waiting_state": waiting_state,
+            "operations_succeeded": reset_steps,
         })
 
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/admin_verify_reset", methods=["GET", "POST", "OPTIONS"])
+@app.route("/verify_reset_account", methods=["GET", "POST", "OPTIONS"])
+def admin_verify_reset():
+    """Read-only reset verification. Never modifies Supabase."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    data = request.get_json(silent=True) or {}
+    trader_id = str(data.get("trader_id") or request.args.get("trader_id") or "").strip()
+    account_id = str(data.get("trader_account_id") or data.get("account_id") or request.args.get("trader_account_id") or request.args.get("account_id") or "").strip()
+    purchase_id = str(data.get("purchase_id") or request.args.get("purchase_id") or "").strip()
+    old_login = str(data.get("old_mt5_login") or data.get("mt5_login") or request.args.get("old_mt5_login") or request.args.get("mt5_login") or "").strip()
+    if not trader_id or not account_id:
+        return _np_fail("trader_id and trader_account_id are required", 400)
+
+    try:
+        trader_rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+        account_rows = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+        purchase_rows = []
+        if purchase_id:
+            purchase_rows = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
+        elif account_rows and account_rows[0].get("purchase_id"):
+            purchase_id = str(account_rows[0].get("purchase_id"))
+            purchase_rows = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
+
+        trader = trader_rows[0] if trader_rows else {}
+        account = account_rows[0] if account_rows else {}
+        purchase = purchase_rows[0] if purchase_rows else {}
+
+        pool_rows = []
+        if account.get("mt5_pool_id"):
+            pool_rows = supabase.table("mt5_pool").select("*").eq("id", account.get("mt5_pool_id")).limit(1).execute().data or []
+        mt5_pool = pool_rows[0] if pool_rows else {}
+
+        active_account_old_login = []
+        purchase_old_login = []
+        if old_login:
+            active_account_old_login = (
+                supabase.table("trader_accounts")
+                .select("id,trader_id,purchase_id,account_status,stage,mt5_login,archived_at")
+                .eq("mt5_login", old_login)
+                .in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
+                .limit(50)
+                .execute()
+                .data
+                or []
+            )
+            purchase_old_login = (
+                supabase.table("challenge_purchases")
+                .select("id,trader_id,status,lifecycle_state,trader_account_id,mt5_login,mt5_pool_id")
+                .eq("mt5_login", old_login)
+                .limit(50)
+                .execute()
+                .data
+                or []
+            )
+
+        account_status = str(account.get("account_status") or account.get("status") or "").lower()
+        trader_state = str(trader.get("challenge_state") or trader.get("status") or "").lower()
+        purchase_login = str(purchase.get("mt5_login") or "").strip()
+        trader_login = str(trader.get("mt5_login") or "").strip()
+        purchase_clear = bool(purchase) and not purchase_login and not str(purchase.get("assigned_mt5_id") or "").strip()
+        trader_waiting = bool(trader) and "waiting" in trader_state and not trader_login and not str(trader.get("current_account_id") or "").strip()
+        selected_archived = bool(account) and account_status.startswith("archived_") and bool(account.get("archived_at"))
+        old_login_in_active_account = len(active_account_old_login) > 0
+        old_login_in_purchase = len(purchase_old_login) > 0
+
+        complete = selected_archived and purchase_clear and trader_waiting and not old_login_in_active_account and not old_login_in_purchase
+
+        return _np_ok({
+            "success": True,
+            "overall_result": "RESET_COMPLETE" if complete else "RESET_INCOMPLETE",
+            "trader_id": trader_id,
+            "trader_account_id": account_id,
+            "purchase_id": purchase_id,
+            "old_mt5_login": old_login,
+            "selected_account_status": account_status or None,
+            "archive_status": {
+                "archived_at": account.get("archived_at"),
+                "archive_reason": account.get("archive_reason"),
+                "monitoring_enabled": account.get("monitoring_enabled"),
+            },
+            "current_phase": trader.get("phase") or account.get("stage") or purchase.get("stage"),
+            "purchase_challenge_state": purchase.get("lifecycle_state") or purchase.get("status"),
+            "purchase_mt5_fields": {
+                "mt5_login": purchase.get("mt5_login"),
+                "mt5_server": purchase.get("mt5_server"),
+                "assigned_mt5_id": purchase.get("assigned_mt5_id"),
+                "trader_account_id": purchase.get("trader_account_id"),
+            },
+            "trader_mirror_mt5_fields": {
+                "mt5_login": trader.get("mt5_login"),
+                "mt5_server": trader.get("mt5_server"),
+                "current_account_id": trader.get("current_account_id"),
+                "challenge_state": trader.get("challenge_state"),
+                "monitoring_enabled": trader.get("monitoring_enabled"),
+                "mt5_access_disabled": trader.get("mt5_access_disabled"),
+            },
+            "mt5_pool_status": mt5_pool.get("status"),
+            "any_active_account_still_uses_old_login": old_login_in_active_account,
+            "active_accounts_using_old_login": active_account_old_login,
+            "any_purchase_still_uses_old_login": old_login_in_purchase,
+            "purchases_using_old_login": purchase_old_login,
+            "trader_correctly_waiting_for_fresh_mt5": trader_waiting,
+        })
     except Exception as e:
         return _np_fail(e, 500)
 
