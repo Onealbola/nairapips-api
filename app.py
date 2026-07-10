@@ -1609,17 +1609,23 @@ def _dashboard_payload_for_trader(trader):
 
 
 
+
 @app.route("/admin_reset_trader_account", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_account", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
 def admin_reset_trader_account():
-    """OPTION 2: Archive old account, lock old MT5, then optionally assign a fresh MT5.
+    """CLEAN RESET ACCOUNT — production-safe and deterministic.
 
-    This is the production-safe reset:
-    - Old account is kept as permanent history.
-    - Old MT5 is NOT reused automatically.
-    - Trader is moved to waiting-for-MT5 if no fresh MT5 is supplied.
-    - If mt5_id is supplied, a fresh MT5 account is assigned immediately.
+    Reset means:
+    1. Archive the trader's CURRENT active MT5 account.
+    2. Lock that old MT5 away as history.
+    3. Clear MT5 credentials from the trader row.
+    4. Move the trader to waiting-for-new-MT5 for the SAME stage.
+    5. Do NOT auto-assign another MT5.
+    6. Do NOT mark funded.
+    7. Do NOT reuse any MT5.
+
+    Fresh assignment must be done separately from Phase Assignment / MT5 Pool.
     """
     if request.method == "OPTIONS":
         return _np_ok({})
@@ -1630,64 +1636,43 @@ def admin_reset_trader_account():
         return _np_fail("Trader ID is required")
 
     staff = _admin_from_payload(data)
-    reset_type = str(data.get("reset_type") or data.get("reason") or "admin_decision").strip()
+    reset_type = str(data.get("reset_type") or data.get("reason") or "admin_reset").strip()
     admin_note = str(
         data.get("admin_note")
         or data.get("reset_reason")
-        or data.get("mt5_reset_reason")
-        or "Account archived and reset approved by admin."
+        or "Account reset by admin."
     ).strip()
-    fresh_mt5_id = str(data.get("mt5_id") or data.get("fresh_mt5_id") or "").strip()
 
     try:
         trader = get_trader_by_id(trader_id)
         if not trader:
             return _np_fail("Trader not found", 404)
 
-        # Find the exact account to close: active first, current_account_id second, latest account third.
         account = _get_active_account(trader_id, trader)
 
+        # If no active account exists, do not guess from history.
+        # This prevents an old archived account from being reset again or moving the trader wrongly.
         if not account:
-            current_account_id = str(trader.get("current_account_id") or "").strip()
-            if current_account_id:
-                try:
-                    rows = supabase.table("trader_accounts").select("*").eq("id", current_account_id).limit(1).execute().data or []
-                    if rows:
-                        account = _decorate_account_for_api(rows[0])
-                except Exception as e:
-                    print("OPTION2 RESET CURRENT ACCOUNT FETCH ERROR:", e)
+            state = str(trader.get("challenge_state") or trader.get("status") or "").strip().lower()
+            if "waiting" in state:
+                return _np_ok({
+                    "success": True,
+                    "message": "Trader already has no active MT5 and is waiting for assignment.",
+                    "data": trader,
+                    "current_account": None,
+                })
+            return _np_fail("No active MT5 account found to reset. Assign an MT5 first.", 409)
 
-        if not account:
-            try:
-                rows = (
-                    supabase.table("trader_accounts")
-                    .select("*")
-                    .eq("trader_id", trader_id)
-                    .order("updated_at", desc=True)
-                    .order("created_at", desc=True)
-                    .limit(1)
-                    .execute()
-                    .data
-                    or []
-                )
-                if rows:
-                    account = _decorate_account_for_api(rows[0])
-            except Exception as e:
-                print("OPTION2 RESET LATEST ACCOUNT FETCH ERROR:", e)
-
-        if not account:
-            return _np_fail("No trader account found to archive/reset. Assign an MT5 account first.", 409)
-
-        now = now_iso()
         stage = str(account.get("stage") or trader.get("phase") or "phase1").strip().lower()
         if stage not in {"phase1", "phase2", "funded"}:
             stage = "phase1"
 
-        reason = f"RESET OPTION 2 — {reset_type}: {admin_note}"
+        now = now_iso()
+        reason = f"ADMIN RESET — {reset_type}: {admin_note}"
+        old_login = str(account.get("mt5_login") or trader.get("mt5_login") or "").strip()
+        start_balance = clean(account.get("start_balance") or account.get("account_size") or trader.get("account_size") or 0)
 
-        # 1) Archive exact old account permanently.
-        # Use existing DB-approved archive statuses.
-        # Do not create new account_status values because Supabase has a CHECK constraint.
+        # 1. Archive exactly the current account.
         archived = _archive_specific_account(
             account,
             reason,
@@ -1696,7 +1681,7 @@ def admin_reset_trader_account():
             archive_status=_archive_status_for_stage(stage, breached=False)
         )
 
-        # 2) Lock old MT5 pool row so the same login is not reused accidentally.
+        # 2. Lock old MT5 pool row; never put it back to available.
         try:
             if account.get("mt5_pool_id"):
                 supabase.table("mt5_pool").update({
@@ -1711,16 +1696,24 @@ def admin_reset_trader_account():
                     "admin_note": reason,
                 }).eq("id", account.get("mt5_pool_id")).execute()
         except Exception as e:
-            print("OPTION2 RESET MT5 LOCK ERROR:", e)
+            print("RESET MT5 POOL LOCK ERROR:", e)
 
-        waiting_state = f"{stage}_waiting_mt5"
+        # 3. Keep same stage, but remove active MT5. Do NOT jump to funded and do NOT assign.
+        if stage == "phase1":
+            waiting_state = "phase1_waiting_mt5"
+            phase_value = "phase1"
+        elif stage == "phase2":
+            waiting_state = "phase2_waiting_mt5"
+            phase_value = "phase2"
+        else:
+            waiting_state = "funded_waiting_mt5"
+            phase_value = "funded_waiting"
 
-        # 3) Move trader away from old MT5 credentials while keeping identity/purchase history.
-        trader_waiting_update = {
+        trader_update = {
             "current_account_id": None,
             "challenge_state": waiting_state,
             "status": "active",
-            "phase": stage,
+            "phase": phase_value,
             "mt5_login": "",
             "mt5_server": "",
             "mt5_master_password": "",
@@ -1728,8 +1721,8 @@ def admin_reset_trader_account():
             "master_password": "",
             "mt5_investor_password": "",
             "investor_password": "",
-            "balance": clean(account.get("start_balance") or account.get("account_size") or trader.get("account_size") or 0),
-            "equity": clean(account.get("start_balance") or account.get("account_size") or trader.get("account_size") or 0),
+            "balance": start_balance,
+            "equity": start_balance,
             "profit": 0,
             "profit_percent": 0,
             "drawdown": 0,
@@ -1739,6 +1732,7 @@ def admin_reset_trader_account():
             "monitoring_enabled": False,
             "mt5_account_active": False,
             "mt5_access_disabled": True,
+            "payout_eligible": False,
             "payout_blocked": False,
             "admin_note": reason,
             "mt5_reset_reason": admin_note,
@@ -1747,88 +1741,51 @@ def admin_reset_trader_account():
             "lifecycle_updated_at": now,
             "updated_at": now,
         }
-        supabase.table("traders").update(trader_waiting_update).eq("id", trader_id).execute()
+
+        result = supabase.table("traders").update(trader_update).eq("id", trader_id).execute().data or []
+        updated = result[0] if result else get_trader_by_id(trader_id)
+
+        # 4. Ledger/audit evidence only. Failure must not block reset.
+        try:
+            supabase.table("monitoring_events").insert({
+                "trader_id": trader_id,
+                "trader_account_id": account.get("id"),
+                "mt5_login": old_login,
+                "event_type": "admin_clean_account_reset",
+                "risk_zone": "waiting_mt5",
+                "message": f"Admin reset completed. Old MT5 archived. Trader waiting for fresh MT5. Reason: {reason}",
+                "dd_used_percent": 0,
+                "max_drawdown_used": 0,
+                "balance": start_balance,
+                "equity": start_balance,
+                "created_at": now,
+            }).execute()
+        except Exception as e:
+            print("RESET EVENT LOG ERROR:", e)
 
         _log_lifecycle_event(
             trader_id,
             account.get("id"),
             str(account.get("account_status") or ""),
             waiting_state,
-            "admin_reset_archive_old_account",
+            "admin_clean_reset_account",
             reason,
             staff,
         )
-
-        # 4) If admin selected a fresh MT5, assign it immediately using existing lifecycle assignment.
-        new_account = None
-        updated_trader = get_trader_by_id(trader_id)
-
-        if fresh_mt5_id:
-            mt5 = _get_mt5_account(mt5_id=fresh_mt5_id)
-            if not mt5:
-                return _np_fail("Fresh MT5 account not found. Old account has been archived and trader is waiting for MT5.", 404)
-            try:
-                _assert_mt5_never_used(mt5)
-            except Exception as used_err:
-                return _np_fail(f"Selected fresh MT5 rejected: {used_err}. Old account has been archived and trader is waiting for MT5.", 409)
-
-            # Use a purchase/account_size bridge only if needed. _assign_mt5_to_trader accepts purchase=None.
-            new_account, updated_trader = _assign_mt5_to_trader(
-                updated_trader or trader,
-                mt5,
-                stage,
-                purchase=None,
-                staff=staff,
-                note=f"Fresh MT5 assigned after reset. {reason}"
-            )
-            _log_lifecycle_event(
-                trader_id,
-                new_account.get("id"),
-                waiting_state,
-                _active_state_for_stage(stage),
-                "admin_reset_assign_fresh_mt5",
-                f"Fresh MT5 {mt5.get('mt5_login')} assigned. {reason}",
-                staff,
-            )
-
-        # 5) Monitoring evidence.
-        try:
-            supabase.table("monitoring_events").insert({
-                "trader_id": trader_id,
-                "trader_account_id": (new_account or archived or account).get("id"),
-                "mt5_login": (new_account or {}).get("mt5_login") or account.get("mt5_login") or trader.get("mt5_login"),
-                "event_type": "admin_reset_option2_archive_fresh_mt5",
-                "risk_zone": "safe" if new_account else "waiting_mt5",
-                "message": (
-                    f"Old account archived. "
-                    f"{'Fresh MT5 assigned: '+str((new_account or {}).get('mt5_login')) if new_account else 'Trader waiting for fresh MT5.'} "
-                    f"Type: {reset_type}. Reason: {admin_note}"
-                ),
-                "dd_used_percent": 0,
-                "max_drawdown_used": 0,
-                "balance": clean((new_account or {}).get("current_balance") or account.get("start_balance") or account.get("account_size") or 0),
-                "equity": clean((new_account or {}).get("current_equity") or account.get("start_balance") or account.get("account_size") or 0),
-                "created_at": now,
-            }).execute()
-        except Exception as e:
-            print("OPTION2 RESET MONITORING EVENT ERROR:", e)
-
         _audit_safe(
             "trader",
-            "admin_reset_option2_archive_fresh_mt5",
-            f"Trader {trader_id}. Old account {account.get('id')} archived. Fresh MT5={fresh_mt5_id or 'none'}. Reason={reason}",
+            "admin_clean_reset_account",
+            f"Trader {trader_id}. Old MT5 {old_login} archived. Waiting state={waiting_state}. Reason={reason}",
             staff,
             trader_id,
         )
 
-        final_trader = updated_trader or get_trader_by_id(trader_id)
         return _np_ok({
             "success": True,
-            "message": "Old account archived. Fresh MT5 assigned." if new_account else "Old account archived. Trader is waiting for fresh MT5 assignment.",
-            "data": final_trader,
+            "message": "Account reset complete. Old MT5 archived. Trader is now waiting for fresh MT5 assignment.",
+            "data": updated,
             "archived_account": archived,
-            "new_account": new_account,
-            "current_account": _get_active_account(trader_id, final_trader),
+            "current_account": None,
         })
 
     except Exception as e:
@@ -3506,61 +3463,6 @@ def update_trader():
         tid = d.get("id") or d.get("trader_id")
         if not tid:
             return bad("Missing trader id")
-
-        # ------------------------------------------------------------------
-        # Backward-compatible lifecycle bridge for existing admin buttons.
-        # The admin UI still calls /update_trader for buttons like:
-        #   Pass Phase 1, Mark Funded, Mark Breached.
-        # Those fields are protected below, so route them through the proper
-        # lifecycle functions instead of failing with the lock message.
-        # ------------------------------------------------------------------
-        lifecycle_keys = {"status", "phase", "challenge_state", "phase_pass_status"}
-        if any(k in d for k in lifecycle_keys):
-            try:
-                staff = _admin_from_payload(d)
-                note = d.get("admin_note") or d.get("note") or "Admin lifecycle action"
-                status_value = str(d.get("status") or "").strip().lower()
-                phase_value = str(d.get("phase") or "").strip().lower()
-                pass_value = str(d.get("phase_pass_status") or "").strip().lower()
-
-                trader = get_trader_by_id(tid)
-                if not trader:
-                    return bad("Trader not found", 404)
-
-                active_account = _get_active_account(tid, trader)
-                active_stage = str((active_account or {}).get("stage") or trader.get("phase") or "").strip().lower()
-                current_state = str(trader.get("challenge_state") or trader.get("status") or "").strip().lower()
-
-                # Mark Breached
-                if status_value == "breached" or phase_value == "breached" or d.get("challenge_state") == "breached":
-                    updated, archived = _breach_specific_account(trader, active_account, note or "Admin marked account breached", staff) if active_account else (_breach_trader_account(tid, note or "Admin marked account breached", staff), None)
-                    return ok({"trader": updated, "archived_account": archived}, "Trader marked breached through lifecycle route")
-
-                # Pass Phase 1 -> Waiting for Phase 2 MT5
-                if pass_value in {"phase1_passed", "passed", "target_hit"}:
-                    if active_account and str(active_account.get("stage") or "").lower() == "phase1":
-                        updated, archived = _pass_specific_account(trader, active_account, "phase1_passed", staff, note or "Phase 1 passed by admin")
-                        return ok({"trader": updated, "archived_account": archived}, "Phase 1 passed through lifecycle route")
-                    if current_state in {"phase2_waiting_mt5", "phase1_passed"}:
-                        return ok({"trader": trader}, "Trader is already waiting for Phase 2 MT5")
-                    return bad("No active Phase 1 account found to pass", 409)
-
-                # Pass Phase 2 / Mark Funded -> Waiting for Funded MT5
-                # The old admin button sends status='funded'. Do not force a funded
-                # live state without assigning funded MT5. If Phase 2 is active, archive
-                # it and move the trader to funded_waiting_mt5.
-                if status_value in {"funded", "live"} or pass_value == "phase2_passed":
-                    if active_account and str(active_account.get("stage") or "").lower() == "phase2":
-                        updated, archived = _pass_specific_account(trader, active_account, "phase2_passed", staff, note or "Phase 2 passed by admin")
-                        return ok({"trader": updated, "archived_account": archived}, "Phase 2 passed. Trader is waiting for Funded MT5")
-                    if current_state in {"funded_waiting_mt5", "phase2_passed"}:
-                        return ok({"trader": trader}, "Trader is already waiting for Funded MT5")
-                    if active_account and str(active_account.get("stage") or "").lower() == "funded":
-                        return ok({"trader": trader, "account": active_account}, "Trader already has an active funded account")
-                    return bad("No active Phase 2 account found. Assign/activate Phase 2 before marking funded.", 409)
-
-            except Exception as lifecycle_error:
-                return bad(lifecycle_error, 500)
 
         blocked = {
             "status", "phase", "challenge_state", "phase_pass_status",
