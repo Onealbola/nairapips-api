@@ -876,17 +876,8 @@ def _get_active_account_by_login(mt5_login):
         login = str(mt5_login or "").strip()
         if not login:
             return None
-        rows = supabase.table("trader_accounts").select("*").eq("mt5_login", login).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(10).execute().data or []
-        for row in rows:
-            if _trader_is_waiting_for_mt5(row):
-                continue
-            text = " ".join(str(row.get(k) or "").strip().lower() for k in ["account_status", "status", "stage", "phase", "archive_reason", "risk_zone"])
-            if any(x in text for x in ["archived", "breached", "locked", "disabled", "waiting_mt5", "admin_reset"]):
-                continue
-            if row.get("monitoring_enabled") is False or row.get("mt5_access_disabled") is True:
-                continue
-            return _decorate_account_for_api(row)
-        return None
+        rows = supabase.table("trader_accounts").select("*").eq("mt5_login", login).eq("account_status", "assigned_active").order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(1).execute().data or []
+        return _decorate_account_for_api(rows[0]) if rows else None
     except Exception as e:
         print("ACTIVE ACCOUNT BY LOGIN FETCH ERROR:", e)
         return None
@@ -1673,8 +1664,6 @@ def admin_reset_trader_account():
 
     data = request.get_json(silent=True) or {}
     trader_id = data.get("trader_id") or data.get("id")
-    requested_account_id = data.get("trader_account_id") or data.get("account_id") or data.get("current_account_id")
-    requested_purchase_id = data.get("purchase_id") or data.get("challenge_purchase_id")
     if not trader_id:
         return _np_fail("Trader ID is required")
 
@@ -1691,29 +1680,7 @@ def admin_reset_trader_account():
         if not trader:
             return _np_fail("Trader not found", 404)
 
-        account = None
-        if requested_account_id:
-            account_rows = (
-                supabase.table("trader_accounts")
-                .select("*")
-                .eq("id", requested_account_id)
-                .limit(1)
-                .execute()
-                .data
-                or []
-            )
-            if not account_rows:
-                return _np_fail("Selected trader account was not found. Refresh admin and retry.", 404)
-            account = account_rows[0]
-            if str(account.get("trader_id") or "") != str(trader_id):
-                return _np_fail("Selected trader account does not belong to this trader.", 409)
-            if requested_purchase_id and str(account.get("purchase_id") or "") != str(requested_purchase_id):
-                return _np_fail("Selected trader account does not belong to this purchase.", 409)
-            account_status = str(account.get("account_status") or "").strip().lower()
-            if account_status not in ACTIVE_ACCOUNT_STATUSES:
-                return _np_fail("Selected account is not active and cannot be reset again.", 409)
-        else:
-            account = _get_active_account(trader_id, trader)
+        account = _get_active_account(trader_id, trader)
 
         # If no active account exists, do not guess from history.
         # This prevents an old archived account from being reset again or moving the trader wrongly.
@@ -1733,9 +1700,6 @@ def admin_reset_trader_account():
         requested_stage = str(data.get("reset_stage") or "").strip().lower()
         account_stage = str(account.get("stage") or "").strip().lower()
         trader_phase = str(trader.get("phase") or "").strip().lower()
-
-        if requested_stage and requested_stage in {"phase1", "phase2", "funded"} and account_stage in {"phase1", "phase2", "funded"} and requested_stage != account_stage:
-            return _np_fail("Submitted reset phase does not match the selected account phase.", 409)
 
         if requested_stage in {"phase1", "phase2", "funded"}:
             stage = requested_stage
@@ -1804,7 +1768,7 @@ def admin_reset_trader_account():
 
         # Neutralise only the purchase linked to this reset account.
         # Archive history already preserves the old MT5 credentials.
-        purchase_id = requested_purchase_id or account.get("purchase_id")
+        purchase_id = account.get("purchase_id")
         purchase_waiting_update = {
             "status": "approved",
             "lifecycle_state": waiting_state if "waiting_state" in locals() else f"{stage}_waiting_mt5",
