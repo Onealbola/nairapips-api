@@ -1663,8 +1663,19 @@ def admin_reset_trader_account():
                 })
             return _np_fail("No active MT5 account found to reset. Assign an MT5 first.", 409)
 
-        stage = str(account.get("stage") or trader.get("phase") or "phase1").strip().lower()
-        if stage not in {"phase1", "phase2", "funded"}:
+        # Preserve the exact phase being reset.
+        # Admin sends reset_stage from the visible current account card.
+        requested_stage = str(data.get("reset_stage") or "").strip().lower()
+        account_stage = str(account.get("stage") or "").strip().lower()
+        trader_phase = str(trader.get("phase") or "").strip().lower()
+
+        if requested_stage in {"phase1", "phase2", "funded"}:
+            stage = requested_stage
+        elif account_stage in {"phase1", "phase2", "funded"}:
+            stage = account_stage
+        elif trader_phase in {"phase1", "phase2", "funded"}:
+            stage = trader_phase
+        else:
             stage = "phase1"
 
         now = now_iso()
@@ -1786,6 +1797,8 @@ def admin_reset_trader_account():
             "data": updated,
             "archived_account": archived,
             "current_account": None,
+            "reset_stage": stage,
+            "waiting_state": waiting_state,
         })
 
     except Exception as e:
