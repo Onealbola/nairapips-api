@@ -407,6 +407,109 @@ def _decorate_account_for_api(account):
     return row
 
 
+_TRADER_ACCOUNT_RESPONSE_FIELDS = {
+    "id", "trader_id", "purchase_id", "challenge_purchase_id", "mt5_pool_id",
+    "stage", "phase", "account_status", "status", "challenge_state",
+    "account_size", "start_balance", "current_balance", "current_equity",
+    "balance", "equity", "profit", "profit_percent", "current_profit_percent",
+    "drawdown_percent", "absolute_drawdown_percent", "dd_limit_percent",
+    "dd_used_percent", "max_drawdown_used", "risk_zone", "display_risk_zone",
+    "target_percent", "target_equity", "payout_split", "payout_eligible",
+    "mt5_login", "mt5_server", "mt5_master_password", "mt5_password",
+    "master_password", "mt5_investor_password", "investor_password",
+    "monitoring_enabled", "started_at", "assigned_at", "created_at",
+    "updated_at", "display_assigned_at", "assignment_date", "last_sync_at",
+    "latest_monitoring_snapshot", "latest_monitoring_event", "_source"
+}
+
+_TRADER_PURCHASE_RESPONSE_FIELDS = {
+    "id", "trader_id", "trader_account_id", "plan_id", "plan_name",
+    "account_size", "fee", "original_fee", "discount_percent",
+    "discount_amount", "final_fee", "amount_due", "payment_status",
+    "status", "lifecycle_state", "stage", "phase", "active_stage",
+    "assigned_phase", "mt5_login", "mt5_server", "current_mt5_login",
+    "current_mt5_server", "mt5_master_password", "mt5_password",
+    "master_password", "mt5_investor_password", "investor_password",
+    "assigned_at", "approved_at", "created_at", "updated_at",
+    "rejected_at", "purchase_month", "purchase_year", "account_origin",
+    "source_type", "programme_type", "campaign_id", "grant_id",
+    "referral_reward_id", "competition_id"
+}
+
+_TRADER_PAYOUT_RESPONSE_FIELDS = {
+    "id", "trader_id", "trader_account_id", "trader_name", "mt5_login",
+    "mt5_server", "account_size", "start_balance", "current_balance",
+    "current_equity", "verified_profit", "payout_split", "available_payout",
+    "amount", "profit_share_amount", "payment_method", "method", "bank_name",
+    "account_number", "account_name", "status", "note", "created_at",
+    "updated_at", "approved_at", "rejected_at", "paid_at"
+}
+
+_TRADER_MONITORING_RESPONSE_FIELDS = {
+    "id", "trader_id", "trader_account_id", "mt5_login", "mt5_server",
+    "balance", "equity", "profit", "profit_percent", "current_balance",
+    "current_equity", "current_profit", "current_profit_percent",
+    "dd_used_percent", "max_drawdown_used", "drawdown_percent",
+    "absolute_drawdown_percent", "highest_equity", "lowest_equity",
+    "risk_zone", "phase_pass_status", "pass_status", "event_type",
+    "message", "source", "created_at", "updated_at", "synced_at",
+    "last_sync_at", "target_percent", "target_equity"
+}
+
+_TRADER_TRADE_RESPONSE_FIELDS = {
+    "id", "ticket", "trader_id", "trader_account_id", "mt5_login",
+    "symbol", "type", "side", "volume", "lots", "open_price",
+    "close_price", "profit", "commission", "swap", "opened_at",
+    "closed_at", "open_time", "close_time", "duration", "status",
+    "created_at", "updated_at", "synced_at"
+}
+
+
+def _only_fields(row, allowed):
+    if not isinstance(row, dict):
+        return row
+    return {k: row.get(k) for k in allowed if k in row}
+
+
+def _trader_safe_monitoring_row(row):
+    return _only_fields(row, _TRADER_MONITORING_RESPONSE_FIELDS)
+
+
+def _trader_safe_account_row(row):
+    row = _only_fields(row, _TRADER_ACCOUNT_RESPONSE_FIELDS)
+    if isinstance(row, dict):
+        snap = row.get("latest_monitoring_snapshot")
+        if isinstance(snap, dict):
+            row["latest_monitoring_snapshot"] = _trader_safe_monitoring_row(snap)
+        event = row.get("latest_monitoring_event")
+        if isinstance(event, dict):
+            row["latest_monitoring_event"] = _trader_safe_monitoring_row(event)
+    return row
+
+
+def _trader_safe_purchase_row(row):
+    return _only_fields(row, _TRADER_PURCHASE_RESPONSE_FIELDS)
+
+
+def _trader_safe_payout_row(row):
+    return _only_fields(row, _TRADER_PAYOUT_RESPONSE_FIELDS)
+
+
+def _trader_safe_trade_row(row):
+    return _only_fields(row, _TRADER_TRADE_RESPONSE_FIELDS)
+
+
+def _trader_safe_offer_row(row):
+    if not isinstance(row, dict):
+        return row
+    allowed = {
+        "id", "title", "headline", "message", "body", "content", "cta_text",
+        "cta_url", "image_url", "banner_url", "starts_at", "ends_at",
+        "created_at", "updated_at", "type", "status", "priority"
+    }
+    return _only_fields(row, allowed)
+
+
 
 def _trader_is_waiting_for_mt5(trader):
     """True only when lifecycle says the trader currently has no active MT5."""
@@ -496,13 +599,6 @@ def _sync_identity_fields(trader):
 
 
 def _get_active_account(trader_id, trader=None):
-    """Return the single authoritative active trader_accounts row.
-
-    Reset/waiting lifecycle remains authoritative until a fresh assignment changes
-    the trader back to an active lifecycle. Otherwise, current_account_id wins only
-    when it belongs to this trader and is genuinely active; the newest active row is
-    the fallback. Historical profile phase/pass fields never override a newer row.
-    """
     try:
         if not trader and trader_id:
             try:
@@ -511,48 +607,37 @@ def _get_active_account(trader_id, trader=None):
             except Exception:
                 trader = None
 
-        # Critical reset protection from the current production file.
+        # Reset/waiting lifecycle is the source of truth until a fresh assignment
+        # changes challenge_state back to phase1_active/phase2_active/funded_active.
         if _trader_is_waiting_for_mt5(trader):
             return None
 
-        rows = (
-            supabase.table("trader_accounts")
-            .select("*")
-            .eq("trader_id", trader_id)
-            .in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
-            .order("updated_at", desc=True)
-            .order("started_at", desc=True)
-            .order("created_at", desc=True)
-            .limit(50)
-            .execute().data or []
-        )
+        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
 
-        current_account_id = str((trader or {}).get("current_account_id") or "").strip()
+        current_account_id = (trader or {}).get("current_account_id")
         if current_account_id:
             for row in rows:
-                if str(row.get("id") or "") == current_account_id:
-                    return _decorate_account_for_api(row)
+                if str(row.get("id") or "") == str(current_account_id):
+                    status = str(row.get("account_status") or "").strip().lower()
+                    if status in ACTIVE_ACCOUNT_STATUSES:
+                        return _decorate_account_for_api(row)
             direct_rows = supabase.table("trader_accounts").select("*").eq("id", current_account_id).limit(1).execute().data or []
             if direct_rows:
-                direct = direct_rows[0]
-                if (
-                    str(direct.get("trader_id") or "") == str(trader_id or "")
-                    and str(direct.get("account_status") or "").strip().lower() in ACTIVE_ACCOUNT_STATUSES
-                ):
-                    return _decorate_account_for_api(direct)
+                status = str(direct_rows[0].get("account_status") or "").strip().lower()
+                if status in ACTIVE_ACCOUNT_STATUSES:
+                    return _decorate_account_for_api(direct_rows[0])
 
         if rows:
-            stage_rank = {"funded": 3, "live": 3, "phase2": 2, "phase1": 1}
-            def authoritative_score(row):
-                stamp = _dt_score(row.get("updated_at") or row.get("started_at") or row.get("created_at"))
-                return (stamp, stage_rank.get(str(row.get("stage") or row.get("phase") or "").strip().lower(), 0))
-            return _decorate_account_for_api(max(rows, key=authoritative_score))
+            preferred_stage = _stage_for_lifecycle_state((trader or {}).get("challenge_state"), (trader or {}).get("phase"))
+            for row in rows:
+                if str(row.get("stage") or "").strip().lower() == preferred_stage:
+                    return _decorate_account_for_api(row)
+            return _decorate_account_for_api(rows[0])
 
         return _active_account_from_trader_profile(trader)
     except Exception as e:
         print("ACTIVE ACCOUNT FETCH ERROR:", e)
         return _active_account_from_trader_profile(trader)
-
 
 
 def _purchase_accounts_for_trader(trader, purchases=None):
@@ -779,38 +864,62 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
             out.sort(key=record_score, reverse=True)
             return out
 
+        account_ids = [
+            str((account or {}).get("id") or "").strip()
+            for account in (accounts or [])
+            if str((account or {}).get("id") or "").strip() and not str((account or {}).get("id") or "").strip().startswith("purchase:")
+        ]
+        account_logins = [
+            str((account or {}).get("mt5_login") or "").strip()
+            for account in (accounts or [])
+            if str((account or {}).get("mt5_login") or "").strip()
+        ]
+
+        def chunks(values, size=100):
+            values = list(dict.fromkeys([str(v).strip() for v in values if str(v).strip()]))
+            for idx in range(0, len(values), size):
+                yield values[idx:idx + size]
+
+        def fetch_evidence(table, limit=5000):
+            found = []
+
+            def add_rows(rows):
+                found.extend(rows or [])
+
+            for batch in chunks(account_ids):
+                try:
+                    add_rows(supabase.table(table).select("*").in_("trader_account_id", batch).order("created_at", desc=True).limit(limit).execute().data or [])
+                except Exception as e:
+                    print(f"{table} bulk account evidence fetch failed:", e)
+            for batch in chunks(account_logins):
+                if trader_id:
+                    try:
+                        add_rows(supabase.table(table).select("*").eq("trader_id", trader_id).in_("mt5_login", batch).order("created_at", desc=True).limit(limit).execute().data or [])
+                    except Exception as e:
+                        print(f"{table} bulk trader/login evidence fetch failed:", e)
+                try:
+                    add_rows(supabase.table(table).select("*").in_("mt5_login", batch).order("created_at", desc=True).limit(limit).execute().data or [])
+                except Exception as e:
+                    print(f"{table} bulk login evidence fetch failed:", e)
+            return dedupe_records(found)
+
+        evidence_by_table = {
+            "monitoring_snapshots": fetch_evidence("monitoring_snapshots"),
+            "monitoring_events": fetch_evidence("monitoring_events"),
+        }
+
         def direct_records(table, account, limit=1500):
             account_id = str((account or {}).get("id") or "").strip()
             login = str((account or {}).get("mt5_login") or "").strip()
             found = []
-            if account_id and not account_id.startswith("purchase:"):
-                try:
-                    found += supabase.table(table).select("*").eq("trader_account_id", account_id).order("created_at", desc=True).limit(limit).execute().data or []
-                except Exception as e:
-                    print(f"{table} exact account fetch failed:", e)
-            if trader_id and login:
-                try:
-                    legacy = supabase.table(table).select("*").eq("trader_id", trader_id).eq("mt5_login", login).order("created_at", desc=True).limit(limit).execute().data or []
-                except Exception as e:
-                    print(f"{table} login evidence fetch failed:", e)
-                    legacy = []
-                for record in legacy:
-                    record_account_id = str((record or {}).get("trader_account_id") or "").strip()
-                    if record_account_id and record_account_id == account_id:
-                        found.append(record)
-                    elif not record_account_id and record_belongs_to_account_by_time(record, account):
-                        found.append(record)
-            if login:
-                try:
-                    global_login_rows = supabase.table(table).select("*").eq("mt5_login", login).order("created_at", desc=True).limit(limit).execute().data or []
-                except Exception as e:
-                    print(f"{table} global login evidence fetch failed:", e)
-                    global_login_rows = []
-                for record in global_login_rows:
-                    record_account_id = str((record or {}).get("trader_account_id") or "").strip()
-                    if record_account_id and account_id and record_account_id == account_id:
-                        found.append(record)
-                    elif not record_account_id and record_belongs_to_account_by_time(record, account):
+            for record in evidence_by_table.get(table, []):
+                record_account_id = str((record or {}).get("trader_account_id") or "").strip()
+                record_login = str((record or {}).get("mt5_login") or "").strip()
+                record_trader_id = str((record or {}).get("trader_id") or "").strip()
+                if record_account_id and account_id and record_account_id == account_id:
+                    found.append(record)
+                elif login and record_login == login and not record_account_id and record_belongs_to_account_by_time(record, account):
+                    if not trader_id or not record_trader_id or record_trader_id == str(trader_id):
                         found.append(record)
             return dedupe_records(found)
 
@@ -953,53 +1062,21 @@ def _resolve_trader_for_money_action(data):
 
 
 def _payout_eligibility(trader):
-    """Authoritative payout eligibility used by bootstrap and payout routes.
-
-    The active trader_accounts row is the lifecycle source of truth. Trader mirror
-    fields are repaired best-effort and cannot wrongly lock a legitimate funded
-    account merely because challenge_state is stale.
-    """
     if not trader:
         return False, "Trader not found", None
+    state = str(trader.get("challenge_state") or "").strip().lower()
     account = _get_active_account(trader.get("id"), trader)
+    if state != "funded_active":
+        return False, "Payouts require funded_active lifecycle state.", account
     if not account:
-        return False, "Payouts require an active funded MT5 account.", None
-
-    stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
-    account_status = str(account.get("account_status") or account.get("status") or "").strip().lower()
-    login = str(account.get("mt5_login") or "").strip()
-
-    if stage not in {"funded", "live", "funded_live"}:
+        return False, "Payouts require an active funded MT5 account.", account
+    if str(account.get("stage") or "").lower() != "funded":
         return False, "Payouts require the current active account to be funded stage.", account
-    if account_status not in ACTIVE_ACCOUNT_STATUSES:
-        return False, "Payouts require a genuinely active funded account.", account
-    if not login:
-        return False, "Payouts require an assigned funded MT5 login.", account
+    if str(account.get("account_status") or "").lower() != "assigned_active":
+        return False, "Payouts require an assigned active account.", account
     if _is_truthy(trader.get("payout_blocked")):
         return False, "Payout blocked for this trader.", account
-
-    # Repair stale identity mirrors without making them eligibility authorities.
-    try:
-        repairs = {}
-        if str(trader.get("challenge_state") or "").strip().lower() != "funded_active":
-            repairs["challenge_state"] = "funded_active"
-        if str(trader.get("phase") or "").strip().lower() not in {"funded", "live"}:
-            repairs["phase"] = "funded"
-        if str(trader.get("status") or "").strip().lower() not in {"funded", "live"}:
-            repairs["status"] = "funded"
-        if str(trader.get("current_account_id") or "") != str(account.get("id") or ""):
-            repairs["current_account_id"] = account.get("id")
-        if str(trader.get("mt5_login") or "").strip() != login:
-            repairs["mt5_login"] = login
-        if repairs:
-            repairs["updated_at"] = now_iso()
-            supabase.table("traders").update(repairs).eq("id", trader.get("id")).execute()
-            trader.update(repairs)
-    except Exception as e:
-        print("PAYOUT LIFECYCLE MIRROR REPAIR SKIPPED:", e)
-
     return True, "Payout eligible", account
-
 
 
 def _get_mt5_account(mt5_id=None, mt5_login=None):
@@ -2553,6 +2630,9 @@ def _quick_available_mt5(rows):
 def admin_bootstrap():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     force = str(request.args.get("force") or request.args.get("fresh") or "").lower() in {"1", "true", "yes", "manual"}
     cached_payload = _ADMIN_BOOTSTRAP_CACHE.get("payload") if isinstance(_ADMIN_BOOTSTRAP_CACHE, dict) else None
     cached_ts = float(_ADMIN_BOOTSTRAP_CACHE.get("ts") or 0) if isinstance(_ADMIN_BOOTSTRAP_CACHE, dict) else 0
@@ -2561,17 +2641,18 @@ def admin_bootstrap():
         return _np_ok(cached_payload)
     started = time.time()
 
-    # Keep this intentionally LIGHT. The old version loaded 18 large endpoints and could hang Render.
-    traders_rows = _admin_rest_rows("traders", "created_at", True, 1200)
-    plan_rows = _admin_rest_rows("challenge_plans", "created_at", True, 500)
-    purchase_rows = _admin_rest_rows("challenge_purchases", "created_at", True, 1200)
-    account_rows = _admin_rest_rows("trader_accounts", "updated_at", True, 2500)
-    payout_rows = _admin_rest_rows("payouts", "created_at", True, 800)
-    mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 1200)
-    ticket_rows = _admin_rest_rows("support_tickets", "created_at", True, 500)
-    announcement_rows = _admin_rest_rows("announcements", "created_at", True, 300)
-    snapshot_rows = _admin_rest_rows("monitoring_snapshots", "created_at", True, 2500)
-    event_rows = _admin_rest_rows("monitoring_events", "created_at", True, 1200)
+    # First screen only: keep this genuinely light. Full module data is lazy-loaded
+    # through existing paginated/module endpoints when the admin opens that module.
+    traders_rows = _admin_rest_rows("traders", "created_at", True, 50)
+    plan_rows = _admin_rest_rows("challenge_plans", "created_at", True, 100)
+    purchase_rows = _admin_rest_rows("challenge_purchases", "created_at", True, 50)
+    account_rows = _admin_rest_rows("trader_accounts", "updated_at", True, 100)
+    payout_rows = _admin_rest_rows("payouts", "created_at", True, 25)
+    mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 100)
+    ticket_rows = []
+    announcement_rows = _admin_rest_rows("announcements", "created_at", True, 25)
+    snapshot_rows = []
+    event_rows = _admin_rest_rows("monitoring_events", "created_at", True, 50)
 
     # This queue was already proven working. If it ever fails, admin still loads.
     try:
@@ -2605,8 +2686,8 @@ def admin_bootstrap():
         "phase_assignment_queue": phase_queue_rows,
         "assignment_queue": phase_queue_rows,
 
-        # Breach monitoring evidence is business-critical. Keep trades empty on bootstrap,
-        # but include recent monitoring rows so breached accounts cannot render as funded.
+        # First-screen bootstrap is intentionally small. Monitoring history is lazy-loaded
+        # by monitoring-specific views/endpoints instead of blocking Admin startup.
         "trader_trades": [],
         "trades": [],
         "monitoring_snapshots": snapshot_rows,
@@ -2631,7 +2712,25 @@ def admin_bootstrap():
             "mt5_pool": len(mt5_rows),
             "available_mt5": len(available_mt5_rows),
             "phase_assignment_queue": len(phase_queue_rows),
-        }
+        },
+        "bootstrap_scope": "first_screen_lightweight",
+        "rows_loaded": {
+            "traders": len(traders_rows),
+            "challenge_plans": len(plan_rows),
+            "challenge_purchases": len(purchase_rows),
+            "trader_accounts": len(account_rows),
+            "payouts": len(payout_rows),
+            "mt5_pool": len(mt5_rows),
+            "support_tickets": len(ticket_rows),
+            "announcements": len(announcement_rows),
+            "monitoring_snapshots": len(snapshot_rows),
+            "monitoring_events": len(event_rows),
+        },
+        "module_data_deferred": [
+            "support", "monitoring", "payouts", "mt5_pool", "users_database",
+            "announcements", "full_traders", "full_purchases", "landing_leads",
+            "affiliates"
+        ],
     }
     try:
         _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
@@ -3338,6 +3437,9 @@ def upload_payment_proof():
 
 @app.route("/traders_raw", methods=["GET"])
 def get_traders_raw():
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     try:
         return jsonify(supabase.table("traders").select("*").order("created_at", desc=True).execute().data)
     except Exception as e:
@@ -3345,6 +3447,9 @@ def get_traders_raw():
 
 @app.route("/traders", methods=["GET"])
 def get_traders():
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     try:
         res = supabase.table("traders").select("*").execute()
         rows = getattr(res, "data", []) or []
@@ -3441,7 +3546,68 @@ def _request_trader_auth_token():
     header = request.headers.get("Authorization") or ""
     if header.lower().startswith("bearer "):
         return header.split(" ", 1)[1].strip()
-    return request.headers.get("X-Trader-Auth") or request.args.get("auth_token") or ""
+    return request.headers.get("X-Trader-Auth") or request.args.get("auth_token") or request.args.get("token") or ""
+
+
+def _trader_id_from_auth_token(token):
+    try:
+        raw = base64.urlsafe_b64decode(str(token or "").encode()).decode()
+        tid, ts, sig = raw.split(":", 2)
+        return tid if _verify_trader_auth_token(token, tid) else ""
+    except Exception:
+        return ""
+
+
+def _authenticated_trader_id_for_request(requested_id=None):
+    token = _request_trader_auth_token()
+    authed_id = _trader_id_from_auth_token(token)
+    if not authed_id:
+        return "", "Trader authentication is required"
+    if requested_id and str(requested_id) != str(authed_id):
+        return "", "Trader token does not match requested trader_id"
+    return authed_id, None
+
+
+ADMIN_AUTH_TOKEN_TTL_SECONDS = int(os.getenv("ADMIN_AUTH_TOKEN_TTL_SECONDS", str(12 * 60 * 60)) or str(12 * 60 * 60))
+
+
+def _make_admin_auth_token(staff):
+    staff_id = str((staff or {}).get("id") or (staff or {}).get("username") or "").strip()
+    role = str((staff or {}).get("role") or "admin").strip()
+    ts = str(int(time.time()))
+    body = f"admin:{staff_id}:{role}:{ts}"
+    sig = hmac.new(_trader_auth_secret(), body.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{body}:{sig}".encode()).decode()
+
+
+def _admin_auth_from_token(token):
+    try:
+        raw = base64.urlsafe_b64decode(str(token or "").encode()).decode()
+        prefix, staff_id, role, ts, sig = raw.split(":", 4)
+        if prefix != "admin":
+            return None
+        body = f"{prefix}:{staff_id}:{role}:{ts}"
+        expected = hmac.new(_trader_auth_secret(), body.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        if (time.time() - int(ts)) > ADMIN_AUTH_TOKEN_TTL_SECONDS:
+            return None
+        return {"id": staff_id, "role": role}
+    except Exception:
+        return None
+
+
+def _request_admin_auth():
+    header = request.headers.get("Authorization") or ""
+    token = header.split(" ", 1)[1].strip() if header.lower().startswith("bearer ") else ""
+    return _admin_auth_from_token(token)
+
+
+def _require_admin():
+    admin = _request_admin_auth()
+    if not admin:
+        return None, _np_fail("Admin authentication is required", 401)
+    return admin, None
 
 def _phone_variants(phone):
     raw = str(phone or "").strip()
@@ -3991,6 +4157,11 @@ _TRADER_BOOTSTRAP_CACHE = {}
 _ADMIN_BOOTSTRAP_CACHE = {"ts": 0, "payload": None}
 TRADER_BOOTSTRAP_TTL_SECONDS = 20
 ADMIN_BOOTSTRAP_TTL_SECONDS = 25
+_NP_SYNC_LOCK = __import__("threading").Lock()
+_NP_SYNC_STATE = {"running": False, "started_at": None, "finished_at": None, "last_result": None, "last_error": None}
+NP_SYNC_LOCK_TABLE = os.getenv("NP_SYNC_LOCK_TABLE", "np_system_locks")
+NP_SYNC_LOCK_NAME = "np_unified_mt5_visibility_sync"
+NP_SYNC_LOCK_TTL_SECONDS = int(os.getenv("NP_SYNC_LOCK_TTL_SECONDS", "900") or 900)
 
 _PUBLIC_TRADER_FIELDS = [
     "id", "name", "email", "phone", "status", "role", "created_at", "last_login_at",
@@ -4081,6 +4252,9 @@ def trader_bootstrap():
             trader = _latest_trader_for_lookup(lookup) if lookup else None
         if not trader:
             return bad("Trader not found", 404)
+        token = _request_trader_auth_token()
+        if not _verify_trader_auth_token(token, trader.get("id")):
+            return _np_fail("Trader authentication is required", 401)
 
         key = _cache_key("trader_bootstrap", trader.get("id"), lookup)
         cached = _cache_get(_TRADER_BOOTSTRAP_CACHE, key, TRADER_BOOTSTRAP_TTL_SECONDS)
@@ -4090,22 +4264,43 @@ def trader_bootstrap():
 
         account = _get_active_account(trader.get("id"), trader)
         purchase = _latest_purchase_for_trader(trader)
-        payout_ok, payout_reason, payout_account = _payout_eligibility(trader)
-        if payout_account:
-            account = payout_account
         payload = {
             "success": True,
             "source": "trader_bootstrap_light",
             "generated_at": now_iso(),
             "duration_ms": int((time.time() - started) * 1000),
             "trader": _public_trader_payload(trader),
-            "current_account": account,
-            "active_purchase": purchase,
+            "current_account": _trader_safe_account_row(account) if account else None,
+            "active_purchase": _trader_safe_purchase_row(purchase) if purchase else None,
+            "latest_trades": [],
+            "latest_monitoring": None,
             "payout_eligibility": {
-                "eligible": bool(payout_ok),
-                "reason": payout_reason
+                "eligible": bool(account and str(account.get("stage") or account.get("phase") or "").lower() in {"funded", "live", "funded_live"}),
+                "reason": "Funded/live account required" if not account else "Check payout rules from admin"
             }
         }
+        if account:
+            account_id = str(account.get("id") or "").strip()
+            login = str(account.get("mt5_login") or "").strip()
+            try:
+                q = supabase.table("monitoring_snapshots").select("id,trader_id,trader_account_id,mt5_login,balance,equity,profit,dd_used_percent,max_drawdown_used,risk_zone,created_at,updated_at").order("created_at", desc=True).limit(1)
+                if account_id:
+                    q = q.eq("trader_account_id", account_id)
+                elif login:
+                    q = q.eq("mt5_login", login).eq("trader_id", trader.get("id"))
+                snap_rows = q.execute().data or []
+                payload["latest_monitoring"] = _trader_safe_monitoring_row(snap_rows[0]) if snap_rows else None
+            except Exception as e:
+                print("TRADER BOOTSTRAP LATEST MONITORING ERROR:", e)
+            try:
+                tq = supabase.table("trader_trades").select("*").order("opened_at", desc=True).limit(5)
+                if account_id:
+                    tq = tq.eq("trader_account_id", account_id)
+                elif login:
+                    tq = tq.eq("mt5_login", login).eq("trader_id", trader.get("id"))
+                payload["latest_trades"] = [_trader_safe_trade_row(r) for r in (tq.execute().data or [])]
+            except Exception as e:
+                print("TRADER BOOTSTRAP LATEST TRADES ERROR:", e)
         if account:
             payload["trader"].update({
                 "current_account_id": account.get("id"),
@@ -4121,7 +4316,6 @@ def trader_bootstrap():
         return ok(_cache_set(_TRADER_BOOTSTRAP_CACHE, key, payload), "Trader bootstrap loaded")
     except Exception as e:
         return bad(e)
-
 
 @app.route("/login_trader", methods=["POST"])
 def login_trader():
@@ -4411,8 +4605,47 @@ def delete_plan():
 
 @app.route("/challenge_purchases", methods=["GET"])
 def challenge_purchases():
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     try: return jsonify(supabase.table("challenge_purchases").select("*").order("created_at", desc=True).execute().data)
     except Exception as e: return bad(e)
+
+@app.route("/trader_challenge_purchases", methods=["GET", "OPTIONS"])
+def trader_challenge_purchases():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True, "purchases": []})
+    requested_id = str(request.args.get("trader_id") or "").strip()
+    authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
+    if auth_error:
+        return _np_fail(auth_error, 401)
+    try:
+        trader = _get_trader_by_id(authed_id) or {}
+        rows = []
+        seen = set()
+
+        def add_rows(query):
+            try:
+                for row in query.order("created_at", desc=True).limit(200).execute().data or []:
+                    key = str(row.get("id") or "")
+                    if key and key not in seen:
+                        seen.add(key)
+                        rows.append(row)
+            except Exception as e:
+                print("TRADER PURCHASE SAFE FETCH ERROR:", e)
+
+        add_rows(supabase.table("challenge_purchases").select("*").eq("trader_id", authed_id))
+        email = str(trader.get("email") or "").strip().lower()
+        phone = str(trader.get("phone") or "").strip()
+        if email:
+            add_rows(supabase.table("challenge_purchases").select("*").eq("email", email))
+        if phone:
+            add_rows(supabase.table("challenge_purchases").select("*").eq("phone", phone))
+        rows.sort(key=lambda r: str(r.get("created_at") or r.get("updated_at") or ""), reverse=True)
+        rows = [_trader_safe_purchase_row(r) for r in rows]
+        return _np_ok({"success": True, "purchases": rows, "data": rows, "count": len(rows)})
+    except Exception as e:
+        return _np_fail(e, 500)
 
 @app.route("/create_challenge_purchase", methods=["POST"])
 def create_purchase():
@@ -4801,6 +5034,9 @@ def admin_bulk_resend_pass_emails():
 
 @app.route("/mt5_pool", methods=["GET"])
 def mt5_pool():
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     try: return jsonify(supabase.table("mt5_pool").select("*").order("created_at", desc=True).execute().data)
     except Exception as e: return bad(e)
 
@@ -5081,12 +5317,25 @@ def payouts():
         limit = max(1, min(limit, 1000))
         trader_id = str(request.args.get("trader_id") or "").strip()
         email = str(request.args.get("email") or "").strip().lower()
+        if trader_id or email:
+            authed_id, auth_error = _authenticated_trader_id_for_request(trader_id)
+            if auth_error:
+                return _np_fail(auth_error, 401)
+            trader_id = authed_id
+            trader = _get_trader_by_id(authed_id) or {}
+            email = str(trader.get("email") or email or "").strip().lower()
+        else:
+            admin, auth_response = _require_admin()
+            if auth_response:
+                return auth_response
         q = supabase.table("payouts").select("*")
         if trader_id:
             q = q.eq("trader_id", trader_id)
         elif email:
             q = q.eq("email", email)
         rows = q.order("created_at", desc=True).limit(limit).execute().data or []
+        if trader_id:
+            rows = [_trader_safe_payout_row(r) for r in rows]
         return jsonify(rows)
     except Exception as e:
         return bad(e)
@@ -5307,6 +5556,9 @@ NairaPips Team"""
 
 @app.route("/support_tickets", methods=["GET"])
 def support_tickets():
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     try: return jsonify(supabase.table("support_tickets").select("*").order("created_at", desc=True).execute().data)
     except Exception as e: return bad(e)
 
@@ -6954,71 +7206,157 @@ def users_database_export():
         return bad(e)
 @app.route("/trader_trades", methods=["GET"])
 def get_trader_trades():
-    """Return trade history for one trader/account without hiding archived passed accounts.
+    """Return authorised trade history without cross-trader data exposure.
 
-    Production safety fix:
-    - Dashboard must not rely on trader_id only because some MT5 history rows can be
-      synced before trader_id is attached, especially around Golden Ticket / phase
-      assignment / archive handoff.
-    - Query by trader_id, trader_account_id and mt5_login, then de-dupe by ticket.
-    - Works for active, passed, archived and breached accounts.
+    Access model:
+    - A valid Admin bearer token may use broad or filtered trade queries.
+    - Every non-Admin request must carry a valid Trader bearer token.
+    - Trader identity is derived exclusively from that token.
+    - Supplied trader_id, trader_account_id and MT5 login filters are rejected
+      unless they belong to the authenticated Trader.
+    - Historical passed/archived/breached account trades remain visible to the
+      owning Trader, including legacy rows whose trader_id was not populated.
     """
     try:
-        trader_id = str(request.args.get("trader_id") or "").strip()
+        requested_trader_id = str(request.args.get("trader_id") or "").strip()
         trader_account_id = str(request.args.get("trader_account_id") or "").strip()
         mt5_login_raw = str(request.args.get("mt5_login") or request.args.get("login") or "").strip()
+
         try:
             limit = int(request.args.get("limit", 300))
         except Exception:
             limit = 300
         limit = max(1, min(limit, 1000))
 
-        logins = []
-        if mt5_login_raw:
-            logins = [x.strip() for x in mt5_login_raw.split(",") if x.strip()]
+        requested_logins = sorted({
+            value.strip()
+            for value in mt5_login_raw.split(",")
+            if value.strip()
+        })
 
-        # If only trader_id is supplied, discover all logins/accounts for this trader
-        # so passed/archived account history still appears.
-        if trader_id:
+        # Admin authentication is checked first so Admin filtered searches remain
+        # available and are never misclassified as Trader requests.
+        admin = _request_admin_auth()
+        trader_id = ""
+        allowed_account_ids = set()
+        allowed_logins = set()
+
+        if not admin:
+            trader_id, auth_error = _authenticated_trader_id_for_request(requested_trader_id or None)
+            if auth_error:
+                status = 403 if "does not match" in str(auth_error).lower() else 401
+                return _np_fail(auth_error, status)
+
+            # trader_accounts is the ownership source of truth. Do not filter by
+            # lifecycle status: the owner must retain legitimate historical trade
+            # visibility for archived, passed and breached accounts.
             try:
-                acct_rows = supabase.table("trader_accounts").select("id,mt5_login").eq("trader_id", trader_id).limit(200).execute().data or []
-                for a in acct_rows:
-                    if str(a.get("mt5_login") or "").strip():
-                        logins.append(str(a.get("mt5_login")).strip())
+                account_rows = (
+                    supabase.table("trader_accounts")
+                    .select("id,trader_id,mt5_login")
+                    .eq("trader_id", trader_id)
+                    .limit(1000)
+                    .execute().data or []
+                )
             except Exception as e:
-                print("TRADER TRADES ACCOUNT DISCOVERY ERROR:", e)
+                print("TRADER TRADES OWNERSHIP DISCOVERY ERROR:", e)
+                return _np_fail("Unable to verify trade-account ownership", 503)
+
+            for account in account_rows:
+                account_id = str(account.get("id") or "").strip()
+                login = str(account.get("mt5_login") or "").strip()
+                if account_id:
+                    allowed_account_ids.add(account_id)
+                if login:
+                    allowed_logins.add(login)
+
+            if trader_account_id and trader_account_id not in allowed_account_ids:
+                return _np_fail("Requested trader_account_id does not belong to the authenticated Trader", 403)
+
+            foreign_logins = [login for login in requested_logins if login not in allowed_logins]
+            if foreign_logins:
+                return _np_fail("One or more requested MT5 logins do not belong to the authenticated Trader", 403)
 
         rows = []
-        def add_query(q):
+
+        def add_query(query):
             try:
-                data = q.order("opened_at", desc=True).limit(limit).execute().data or []
+                data = query.order("opened_at", desc=True).limit(limit).execute().data or []
                 rows.extend(data)
             except Exception as e:
                 print("TRADER TRADES QUERY ERROR:", e)
 
-        if trader_id:
-            add_query(supabase.table("trader_trades").select("*").eq("trader_id", trader_id))
-        if trader_account_id:
-            add_query(supabase.table("trader_trades").select("*").eq("trader_account_id", trader_account_id))
-        for login in sorted(set(logins)):
-            add_query(supabase.table("trader_trades").select("*").eq("mt5_login", login))
+        if admin:
+            # Admin bearer authentication authorises broad and filtered operational views.
+            if requested_trader_id:
+                add_query(supabase.table("trader_trades").select("*").eq("trader_id", requested_trader_id))
+            if trader_account_id:
+                add_query(supabase.table("trader_trades").select("*").eq("trader_account_id", trader_account_id))
+            for login in requested_logins:
+                add_query(supabase.table("trader_trades").select("*").eq("mt5_login", login))
+            if not requested_trader_id and not trader_account_id and not requested_logins:
+                add_query(supabase.table("trader_trades").select("*"))
+        else:
+            # Always include the direct ownership query for modern rows.
+            direct_query = supabase.table("trader_trades").select("*").eq("trader_id", trader_id)
+            if trader_account_id:
+                direct_query = direct_query.eq("trader_account_id", trader_account_id)
+            if len(requested_logins) == 1:
+                direct_query = direct_query.eq("mt5_login", requested_logins[0])
+            add_query(direct_query)
 
-        # Fallback only when no filter is provided; do not leak all rows into normal dashboard calls.
-        if not rows and not trader_id and not trader_account_id and not logins:
-            add_query(supabase.table("trader_trades").select("*"))
+            # Legacy rows can lack trader_id. Query only identifiers already proven
+            # through trader_accounts ownership, then post-filter every returned row.
+            legacy_account_ids = [trader_account_id] if trader_account_id else sorted(allowed_account_ids)
+            legacy_logins = requested_logins if requested_logins else sorted(allowed_logins)
+
+            for account_id in legacy_account_ids:
+                add_query(
+                    supabase.table("trader_trades")
+                    .select("*")
+                    .eq("trader_account_id", account_id)
+                )
+            for login in legacy_logins:
+                add_query(
+                    supabase.table("trader_trades")
+                    .select("*")
+                    .eq("mt5_login", login)
+                )
 
         seen = set()
         out = []
-        for r in rows:
-            key = str(r.get("ticket") or r.get("id") or "")
+        for row in rows:
+            if not admin:
+                row_trader_id = str(row.get("trader_id") or "").strip()
+                row_account_id = str(row.get("trader_account_id") or "").strip()
+                row_login = str(row.get("mt5_login") or "").strip()
+
+                owned = (
+                    row_trader_id == trader_id
+                    or (row_account_id and row_account_id in allowed_account_ids)
+                    or (row_login and row_login in allowed_logins)
+                )
+                if not owned:
+                    # Defence in depth: never return a row that cannot be tied back
+                    # to the authenticated Trader, even if a database query behaves
+                    # unexpectedly or contains inconsistent legacy data.
+                    continue
+
+                if trader_account_id and row_account_id != trader_account_id:
+                    continue
+                if requested_logins and row_login not in requested_logins:
+                    continue
+
+            key = str(row.get("ticket") or row.get("id") or "")
             if key and key in seen:
                 continue
             if key:
                 seen.add(key)
-            out.append(r)
+            out.append(row if admin else _trader_safe_trade_row(row))
 
         def _score(row):
             return str(row.get("closed_at") or row.get("opened_at") or row.get("synced_at") or row.get("created_at") or "")
+
         out.sort(key=_score, reverse=True)
         return jsonify(out[:limit])
 
@@ -7027,6 +7365,15 @@ def get_trader_trades():
 @app.route("/monitoring_events", methods=["GET"])
 def monitoring_events():
     trader_id = request.args.get("trader_id")
+    if trader_id:
+        authed_id, auth_error = _authenticated_trader_id_for_request(trader_id)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+        trader_id = authed_id
+    else:
+        admin, auth_response = _require_admin()
+        if auth_response:
+            return auth_response
     try:
         limit = int(request.args.get("limit", 1000))
     except Exception:
@@ -7036,11 +7383,23 @@ def monitoring_events():
     if trader_id:
         query = query.eq("trader_id", trader_id)
     res = query.execute()
-    return jsonify(getattr(res, "data", []) or [])
+    rows = getattr(res, "data", []) or []
+    if trader_id:
+        rows = [_trader_safe_monitoring_row(r) for r in rows]
+    return jsonify(rows)
 
 @app.route("/monitoring_snapshots", methods=["GET"])
 def monitoring_snapshots():
     trader_id = request.args.get("trader_id")
+    if trader_id:
+        authed_id, auth_error = _authenticated_trader_id_for_request(trader_id)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+        trader_id = authed_id
+    else:
+        admin, auth_response = _require_admin()
+        if auth_response:
+            return auth_response
     try:
         limit = int(request.args.get("limit", 1000))
     except Exception:
@@ -7050,7 +7409,10 @@ def monitoring_snapshots():
     if trader_id:
         query = query.eq("trader_id", trader_id)
     res = query.execute()
-    return jsonify(getattr(res, "data", []) or [])
+    rows = getattr(res, "data", []) or []
+    if trader_id:
+        rows = [_trader_safe_monitoring_row(r) for r in rows]
+    return jsonify(rows)
 
 @app.route("/breach_evidence/<trader_id>", methods=["GET"])
 def breach_evidence(trader_id):
@@ -7276,6 +7638,9 @@ def debug_supabase():
         }), 500
 @app.route("/api/admin/traders", methods=["GET"])
 def get_admin_traders():
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     try:
         response = supabase.table("traders").select("*").execute()
 
@@ -7432,6 +7797,9 @@ def reset_referral_settings():
 
 @app.get('/staff_members')
 def staff_members():
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     try:
         res = supabase.table('admin_staff_members').select('*').order('created_at', desc=True).execute()
         rows = res.data or []
@@ -7457,7 +7825,7 @@ def staff_login():
         supabase.table('admin_staff_members').update({'last_login_at': 'now()'}).eq('id', staff['id']).execute()
         audit_log(staff, 'auth', 'login', 'Staff logged in')
         staff.pop('password', None)
-        return jsonify({'success': True, 'staff': staff})
+        return jsonify({'success': True, 'staff': staff, 'token': _make_admin_auth_token(staff)})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -9384,6 +9752,9 @@ def admin_v2_health():
 def admin_v2_summary():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     started = time.time()
     counts = _v2_summary_counts()
     return _np_ok({"success": True, "counts": counts, "duration_ms": int((time.time() - started) * 1000), "generated_at": now_iso()})
@@ -9393,6 +9764,9 @@ def admin_v2_summary():
 def admin_v2_traders():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     payload = _v2_table_page(
         "traders",
         "*",
@@ -9407,6 +9781,9 @@ def admin_v2_traders():
 def admin_v2_accounts():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     stage = str(request.args.get("stage") or "").strip().lower()
     view = str(request.args.get("view") or "active").strip().lower()
     filters = {}
@@ -9445,8 +9822,20 @@ def admin_trader_accounts_feed():
     except Exception:
         limit = 5000
     view = str(request.args.get("view") or "all").strip().lower()
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    if trader_id:
+        authed_id, auth_error = _authenticated_trader_id_for_request(trader_id)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+        trader_id = authed_id
+    else:
+        admin, auth_response = _require_admin()
+        if auth_response:
+            return auth_response
     try:
         query = supabase.table("trader_accounts").select("*").order("updated_at", desc=True).limit(limit)
+        if trader_id:
+            query = query.eq("trader_id", trader_id)
         if view == "active":
             query = query.in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
         rows = query.execute().data or []
@@ -9503,6 +9892,8 @@ def admin_trader_accounts_feed():
             print("ADMIN ACCOUNT FEED MONITORING ENRICH ERROR:", enrich_err)
 
         rows = [_decorate_account_for_api(r) if "_decorate_account_for_api" in globals() else r for r in rows]
+        if trader_id:
+            rows = [_trader_safe_account_row(r) for r in rows]
         return _np_ok({"success": True, "data": rows, "accounts": rows, "trader_accounts": rows, "count": len(rows)})
     except Exception as e:
         return _np_fail(e, 500)
@@ -9608,6 +9999,9 @@ def np_assignment_center():
 def admin_v2_phase1():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     return admin_v2_accounts_stage("phase1")
 
 
@@ -9629,6 +10023,9 @@ def admin_v2_accounts_stage(stage):
 def admin_v2_phase2():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     return admin_v2_accounts_stage("phase2")
 
 
@@ -9636,6 +10033,9 @@ def admin_v2_phase2():
 def admin_v2_funded():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     return admin_v2_accounts_stage("funded")
 
 
@@ -9643,6 +10043,9 @@ def admin_v2_funded():
 def admin_v2_breached():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     page = _v2_page(); limit = _v2_limit(); start = _v2_offset(page, limit); end = start + limit - 1
     q = _v2_q().lower()
     try:
@@ -9660,6 +10063,9 @@ def admin_v2_breached():
 def admin_v2_purchases():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     payload = _v2_table_page("challenge_purchases", "*", order_by=request.args.get("order_by") or "created_at", search_cols=["name", "trader_name", "email", "phone", "status", "payment_status", "mt5_login", "plan_name", "selected_plan"])
     return _np_ok(payload)
 
@@ -9668,6 +10074,9 @@ def admin_v2_purchases():
 def admin_v2_payments():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     payload = _v2_table_page("payments", "*", order_by=request.args.get("order_by") or "created_at", search_cols=["name", "trader_name", "email", "phone", "status", "reference", "payment_reference"])
     return _np_ok(payload)
 
@@ -9676,6 +10085,9 @@ def admin_v2_payments():
 def admin_v2_payouts():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     payload = _v2_table_page("payouts", "*", order_by=request.args.get("order_by") or "created_at", search_cols=["name", "trader_name", "email", "phone", "status", "bank_name", "account_number", "mt5_login"])
     return _np_ok(payload)
 
@@ -9684,6 +10096,9 @@ def admin_v2_payouts():
 def admin_v2_mt5_pool():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     status = str(request.args.get("status") or "").strip().lower()
     filters = {"status": status} if status else {}
     payload = _v2_table_page("mt5_pool", "*", order_by=request.args.get("order_by") or "created_at", filters=filters, search_cols=["mt5_login", "mt5_server", "status", "plan_name", "assigned_trader_name", "assigned_email"])
@@ -9694,6 +10109,9 @@ def admin_v2_mt5_pool():
 def admin_v2_phase_queue():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     try:
         rows = _fetch_phase_assignment_queue()
     except Exception as e:
@@ -9711,6 +10129,9 @@ def admin_v2_phase_queue():
 def admin_v2_trader_360(lookup):
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     try:
         trader = None
         if _is_uuid(lookup):
@@ -9863,55 +10284,40 @@ def _np_sync_account_payload(source, row, trader, now):
         "updated_at": now,
     }
 
-def _np_safe_account_upsert(payload, existing_by_login=None):
-    """Upsert without one Supabase lookup per source row.
-
-    existing_by_login is a preloaded index created by the sync job. This prevents
-    /system_sync_mt5_assignments from exhausting the single Gunicorn worker.
-    """
+def _np_safe_account_upsert(payload, accounts_by_login=None):
     login = _np_sync_text(payload.get("mt5_login"))
     if not login:
         return None, "missing_login"
-
-    if existing_by_login is not None:
-        existing = list(existing_by_login.get(login, []))
-    else:
+    existing = list((accounts_by_login or {}).get(login) or [])
+    if accounts_by_login is None:
         try:
-            existing = supabase.table("trader_accounts").select("*").eq("mt5_login", login).order("updated_at", desc=True).limit(20).execute().data or []
+            existing = supabase.table("trader_accounts").select("*").eq("mt5_login", login).order("updated_at", desc=True).limit(5).execute().data or []
         except Exception as e:
             return None, "lookup_failed:" + str(e)
-
-    owner_id = str(payload.get("trader_id") or "")
-    active = [
-        r for r in existing
-        if _np_sync_lower(r.get("account_status")) in NP_ACTIVE_ACCOUNT_STATUSES
-        and (not owner_id or str(r.get("trader_id") or "") == owner_id)
-    ]
-    foreign_active = [
-        r for r in existing
-        if _np_sync_lower(r.get("account_status")) in NP_ACTIVE_ACCOUNT_STATUSES
-        and owner_id and str(r.get("trader_id") or "") != owner_id
-    ]
+    existing.sort(key=lambda r: str((r or {}).get("updated_at") or (r or {}).get("created_at") or ""), reverse=True)
+    active = [r for r in existing if _np_sync_lower(r.get("account_status")) in NP_ACTIVE_ACCOUNT_STATUSES]
     terminal = [r for r in existing if _np_sync_terminal(r)]
-
-    if foreign_active and not active:
-        return foreign_active[0], "skipped_login_owned_by_other_active_trader"
     if active:
-        row = sorted(active, key=lambda r: _dt_score(r.get("updated_at") or r.get("started_at") or r.get("created_at")), reverse=True)[0]
-        row_id = row.get("id")
-        safe_payload = {k: v for k, v in payload.items() if v not in [None, ""]}
+        row_id = active[0].get("id")
+        safe_payload = {k:v for k,v in payload.items() if v not in [None, ""]}
         try:
             out = supabase.table("trader_accounts").update(safe_payload).eq("id", row_id).execute().data or []
-            updated = out[0] if out else dict(row, **safe_payload)
-            if existing_by_login is not None:
-                existing_by_login[login] = [updated if str(x.get("id")) == str(row_id) else x for x in existing]
-            return updated, "updated_active"
+            row = out[0] if out else dict(active[0], **safe_payload)
+            if accounts_by_login is not None:
+                bucket = accounts_by_login.setdefault(login, [])
+                for idx, existing_row in enumerate(bucket):
+                    if str(existing_row.get("id") or "") == str(row_id):
+                        bucket[idx] = row
+                        break
+                else:
+                    bucket.insert(0, row)
+            return row, "updated_active"
         except Exception as e:
-            return row, "active_update_skipped:" + str(e)
+            return active[0], "active_update_skipped:" + str(e)
     if terminal:
         return terminal[0], "skipped_terminal_existing"
-
     attempts = [payload]
+    # schema-safe fallbacks if optional columns do not exist in Supabase
     optional_sets = [
         ["mt5_password", "master_password", "investor_password", "assigned_at", "mt5_access_disabled"],
         ["purchase_id", "mt5_pool_id", "target_percent", "dd_limit_percent", "dd_used_percent", "absolute_drawdown_percent"],
@@ -9926,129 +10332,238 @@ def _np_safe_account_upsert(payload, existing_by_login=None):
     for candidate in attempts:
         try:
             out = supabase.table("trader_accounts").insert(candidate).execute().data or []
-            created = out[0] if out else candidate
-            if existing_by_login is not None:
-                existing_by_login.setdefault(login, []).insert(0, created)
-            return created, "created"
+            row = out[0] if out else candidate
+            if accounts_by_login is not None:
+                accounts_by_login.setdefault(login, []).insert(0, row)
+            return row, "created"
         except Exception as e:
             last = str(e)
     return None, "insert_failed:" + last
 
+def _np_source_identity(row):
+    source = str((row or {}).get("_np_source") or "").strip()
+    row_id = str((row or {}).get("id") or (row or {}).get("purchase_id") or (row or {}).get("mt5_pool_id") or "").strip()
+    login = _np_sync_text((row or {}).get("mt5_login") or (row or {}).get("login") or (row or {}).get("account_login") or (row or {}).get("account_number"))
+    return "|".join([source, row_id, login])
 
-def _np_unified_mt5_visibility_sync(force_logins=None, lookback_days=45):
-    """Repair visibility using trader_accounts as authority and bounded fallbacks.
 
-    Previous implementation performed a Supabase lookup for every source row and
-    let stale purchases/pool/trader mirrors overwrite current lifecycle. This
-    version preloads once, processes each login once, and only uses fallback rows
-    when no authoritative account exists.
-    """
+def _np_source_priority(row, force_logins=None, lookback_days=45):
+    force_logins = force_logins or set()
+    login = _np_sync_text((row or {}).get("mt5_login") or (row or {}).get("login") or (row or {}).get("account_login") or (row or {}).get("account_number"))
+    score = 0
+    if login and login in force_logins:
+        score += 1_000_000_000
+    if _np_sync_active_signal(row):
+        score += 100_000_000
+    if _np_sync_recent(row, lookback_days):
+        score += 10_000_000
+    if str((row or {}).get("assigned_trader_id") or (row or {}).get("trader_id") or "").strip():
+        score += 1_000_000
+    if _np_sync_terminal(row):
+        score -= 500_000_000
+    score += _dt_score((row or {}).get("updated_at") or (row or {}).get("created_at") or (row or {}).get("assigned_at"))
+    return score
+
+
+def _np_unified_mt5_visibility_sync(force_logins=None, lookback_days=45, max_sources=4000):
     now = now_iso()
     force_logins = {str(x).strip() for x in (force_logins or []) if str(x).strip()}
     traders = _np_sync_rows("traders")
+    account_rows = _np_sync_rows("trader_accounts")
+    purchase_rows = _np_sync_rows("challenge_purchases")
+    mt5_rows = _np_sync_rows("mt5_pool")
     traders_by_id = {str(t.get("id")): t for t in traders if t.get("id")}
     traders_by_email = {str(t.get("email") or "").strip().lower(): t for t in traders if t.get("email")}
     traders_by_phone = {str(t.get("phone") or "").strip(): t for t in traders if t.get("phone")}
-
-    account_rows = _np_sync_rows("trader_accounts")
-    existing_by_login = {}
-    for row in account_rows:
-        login = _np_sync_text(row.get("mt5_login"))
-        if login:
-            existing_by_login.setdefault(login, []).append(row)
-    for rows in existing_by_login.values():
-        rows.sort(key=lambda r: _dt_score(r.get("updated_at") or r.get("started_at") or r.get("created_at")), reverse=True)
-
-    source_rows = []
-    for row in account_rows:
-        rr = dict(row); rr["_np_source"] = "trader_accounts"; source_rows.append(rr)
-    for table in ["challenge_purchases", "mt5_pool", "traders"]:
-        for row in _np_sync_rows(table):
-            rr = dict(row); rr["_np_source"] = table; source_rows.append(rr)
-
-    priority = {"trader_accounts": 0, "challenge_purchases": 1, "mt5_pool": 2, "traders": 3}
-    source_rows.sort(key=lambda r: (priority.get(r.get("_np_source"), 9), -_dt_score(r.get("updated_at") or r.get("assigned_at") or r.get("created_at"))))
-
-    created, updated, skipped, visible = [], [], [], []
-    processed = set()
-    for row in source_rows:
+    purchases_by_id = {str(p.get("id") or ""): p for p in purchase_rows if p.get("id")}
+    pools_by_id = {str(m.get("id") or ""): m for m in mt5_rows if m.get("id")}
+    accounts_by_login = {}
+    for account in account_rows:
+        account_login = _np_sync_text(account.get("mt5_login"))
+        if account_login:
+            accounts_by_login.setdefault(account_login, []).append(account)
+    for account_bucket in accounts_by_login.values():
+        account_bucket.sort(key=lambda r: str((r or {}).get("updated_at") or (r or {}).get("created_at") or ""), reverse=True)
+    per_table_found = {}
+    raw_sources = []
+    for table, table_rows in [("trader_accounts", account_rows), ("challenge_purchases", purchase_rows), ("mt5_pool", mt5_rows), ("traders", traders)]:
+        per_table_found[table] = len(table_rows)
+        for r in table_rows:
+            rr = dict(r); rr["_np_source"] = table; raw_sources.append(rr)
+    deduped_sources = {}
+    for row in raw_sources:
+        deduped_sources[_np_source_identity(row)] = row
+    sources = list(deduped_sources.values())
+    sources.sort(key=lambda row: _np_source_priority(row, force_logins, lookback_days), reverse=True)
+    total_sources_found = len(sources)
+    if max_sources:
+        max_sources = max(1, int(max_sources))
+        bounded = sources[:max_sources]
+    else:
+        bounded = sources
+    force_rows = [r for r in sources if _np_sync_text(r.get("mt5_login") or r.get("login") or r.get("account_login") or r.get("account_number")) in force_logins]
+    force_keys = {_np_source_identity(r) for r in force_rows}
+    bounded_keys = {_np_source_identity(r) for r in bounded}
+    for row in force_rows:
+        if _np_source_identity(row) not in bounded_keys:
+            bounded.append(row)
+            bounded_keys.add(_np_source_identity(row))
+    sources = bounded
+    truncated = len(sources) < total_sources_found
+    per_table_processed = {}
+    for row in sources:
+        per_table_processed[row.get("_np_source")] = per_table_processed.get(row.get("_np_source"), 0) + 1
+    created=[]; updated=[]; skipped=[]; visible=[]
+    force_logins_found = set()
+    force_logins_successful = set()
+    force_logins_skipped = []
+    force_logins_failed = []
+    for row in sources:
         source = row.get("_np_source")
         login = _np_sync_text(row.get("mt5_login") or row.get("login") or row.get("account_login") or row.get("account_number"))
         server = _np_sync_text(row.get("mt5_server") or row.get("server") or row.get("account_server"))
+        is_forced = login in force_logins
+        if is_forced:
+            force_logins_found.add(login)
         if not _np_sync_valid_login(login) or not server:
+            if is_forced:
+                force_logins_skipped.append({"login": login, "source": source, "reason": "missing_or_invalid_login_or_server"})
             continue
-        if login in processed:
-            continue
-
-        existing = existing_by_login.get(login, [])
-        existing_active = [r for r in existing if _np_sync_lower(r.get("account_status")) in NP_ACTIVE_ACCOUNT_STATUSES]
-        existing_terminal = [r for r in existing if _np_sync_terminal(r)]
-
-        if source != "trader_accounts":
-            if existing_active:
-                skipped.append({"login": login, "source": source, "reason": "authoritative active account already exists"})
-                processed.add(login)
-                continue
-            if existing_terminal:
-                skipped.append({"login": login, "source": source, "reason": "terminal account history blocks resurrection"})
-                processed.add(login)
-                continue
-            if login not in force_logins and not _np_sync_recent(row, lookback_days):
-                skipped.append({"login": login, "source": source, "reason": "not recent fallback"})
-                processed.add(login)
-                continue
-
         if _np_sync_terminal(row):
-            skipped.append({"login": login, "source": source, "reason": "terminal/dead"})
-            processed.add(login)
-            continue
+            if is_forced:
+                force_logins_skipped.append({"login": login, "source": source, "reason": "terminal/dead"})
+            skipped.append({"login": login, "source": source, "reason": "terminal/dead"}); continue
         if not _np_sync_active_signal(row):
-            skipped.append({"login": login, "source": source, "reason": "no active/approved signal"})
-            processed.add(login)
-            continue
-
+            if is_forced:
+                force_logins_skipped.append({"login": login, "source": source, "reason": "no active/approved signal"})
+            skipped.append({"login": login, "source": source, "reason": "no active/approved signal"}); continue
+        if source not in {"trader_accounts"} and login not in force_logins and not _np_sync_recent(row, lookback_days):
+            skipped.append({"login": login, "source": source, "reason": "not recent fallback"}); continue
         trader = _np_find_trader_for_sync(row, traders_by_id, traders_by_email, traders_by_phone)
-        if not trader and source == "traders":
-            trader = row
-        if not trader or not trader.get("id"):
-            skipped.append({"login": login, "source": source, "reason": "no trader link"})
-            processed.add(login)
-            continue
-
+        if not trader and source == "traders": trader = row
+        if not trader.get("id"):
+            if is_forced:
+                force_logins_skipped.append({"login": login, "source": source, "reason": "no trader link"})
+            skipped.append({"login": login, "source": source, "reason": "no trader link"}); continue
         payload = _np_sync_account_payload(source, row, trader, now)
-        account, action = _np_safe_account_upsert(payload, existing_by_login=existing_by_login)
+        if payload.get("purchase_id") and str(payload.get("purchase_id")) not in purchases_by_id:
+            payload.pop("purchase_id", None)
+        if payload.get("mt5_pool_id") and str(payload.get("mt5_pool_id")) not in pools_by_id:
+            payload.pop("mt5_pool_id", None)
+        account, action = _np_safe_account_upsert(payload, accounts_by_login=accounts_by_login)
         entry = {"login": login, "source": source, "action": action, "trader_id": trader.get("id"), "account_id": (account or {}).get("id")}
         if action.startswith("created"):
             created.append(entry)
+            if is_forced:
+                force_logins_successful.add(login)
         elif action.startswith("updated"):
             updated.append(entry)
+            if is_forced:
+                force_logins_successful.add(login)
+        elif action.startswith("skipped"):
+            skipped.append(entry)
+            if is_forced:
+                force_logins_skipped.append({"login": login, "source": source, "reason": action})
+        elif "failed" in action or "error" in action:
+            skipped.append(entry)
+            if is_forced:
+                force_logins_failed.append({"login": login, "source": source, "reason": action})
         else:
             skipped.append(entry)
-
-        if account and action in {"created", "updated_active"}:
+            if is_forced and account and str((account or {}).get("id") or "").strip():
+                force_logins_successful.add(login)
+            elif is_forced:
+                force_logins_failed.append({"login": login, "source": source, "reason": action})
+        if account and not action.startswith("skipped"):
             visible.append(entry)
+            # also synchronize trader identity/current account fields best-effort
             try:
-                stage = str(account.get("stage") or payload.get("stage") or "phase1").lower()
-                trader_update = {
-                    "current_account_id": account.get("id"),
-                    "mt5_login": login,
-                    "mt5_server": server,
-                    "phase": "funded" if stage in {"funded", "live"} else stage,
-                    "status": "funded" if stage in {"funded", "live"} else "active",
-                    "challenge_state": "funded_active" if stage in {"funded", "live"} else _active_state_for_stage(stage),
-                    "payment_status": "approved",
-                    "monitoring_enabled": True,
-                    "mt5_access_disabled": False,
-                    "updated_at": now,
-                    "mt5_updated_at": now,
-                }
-                supabase.table("traders").update(trader_update).eq("id", trader.get("id")).execute()
+                supabase.table("traders").update({
+                    "current_account_id": account.get("id"), "mt5_login": login, "mt5_server": server,
+                    "phase": payload.get("stage"), "status": "active" if payload.get("stage") not in {"funded", "live"} else "funded",
+                    "payment_status": "approved", "monitoring_enabled": True, "mt5_access_disabled": False,
+                    "updated_at": now, "mt5_updated_at": now
+                }).eq("id", trader.get("id")).execute()
             except Exception as e:
                 print("NP SYNC TRADER UPDATE SKIPPED", e)
-        processed.add(login)
+    return {
+        "created": created,
+        "updated": updated,
+        "skipped": skipped[:250],
+        "visible": visible,
+        "visible_count": len(visible),
+        "total_sources_found": total_sources_found,
+        "processed_sources": len(sources),
+        "skipped_sources": max(0, total_sources_found - len(sources)) + len(skipped),
+        "truncated": bool(truncated),
+        "remaining_sources": max(0, total_sources_found - len(sources)),
+        "per_table_found": per_table_found,
+        "per_table_processed": per_table_processed,
+        "force_logins_requested": sorted(force_logins),
+        "force_logins_found": sorted(force_logins_found),
+        "force_logins_successful": sorted(force_logins_successful),
+        "force_logins_skipped": force_logins_skipped,
+        "force_logins_failed": force_logins_failed,
+        "force_logins_missing": sorted(set(force_logins) - force_logins_found),
+    }
 
-    return {"created": created, "updated": updated, "skipped": skipped[:250], "visible": visible, "visible_count": len(visible)}
 
+def _np_lock_expiry_iso(ttl_seconds=None):
+    ttl = int(ttl_seconds or NP_SYNC_LOCK_TTL_SECONDS)
+    return datetime.fromtimestamp(time.time() + ttl, tz=timezone.utc).isoformat()
+
+
+def _np_acquire_distributed_sync_lock():
+    owner = uuid.uuid4().hex
+    now = now_iso()
+    expires_at = _np_lock_expiry_iso()
+    row = {
+        "lock_name": NP_SYNC_LOCK_NAME,
+        "owner_token": owner,
+        "status": "running",
+        "started_at": now,
+        "updated_at": now,
+        "expires_at": expires_at,
+    }
+    try:
+        inserted = supabase.table(NP_SYNC_LOCK_TABLE).insert(row).execute().data or []
+        if inserted:
+            return owner, None
+    except Exception as insert_err:
+        try:
+            existing = supabase.table(NP_SYNC_LOCK_TABLE).select("*").eq("lock_name", NP_SYNC_LOCK_NAME).limit(1).execute().data or []
+        except Exception as read_err:
+            return None, f"distributed lock unavailable: {read_err}; create {NP_SYNC_LOCK_TABLE} before running production sync"
+        current = existing[0] if existing else {}
+        current_owner = str(current.get("owner_token") or "")
+        current_expires = str(current.get("expires_at") or "")
+        current_status = str(current.get("status") or "").lower()
+        if current_status == "running" and current_expires and _dt_score(current_expires) > time.time():
+            return None, f"sync already running by {current_owner or 'another worker'} until {current_expires}"
+        try:
+            if current_status == "running":
+                refreshed = supabase.table(NP_SYNC_LOCK_TABLE).update(row).eq("lock_name", NP_SYNC_LOCK_NAME).lt("expires_at", now).execute().data or []
+            else:
+                try:
+                    supabase.table(NP_SYNC_LOCK_TABLE).delete().eq("lock_name", NP_SYNC_LOCK_NAME).execute()
+                except Exception:
+                    pass
+                refreshed = supabase.table(NP_SYNC_LOCK_TABLE).insert(row).execute().data or []
+            if refreshed and str((refreshed[0] or {}).get("owner_token") or "") == owner:
+                return owner, None
+        except Exception as update_err:
+            return None, f"could not acquire expired distributed lock: {update_err}"
+        return None, "sync already running or lock changed while acquiring"
+    return None, "distributed lock insert did not return a row"
+
+
+def _np_release_distributed_sync_lock(owner, status="complete", error=None):
+    if not owner:
+        return
+    try:
+        supabase.table(NP_SYNC_LOCK_TABLE).delete().eq("lock_name", NP_SYNC_LOCK_NAME).eq("owner_token", owner).execute()
+    except Exception as e:
+        print("NP SYNC LOCK RELEASE FAILED:", e)
 
 @app.route("/np_unified_mt5_sync", methods=["GET", "POST", "OPTIONS"])
 @app.route("/system_sync_mt5_assignments", methods=["GET", "POST", "OPTIONS"])
@@ -10058,6 +10573,21 @@ def np_unified_mt5_sync_route():
     if request.method == "OPTIONS":
         return _np_ok({"success": True}) if "_np_ok" in globals() else ok({})
     data = request.get_json(silent=True) or {}
+    if request.method == "GET":
+        payload = {
+            "success": True,
+            "read_only": True,
+            "message": "MT5 visibility sync status only. Use POST to run the controlled sync.",
+            "running": bool(_NP_SYNC_STATE.get("running")),
+            "started_at": _NP_SYNC_STATE.get("started_at"),
+            "finished_at": _NP_SYNC_STATE.get("finished_at"),
+            "last_error": _NP_SYNC_STATE.get("last_error"),
+            "last_result_summary": _NP_SYNC_STATE.get("last_result"),
+            "distributed_lock_table": NP_SYNC_LOCK_TABLE,
+            "lock_name": NP_SYNC_LOCK_NAME,
+            "routes": ["/np_unified_mt5_sync", "/system_sync_mt5_assignments", "/admin/np_unified_mt5_sync", "/dashboard/np_unified_mt5_sync"],
+        }
+        return jsonify(payload)
     force = request.args.get("force_logins") or data.get("force_logins") or ""
     if isinstance(force, str):
         force_logins = [x.strip() for x in force.split(",") if x.strip()]
@@ -10066,12 +10596,51 @@ def np_unified_mt5_sync_route():
     else:
         force_logins = []
     lookback = request.args.get("lookback_days") or data.get("lookback_days") or 45
+    max_sources = request.args.get("max_sources") or data.get("max_sources") or 4000
+    owner_token, lock_error = _np_acquire_distributed_sync_lock()
+    if lock_error:
+        return jsonify({
+            "success": False,
+            "code": "sync_already_running" if "already running" in lock_error else "sync_lock_unavailable",
+            "message": lock_error,
+            "running": True,
+            "distributed_lock_table": NP_SYNC_LOCK_TABLE,
+        }), 409
+    if not _NP_SYNC_LOCK.acquire(blocking=False):
+        _np_release_distributed_sync_lock(owner_token, status="local_lock_rejected")
+        return jsonify({
+            "success": False,
+            "code": "sync_already_running_local_worker",
+            "message": "MT5 visibility sync is already running in this worker. Distributed lock was released.",
+            "running": True,
+            "started_at": _NP_SYNC_STATE.get("started_at"),
+        }), 409
     try:
-        result = _np_unified_mt5_visibility_sync(force_logins=force_logins, lookback_days=int(lookback))
-        payload = {"success": True, "message": f"MT5 visibility sync complete: {result.get('visible_count', 0)} account(s) visible/repaired", "data": result}
+        _NP_SYNC_STATE.update({"running": True, "started_at": now_iso(), "finished_at": None, "last_error": None})
+        result = _np_unified_mt5_visibility_sync(force_logins=force_logins, lookback_days=int(lookback), max_sources=int(max_sources))
+        summary = {
+            "created": len(result.get("created") or []),
+            "updated": len(result.get("updated") or []),
+            "visible_count": result.get("visible_count", 0),
+            "skipped": len(result.get("skipped") or []),
+            "truncated": result.get("truncated"),
+            "processed_sources": result.get("processed_sources"),
+            "total_sources_found": result.get("total_sources_found"),
+        }
+        _NP_SYNC_STATE.update({"running": False, "finished_at": now_iso(), "last_result": summary, "last_error": None})
+        msg = "Partial controlled sync" if result.get("truncated") else "MT5 visibility sync complete"
+        payload = {"success": True, "partial": bool(result.get("truncated")), "message": f"{msg}: {result.get('visible_count', 0)} account(s) visible/repaired", "data": result, "summary": summary}
+        _np_release_distributed_sync_lock(owner_token, status="complete")
         return jsonify(payload)
     except Exception as e:
+        _NP_SYNC_STATE.update({"running": False, "finished_at": now_iso(), "last_error": str(e)})
+        _np_release_distributed_sync_lock(owner_token, status="error", error=e)
         return _np_fail(e, 500) if "_np_fail" in globals() else bad(e, 500)
+    finally:
+        try:
+            _NP_SYNC_LOCK.release()
+        except Exception:
+            pass
 
 
 # ================================
@@ -10138,6 +10707,14 @@ def private_offers_for_trader():
         email = _np_offer_clean_str(request.args.get("email"), 250).lower()
         phone = _np_offer_clean_str(request.args.get("phone"), 80)
         account_reference = _np_offer_clean_str(request.args.get("account_reference"), 120)
+        authed_id, auth_error = _authenticated_trader_id_for_request(trader_id)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+        trader = _get_trader_by_id(authed_id) or {}
+        trader_id = authed_id
+        email = str(trader.get("email") or email or "").strip().lower()
+        phone = str(trader.get("phone") or phone or "").strip()
+        account_reference = str(trader.get("account_reference") or account_reference or "").strip()
 
         rows = []
         try:
@@ -10156,7 +10733,7 @@ def private_offers_for_trader():
                 continue
             if not _np_private_offer_matches(row, trader_id, email, phone, account_reference):
                 continue
-            visible.append(row)
+            visible.append(_trader_safe_offer_row(row))
 
         # Return a plain array because older dashboard getJSON() only accepts arrays.
         return jsonify(visible)
