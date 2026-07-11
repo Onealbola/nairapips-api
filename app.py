@@ -496,6 +496,13 @@ def _sync_identity_fields(trader):
 
 
 def _get_active_account(trader_id, trader=None):
+    """Return the single authoritative active trader_accounts row.
+
+    Reset/waiting lifecycle remains authoritative until a fresh assignment changes
+    the trader back to an active lifecycle. Otherwise, current_account_id wins only
+    when it belongs to this trader and is genuinely active; the newest active row is
+    the fallback. Historical profile phase/pass fields never override a newer row.
+    """
     try:
         if not trader and trader_id:
             try:
@@ -504,37 +511,48 @@ def _get_active_account(trader_id, trader=None):
             except Exception:
                 trader = None
 
-        # Reset/waiting lifecycle is the source of truth until a fresh assignment
-        # changes challenge_state back to phase1_active/phase2_active/funded_active.
+        # Critical reset protection from the current production file.
         if _trader_is_waiting_for_mt5(trader):
             return None
 
-        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
+        rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("trader_id", trader_id)
+            .in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
+            .order("updated_at", desc=True)
+            .order("started_at", desc=True)
+            .order("created_at", desc=True)
+            .limit(50)
+            .execute().data or []
+        )
 
-        current_account_id = (trader or {}).get("current_account_id")
+        current_account_id = str((trader or {}).get("current_account_id") or "").strip()
         if current_account_id:
             for row in rows:
-                if str(row.get("id") or "") == str(current_account_id):
-                    status = str(row.get("account_status") or "").strip().lower()
-                    if status in ACTIVE_ACCOUNT_STATUSES:
-                        return _decorate_account_for_api(row)
+                if str(row.get("id") or "") == current_account_id:
+                    return _decorate_account_for_api(row)
             direct_rows = supabase.table("trader_accounts").select("*").eq("id", current_account_id).limit(1).execute().data or []
             if direct_rows:
-                status = str(direct_rows[0].get("account_status") or "").strip().lower()
-                if status in ACTIVE_ACCOUNT_STATUSES:
-                    return _decorate_account_for_api(direct_rows[0])
+                direct = direct_rows[0]
+                if (
+                    str(direct.get("trader_id") or "") == str(trader_id or "")
+                    and str(direct.get("account_status") or "").strip().lower() in ACTIVE_ACCOUNT_STATUSES
+                ):
+                    return _decorate_account_for_api(direct)
 
         if rows:
-            preferred_stage = _stage_for_lifecycle_state((trader or {}).get("challenge_state"), (trader or {}).get("phase"))
-            for row in rows:
-                if str(row.get("stage") or "").strip().lower() == preferred_stage:
-                    return _decorate_account_for_api(row)
-            return _decorate_account_for_api(rows[0])
+            stage_rank = {"funded": 3, "live": 3, "phase2": 2, "phase1": 1}
+            def authoritative_score(row):
+                stamp = _dt_score(row.get("updated_at") or row.get("started_at") or row.get("created_at"))
+                return (stamp, stage_rank.get(str(row.get("stage") or row.get("phase") or "").strip().lower(), 0))
+            return _decorate_account_for_api(max(rows, key=authoritative_score))
 
         return _active_account_from_trader_profile(trader)
     except Exception as e:
         print("ACTIVE ACCOUNT FETCH ERROR:", e)
         return _active_account_from_trader_profile(trader)
+
 
 
 def _purchase_accounts_for_trader(trader, purchases=None):
@@ -935,21 +953,53 @@ def _resolve_trader_for_money_action(data):
 
 
 def _payout_eligibility(trader):
+    """Authoritative payout eligibility used by bootstrap and payout routes.
+
+    The active trader_accounts row is the lifecycle source of truth. Trader mirror
+    fields are repaired best-effort and cannot wrongly lock a legitimate funded
+    account merely because challenge_state is stale.
+    """
     if not trader:
         return False, "Trader not found", None
-    state = str(trader.get("challenge_state") or "").strip().lower()
     account = _get_active_account(trader.get("id"), trader)
-    if state != "funded_active":
-        return False, "Payouts require funded_active lifecycle state.", account
     if not account:
-        return False, "Payouts require an active funded MT5 account.", account
-    if str(account.get("stage") or "").lower() != "funded":
+        return False, "Payouts require an active funded MT5 account.", None
+
+    stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
+    account_status = str(account.get("account_status") or account.get("status") or "").strip().lower()
+    login = str(account.get("mt5_login") or "").strip()
+
+    if stage not in {"funded", "live", "funded_live"}:
         return False, "Payouts require the current active account to be funded stage.", account
-    if str(account.get("account_status") or "").lower() != "assigned_active":
-        return False, "Payouts require an assigned active account.", account
+    if account_status not in ACTIVE_ACCOUNT_STATUSES:
+        return False, "Payouts require a genuinely active funded account.", account
+    if not login:
+        return False, "Payouts require an assigned funded MT5 login.", account
     if _is_truthy(trader.get("payout_blocked")):
         return False, "Payout blocked for this trader.", account
+
+    # Repair stale identity mirrors without making them eligibility authorities.
+    try:
+        repairs = {}
+        if str(trader.get("challenge_state") or "").strip().lower() != "funded_active":
+            repairs["challenge_state"] = "funded_active"
+        if str(trader.get("phase") or "").strip().lower() not in {"funded", "live"}:
+            repairs["phase"] = "funded"
+        if str(trader.get("status") or "").strip().lower() not in {"funded", "live"}:
+            repairs["status"] = "funded"
+        if str(trader.get("current_account_id") or "") != str(account.get("id") or ""):
+            repairs["current_account_id"] = account.get("id")
+        if str(trader.get("mt5_login") or "").strip() != login:
+            repairs["mt5_login"] = login
+        if repairs:
+            repairs["updated_at"] = now_iso()
+            supabase.table("traders").update(repairs).eq("id", trader.get("id")).execute()
+            trader.update(repairs)
+    except Exception as e:
+        print("PAYOUT LIFECYCLE MIRROR REPAIR SKIPPED:", e)
+
     return True, "Payout eligible", account
+
 
 
 def _get_mt5_account(mt5_id=None, mt5_login=None):
@@ -4040,6 +4090,9 @@ def trader_bootstrap():
 
         account = _get_active_account(trader.get("id"), trader)
         purchase = _latest_purchase_for_trader(trader)
+        payout_ok, payout_reason, payout_account = _payout_eligibility(trader)
+        if payout_account:
+            account = payout_account
         payload = {
             "success": True,
             "source": "trader_bootstrap_light",
@@ -4049,8 +4102,8 @@ def trader_bootstrap():
             "current_account": account,
             "active_purchase": purchase,
             "payout_eligibility": {
-                "eligible": bool(account and str(account.get("stage") or account.get("phase") or "").lower() in {"funded", "live", "funded_live"}),
-                "reason": "Funded/live account required" if not account else "Check payout rules from admin"
+                "eligible": bool(payout_ok),
+                "reason": payout_reason
             }
         }
         if account:
@@ -4068,6 +4121,7 @@ def trader_bootstrap():
         return ok(_cache_set(_TRADER_BOOTSTRAP_CACHE, key, payload), "Trader bootstrap loaded")
     except Exception as e:
         return bad(e)
+
 
 @app.route("/login_trader", methods=["POST"])
 def login_trader():
@@ -9809,29 +9863,55 @@ def _np_sync_account_payload(source, row, trader, now):
         "updated_at": now,
     }
 
-def _np_safe_account_upsert(payload):
+def _np_safe_account_upsert(payload, existing_by_login=None):
+    """Upsert without one Supabase lookup per source row.
+
+    existing_by_login is a preloaded index created by the sync job. This prevents
+    /system_sync_mt5_assignments from exhausting the single Gunicorn worker.
+    """
     login = _np_sync_text(payload.get("mt5_login"))
     if not login:
         return None, "missing_login"
-    existing = []
-    try:
-        existing = supabase.table("trader_accounts").select("*").eq("mt5_login", login).order("updated_at", desc=True).limit(5).execute().data or []
-    except Exception as e:
-        return None, "lookup_failed:" + str(e)
-    active = [r for r in existing if _np_sync_lower(r.get("account_status")) in NP_ACTIVE_ACCOUNT_STATUSES]
+
+    if existing_by_login is not None:
+        existing = list(existing_by_login.get(login, []))
+    else:
+        try:
+            existing = supabase.table("trader_accounts").select("*").eq("mt5_login", login).order("updated_at", desc=True).limit(20).execute().data or []
+        except Exception as e:
+            return None, "lookup_failed:" + str(e)
+
+    owner_id = str(payload.get("trader_id") or "")
+    active = [
+        r for r in existing
+        if _np_sync_lower(r.get("account_status")) in NP_ACTIVE_ACCOUNT_STATUSES
+        and (not owner_id or str(r.get("trader_id") or "") == owner_id)
+    ]
+    foreign_active = [
+        r for r in existing
+        if _np_sync_lower(r.get("account_status")) in NP_ACTIVE_ACCOUNT_STATUSES
+        and owner_id and str(r.get("trader_id") or "") != owner_id
+    ]
     terminal = [r for r in existing if _np_sync_terminal(r)]
+
+    if foreign_active and not active:
+        return foreign_active[0], "skipped_login_owned_by_other_active_trader"
     if active:
-        row_id = active[0].get("id")
-        safe_payload = {k:v for k,v in payload.items() if v not in [None, ""]}
+        row = sorted(active, key=lambda r: _dt_score(r.get("updated_at") or r.get("started_at") or r.get("created_at")), reverse=True)[0]
+        row_id = row.get("id")
+        safe_payload = {k: v for k, v in payload.items() if v not in [None, ""]}
         try:
             out = supabase.table("trader_accounts").update(safe_payload).eq("id", row_id).execute().data or []
-            return (out[0] if out else active[0]), "updated_active"
+            updated = out[0] if out else dict(row, **safe_payload)
+            if existing_by_login is not None:
+                existing_by_login[login] = [updated if str(x.get("id")) == str(row_id) else x for x in existing]
+            return updated, "updated_active"
         except Exception as e:
-            return active[0], "active_update_skipped:" + str(e)
+            return row, "active_update_skipped:" + str(e)
     if terminal:
         return terminal[0], "skipped_terminal_existing"
+
     attempts = [payload]
-    # schema-safe fallbacks if optional columns do not exist in Supabase
     optional_sets = [
         ["mt5_password", "master_password", "investor_password", "assigned_at", "mt5_access_disabled"],
         ["purchase_id", "mt5_pool_id", "target_percent", "dd_limit_percent", "dd_used_percent", "absolute_drawdown_percent"],
@@ -9846,41 +9926,97 @@ def _np_safe_account_upsert(payload):
     for candidate in attempts:
         try:
             out = supabase.table("trader_accounts").insert(candidate).execute().data or []
-            return (out[0] if out else candidate), "created"
+            created = out[0] if out else candidate
+            if existing_by_login is not None:
+                existing_by_login.setdefault(login, []).insert(0, created)
+            return created, "created"
         except Exception as e:
             last = str(e)
     return None, "insert_failed:" + last
 
+
 def _np_unified_mt5_visibility_sync(force_logins=None, lookback_days=45):
+    """Repair visibility using trader_accounts as authority and bounded fallbacks.
+
+    Previous implementation performed a Supabase lookup for every source row and
+    let stale purchases/pool/trader mirrors overwrite current lifecycle. This
+    version preloads once, processes each login once, and only uses fallback rows
+    when no authoritative account exists.
+    """
     now = now_iso()
     force_logins = {str(x).strip() for x in (force_logins or []) if str(x).strip()}
     traders = _np_sync_rows("traders")
     traders_by_id = {str(t.get("id")): t for t in traders if t.get("id")}
     traders_by_email = {str(t.get("email") or "").strip().lower(): t for t in traders if t.get("email")}
     traders_by_phone = {str(t.get("phone") or "").strip(): t for t in traders if t.get("phone")}
-    sources = []
-    for table in ["trader_accounts", "challenge_purchases", "mt5_pool", "traders"]:
-        for r in _np_sync_rows(table):
-            rr = dict(r); rr["_np_source"] = table; sources.append(rr)
-    created=[]; updated=[]; skipped=[]; visible=[]
-    for row in sources:
+
+    account_rows = _np_sync_rows("trader_accounts")
+    existing_by_login = {}
+    for row in account_rows:
+        login = _np_sync_text(row.get("mt5_login"))
+        if login:
+            existing_by_login.setdefault(login, []).append(row)
+    for rows in existing_by_login.values():
+        rows.sort(key=lambda r: _dt_score(r.get("updated_at") or r.get("started_at") or r.get("created_at")), reverse=True)
+
+    source_rows = []
+    for row in account_rows:
+        rr = dict(row); rr["_np_source"] = "trader_accounts"; source_rows.append(rr)
+    for table in ["challenge_purchases", "mt5_pool", "traders"]:
+        for row in _np_sync_rows(table):
+            rr = dict(row); rr["_np_source"] = table; source_rows.append(rr)
+
+    priority = {"trader_accounts": 0, "challenge_purchases": 1, "mt5_pool": 2, "traders": 3}
+    source_rows.sort(key=lambda r: (priority.get(r.get("_np_source"), 9), -_dt_score(r.get("updated_at") or r.get("assigned_at") or r.get("created_at"))))
+
+    created, updated, skipped, visible = [], [], [], []
+    processed = set()
+    for row in source_rows:
         source = row.get("_np_source")
         login = _np_sync_text(row.get("mt5_login") or row.get("login") or row.get("account_login") or row.get("account_number"))
         server = _np_sync_text(row.get("mt5_server") or row.get("server") or row.get("account_server"))
         if not _np_sync_valid_login(login) or not server:
             continue
+        if login in processed:
+            continue
+
+        existing = existing_by_login.get(login, [])
+        existing_active = [r for r in existing if _np_sync_lower(r.get("account_status")) in NP_ACTIVE_ACCOUNT_STATUSES]
+        existing_terminal = [r for r in existing if _np_sync_terminal(r)]
+
+        if source != "trader_accounts":
+            if existing_active:
+                skipped.append({"login": login, "source": source, "reason": "authoritative active account already exists"})
+                processed.add(login)
+                continue
+            if existing_terminal:
+                skipped.append({"login": login, "source": source, "reason": "terminal account history blocks resurrection"})
+                processed.add(login)
+                continue
+            if login not in force_logins and not _np_sync_recent(row, lookback_days):
+                skipped.append({"login": login, "source": source, "reason": "not recent fallback"})
+                processed.add(login)
+                continue
+
         if _np_sync_terminal(row):
-            skipped.append({"login": login, "source": source, "reason": "terminal/dead"}); continue
+            skipped.append({"login": login, "source": source, "reason": "terminal/dead"})
+            processed.add(login)
+            continue
         if not _np_sync_active_signal(row):
-            skipped.append({"login": login, "source": source, "reason": "no active/approved signal"}); continue
-        if source not in {"trader_accounts"} and login not in force_logins and not _np_sync_recent(row, lookback_days):
-            skipped.append({"login": login, "source": source, "reason": "not recent fallback"}); continue
+            skipped.append({"login": login, "source": source, "reason": "no active/approved signal"})
+            processed.add(login)
+            continue
+
         trader = _np_find_trader_for_sync(row, traders_by_id, traders_by_email, traders_by_phone)
-        if not trader and source == "traders": trader = row
-        if not trader.get("id"):
-            skipped.append({"login": login, "source": source, "reason": "no trader link"}); continue
+        if not trader and source == "traders":
+            trader = row
+        if not trader or not trader.get("id"):
+            skipped.append({"login": login, "source": source, "reason": "no trader link"})
+            processed.add(login)
+            continue
+
         payload = _np_sync_account_payload(source, row, trader, now)
-        account, action = _np_safe_account_upsert(payload)
+        account, action = _np_safe_account_upsert(payload, existing_by_login=existing_by_login)
         entry = {"login": login, "source": source, "action": action, "trader_id": trader.get("id"), "account_id": (account or {}).get("id")}
         if action.startswith("created"):
             created.append(entry)
@@ -9888,19 +10024,31 @@ def _np_unified_mt5_visibility_sync(force_logins=None, lookback_days=45):
             updated.append(entry)
         else:
             skipped.append(entry)
-        if account and not action.startswith("skipped"):
+
+        if account and action in {"created", "updated_active"}:
             visible.append(entry)
-            # also synchronize trader identity/current account fields best-effort
             try:
-                supabase.table("traders").update({
-                    "current_account_id": account.get("id"), "mt5_login": login, "mt5_server": server,
-                    "phase": payload.get("stage"), "status": "active" if payload.get("stage") not in {"funded", "live"} else "funded",
-                    "payment_status": "approved", "monitoring_enabled": True, "mt5_access_disabled": False,
-                    "updated_at": now, "mt5_updated_at": now
-                }).eq("id", trader.get("id")).execute()
+                stage = str(account.get("stage") or payload.get("stage") or "phase1").lower()
+                trader_update = {
+                    "current_account_id": account.get("id"),
+                    "mt5_login": login,
+                    "mt5_server": server,
+                    "phase": "funded" if stage in {"funded", "live"} else stage,
+                    "status": "funded" if stage in {"funded", "live"} else "active",
+                    "challenge_state": "funded_active" if stage in {"funded", "live"} else _active_state_for_stage(stage),
+                    "payment_status": "approved",
+                    "monitoring_enabled": True,
+                    "mt5_access_disabled": False,
+                    "updated_at": now,
+                    "mt5_updated_at": now,
+                }
+                supabase.table("traders").update(trader_update).eq("id", trader.get("id")).execute()
             except Exception as e:
                 print("NP SYNC TRADER UPDATE SKIPPED", e)
+        processed.add(login)
+
     return {"created": created, "updated": updated, "skipped": skipped[:250], "visible": visible, "visible_count": len(visible)}
+
 
 @app.route("/np_unified_mt5_sync", methods=["GET", "POST", "OPTIONS"])
 @app.route("/system_sync_mt5_assignments", methods=["GET", "POST", "OPTIONS"])
