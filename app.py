@@ -506,7 +506,8 @@ def _trader_safe_offer_row(row):
         "id", "title", "subject", "headline", "message", "body", "content",
         "cta_text", "cta_label", "cta_url", "image_url", "banner_url",
         "starts_at", "ends_at", "expires_at", "created_at", "updated_at",
-        "type", "status", "priority", "message_only", "private_offer",
+        "type", "notice_type", "status", "priority", "message_only", "private_offer",
+        "audience_segment", "audience_label",
         "target_trader_id", "target_email", "target_phone",
         "target_account_reference", "target_name", "show_on_dashboard",
         "delivery_dashboard", "offer_code", "promo_code",
@@ -6657,6 +6658,16 @@ def create_private_offer():
         message = _np_offer_clean_str(d.get("message"), 5000)
         target_email = _np_offer_clean_str(d.get("target_email"), 250).lower()
         target_trader_id = _np_offer_clean_str(d.get("target_trader_id"), 120)
+        audience_segment = _np_offer_clean_str(d.get("audience_segment") or "single", 80).lower()
+        audience_label = _np_offer_clean_str(d.get("audience_label"), 120)
+        notice_type = _np_offer_clean_str(d.get("notice_type") or d.get("announcement_type"), 80).lower()
+
+        allowed_audiences = {
+            "single", "all_traders", "phase1", "phase2", "funded",
+            "breached", "vip_founding", "everyone"
+        }
+        if audience_segment not in allowed_audiences:
+            return bad("Invalid announcement audience")
 
         trader = _np_find_offer_trader(target_trader_id, target_email)
         if trader:
@@ -6665,8 +6676,12 @@ def create_private_offer():
 
         if not title or not message:
             return bad("Title and message are required")
-        if not target_email and not target_trader_id:
-            return bad("Choose a target trader for a private offer")
+        if audience_segment == "single" and not target_email and not target_trader_id:
+            return bad("Choose a target trader for this private notice")
+        if audience_segment != "single":
+            target_email = ""
+            target_trader_id = ""
+            trader = None
 
         delivery_dashboard = _np_offer_bool(d.get("delivery_dashboard"), True)
         delivery_email = _np_offer_bool(d.get("delivery_email"), False)
@@ -6703,6 +6718,9 @@ def create_private_offer():
             "delivery_whatsapp": delivery_whatsapp,
             "read_at": None,
             "message_only": message_only,
+            "audience_segment": audience_segment,
+            "audience_label": audience_label or audience_segment.replace("_", " ").title(),
+            "notice_type": notice_type or "public_notice",
         }
 
         dashboard_saved = True
@@ -6718,6 +6736,9 @@ def create_private_offer():
             meta = {
                 "private_offer": True,
                 "message_only": message_only,
+                "audience_segment": audience_segment,
+                "audience_label": audience_label or audience_segment.replace("_", " ").title(),
+                "notice_type": notice_type or "public_notice",
                 "target_trader_id": target_trader_id or "",
                 "target_email": target_email or "",
                 "target_name": _np_offer_clean_str(d.get("target_name") or (trader or {}).get("name"), 250),
@@ -11812,6 +11833,46 @@ def admin_cron_status():
         return _np_fail(e, 500)
 
 
+
+def _np_notice_audience_matches(row, trader, account=None):
+    segment = str(row.get("audience_segment") or "single").strip().lower()
+    if segment in {"all_traders", "everyone"}:
+        return True
+
+    trader = trader or {}
+    account = account or {}
+    blob = " ".join(str(v or "").strip().lower() for v in [
+        account.get("stage"), account.get("phase"), account.get("account_status"),
+        account.get("status"), trader.get("phase"), trader.get("challenge_state"),
+        trader.get("status")
+    ])
+
+    if segment == "phase1":
+        return "phase1" in blob or "phase 1" in blob
+    if segment == "phase2":
+        return "phase2" in blob or "phase 2" in blob
+    if segment == "funded":
+        return "funded" in blob or "live" in blob
+    if segment == "breached":
+        return any(word in blob for word in ["breach", "locked", "disabled"])
+
+    if segment == "vip_founding":
+        vip_blob = " ".join(str(v or "").strip().lower() for v in [
+            trader.get("vip_status"), trader.get("founding_trader_status"),
+            trader.get("golden_ticket_status"), trader.get("membership_status"),
+            trader.get("trader_type"), trader.get("tags")
+        ])
+        return (
+            _is_truthy(trader.get("is_vip"))
+            or _is_truthy(trader.get("vip"))
+            or _is_truthy(trader.get("is_founding_trader"))
+            or "vip" in vip_blob
+            or "founding" in vip_blob
+        )
+
+    return False
+
+
 @app.route("/trader_targeted_offers", methods=["GET", "OPTIONS"])
 def trader_targeted_offers():
     if request.method == "OPTIONS":
@@ -11827,6 +11888,10 @@ def trader_targeted_offers():
         email = str(trader.get("email") or "").strip().lower()
         phone = str(trader.get("phone") or "").strip()
         account_reference = str(trader.get("account_reference") or "").strip()
+        try:
+            account = _get_active_account(trader_id) or {}
+        except Exception:
+            account = {}
 
         try:
             rows = (
@@ -11865,13 +11930,17 @@ def trader_targeted_offers():
             if _np_private_offer_expired(row):
                 continue
 
-            if not _np_private_offer_matches(
-                row,
-                trader_id,
-                email,
-                phone,
-                account_reference,
-            ):
+            segment = str(row.get("audience_segment") or "single").strip().lower()
+            if segment == "single":
+                if not _np_private_offer_matches(
+                    row,
+                    trader_id,
+                    email,
+                    phone,
+                    account_reference,
+                ):
+                    continue
+            elif not _np_notice_audience_matches(row, trader, account):
                 continue
 
             visible.append(_trader_safe_offer_row(row))
