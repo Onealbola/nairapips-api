@@ -503,9 +503,15 @@ def _trader_safe_offer_row(row):
     if not isinstance(row, dict):
         return row
     allowed = {
-        "id", "title", "headline", "message", "body", "content", "cta_text",
-        "cta_url", "image_url", "banner_url", "starts_at", "ends_at",
-        "created_at", "updated_at", "type", "status", "priority"
+        "id", "title", "subject", "headline", "message", "body", "content",
+        "cta_text", "cta_label", "cta_url", "image_url", "banner_url",
+        "starts_at", "ends_at", "expires_at", "created_at", "updated_at",
+        "type", "status", "priority", "message_only", "private_offer",
+        "target_trader_id", "target_email", "target_phone",
+        "target_account_reference", "target_name", "show_on_dashboard",
+        "delivery_dashboard", "offer_code", "promo_code",
+        "discount_percent", "discount_type", "discount_value",
+        "require_ack", "read_at"
     }
     return _only_fields(row, allowed)
 
@@ -11811,25 +11817,68 @@ def trader_targeted_offers():
     if request.method == "OPTIONS":
         return _np_ok({})
     try:
-        trader_id = _np_offer_clean_str(request.args.get("trader_id"), 120)
-        email = _np_offer_clean_str(request.args.get("email"), 250).lower()
-        if not trader_id and not email:
-            return jsonify([])
-        rows = []
+        requested_trader_id = _np_offer_clean_str(request.args.get("trader_id"), 120)
+        authed_id, auth_error = _authenticated_trader_id_for_request(requested_trader_id)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+
+        trader = _get_trader_by_id(authed_id) or {}
+        trader_id = str(authed_id or "").strip()
+        email = str(trader.get("email") or "").strip().lower()
+        phone = str(trader.get("phone") or "").strip()
+        account_reference = str(trader.get("account_reference") or "").strip()
+
         try:
-            rows = supabase.table("announcements").select("*").eq("status", "active").eq("type", "private_offer").order("created_at", desc=True).limit(50).execute().data or []
+            rows = (
+                supabase.table("announcements")
+                .select("*")
+                .eq("status", "active")
+                .eq("type", "private_offer")
+                .order("created_at", desc=True)
+                .limit(100)
+                .execute()
+                .data
+                or []
+            )
         except Exception:
-            rows = []
+            rows = (
+                supabase.table("announcements")
+                .select("*")
+                .eq("type", "private_offer")
+                .order("created_at", desc=True)
+                .limit(100)
+                .execute()
+                .data
+                or []
+            )
+
         visible = []
-        for row in rows:
-            target = row.get("target_trader_id")
-            if target and str(target) == str(trader_id):
-                visible.append(row)
-            elif not target:
-                visible.append(row)
-        return jsonify(visible[:10])
+        for raw_row in rows:
+            row = _np_offer_merge_meta(raw_row)
+
+            if not _np_offer_bool(
+                row.get("delivery_dashboard"),
+                _np_offer_bool(row.get("show_on_dashboard"), False),
+            ):
+                continue
+
+            if _np_private_offer_expired(row):
+                continue
+
+            if not _np_private_offer_matches(
+                row,
+                trader_id,
+                email,
+                phone,
+                account_reference,
+            ):
+                continue
+
+            visible.append(_trader_safe_offer_row(row))
+
+        return jsonify(visible[:20])
     except Exception as e:
-        return jsonify([])
+        return _np_fail(e, 500)
 
 
 @app.route("/validate_promo_code", methods=["POST", "GET", "OPTIONS"])
