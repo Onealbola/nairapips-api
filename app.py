@@ -6665,8 +6665,11 @@ def create_private_offer():
         delivery_dashboard = _np_offer_bool(d.get("delivery_dashboard"), True)
         delivery_email = _np_offer_bool(d.get("delivery_email"), False)
         delivery_whatsapp = _np_offer_bool(d.get("delivery_whatsapp"), False)
+        message_only = _np_offer_bool(d.get("message_only"), False)
         subject = _np_offer_clean_str(d.get("subject") or title, 250)
         cta_url = _np_offer_clean_str(d.get("cta_url") or "https://nairapips.com/dashboard/", 500)
+        offer_code = "" if message_only else (_np_offer_clean_str(d.get("offer_code") or "PHASEHELP", 120) or "PHASEHELP")
+        cta_label = "" if message_only else _np_offer_clean_str(d.get("cta_label") or "Contact Support", 120)
 
         row = {
             "title": title,
@@ -6683,9 +6686,9 @@ def create_private_offer():
             "target_phone": _np_offer_clean_str(d.get("target_phone") or (trader or {}).get("phone"), 80) or None,
             "target_account_reference": _np_offer_clean_str(d.get("target_account_reference") or (trader or {}).get("account_reference"), 120) or None,
             "subject": subject,
-            "offer_code": _np_offer_clean_str(d.get("offer_code") or "PHASEHELP", 120) or "PHASEHELP",
+            "offer_code": offer_code,
             "expires_at": _np_offer_clean_str(d.get("expires_at"), 120) or None,
-            "cta_label": _np_offer_clean_str(d.get("cta_label") or "Contact Support", 120),
+            "cta_label": cta_label,
             "cta_url": cta_url,
             "priority": _np_offer_clean_str(d.get("priority") or "normal", 40),
             "require_ack": _np_offer_bool(d.get("require_ack"), True),
@@ -6693,6 +6696,7 @@ def create_private_offer():
             "delivery_email": delivery_email,
             "delivery_whatsapp": delivery_whatsapp,
             "read_at": None,
+            "message_only": message_only,
         }
 
         dashboard_saved = True
@@ -6707,15 +6711,16 @@ def create_private_offer():
             # show_on_dashboard stays false so it never leaks as a public announcement.
             meta = {
                 "private_offer": True,
+                "message_only": message_only,
                 "target_trader_id": target_trader_id or "",
                 "target_email": target_email or "",
                 "target_name": _np_offer_clean_str(d.get("target_name") or (trader or {}).get("name"), 250),
                 "target_phone": _np_offer_clean_str(d.get("target_phone") or (trader or {}).get("phone"), 80),
                 "target_account_reference": _np_offer_clean_str(d.get("target_account_reference") or (trader or {}).get("account_reference"), 120),
                 "subject": subject,
-                "offer_code": _np_offer_clean_str(d.get("offer_code") or "PHASEHELP", 120),
+                "offer_code": offer_code,
                 "expires_at": _np_offer_clean_str(d.get("expires_at"), 120),
-                "cta_label": _np_offer_clean_str(d.get("cta_label") or "Contact Support", 120),
+                "cta_label": cta_label,
                 "cta_url": cta_url,
                 "priority": _np_offer_clean_str(d.get("priority") or "normal", 40),
                 "require_ack": _np_offer_bool(d.get("require_ack"), True),
@@ -6747,13 +6752,22 @@ def create_private_offer():
             if not target_email:
                 email_error = "Target trader has no email"
             else:
-                html_body = _np_private_offer_html(
-                    subject,
-                    d.get("email_body") or message,
-                    d.get("offer_code") or "PHASEHELP",
-                    d.get("expires_at") or "",
-                    cta_url,
-                )
+                if message_only:
+                    html_body = (
+                        "<div style='font-family:Arial,sans-serif;line-height:1.6'>"
+                        f"<h2>{html.escape(subject)}</h2>"
+                        f"<div>{html.escape(d.get('email_body') or message).replace(chr(10), '<br>')}</div>"
+                        "<p style='margin-top:24px'>NairaPips<br>Rewarding Nigerian Traders. Changing Trading Stories.</p>"
+                        "</div>"
+                    )
+                else:
+                    html_body = _np_private_offer_html(
+                        subject,
+                        d.get("email_body") or message,
+                        offer_code,
+                        d.get("expires_at") or "",
+                        cta_url,
+                    )
                 try:
                     email_sent = bool(send_email_brevo(target_email, subject, html_body))
                     if not email_sent:
