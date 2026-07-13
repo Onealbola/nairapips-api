@@ -26,18 +26,11 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 PAYOUT_PROFIT_SHARE_PERCENT = 60
 
 def _effective_payout_split(*values):
-    """Return the allowed payout share, capped at 60% for the funded-cycle model.
-    Accepts numeric values or strings with a percent sign. Missing/invalid values default to 60.
+    """Enforce the global funded payout policy: 60% trader / 40% NairaPips.
+
+    Older trader/account/database rows may still contain 50. Those legacy values
+    must not override the current global policy.
     """
-    for value in values:
-        if value is None or str(value).strip() == "":
-            continue
-        try:
-            n = float(str(value).replace("%", "").replace(",", "").strip())
-            if n > 0:
-                return min(n, PAYOUT_PROFIT_SHARE_PERCENT)
-        except Exception:
-            continue
     return PAYOUT_PROFIT_SHARE_PERCENT
 
 # ================================
