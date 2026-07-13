@@ -23,11 +23,11 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # NairaPips payout safety cap. Keep server-side because frontend/admin values can be stale.
-PAYOUT_PROFIT_SHARE_PERCENT = 50
+PAYOUT_PROFIT_SHARE_PERCENT = 60
 
 def _effective_payout_split(*values):
-    """Return the allowed payout share, capped at 50% for business safety.
-    Accepts numeric values or strings with a percent sign. Missing/invalid values default to 50.
+    """Return the allowed payout share, capped at 60% for the funded-cycle model.
+    Accepts numeric values or strings with a percent sign. Missing/invalid values default to 60.
     """
     for value in values:
         if value is None or str(value).strip() == "":
@@ -5560,6 +5560,246 @@ NairaPips Team"""
         _audit_safe("payouts", "payout_paid", f"Payout {pid} marked paid", _admin_from_payload(d))
         return ok(result, "Payout marked paid")
     except Exception as e: return bad(e)
+
+
+# =============================================================================
+# NAIRAPIPS STANDALONE FUNDED PAYOUT-CYCLE RETURN
+# =============================================================================
+# IMPORTANT: This workflow is intentionally separate from every breach/reset route.
+# It NEVER calls admin_reset_trader_account(), _archive_active_account(),
+# _archive_specific_account(), MT5 assignment, purchase reset, or waiting-state logic.
+# It keeps the SAME funded trader_accounts row and SAME MT5 credentials.
+
+FUNDED_CYCLE_TRADER_SHARE_PERCENT = 60
+FUNDED_CYCLE_NAIRAPIPS_SHARE_PERCENT = 40
+FUNDED_CYCLE_PROFIT_CAP_PERCENT = 30
+FUNDED_CYCLE_MARKER_PREFIX = "FUNDED_CYCLE_RETURNED"
+
+
+def _funded_cycle_marker(payout_id, account_id):
+    return f"[{FUNDED_CYCLE_MARKER_PREFIX}:{payout_id}:{account_id}]"
+
+
+def _get_exact_trader_account(account_id):
+    if not account_id:
+        return None
+    rows = (
+        supabase.table("trader_accounts")
+        .select("*")
+        .eq("id", account_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return rows[0] if rows else None
+
+
+@app.route("/admin_complete_funded_payout_cycle", methods=["POST", "OPTIONS"])
+def admin_complete_funded_payout_cycle():
+    """Reactivate the SAME paid funded MT5 account for a new profit cycle.
+
+    This endpoint is deliberately isolated from the normal reset system.
+    It does not archive, replace, rotate, clear, or assign MT5 credentials.
+    The administrator must first return the broker account balance to the exact
+    starting capital manually, then explicitly confirm that action here.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({})
+
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    data = request.get_json(silent=True) or {}
+    payout_id = str(data.get("payout_id") or data.get("id") or "").strip()
+    account_id = str(data.get("trader_account_id") or data.get("account_id") or "").strip()
+    balance_return_confirmed = _is_truthy(data.get("balance_return_confirmed"))
+    typed_confirmation = str(data.get("confirmation_text") or "").strip().upper()
+    admin_note = str(data.get("admin_note") or "Funded payout cycle completed and same MT5 returned to starting capital.").strip()
+
+    if not payout_id:
+        return _np_fail("Exact payout_id is required.", 400)
+    if not account_id:
+        return _np_fail("Exact trader_account_id is required. Refusing to guess an account.", 400)
+    if not balance_return_confirmed or typed_confirmation != "RETURN TO STARTING CAPITAL":
+        return _np_fail("Manual broker balance return must be confirmed with the exact confirmation text.", 400)
+
+    try:
+        payout = get_payout_by_id(payout_id)
+        if not payout:
+            return _np_fail("Payout not found.", 404)
+        if payout_status(payout) != "paid":
+            return _np_fail("Only a payout already marked paid can start a new funded cycle.", 409)
+
+        payout_account_id = str(payout.get("trader_account_id") or "").strip()
+        if not payout_account_id:
+            return _np_fail("This payout is not attached to an exact trader account. Cycle return cancelled.", 409)
+        if payout_account_id != account_id:
+            return _np_fail("Payout trader_account_id does not match the selected account.", 409)
+
+        account = _get_exact_trader_account(account_id)
+        if not account:
+            return _np_fail("Selected funded trader account was not found.", 404)
+
+        trader_id = str(account.get("trader_id") or "").strip()
+        payout_trader_id = str(payout.get("trader_id") or "").strip()
+        if not trader_id or (payout_trader_id and payout_trader_id != trader_id):
+            return _np_fail("Payout ownership does not match the selected trader account.", 409)
+
+        trader = get_trader_by_id(trader_id)
+        if not trader:
+            return _np_fail("Trader not found.", 404)
+
+        stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
+        if stage not in {"funded", "live"}:
+            return _np_fail("Only an exact funded account can use the funded payout-cycle return.", 409)
+
+        mt5_login = str(account.get("mt5_login") or "").strip()
+        if not mt5_login:
+            return _np_fail("Funded account has no MT5 login. Cycle return cancelled.", 409)
+        payout_login = str(payout.get("mt5_login") or "").strip()
+        if payout_login and payout_login != mt5_login:
+            return _np_fail("Payout MT5 login does not match the selected funded account.", 409)
+
+        start_balance = clean(account.get("start_balance") or account.get("account_size") or payout.get("start_balance") or payout.get("account_size"))
+        if start_balance <= 0:
+            return _np_fail("A valid starting capital could not be verified. No account data was changed.", 409)
+
+        marker = _funded_cycle_marker(payout_id, account_id)
+        existing_note = str(payout.get("admin_note") or "")
+        if marker in existing_note:
+            return _np_ok({
+                "success": True,
+                "message": "This funded payout cycle was already returned to starting capital.",
+                "idempotent": True,
+                "payout_id": payout_id,
+                "trader_account_id": account_id,
+                "mt5_login": mt5_login,
+                "start_balance": start_balance,
+            })
+
+        now = now_iso()
+
+        # First mutation: exact account only. No trader-wide account update.
+        account_payload = {
+            "account_status": "assigned_active",
+            "stage": "funded",
+            "current_balance": start_balance,
+            "current_equity": start_balance,
+            "profit": 0,
+            "profit_percent": 0,
+            "absolute_drawdown_percent": 0,
+            "dd_used_percent": 0,
+            "monitoring_enabled": True,
+            "updated_at": now,
+        }
+        account_result = (
+            supabase.table("trader_accounts")
+            .update(account_payload)
+            .eq("id", account_id)
+            .eq("trader_id", trader_id)
+            .execute()
+            .data
+            or []
+        )
+        if not account_result:
+            return _np_fail("Funded account was not updated. No reset route was called.", 500)
+
+        # Keep the identity mirror aligned without clearing or rotating MT5 credentials.
+        trader_payload = {
+            "challenge_state": "funded_active",
+            "status": "funded",
+            "phase": "funded",
+            "current_account_id": account_id,
+            "balance": start_balance,
+            "equity": start_balance,
+            "profit": 0,
+            "profit_percent": 0,
+            "drawdown": 0,
+            "drawdown_percent": 0,
+            "max_drawdown_used": 0,
+            "monitoring_enabled": True,
+            "payout_blocked": False,
+            "payout_eligible": False,
+            "updated_at": now,
+            "lifecycle_updated_at": now,
+        }
+        trader_result = (
+            supabase.table("traders")
+            .update(trader_payload)
+            .eq("id", trader_id)
+            .execute()
+            .data
+            or []
+        )
+        if not trader_result:
+            # Fail closed: relock the exact account so it cannot trade with an unsynchronised trader mirror.
+            try:
+                supabase.table("trader_accounts").update({
+                    "account_status": "funded_profit_cap_reached",
+                    "monitoring_enabled": False,
+                    "updated_at": now_iso(),
+                }).eq("id", account_id).eq("trader_id", trader_id).execute()
+            except Exception as rollback_error:
+                print("FUNDED CYCLE FAIL-CLOSED ERROR:", rollback_error)
+            return _np_fail("Trader mirror update failed. The exact funded account was left locked for review.", 500)
+
+        cycle_note = f"{existing_note}\n{marker} {admin_note}".strip()
+        payout_result = (
+            supabase.table("payouts")
+            .update({"admin_note": cycle_note, "updated_at": now})
+            .eq("id", payout_id)
+            .eq("trader_account_id", account_id)
+            .execute()
+            .data
+            or []
+        )
+        if not payout_result:
+            # Account is safe and active, but report the missing idempotency marker loudly.
+            print("FUNDED CYCLE PAYOUT MARKER UPDATE FAILED:", payout_id, account_id)
+
+        _log_lifecycle_event(
+            trader_id,
+            account_id,
+            "funded_profit_cap_reached",
+            "funded_active",
+            "funded_cycle_return_to_starting_capital",
+            f"payout_id={payout_id}; mt5_login={mt5_login}; starting_capital={start_balance}; trader_share={FUNDED_CYCLE_TRADER_SHARE_PERCENT}%; nairapips_share={FUNDED_CYCLE_NAIRAPIPS_SHARE_PERCENT}%",
+            _admin_from_payload(data),
+        )
+        _audit_safe(
+            "payouts",
+            "funded_cycle_returned_to_starting_capital",
+            f"Payout {payout_id}; account {account_id}; same MT5 {mt5_login}; starting capital {start_balance}",
+            _admin_from_payload(data),
+            payout_id,
+        )
+
+        try:
+            send_account_status_email(
+                trader,
+                "NairaPips — New funded profit cycle activated",
+                "Your payout cycle has been completed and your funded account is active again.",
+                f"Same MT5 Login: {mt5_login}\nStarting Capital: {email_money(start_balance)}\n\nTrade. Profit. Withdraw. Return to Your Starting Capital. Start Another Profit Cycle.",
+            )
+        except Exception as email_error:
+            print("FUNDED CYCLE EMAIL ERROR:", email_error)
+
+        return _np_ok({
+            "success": True,
+            "message": "Same funded MT5 account returned to starting capital and reactivated.",
+            "payout_id": payout_id,
+            "trader_account_id": account_id,
+            "trader_id": trader_id,
+            "mt5_login": mt5_login,
+            "start_balance": start_balance,
+            "account": _trader_safe_account_row(_decorate_account_for_api(account_result[0])),
+        })
+    except Exception as e:
+        print("FUNDED PAYOUT CYCLE RETURN ERROR:", e)
+        return _np_fail(str(e), 500)
+
 
 @app.route("/support_tickets", methods=["GET"])
 def support_tickets():
