@@ -5649,8 +5649,31 @@ def cancel_payout():
             return bad("Payout not found", 404)
         if str(payout.get("trader_id") or "") != str(authed_trader_id):
             return bad("You can cancel only your own payout request.", 403)
-        if payout_status(payout) != "pending":
-            return bad("Only a pending payout can be cancelled by the trader.", 409)
+        # Different production generations used several labels for a payout
+        # that has been submitted but not yet approved. Treat those consistently
+        # as Pending, while refusing any request that has approval/payment evidence.
+        current_status = payout_status(payout)
+        cancellable_pending_statuses = {
+            "", "pending", "requested", "submitted", "under_review",
+            "pending_review", "awaiting_review", "request_pending",
+        }
+        has_admin_progress = any(
+            payout.get(field)
+            for field in ("approved_at", "paid_at", "rejected_at", "cancelled_at")
+        )
+        terminal_or_admin_statuses = {
+            "approved", "paid", "rejected", "cancelled", "canceled",
+            "processing", "payment_processing", "approved_payout_pending",
+        }
+        if (
+            current_status in terminal_or_admin_statuses
+            or has_admin_progress
+            or current_status not in cancellable_pending_statuses
+        ):
+            return bad(
+                f"Only a pending payout can be cancelled by the trader. Current status: {current_status or 'unknown'}.",
+                409,
+            )
 
         trader_row = get_trader_by_id(authed_trader_id)
         account = _get_exact_trader_account(payout.get("trader_account_id"))
