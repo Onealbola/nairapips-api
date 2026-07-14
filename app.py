@@ -5353,6 +5353,45 @@ def create_payout():
         if not eligible:
             return bad(reason, 403)
 
+        # Standalone payout safety: one open request per exact funded account.
+        # This does not call, modify, or share logic with the breach/reset system.
+        open_payout_statuses = ["pending", "approved", "processing", "payment_processing"]
+        try:
+            open_rows = (
+                supabase.table("payouts")
+                .select("id,status,amount,created_at")
+                .eq("trader_id", trader_row.get("id"))
+                .eq("trader_account_id", account.get("id"))
+                .in_("status", open_payout_statuses)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+        except Exception as open_check_error:
+            # Compatibility for an older table that may not yet expose trader_account_id.
+            print("OPEN PAYOUT ACCOUNT CHECK FALLBACK:", open_check_error)
+            open_rows = (
+                supabase.table("payouts")
+                .select("id,status,amount,created_at")
+                .eq("trader_id", trader_row.get("id"))
+                .in_("status", open_payout_statuses)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+        if open_rows:
+            open_request = open_rows[0]
+            return bad(
+                f"You already have an open payout request ({str(open_request.get('status') or 'pending').upper()}) "
+                f"for {email_money(clean(open_request.get('amount')))}. "
+                "Wait for Admin to pay or reject it before submitting another request.",
+                409,
+            )
+
         start_balance = clean(account.get("start_balance") or account.get("account_size") or 0)
         current_equity = clean(account.get("current_equity") or account.get("equity") or account.get("current_balance") or account.get("balance") or start_balance)
         verified_profit = max(0, current_equity - start_balance)
