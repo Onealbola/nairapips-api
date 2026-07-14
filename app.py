@@ -5640,9 +5640,9 @@ def cancel_payout():
         if not payout_id:
             return bad("Missing payout id", 400)
 
-        authed_trader_id, auth_response = _require_trader_owner()
-        if auth_response:
-            return auth_response
+        authed_trader_id, auth_error = _authenticated_trader_id_for_request(d.get("trader_id"))
+        if auth_error:
+            return bad(auth_error, 401 if "required" in auth_error.lower() else 403)
 
         payout = get_payout_by_id(payout_id)
         if not payout:
