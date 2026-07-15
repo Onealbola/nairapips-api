@@ -22,22 +22,16 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# NairaPips payout safety cap. Keep server-side because frontend/admin values can be stale.
-PAYOUT_PROFIT_SHARE_PERCENT = 50
+# NairaPips global funded payout policy. Keep server-side because legacy
+# trader/account rows may still contain the former 50% value.
+PAYOUT_PROFIT_SHARE_PERCENT = 60
 
 def _effective_payout_split(*values):
-    """Return the allowed payout share, capped at 50% for business safety.
-    Accepts numeric values or strings with a percent sign. Missing/invalid values default to 50.
+    """Enforce 60% trader / 40% NairaPips for every funded payout.
+
+    Stored values are intentionally ignored so stale 50% rows cannot override
+    the current global payout policy.
     """
-    for value in values:
-        if value is None or str(value).strip() == "":
-            continue
-        try:
-            n = float(str(value).replace("%", "").replace(",", "").strip())
-            if n > 0:
-                return min(n, PAYOUT_PROFIT_SHARE_PERCENT)
-        except Exception:
-            continue
     return PAYOUT_PROFIT_SHARE_PERCENT
 
 # ================================
@@ -5369,6 +5363,49 @@ def payouts():
         return jsonify(rows)
     except Exception as e:
         return bad(e)
+
+@app.route("/payout_quote", methods=["POST"])
+def payout_quote():
+    """Return the backend-authoritative payout amount before submission.
+
+    This is additive and does not create, cancel, approve, pay, lock, reset, or
+    modify any payout/account record.
+    """
+    try:
+        d = request.json or {}
+        trader_row = _resolve_trader_for_money_action(d)
+        if not trader_row:
+            return bad("Trader not found", 404)
+
+        token = _request_trader_auth_token()
+        if not _verify_trader_auth_token(token, trader_row.get("id")):
+            return _np_fail("Trader authentication is required", 401)
+
+        eligible, reason, account = _payout_eligibility(trader_row)
+        if not eligible:
+            return bad(reason, 403)
+
+        start_balance = clean(account.get("start_balance") or account.get("account_size") or 0)
+        current_equity = clean(account.get("current_equity") or account.get("equity") or account.get("current_balance") or account.get("balance") or start_balance)
+        verified_profit = max(0, current_equity - start_balance)
+        split_pct = _effective_payout_split(account.get("payout_split"), trader_row.get("payout_split"), d.get("payout_split"))
+        max_payout = max(0, round((verified_profit * split_pct) / 100, 2))
+
+        return jsonify({
+            "success": True,
+            "eligible": True,
+            "trader_account_id": account.get("id"),
+            "mt5_login": account.get("mt5_login"),
+            "start_balance": start_balance,
+            "current_equity": current_equity,
+            "verified_profit": verified_profit,
+            "payout_split": split_pct,
+            "available_payout": max_payout,
+            "generated_at": now_iso(),
+        })
+    except Exception as e:
+        return bad(e)
+
 
 @app.route("/create_payout", methods=["POST"])
 def create_payout():
