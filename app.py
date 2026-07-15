@@ -5930,22 +5930,25 @@ def admin_complete_funded_payout_cycle():
         now = now_iso()
 
         # First mutation: exact account only. No trader-wide account update.
+        #
+        # IMPORTANT: do NOT overwrite current_balance/current_equity here.
+        # Production validates its protected worst_static_dd against the current
+        # risk values stored on trader_accounts. The previous implementation set
+        # balance/equity to starting capital inside this same update, making the
+        # calculated DD become 0 while the protected value was still 6.51; the
+        # database correctly rejected that mismatch.
+        #
+        # The broker balance has already been restored manually. This endpoint
+        # only releases the exact funded account and resets PROFIT-CYCLE evidence.
+        # The MT5 engine then reads the real Exness balance/equity and refreshes
+        # current risk fields on its next monitoring pass. Lifetime DD evidence
+        # remains untouched.
         account_payload = {
             "account_status": "assigned_active",
-            # Production trader_accounts uses account_status, not status.
             "stage": "funded",
-            "current_balance": start_balance,
-            "current_equity": start_balance,
             "highest_equity": start_balance,
-            "lowest_equity": start_balance,
             "profit": 0,
             "profit_percent": 0,
-            # Only write drawdown columns confirmed to exist in production.
-            # The database reconciliation trigger derives its own internal
-            # worst-static value; writing non-schema or competing DD fields
-            # causes PGRST204/P0001 failures.
-            "absolute_drawdown_percent": 0,
-            "dd_used_percent": 0,
             "monitoring_enabled": True,
             "updated_at": now,
         }
@@ -5967,13 +5970,10 @@ def admin_complete_funded_payout_cycle():
             "status": "funded",
             "phase": "funded",
             "current_account_id": account_id,
-            "balance": start_balance,
-            "equity": start_balance,
+            # Do not manufacture live balance/equity/DD in the trader mirror.
+            # The MT5 engine will refresh them from Exness after release.
             "profit": 0,
             "profit_percent": 0,
-            "drawdown": 0,
-            "drawdown_percent": 0,
-            "max_drawdown_used": 0,
             "monitoring_enabled": True,
             "payout_blocked": False,
             "payout_eligible": False,
