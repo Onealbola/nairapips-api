@@ -22,15 +22,14 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# NairaPips global funded payout policy. Keep server-side because legacy
-# trader/account rows may still contain the former 50% value.
+# NairaPips payout safety cap. Keep server-side because frontend/admin values can be stale.
 PAYOUT_PROFIT_SHARE_PERCENT = 60
 
 def _effective_payout_split(*values):
-    """Enforce 60% trader / 40% NairaPips for every funded payout.
+    """Enforce the global funded payout policy: 60% trader / 40% NairaPips.
 
-    Stored values are intentionally ignored so stale 50% rows cannot override
-    the current global payout policy.
+    Older trader/account/database rows may still contain 50. Those legacy values
+    must not override the current global policy.
     """
     return PAYOUT_PROFIT_SHARE_PERCENT
 
@@ -1063,43 +1062,20 @@ def _resolve_trader_for_money_action(data):
 
 
 def _payout_eligibility(trader):
-    """Validate payout eligibility from the active funded account.
-
-    trader_accounts is the operational source of truth. The trader-level
-    challenge_state is a compatibility mirror and may be stale after phase or
-    funded-cycle transitions. A valid assigned funded account must not be
-    rejected only because that mirror has not refreshed yet.
-    """
     if not trader:
         return False, "Trader not found", None
-
+    state = str(trader.get("challenge_state") or "").strip().lower()
     account = _get_active_account(trader.get("id"), trader)
+    if state != "funded_active":
+        return False, "Payouts require funded_active lifecycle state.", account
     if not account:
         return False, "Payouts require an active funded MT5 account.", account
-
-    stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
-    account_status = str(account.get("account_status") or "").strip().lower()
-
-    if stage not in {"funded", "live"}:
+    if str(account.get("stage") or "").lower() != "funded":
         return False, "Payouts require the current active account to be funded stage.", account
-    if account_status not in {"assigned_active", "funded_active", "active", "current_active", "live", "funded"}:
+    if str(account.get("account_status") or "").lower() != "assigned_active":
         return False, "Payouts require an assigned active account.", account
     if _is_truthy(trader.get("payout_blocked")):
         return False, "Payout blocked for this trader.", account
-
-    # Best-effort repair of the trader compatibility mirror. Failure here must
-    # not block a payout that the authoritative funded account already permits.
-    state = str(trader.get("challenge_state") or "").strip().lower()
-    if state != "funded_active":
-        try:
-            supabase.table("traders").update({
-                "challenge_state": "funded_active",
-                "updated_at": now_iso(),
-            }).eq("id", trader.get("id")).execute()
-            trader["challenge_state"] = "funded_active"
-        except Exception as e:
-            print("PAYOUT FUNDED STATE MIRROR REPAIR WARNING:", e)
-
     return True, "Payout eligible", account
 
 
@@ -5364,47 +5340,114 @@ def payouts():
     except Exception as e:
         return bad(e)
 
-@app.route("/payout_quote", methods=["POST"])
-def payout_quote():
-    """Return the backend-authoritative payout amount before submission.
 
-    This is additive and does not create, cancel, approve, pay, lock, reset, or
-    modify any payout/account record.
-    """
+def _set_funded_payout_trade_lock(trader_row, account, payout_id=None, reason="Payout request pending"):
+    """Lock exact funded account while payout is open; separate from reset."""
+    now = now_iso()
+    account_id = str((account or {}).get("id") or "").strip()
+    trader_id = str((trader_row or {}).get("id") or "").strip()
+    if not account_id or not trader_id:
+        raise ValueError("Exact trader and funded account are required for payout lock")
+
+    account_payload = {"status": "payout_pending", "monitoring_enabled": True, "updated_at": now}
+    optional_account = {
+        "payout_required": True,
+        "payout_blocked": True,
+        "mt5_access_disabled": True,
+        "trading_must_remain_locked_until_payout": True,
+        "payout_lock_reason": reason,
+        "active_payout_id": payout_id,
+        "payout_locked_at": now,
+    }
     try:
-        d = request.json or {}
-        trader_row = _resolve_trader_for_money_action(d)
-        if not trader_row:
-            return bad("Trader not found", 404)
-
-        token = _request_trader_auth_token()
-        if not _verify_trader_auth_token(token, trader_row.get("id")):
-            return _np_fail("Trader authentication is required", 401)
-
-        eligible, reason, account = _payout_eligibility(trader_row)
-        if not eligible:
-            return bad(reason, 403)
-
-        start_balance = clean(account.get("start_balance") or account.get("account_size") or 0)
-        current_equity = clean(account.get("current_equity") or account.get("equity") or account.get("current_balance") or account.get("balance") or start_balance)
-        verified_profit = max(0, current_equity - start_balance)
-        split_pct = _effective_payout_split(account.get("payout_split"), trader_row.get("payout_split"), d.get("payout_split"))
-        max_payout = max(0, round((verified_profit * split_pct) / 100, 2))
-
-        return jsonify({
-            "success": True,
-            "eligible": True,
-            "trader_account_id": account.get("id"),
-            "mt5_login": account.get("mt5_login"),
-            "start_balance": start_balance,
-            "current_equity": current_equity,
-            "verified_profit": verified_profit,
-            "payout_split": split_pct,
-            "available_payout": max_payout,
-            "generated_at": now_iso(),
-        })
+        supabase.table("trader_accounts").update({**account_payload, **optional_account}).eq("id", account_id).execute()
     except Exception as e:
-        return bad(e)
+        print("PAYOUT LOCK RICH ACCOUNT UPDATE FALLBACK:", e)
+        supabase.table("trader_accounts").update(account_payload).eq("id", account_id).execute()
+
+    trader_payload = {
+        "payout_blocked": True,
+        "payout_eligible": False,
+        "mt5_access_disabled": True,
+        "monitoring_enabled": True,
+        "admin_note": reason,
+        "updated_at": now,
+    }
+    optional_trader = {
+        "payout_required": True,
+        "trading_must_remain_locked_until_payout": True,
+        "active_payout_id": payout_id,
+        "payout_locked_at": now,
+    }
+    try:
+        supabase.table("traders").update({**trader_payload, **optional_trader}).eq("id", trader_id).execute()
+    except Exception as e:
+        print("PAYOUT LOCK RICH TRADER UPDATE FALLBACK:", e)
+        supabase.table("traders").update(trader_payload).eq("id", trader_id).execute()
+
+    _log_lifecycle_event(
+        trader_id, account_id, "funded_active", "payout_pending",
+        "payout_request_trade_lock", f"{reason}; payout_id={payout_id or ''}",
+        {"name": "system", "username": "system"},
+    )
+
+
+def _release_funded_payout_trade_lock(trader_row, account, reason="Payout request cancelled or rejected"):
+    """Release only payout-request lock; refuse to release other lock types."""
+    now = now_iso()
+    account_id = str((account or {}).get("id") or "").strip()
+    trader_id = str((trader_row or {}).get("id") or "").strip()
+    if not account_id or not trader_id:
+        raise ValueError("Exact trader and funded account are required for payout unlock")
+
+    current_status = str((account or {}).get("status") or "").strip().lower()
+    if current_status and current_status not in {
+        "payout_pending", "approved_payout_pending", "payment_processing",
+        "funded_active", "active", "assigned_active"
+    }:
+        raise ValueError(f"Non-payout lock/status {current_status}; refusing automatic unlock")
+
+    account_payload = {"status": "funded_active", "monitoring_enabled": True, "updated_at": now}
+    optional_account = {
+        "payout_required": False,
+        "payout_blocked": False,
+        "mt5_access_disabled": False,
+        "trading_must_remain_locked_until_payout": False,
+        "payout_lock_reason": "",
+        "active_payout_id": None,
+        "payout_unlocked_at": now,
+    }
+    try:
+        supabase.table("trader_accounts").update({**account_payload, **optional_account}).eq("id", account_id).execute()
+    except Exception as e:
+        print("PAYOUT UNLOCK RICH ACCOUNT UPDATE FALLBACK:", e)
+        supabase.table("trader_accounts").update(account_payload).eq("id", account_id).execute()
+
+    trader_payload = {
+        "payout_blocked": False,
+        "payout_eligible": True,
+        "mt5_access_disabled": False,
+        "monitoring_enabled": True,
+        "admin_note": reason,
+        "updated_at": now,
+    }
+    optional_trader = {
+        "payout_required": False,
+        "trading_must_remain_locked_until_payout": False,
+        "active_payout_id": None,
+        "payout_unlocked_at": now,
+    }
+    try:
+        supabase.table("traders").update({**trader_payload, **optional_trader}).eq("id", trader_id).execute()
+    except Exception as e:
+        print("PAYOUT UNLOCK RICH TRADER UPDATE FALLBACK:", e)
+        supabase.table("traders").update(trader_payload).eq("id", trader_id).execute()
+
+    _log_lifecycle_event(
+        trader_id, account_id, "payout_pending", "funded_active",
+        "payout_request_trade_unlock", reason,
+        {"name": "system", "username": "system"},
+    )
 
 
 @app.route("/create_payout", methods=["POST"])
@@ -5419,6 +5462,45 @@ def create_payout():
         eligible, reason, account = _payout_eligibility(trader_row)
         if not eligible:
             return bad(reason, 403)
+
+        # Standalone payout safety: one open request per exact funded account.
+        # This does not call, modify, or share logic with the breach/reset system.
+        open_payout_statuses = ["pending", "approved", "processing", "payment_processing"]
+        try:
+            open_rows = (
+                supabase.table("payouts")
+                .select("id,status,amount,created_at")
+                .eq("trader_id", trader_row.get("id"))
+                .eq("trader_account_id", account.get("id"))
+                .in_("status", open_payout_statuses)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+        except Exception as open_check_error:
+            # Compatibility for an older table that may not yet expose trader_account_id.
+            print("OPEN PAYOUT ACCOUNT CHECK FALLBACK:", open_check_error)
+            open_rows = (
+                supabase.table("payouts")
+                .select("id,status,amount,created_at")
+                .eq("trader_id", trader_row.get("id"))
+                .in_("status", open_payout_statuses)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+        if open_rows:
+            open_request = open_rows[0]
+            return bad(
+                f"You already have an open payout request ({str(open_request.get('status') or 'pending').upper()}) "
+                f"for {email_money(clean(open_request.get('amount')))}. "
+                "Wait for Admin to pay or reject it before submitting another request.",
+                409,
+            )
 
         start_balance = clean(account.get("start_balance") or account.get("account_size") or 0)
         current_equity = clean(account.get("current_equity") or account.get("equity") or account.get("current_balance") or account.get("balance") or start_balance)
@@ -5490,6 +5572,28 @@ def create_payout():
             row.update(fallback)
             print("PAYOUT RICH INSERT FALLBACK:", insert_error)
 
+        created_payout = (created or [None])[0] or {}
+        payout_id = created_payout.get("id")
+        try:
+            _set_funded_payout_trade_lock(
+                trader_row,
+                account,
+                payout_id=payout_id,
+                reason=f"Payout request {payout_id or ''} pending. Trading locked until cycle completion, rejection, or cancellation.",
+            )
+        except Exception as lock_error:
+            print("CRITICAL PAYOUT LOCK FAILURE:", lock_error)
+            if payout_id:
+                try:
+                    supabase.table("payouts").update({
+                        "status": "cancelled",
+                        "admin_note": f"Auto-cancelled because trade lock failed: {lock_error}",
+                        "updated_at": now_iso(),
+                    }).eq("id", payout_id).execute()
+                except Exception as cancel_error:
+                    print("CRITICAL PAYOUT AUTO-CANCEL FAILURE:", cancel_error)
+            return bad("Payout was not opened because the funded account could not be locked safely.", 503)
+
         send_email_safe(
             row.get("email"),
             "NairaPips payout request received",
@@ -5527,6 +5631,70 @@ Account / Wallet Address: {row.get("account_number") or "Not provided"}"""
     except Exception as e:
         return bad(e)
 
+
+@app.route("/cancel_payout", methods=["POST"])
+def cancel_payout():
+    try:
+        d = request.get_json(silent=True) or {}
+        payout_id = str(d.get("id") or d.get("payout_id") or "").strip()
+        if not payout_id:
+            return bad("Missing payout id", 400)
+
+        authed_trader_id, auth_error = _authenticated_trader_id_for_request(d.get("trader_id"))
+        if auth_error:
+            return bad(auth_error, 401 if "required" in auth_error.lower() else 403)
+
+        payout = get_payout_by_id(payout_id)
+        if not payout:
+            return bad("Payout not found", 404)
+        if str(payout.get("trader_id") or "") != str(authed_trader_id):
+            return bad("You can cancel only your own payout request.", 403)
+        # Different production generations used several labels for a payout
+        # that has been submitted but not yet approved. Treat those consistently
+        # as Pending, while refusing any request that has approval/payment evidence.
+        current_status = payout_status(payout)
+        cancellable_pending_statuses = {
+            "", "pending", "requested", "submitted", "under_review",
+            "pending_review", "awaiting_review", "request_pending",
+        }
+        has_admin_progress = any(
+            payout.get(field)
+            for field in ("approved_at", "paid_at", "rejected_at", "cancelled_at")
+        )
+        terminal_or_admin_statuses = {
+            "approved", "paid", "rejected", "cancelled", "canceled",
+            "processing", "payment_processing", "approved_payout_pending",
+        }
+        if (
+            current_status in terminal_or_admin_statuses
+            or has_admin_progress
+            or current_status not in cancellable_pending_statuses
+        ):
+            return bad(
+                f"Only a pending payout can be cancelled by the trader. Current status: {current_status or 'unknown'}.",
+                409,
+            )
+
+        trader_row = get_trader_by_id(authed_trader_id)
+        account = _get_exact_trader_account(payout.get("trader_account_id"))
+        if not trader_row or not account:
+            return bad("Exact funded account could not be verified.", 409)
+
+        updated = supabase.table("payouts").update({
+            "status": "cancelled",
+            "admin_note": "Cancelled by trader before Admin approval.",
+            "updated_at": now_iso(),
+        }).eq("id", payout_id).execute().data or []
+
+        _release_funded_payout_trade_lock(
+            trader_row, account,
+            reason=f"Payout {payout_id} cancelled by trader before approval.",
+        )
+        return ok(updated, "Payout cancelled. Submit a new request using the latest verified profit.")
+    except Exception as e:
+        return bad(e)
+
+
 @app.route("/approve_payout", methods=["POST"])
 def approve_payout():
     try:
@@ -5546,6 +5714,12 @@ def approve_payout():
 
         note = d.get("admin_note","")
         result = supabase.table("payouts").update({"status":"approved","approved_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+        try:
+            supabase.table("trader_accounts").update({
+                "status": "approved_payout_pending", "monitoring_enabled": True, "updated_at": now_iso()
+            }).eq("id", account.get("id")).execute()
+        except Exception as e:
+            print("APPROVED PAYOUT LOCK STATE UPDATE:", e)
 
         send_email_safe(
             payout.get("email"),
@@ -5575,6 +5749,13 @@ def reject_payout():
             return bad("Only pending payouts can be rejected",409)
         note = d.get("admin_note","")
         result = supabase.table("payouts").update({"status":"rejected","rejected_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+        trader_row = _resolve_trader_for_money_action(payout)
+        account = _get_exact_trader_account(payout.get("trader_account_id"))
+        if trader_row and account:
+            _release_funded_payout_trade_lock(
+                trader_row, account,
+                reason=f"Payout {pid} rejected by Admin. Same funded account reopened.",
+            )
 
         send_email_safe(
             payout.get("email"),
@@ -5603,6 +5784,13 @@ def mark_paid():
             return bad("Only approved payouts can be marked paid",409)
         note = d.get("admin_note","")
         result = supabase.table("payouts").update({"status":"paid","paid_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+        try:
+            if payout.get("trader_account_id"):
+                supabase.table("trader_accounts").update({
+                    "status": "payment_processing", "monitoring_enabled": True, "updated_at": now_iso()
+                }).eq("id", payout.get("trader_account_id")).execute()
+        except Exception as e:
+            print("PAID PAYOUT LOCK STATE UPDATE:", e)
 
         send_email_safe(
             payout.get("email"),
@@ -5621,6 +5809,12 @@ NairaPips Team"""
         return ok(result, "Payout marked paid")
     except Exception as e: return bad(e)
 
+
+# =============================================================================
+# NAIRAPIPS STANDALONE FUNDED PAYOUT-CYCLE RETURN
+# =============================================================================
+# IMPORTANT: This workflow is intentionally separate from every breach/reset route.
+# It NEVER calls admin_reset_trader_account(), _archive_active_account(),
 # _archive_specific_account(), MT5 assignment, purchase reset, or waiting-state logic.
 # It keeps the SAME funded trader_accounts row and SAME MT5 credentials.
 
@@ -5738,15 +5932,23 @@ def admin_complete_funded_payout_cycle():
         # First mutation: exact account only. No trader-wide account update.
         account_payload = {
             "account_status": "assigned_active",
+            "status": "funded_active",
             "stage": "funded",
             "current_balance": start_balance,
             "current_equity": start_balance,
+            # A new funded cycle begins from the restored starting capital.
+            # These values must be written atomically because the database
+            # reconciliation trigger validates worst_static_dd against the
+            # new balance/equity baseline during this same UPDATE statement.
             "highest_equity": start_balance,
             "lowest_equity": start_balance,
             "profit": 0,
             "profit_percent": 0,
             "absolute_drawdown_percent": 0,
+            "drawdown_percent": 0,
             "dd_used_percent": 0,
+            "max_drawdown_used": 0,
+            "worst_static_dd": 0,
             "monitoring_enabled": True,
             "updated_at": now,
         }
@@ -5855,8 +6057,6 @@ def admin_complete_funded_payout_cycle():
     except Exception as e:
         print("FUNDED PAYOUT CYCLE RETURN ERROR:", e)
         return _np_fail(str(e), 500)
-
-
 
 
 @app.route("/support_tickets", methods=["GET"])
