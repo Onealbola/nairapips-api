@@ -5932,7 +5932,8 @@ def admin_complete_funded_payout_cycle():
         # First mutation: exact account only. No trader-wide account update.
         account_payload = {
             "account_status": "assigned_active",
-            "status": "funded_active",
+            # trader_accounts has no `status` column in production.
+            # `account_status` is the account lifecycle source of truth.
             "stage": "funded",
             "current_balance": start_balance,
             "current_equity": start_balance,
