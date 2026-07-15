@@ -5932,24 +5932,20 @@ def admin_complete_funded_payout_cycle():
         # First mutation: exact account only. No trader-wide account update.
         account_payload = {
             "account_status": "assigned_active",
-            # trader_accounts has no `status` column in production.
-            # `account_status` is the account lifecycle source of truth.
+            # Production trader_accounts uses account_status, not status.
             "stage": "funded",
             "current_balance": start_balance,
             "current_equity": start_balance,
-            # A new funded cycle begins from the restored starting capital.
-            # These values must be written atomically because the database
-            # reconciliation trigger validates worst_static_dd against the
-            # new balance/equity baseline during this same UPDATE statement.
             "highest_equity": start_balance,
             "lowest_equity": start_balance,
             "profit": 0,
             "profit_percent": 0,
+            # Only write drawdown columns confirmed to exist in production.
+            # The database reconciliation trigger derives its own internal
+            # worst-static value; writing non-schema or competing DD fields
+            # causes PGRST204/P0001 failures.
             "absolute_drawdown_percent": 0,
-            "drawdown_percent": 0,
             "dd_used_percent": 0,
-            "max_drawdown_used": 0,
-            "worst_static_dd": 0,
             "monitoring_enabled": True,
             "updated_at": now,
         }
