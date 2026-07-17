@@ -22,6 +22,15 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) if SUPABASE_SERVICE_ROLE_KEY else None
+
+def _staff_db():
+    if supabase_admin:
+        return supabase_admin
+    return supabase
+
+
 # NairaPips payout safety cap. Keep server-side because frontend/admin values can be stale.
 PAYOUT_PROFIT_SHARE_PERCENT = 60
 
