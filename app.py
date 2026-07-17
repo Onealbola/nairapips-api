@@ -22,13 +22,20 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Service-role client is used only for protected server-side staff operations.
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-supabase_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) if SUPABASE_SERVICE_ROLE_KEY else None
+supabase_admin = (
+    create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    if SUPABASE_SERVICE_ROLE_KEY
+    else None
+)
 
 def _staff_db():
-    if supabase_admin:
-        return supabase_admin
-    return supabase
+    if not supabase_admin:
+        raise RuntimeError(
+            "SUPABASE_SERVICE_ROLE_KEY is missing from the Render service environment"
+        )
+    return supabase_admin
 
 
 # NairaPips payout safety cap. Keep server-side because frontend/admin values can be stale.
@@ -2854,7 +2861,7 @@ def _admin_view_request_ok(data):
         if not username or not password:
             return False
 
-        rows = supabase.table("admin_staff_members").select("id,username,password,status,role").eq("username", username).eq("password", password).limit(1).execute().data or []
+        rows = _staff_db().table("admin_staff_members").select("id,username,password,status,role").eq("username", username).eq("password", password).limit(1).execute().data or []
         if not rows:
             return False
 
@@ -8346,7 +8353,7 @@ def staff_members():
     if auth_response:
         return auth_response
     try:
-        res = supabase.table('admin_staff_members').select('*').order('created_at', desc=True).execute()
+        res = _staff_db().table('admin_staff_members').select('*').order('created_at', desc=True).execute()
         rows = res.data or []
         for r in rows:
             r.pop('password', None)
@@ -8362,7 +8369,7 @@ def staff_login():
         password = data.get('password') or ''
 
         # First use the real staff table. This remains the normal production path.
-        res = supabase.table('admin_staff_members').select('*').eq('username', username).eq('password', password).limit(1).execute()
+        res = _staff_db().table('admin_staff_members').select('*').eq('username', username).eq('password', password).limit(1).execute()
         rows = res.data or []
         staff = rows[0] if rows else None
 
@@ -8392,7 +8399,7 @@ def staff_login():
         # Only update the database row when this is a real stored staff account.
         if staff.get('id') != 'bootstrap-super-admin':
             try:
-                supabase.table('admin_staff_members').update({'last_login_at': 'now()'}).eq('id', staff['id']).execute()
+                _staff_db().table('admin_staff_members').update({'last_login_at': 'now()'}).eq('id', staff['id']).execute()
             except Exception as update_error:
                 print('STAFF LAST LOGIN UPDATE ERROR:', str(update_error))
 
@@ -8416,7 +8423,7 @@ def create_staff_member():
             'permissions': data.get('permissions') or {},
             'status': data.get('status') or 'active'
         }
-        res = supabase.table('admin_staff_members').insert(payload).execute()
+        res = _staff_db().table('admin_staff_members').insert(payload).execute()
         return jsonify({'success': True, 'data': res.data})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -8427,7 +8434,7 @@ def update_staff_member():
         data = request.get_json() or {}
         staff_id = data.get('id')
         payload = {k: data.get(k) for k in ['name','email','role','permissions'] if k in data}
-        res = supabase.table('admin_staff_members').update(payload).eq('id', staff_id).execute()
+        res = _staff_db().table('admin_staff_members').update(payload).eq('id', staff_id).execute()
         return jsonify({'success': True, 'data': res.data})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -8436,7 +8443,7 @@ def update_staff_member():
 def staff_member_status():
     try:
         data = request.get_json() or {}
-        res = supabase.table('admin_staff_members').update({'status': data.get('status')}).eq('id', data.get('id')).execute()
+        res = _staff_db().table('admin_staff_members').update({'status': data.get('status')}).eq('id', data.get('id')).execute()
         return jsonify({'success': True, 'data': res.data})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -8445,7 +8452,7 @@ def staff_member_status():
 def staff_member_password():
     try:
         data = request.get_json() or {}
-        res = supabase.table('admin_staff_members').update({'password': data.get('password')}).eq('id', data.get('id')).execute()
+        res = _staff_db().table('admin_staff_members').update({'password': data.get('password')}).eq('id', data.get('id')).execute()
         return jsonify({'success': True, 'data': res.data})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -8454,7 +8461,7 @@ def staff_member_password():
 def staff_member_delete():
     try:
         data = request.get_json() or {}
-        res = supabase.table('admin_staff_members').delete().eq('id', data.get('id')).execute()
+        res = _staff_db().table('admin_staff_members').delete().eq('id', data.get('id')).execute()
         return jsonify({'success': True, 'data': res.data})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
