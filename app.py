@@ -623,11 +623,8 @@ def _get_active_account(trader_id, trader=None):
             except Exception:
                 trader = None
 
-        # Reset/waiting lifecycle is the source of truth until a fresh assignment
-        # changes challenge_state back to phase1_active/phase2_active/funded_active.
-        if _trader_is_waiting_for_mt5(trader):
-            return None
-
+        # Account-scoped authority: a trader-level waiting mirror must never hide
+        # other independent active trader_accounts owned by the same trader.
         rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
 
         current_account_id = (trader or {}).get("current_account_id")
@@ -661,10 +658,8 @@ def _purchase_accounts_for_trader(trader, purchases=None):
     This keeps newly assigned purchases visible only during an active lifecycle.
     """
     accounts = []
-    # A reset trader may still have historical MT5 values on the purchase row.
-    # Those values are history, not a current account.
-    if _trader_is_waiting_for_mt5(trader):
-        return accounts
+    # Account-scoped authority: one reset purchase must not hide other active
+    # purchases/accounts belonging to the same trader.
     try:
         rows = list(purchases or [])
         if not rows and trader:
@@ -675,8 +670,6 @@ def _purchase_accounts_for_trader(trader, purchases=None):
                 rows += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
         for p in rows:
             login = str(p.get("mt5_login") or p.get("current_mt5_login") or "").strip()
-            if not login:
-                continue
             payment_status = str(p.get("payment_status") or "").strip().lower()
             status = str(p.get("status") or "").strip().lower()
             if payment_status != "approved" and status not in {"approved", "approved_active", "active"}:
@@ -696,12 +689,18 @@ def _purchase_accounts_for_trader(trader, purchases=None):
                 stage = "phase1"
             account_size = clean(p.get("account_size") or p.get("challenge_size") or 0)
             assigned_at = p.get("assigned_at") or p.get("approved_at") or p.get("updated_at") or p.get("created_at") or now_iso()
+            is_waiting = ("waiting" in stage_text and "mt5" in stage_text and not login)
+            if not login and not is_waiting:
+                continue
             accounts.append(_decorate_account_for_api({
-                "id": p.get("trader_account_id") or f"purchase:{p.get('id')}",
+                "id": (f"waiting:{p.get('id')}" if is_waiting else (p.get("trader_account_id") or f"purchase:{p.get('id')}")),
                 "trader_id": (trader or {}).get("id") or p.get("trader_id"),
                 "purchase_id": p.get("id"),
                 "stage": stage,
-                "account_status": "assigned_active",
+                "account_status": ("waiting_mt5" if is_waiting else "assigned_active"),
+                "status": ("waiting_mt5" if is_waiting else "assigned_active"),
+                "lifecycle_state": p.get("lifecycle_state") or (f"{stage}_waiting_mt5" if is_waiting else _active_state_for_stage(stage)),
+                "waiting_for_stage": stage if is_waiting else None,
                 "mt5_login": login,
                 "mt5_server": p.get("mt5_server") or p.get("current_mt5_server") or "",
                 "mt5_master_password": p.get("mt5_master_password") or p.get("mt5_password") or p.get("master_password") or "",
@@ -716,7 +715,7 @@ def _purchase_accounts_for_trader(trader, purchases=None):
                 "dd_limit_percent": 20,
                 "dd_used_percent": 0,
                 "target_percent": _target_for_stage(stage),
-                "monitoring_enabled": True,
+                "monitoring_enabled": False if is_waiting else True,
                 "started_at": assigned_at,
                 "assigned_at": assigned_at,
                 "created_at": assigned_at,
@@ -735,7 +734,8 @@ def _get_active_accounts(trader_id, trader=None, purchases=None):
         visible_statuses = {
             "assigned_active", "active", "current_active",
             "archived_phase1", "archived_phase2", "archived_funded",
-            "breached_archived", "breached", "locked", "closed"
+            "breached_archived", "breached", "locked", "closed",
+            "waiting_mt5", "phase1_waiting_mt5", "phase2_waiting_mt5", "funded_waiting_mt5"
         }
         rows = []
         for row in raw_rows:
@@ -2058,46 +2058,101 @@ def admin_reset_trader_account():
             print("RESET MT5 POOL LOCK ERROR:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login, "error": str(e)})
             return _np_fail("Reset failed while retiring the old MT5 pool row.", 500)
 
-        # 3. Clear the trader mirror and keep the same waiting phase.
-        trader_update = {
-            "current_account_id": None,
-            "challenge_state": waiting_state,
-            "status": "active",
-            "phase": phase_value,
-            "mt5_login": "",
-            "mt5_server": "",
-            "mt5_master_password": "",
-            "mt5_password": "",
-            "master_password": "",
-            "mt5_investor_password": "",
-            "investor_password": "",
-            "balance": start_balance,
-            "equity": start_balance,
-            "profit": 0,
-            "profit_percent": 0,
-            "drawdown": 0,
-            "drawdown_percent": 0,
-            "max_drawdown_used": 0,
-            "risk_zone": "waiting_mt5",
-            "monitoring_enabled": False,
-            "mt5_account_active": False,
-            "mt5_access_disabled": True,
-            "payout_eligible": False,
-            "payout_blocked": False,
-            "admin_note": reason,
-            "mt5_reset_reason": admin_note,
-            "mt5_updated_at": now,
-            "mt5_updated_by": staff.get("username") or staff.get("name") or "admin",
-            "lifecycle_updated_at": now,
-            "updated_at": now,
-        }
+        # 3. Reconcile the trader compatibility mirror without disabling unrelated accounts.
+        # trader_accounts remains the lifecycle authority. The trader row is only a
+        # convenience pointer for old screens and must point to another valid active
+        # account when one exists.
+        remaining_rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("trader_id", trader_id)
+            .in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
+            .order("updated_at", desc=True)
+            .order("started_at", desc=True)
+            .order("created_at", desc=True)
+            .limit(100)
+            .execute()
+            .data
+            or []
+        )
+        remaining_rows = [r for r in remaining_rows if str(r.get("id") or "") != str(account.get("id") or "")]
+        replacement_account = remaining_rows[0] if remaining_rows else None
+
+        if replacement_account:
+            replacement_stage = str(replacement_account.get("stage") or replacement_account.get("phase") or "phase1").strip().lower()
+            trader_update = {
+                "current_account_id": replacement_account.get("id"),
+                "challenge_state": _active_state_for_stage(replacement_stage),
+                "status": "active",
+                "phase": replacement_stage,
+                "mt5_login": replacement_account.get("mt5_login") or "",
+                "mt5_server": replacement_account.get("mt5_server") or "",
+                "mt5_master_password": replacement_account.get("mt5_master_password") or "",
+                "mt5_password": replacement_account.get("mt5_master_password") or "",
+                "master_password": replacement_account.get("mt5_master_password") or "",
+                "mt5_investor_password": replacement_account.get("mt5_investor_password") or "",
+                "investor_password": replacement_account.get("mt5_investor_password") or "",
+                "balance": clean(replacement_account.get("current_balance") or replacement_account.get("balance") or replacement_account.get("start_balance") or 0),
+                "equity": clean(replacement_account.get("current_equity") or replacement_account.get("equity") or replacement_account.get("current_balance") or replacement_account.get("start_balance") or 0),
+                "profit": clean(replacement_account.get("profit") or 0),
+                "profit_percent": clean(replacement_account.get("profit_percent") or 0),
+                "drawdown": clean(replacement_account.get("absolute_drawdown_percent") or replacement_account.get("drawdown_percent") or 0),
+                "drawdown_percent": clean(replacement_account.get("absolute_drawdown_percent") or replacement_account.get("drawdown_percent") or 0),
+                "max_drawdown_used": clean(replacement_account.get("dd_used_percent") or replacement_account.get("max_drawdown_used") or 0),
+                "risk_zone": replacement_account.get("risk_zone") or "safe",
+                "monitoring_enabled": bool(replacement_account.get("monitoring_enabled", True)),
+                "mt5_account_active": True,
+                "mt5_access_disabled": bool(replacement_account.get("mt5_access_disabled", False)),
+                "payout_eligible": bool(replacement_stage == "funded"),
+                "payout_blocked": False,
+                "admin_note": reason,
+                "mt5_reset_reason": admin_note,
+                "mt5_updated_at": now,
+                "mt5_updated_by": staff.get("username") or staff.get("name") or "admin",
+                "lifecycle_updated_at": now,
+                "updated_at": now,
+            }
+            reset_steps.append("trader_mirror_repointed_to_other_active_account")
+        else:
+            trader_update = {
+                "current_account_id": None,
+                "challenge_state": waiting_state,
+                "status": "active",
+                "phase": phase_value,
+                "mt5_login": "",
+                "mt5_server": "",
+                "mt5_master_password": "",
+                "mt5_password": "",
+                "master_password": "",
+                "mt5_investor_password": "",
+                "investor_password": "",
+                "balance": start_balance,
+                "equity": start_balance,
+                "profit": 0,
+                "profit_percent": 0,
+                "drawdown": 0,
+                "drawdown_percent": 0,
+                "max_drawdown_used": 0,
+                "risk_zone": "waiting_mt5",
+                "monitoring_enabled": False,
+                "mt5_account_active": False,
+                "mt5_access_disabled": True,
+                "payout_eligible": False,
+                "payout_blocked": False,
+                "admin_note": reason,
+                "mt5_reset_reason": admin_note,
+                "mt5_updated_at": now,
+                "mt5_updated_by": staff.get("username") or staff.get("name") or "admin",
+                "lifecycle_updated_at": now,
+                "updated_at": now,
+            }
+            reset_steps.append("trader_mirror_set_to_waiting_no_other_active_account")
 
         result = supabase.table("traders").update(trader_update).eq("id", trader_id).execute().data or []
         if not result:
-            print("RESET TRADER MIRROR CLEAR EMPTY:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login})
-            return _np_fail("Reset failed while clearing the trader MT5 mirror fields.", 500)
+            print("RESET TRADER MIRROR RECONCILE EMPTY:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login})
+            return _np_fail("Reset failed while reconciling the trader compatibility mirror.", 500)
         updated = result[0] if result else get_trader_by_id(trader_id)
-        reset_steps.append("trader_mirror_cleared")
 
         # 4. Ledger/audit evidence only. Failure must not block reset.
         try:
@@ -4300,6 +4355,10 @@ def trader_bootstrap():
 
         account = _get_active_account(trader.get("id"), trader)
         purchase = _latest_purchase_for_trader(trader)
+        pending_replacements = [
+            row for row in _purchase_accounts_for_trader(trader)
+            if str(row.get("account_status") or "").strip().lower() == "waiting_mt5"
+        ]
         payload = {
             "success": True,
             "source": "trader_bootstrap_light",
@@ -4308,6 +4367,7 @@ def trader_bootstrap():
             "trader": _public_trader_payload(trader),
             "current_account": _trader_safe_account_row(account) if account else None,
             "active_purchase": _trader_safe_purchase_row(purchase) if purchase else None,
+            "pending_replacements": [_trader_safe_account_row(row) for row in pending_replacements],
             "latest_trades": [],
             "latest_monitoring": None,
             "payout_eligibility": {
