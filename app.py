@@ -9,6 +9,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
+NAIRAPIPS_RELEASE = "LIFECYCLE_COORDINATED_R2"
 CORS(app)
 
 REGISTER_RATE_WINDOW_SECONDS = 15 * 60
@@ -4232,7 +4233,7 @@ def delete_trader():
 # ================================
 _TRADER_BOOTSTRAP_CACHE = {}
 _ADMIN_BOOTSTRAP_CACHE = {"ts": 0, "payload": None}
-TRADER_BOOTSTRAP_TTL_SECONDS = 20
+TRADER_BOOTSTRAP_TTL_SECONDS = 5
 ADMIN_BOOTSTRAP_TTL_SECONDS = 25
 _NP_SYNC_LOCK = __import__("threading").Lock()
 _NP_SYNC_STATE = {"running": False, "started_at": None, "finished_at": None, "last_result": None, "last_error": None}
@@ -10494,21 +10495,34 @@ def admin_trader_accounts_feed():
                 lg = str((r or {}).get("mt5_login") or "").strip()
                 if lg and lg not in logins:
                     logins.append(lg)
-            latest_by_login = {}
+            latest_by_account = {}
+            snapshots_by_login = {}
             for i in range(0, len(logins), 100):
                 batch = logins[i:i+100]
                 if not batch:
                     continue
                 snaps = supabase.table("monitoring_snapshots").select("*").in_("mt5_login", batch).order("created_at", desc=True).limit(1000).execute().data or []
                 for snap in snaps:
+                    aid = str((snap or {}).get("trader_account_id") or "").strip()
                     lg = str((snap or {}).get("mt5_login") or "").strip()
-                    if lg and lg not in latest_by_login:
-                        latest_by_login[lg] = snap
+                    if aid and aid not in latest_by_account:
+                        latest_by_account[aid] = snap
+                    if lg:
+                        snapshots_by_login.setdefault(lg, []).append(snap)
             enriched = []
             for r in rows:
                 row = dict(r or {})
+                account_id = str(row.get("id") or "").strip()
+                trader_owner = str(row.get("trader_id") or "").strip()
                 lg = str(row.get("mt5_login") or "").strip()
-                snap = latest_by_login.get(lg)
+                snap = latest_by_account.get(account_id)
+                # Legacy fallback is allowed only when exactly one snapshot candidate belongs
+                # to the same trader. Login alone is never lifecycle authority.
+                if not snap and lg:
+                    candidates = [x for x in snapshots_by_login.get(lg, []) if str((x or {}).get("trader_id") or "").strip() == trader_owner]
+                    accountless = [x for x in candidates if not str((x or {}).get("trader_account_id") or "").strip()]
+                    if len(accountless) == 1:
+                        snap = accountless[0]
                 if snap:
                     # Prefer monitoring truth for live metrics, especially newly-fixed
                     # accounts like Fatoba where trader_accounts may still show defaults.
