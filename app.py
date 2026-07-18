@@ -1805,12 +1805,18 @@ def admin_reset_trader_account():
     if request.method == "OPTIONS":
         return _np_ok({})
 
+    admin_auth, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
     data = request.get_json(silent=True) or {}
     trader_id = data.get("trader_id") or data.get("id")
     if not trader_id:
         return _np_fail("Trader ID is required")
 
     staff = _admin_from_payload(data)
+    staff["id"] = admin_auth.get("id") or staff.get("id")
+    staff["role"] = admin_auth.get("role") or staff.get("role")
     reset_type = str(data.get("reset_type") or data.get("reason") or "admin_reset").strip()
     admin_note = str(
         data.get("admin_note")
@@ -1875,10 +1881,12 @@ def admin_reset_trader_account():
         account_purchase_id = str(account.get("purchase_id") or "").strip()
         linked_purchase = None
         if account_purchase_id:
-            if not requested_purchase_id:
-                return _np_fail("Exact purchase_id is required for this reset. Reset cancelled.", 400)
-            if requested_purchase_id != account_purchase_id:
+            # The selected trader_account row is the authority. The browser may send
+            # purchase_id as an additional consistency check, but reset must not depend
+            # on a duplicated client-side identifier.
+            if requested_purchase_id and requested_purchase_id != account_purchase_id:
                 return _np_fail("purchase_id does not match the selected trader_account_id. Reset cancelled.", 409)
+            requested_purchase_id = account_purchase_id
 
             # Validate the linked purchase BEFORE the first database mutation.
             purchase_rows = (
@@ -1908,10 +1916,14 @@ def admin_reset_trader_account():
         account_stage = str(account.get("stage") or "").strip().lower()
         trader_phase = str(trader.get("phase") or "").strip().lower()
 
-        if requested_stage in {"phase1", "phase2", "funded"}:
-            stage = requested_stage
-        elif account_stage in {"phase1", "phase2", "funded"}:
+        # The selected account is authoritative. reset_stage is only a stale-UI
+        # consistency check and can never move an account into another phase.
+        if account_stage in {"phase1", "phase2", "funded"}:
             stage = account_stage
+            if requested_stage in {"phase1", "phase2", "funded"} and requested_stage != account_stage:
+                return _np_fail("Reset stage does not match the selected trader account. Reload Admin and try again.", 409)
+        elif requested_stage in {"phase1", "phase2", "funded"}:
+            stage = requested_stage
         elif trader_phase in {"phase1", "phase2", "funded"}:
             stage = trader_phase
         else:
@@ -1992,6 +2004,7 @@ def admin_reset_trader_account():
             "admin_note": reason,
         }
         reset_steps = []
+        reset_warnings = []
         archived_check = (
             supabase.table("trader_accounts")
             .select("id,account_status,archived_at,monitoring_enabled")
@@ -2103,11 +2116,12 @@ def admin_reset_trader_account():
             }).execute().data or []
             if not event_rows:
                 print("RESET EVENT LOG EMPTY:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login})
-                return _np_fail("Reset failed while writing monitoring reset evidence.", 500)
-            reset_steps.append("monitoring_event_logged")
+                reset_warnings.append("monitoring_event_not_written")
+            else:
+                reset_steps.append("monitoring_event_logged")
         except Exception as e:
             print("RESET EVENT LOG ERROR:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login, "error": str(e)})
-            return _np_fail("Reset failed while writing monitoring reset evidence.", 500)
+            reset_warnings.append("monitoring_event_not_written")
 
         _log_lifecycle_event(
             trader_id,
@@ -2135,6 +2149,7 @@ def admin_reset_trader_account():
             "reset_stage": stage,
             "waiting_state": waiting_state,
             "operations_succeeded": reset_steps,
+            "warnings": reset_warnings,
         })
 
     except Exception as e:
@@ -2147,6 +2162,9 @@ def admin_verify_reset():
     """Read-only reset verification. Never modifies Supabase."""
     if request.method == "OPTIONS":
         return _np_ok({})
+    admin_auth, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     data = request.get_json(silent=True) or {}
     trader_id = str(data.get("trader_id") or request.args.get("trader_id") or "").strip()
     account_id = str(data.get("trader_account_id") or data.get("account_id") or request.args.get("trader_account_id") or request.args.get("account_id") or "").strip()
@@ -2201,7 +2219,10 @@ def admin_verify_reset():
         trader_state = str(trader.get("challenge_state") or trader.get("status") or "").lower()
         purchase_login = str(purchase.get("mt5_login") or "").strip()
         trader_login = str(trader.get("mt5_login") or "").strip()
-        purchase_clear = bool(purchase) and not purchase_login and not str(purchase.get("assigned_mt5_id") or "").strip()
+        purchase_clear = (
+            not purchase_id
+            or (bool(purchase) and not purchase_login and not str(purchase.get("assigned_mt5_id") or "").strip())
+        )
         trader_waiting = bool(trader) and "waiting" in trader_state and not trader_login and not str(trader.get("current_account_id") or "").strip()
         selected_archived = bool(account) and account_status.startswith("archived_") and bool(account.get("archived_at"))
         old_login_in_active_account = len(active_account_old_login) > 0
@@ -2670,12 +2691,11 @@ def admin_bootstrap():
     snapshot_rows = []
     event_rows = _admin_rest_rows("monitoring_events", "created_at", True, 50)
 
-    # This queue was already proven working. If it ever fails, admin still loads.
-    try:
-        phase_queue_rows = _fetch_phase_assignment_queue()
-    except Exception as e:
-        print("ADMIN BOOTSTRAP PHASE QUEUE ERROR:", e)
-        phase_queue_rows = []
+    # Phase assignment is operational module data, not first-screen data.
+    # Loading it here previously allowed a slow queue scan to block Admin startup.
+    # The existing /np_assignment_center endpoint now loads it only when the
+    # Phase Assignment module is opened.
+    phase_queue_rows = []
 
     available_mt5_rows = _quick_available_mt5(mt5_rows)
 
@@ -5045,8 +5065,6 @@ def admin_bulk_resend_pass_emails():
         return ok({"total": len(rows1), "sent": sent_count, "failed": failed_count, "skipped": skipped_count, "results": results}, f"Bulk resend complete: {sent_count} sent")
     except Exception as e:
         return bad(e, 500)
-
-@app.route("/resend_phase_pass_email", methods=["POST", "OPTIONS"])
 
 @app.route("/mt5_pool", methods=["GET"])
 def mt5_pool():
