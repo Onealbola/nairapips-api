@@ -262,6 +262,15 @@ def _archive_status_for_stage(stage, breached=False):
     return {"phase1": "archived_phase1", "phase2": "archived_phase2", "funded": "archived_funded"}.get(str(stage or "").lower(), "closed")
 
 
+def _reset_archive_status_for_stage(stage):
+    """Terminal status reserved for admin reset history, never phase-pass history."""
+    return {
+        "phase1": "archived_reset_phase1",
+        "phase2": "archived_reset_phase2",
+        "funded": "archived_reset_funded",
+    }.get(str(stage or "").lower(), "archived_reset")
+
+
 def _normalize_phone_value(phone):
     digits = "".join(ch for ch in str(phone or "") if ch.isdigit())
     if digits.startswith("0") and len(digits) >= 10:
@@ -615,115 +624,92 @@ def _sync_identity_fields(trader):
 
 
 def _get_active_account(trader_id, trader=None):
+    """Return one display pointer from genuine active trader_accounts rows only.
+
+    A trader may own many active accounts. This helper chooses a convenience
+    pointer, but it never manufactures an account from traders mirror fields.
+    """
     try:
         if not trader and trader_id:
-            try:
-                trader_rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
-                trader = trader_rows[0] if trader_rows else None
-            except Exception:
-                trader = None
+            rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+            trader = rows[0] if rows else None
 
-        # Account-scoped authority: a trader-level waiting mirror must never hide
-        # other independent active trader_accounts owned by the same trader.
-        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
-
-        current_account_id = (trader or {}).get("current_account_id")
+        rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("trader_id", trader_id)
+            .in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
+            .order("updated_at", desc=True)
+            .order("started_at", desc=True)
+            .order("created_at", desc=True)
+            .limit(100)
+            .execute()
+            .data
+            or []
+        )
+        current_account_id = str((trader or {}).get("current_account_id") or "").strip()
         if current_account_id:
-            for row in rows:
-                if str(row.get("id") or "") == str(current_account_id):
-                    status = str(row.get("account_status") or "").strip().lower()
-                    if status in ACTIVE_ACCOUNT_STATUSES:
-                        return _decorate_account_for_api(row)
-            direct_rows = supabase.table("trader_accounts").select("*").eq("id", current_account_id).limit(1).execute().data or []
-            if direct_rows:
-                status = str(direct_rows[0].get("account_status") or "").strip().lower()
-                if status in ACTIVE_ACCOUNT_STATUSES:
-                    return _decorate_account_for_api(direct_rows[0])
-
-        if rows:
-            preferred_stage = _stage_for_lifecycle_state((trader or {}).get("challenge_state"), (trader or {}).get("phase"))
-            for row in rows:
-                if str(row.get("stage") or "").strip().lower() == preferred_stage:
-                    return _decorate_account_for_api(row)
-            return _decorate_account_for_api(rows[0])
-
-        return _active_account_from_trader_profile(trader)
+            pointed = next((r for r in rows if str(r.get("id") or "") == current_account_id), None)
+            if pointed:
+                return _decorate_account_for_api(pointed)
+        return _decorate_account_for_api(rows[0]) if rows else None
     except Exception as e:
         print("ACTIVE ACCOUNT FETCH ERROR:", e)
-        return _active_account_from_trader_profile(trader)
+        return None
 
 
 def _purchase_accounts_for_trader(trader, purchases=None):
-    """Create dashboard account cards from approved purchases with assigned MT5.
-    This keeps newly assigned purchases visible only during an active lifecycle.
+    """Return account-scoped waiting placeholders from purchases.
+
+    Active MT5 cards must come from trader_accounts only. challenge_purchases is
+    used solely to display a reset/passed lifecycle waiting for a replacement.
     """
     accounts = []
-    # Account-scoped authority: one reset purchase must not hide other active
-    # purchases/accounts belonging to the same trader.
     try:
         rows = list(purchases or [])
         if not rows and trader:
             rows = _safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100)
-            if trader.get("email"):
-                rows += _safe_fetch("challenge_purchases", "email", trader.get("email"), 100)
-            if trader.get("phone"):
-                rows += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
+        seen = set()
         for p in rows:
+            pid = str(p.get("id") or "").strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
             login = str(p.get("mt5_login") or p.get("current_mt5_login") or "").strip()
-            payment_status = str(p.get("payment_status") or "").strip().lower()
-            status = str(p.get("status") or "").strip().lower()
-            if payment_status != "approved" and status not in {"approved", "approved_active", "active"}:
-                continue
             stage_text = " ".join([
-                str(p.get("lifecycle_state") or ""),
-                str(p.get("assigned_phase") or ""),
-                str(p.get("active_stage") or ""),
-                str(p.get("phase") or ""),
+                str(p.get("lifecycle_state") or ""), str(p.get("assigned_phase") or ""),
+                str(p.get("active_stage") or ""), str(p.get("phase") or ""),
                 str(p.get("status") or ""),
-            ]).lower()
-            if "funded" in stage_text:
-                stage = "funded"
-            elif "phase2" in stage_text or "phase_2" in stage_text:
-                stage = "phase2"
-            else:
-                stage = "phase1"
-            account_size = clean(p.get("account_size") or p.get("challenge_size") or 0)
-            assigned_at = p.get("assigned_at") or p.get("approved_at") or p.get("updated_at") or p.get("created_at") or now_iso()
-            is_waiting = ("waiting" in stage_text and "mt5" in stage_text and not login)
-            if not login and not is_waiting:
+            ]).lower().replace(" ", "_")
+            is_waiting = "waiting" in stage_text and "mt5" in stage_text and not login
+            if not is_waiting:
                 continue
+            stage = "funded" if "funded" in stage_text else ("phase2" if "phase2" in stage_text or "phase_2" in stage_text else "phase1")
+            account_size = clean(p.get("account_size") or p.get("challenge_size") or 0)
+            assigned_at = p.get("updated_at") or p.get("approved_at") or p.get("created_at") or now_iso()
             accounts.append(_decorate_account_for_api({
-                "id": (f"waiting:{p.get('id')}" if is_waiting else (p.get("trader_account_id") or f"purchase:{p.get('id')}")),
+                "id": f"waiting:{pid}",
                 "trader_id": (trader or {}).get("id") or p.get("trader_id"),
-                "purchase_id": p.get("id"),
+                "purchase_id": pid,
+                "replaces_trader_account_id": p.get("previous_trader_account_id") or p.get("reset_trader_account_id"),
                 "stage": stage,
-                "account_status": ("waiting_mt5" if is_waiting else "assigned_active"),
-                "status": ("waiting_mt5" if is_waiting else "assigned_active"),
-                "lifecycle_state": p.get("lifecycle_state") or (f"{stage}_waiting_mt5" if is_waiting else _active_state_for_stage(stage)),
-                "waiting_for_stage": stage if is_waiting else None,
-                "mt5_login": login,
-                "mt5_server": p.get("mt5_server") or p.get("current_mt5_server") or "",
-                "mt5_master_password": p.get("mt5_master_password") or p.get("mt5_password") or p.get("master_password") or "",
-                "mt5_investor_password": p.get("mt5_investor_password") or p.get("investor_password") or "",
-                "account_size": account_size,
-                "start_balance": account_size,
-                "current_balance": account_size,
-                "current_equity": account_size,
-                "profit": 0,
-                "profit_percent": 0,
-                "absolute_drawdown_percent": 0,
-                "dd_limit_percent": 20,
-                "dd_used_percent": 0,
+                "waiting_for_stage": stage,
+                "account_status": "waiting_mt5",
+                "status": "waiting_mt5",
+                "lifecycle_state": p.get("lifecycle_state") or f"{stage}_waiting_mt5",
+                "mt5_login": "", "mt5_server": "",
+                "account_size": account_size, "start_balance": account_size,
+                "current_balance": account_size, "current_equity": account_size,
+                "profit": 0, "profit_percent": 0,
+                "absolute_drawdown_percent": 0, "dd_limit_percent": 20, "dd_used_percent": 0,
                 "target_percent": _target_for_stage(stage),
-                "monitoring_enabled": False if is_waiting else True,
-                "started_at": assigned_at,
-                "assigned_at": assigned_at,
-                "created_at": assigned_at,
-                "updated_at": p.get("updated_at") or assigned_at,
-                "_source": "challenge_purchase_assignment",
+                "monitoring_enabled": False, "mt5_access_disabled": True,
+                "started_at": assigned_at, "assigned_at": assigned_at,
+                "created_at": assigned_at, "updated_at": assigned_at,
+                "_source": "challenge_purchase_waiting",
             }))
     except Exception as e:
-        print("PURCHASE ACCOUNT BRIDGE ERROR:", e)
+        print("PURCHASE WAITING BRIDGE ERROR:", e)
     return accounts
 
 
@@ -1951,7 +1937,7 @@ def admin_reset_trader_account():
             reason,
             staff,
             breached=False,
-            archive_status=_archive_status_for_stage(stage, breached=False)
+            archive_status=_reset_archive_status_for_stage(stage)
         )
 
         # Archive duplicate active rows for the same MT5 login only.
@@ -1977,10 +1963,7 @@ def admin_reset_trader_account():
                         reason + " — duplicate active row closed",
                         staff,
                         breached=False,
-                        archive_status=_archive_status_for_stage(
-                            duplicate.get("stage") or stage,
-                            breached=False
-                        )
+                        archive_status=_reset_archive_status_for_stage(duplicate.get("stage") or stage)
                     )
             except Exception as e:
                 print("RESET DUPLICATE ACTIVE ACCOUNT CLEANUP ERROR:", e)
@@ -2001,7 +1984,7 @@ def admin_reset_trader_account():
             "mt5_investor_password": "",
             "investor_password": "",
             "updated_at": now,
-            "admin_note": reason,
+            "admin_note": f"{reason} | reset_trader_account_id={account.get('id')} | reset_stage={stage}",
         }
         reset_steps = []
         reset_warnings = []
@@ -2040,7 +2023,7 @@ def admin_reset_trader_account():
         try:
             if account.get("mt5_pool_id"):
                 pool_rows = supabase.table("mt5_pool").update({
-                    "status": _archive_status_for_stage(stage, breached=False),
+                    "status": _reset_archive_status_for_stage(stage),
                     "assigned_trader_id": trader_id,
                     "assigned_trader_name": trader.get("name") or trader.get("full_name") or trader.get("email"),
                     "assigned_email": trader.get("email"),
@@ -2278,12 +2261,15 @@ def admin_verify_reset():
             not purchase_id
             or (bool(purchase) and not purchase_login and not str(purchase.get("assigned_mt5_id") or "").strip())
         )
-        trader_waiting = bool(trader) and "waiting" in trader_state and not trader_login and not str(trader.get("current_account_id") or "").strip()
+        current_pointer = str(trader.get("current_account_id") or "").strip()
+        pointer_is_selected_archived = bool(current_pointer) and current_pointer == str(account_id)
+        trader_mirror_consistent = bool(trader) and not pointer_is_selected_archived and str(trader_login or "") != str(old_login or "")
         selected_archived = bool(account) and account_status.startswith("archived_") and bool(account.get("archived_at"))
+        reset_archive_kind_ok = account_status.startswith("archived_reset")
         old_login_in_active_account = len(active_account_old_login) > 0
         old_login_in_purchase = len(purchase_old_login) > 0
 
-        complete = selected_archived and purchase_clear and trader_waiting and not old_login_in_active_account and not old_login_in_purchase
+        complete = selected_archived and reset_archive_kind_ok and purchase_clear and trader_mirror_consistent and not old_login_in_active_account and not old_login_in_purchase
 
         return _np_ok({
             "success": True,
@@ -2319,7 +2305,7 @@ def admin_verify_reset():
             "active_accounts_using_old_login": active_account_old_login,
             "any_purchase_still_uses_old_login": old_login_in_purchase,
             "purchases_using_old_login": purchase_old_login,
-            "trader_correctly_waiting_for_fresh_mt5": trader_waiting,
+            "trader_mirror_consistent_after_account_reset": trader_mirror_consistent,
         })
     except Exception as e:
         return _np_fail(e, 500)
