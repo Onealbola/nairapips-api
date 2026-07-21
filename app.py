@@ -13609,3 +13609,434 @@ def repair_phase_pass_handoff():
         })
     except Exception as e:
         return _np_fail(e, 500)
+
+
+
+# =============================================================================
+# NAIRAPIPS INTELLIGENCE CENTER — SPRINT 1
+# Read-only intelligence aggregation + authenticated breach dispute submission.
+# No reset, payout, phase progression, MT5 assignment, or trading enforcement logic
+# is changed by this module.
+# =============================================================================
+
+def _nic_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(str(value).replace("₦", "").replace(",", "").strip())
+    except Exception:
+        return float(default)
+
+
+def _nic_iso(value):
+    return str(value or "").strip()
+
+
+def _nic_account_owned_by_trader(account, trader_id):
+    return bool(account and str(account.get("trader_id") or "") == str(trader_id or ""))
+
+
+def _nic_trade_side(row):
+    value = str(row.get("side") or row.get("type") or "").strip().lower()
+    if value in {"0", "buy", "long"} or "buy" in value:
+        return "BUY"
+    if value in {"1", "sell", "short"} or "sell" in value:
+        return "SELL"
+    return value.upper() or "—"
+
+
+def _nic_trade_time(row, *keys):
+    for key in keys:
+        if row.get(key):
+            return row.get(key)
+    return None
+
+
+def _nic_health_score(dd_absolute, dd_limit, status):
+    if "breach" in str(status or "").lower():
+        return 0
+    if not dd_limit:
+        return 100
+    used_ratio = max(0.0, min(1.0, float(dd_absolute or 0) / float(dd_limit or 20)))
+    return max(0, min(100, round(100 - used_ratio * 100)))
+
+
+def _nic_statistics(trades):
+    closed = []
+    for row in trades or []:
+        status = str(row.get("status") or "").lower()
+        closed_at = row.get("closed_at") or row.get("close_time")
+        if closed_at or status in {"closed", "history", "done"}:
+            closed.append(row)
+
+    profits = [_nic_float(x.get("profit"), 0) + _nic_float(x.get("commission"), 0) + _nic_float(x.get("swap"), 0) for x in closed]
+    wins = [p for p in profits if p > 0]
+    losses = [p for p in profits if p < 0]
+
+    best = max(profits) if profits else 0
+    worst = min(profits) if profits else 0
+    gross_win = sum(wins)
+    gross_loss = abs(sum(losses))
+    profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else (999 if gross_win > 0 else 0)
+
+    streak = 0
+    max_win_streak = 0
+    max_loss_streak = 0
+    loss_streak = 0
+    for p in profits:
+        if p > 0:
+            streak += 1
+            loss_streak = 0
+            max_win_streak = max(max_win_streak, streak)
+        elif p < 0:
+            loss_streak += 1
+            streak = 0
+            max_loss_streak = max(max_loss_streak, loss_streak)
+        else:
+            streak = 0
+            loss_streak = 0
+
+    largest_lot = 0
+    for row in trades or []:
+        largest_lot = max(largest_lot, _nic_float(row.get("volume"), _nic_float(row.get("lots"), 0)))
+
+    return {
+        "total_trades": len(trades or []),
+        "closed_trades": len(closed),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round((len(wins) / len(closed)) * 100, 2) if closed else 0,
+        "net_profit": round(sum(profits), 2),
+        "gross_profit": round(gross_win, 2),
+        "gross_loss": round(gross_loss, 2),
+        "best_trade": round(best, 2),
+        "worst_trade": round(worst, 2),
+        "average_win": round(sum(wins) / len(wins), 2) if wins else 0,
+        "average_loss": round(sum(losses) / len(losses), 2) if losses else 0,
+        "profit_factor": profit_factor,
+        "largest_lot": largest_lot,
+        "longest_win_streak": max_win_streak,
+        "longest_loss_streak": max_loss_streak,
+    }
+
+
+def _nic_build_timeline(account, snapshots, events, trades):
+    items = []
+    started = account.get("started_at") or account.get("created_at") or account.get("assigned_at")
+    if started:
+        items.append({
+            "time": started,
+            "type": "account_started",
+            "zone": "safe",
+            "title": "Account started",
+            "message": f"MT5 {account.get('mt5_login') or '—'} entered {account.get('stage') or 'challenge'} stage.",
+        })
+
+    for row in reversed(snapshots or []):
+        zone = str(row.get("risk_zone") or row.get("zone") or "safe").lower()
+        event_type = str(row.get("event_type") or "snapshot").lower()
+        if event_type == "snapshot" and zone not in {"warning", "danger", "critical", "breached", "passed"}:
+            continue
+        items.append({
+            "time": row.get("created_at") or row.get("updated_at"),
+            "type": event_type,
+            "zone": zone,
+            "title": {
+                "warning": "Warning zone reached",
+                "danger": "Danger zone reached",
+                "critical": "Critical zone reached",
+                "breached": "Account breached",
+                "passed": "Challenge target reached",
+            }.get(zone, str(row.get("message") or event_type).replace("_", " ").title()),
+            "message": row.get("message") or "",
+            "balance": row.get("balance") or row.get("current_balance"),
+            "equity": row.get("equity") or row.get("current_equity"),
+            "drawdown_percent": row.get("drawdown_percent") or row.get("absolute_drawdown_percent"),
+        })
+
+    for row in reversed(events or []):
+        event_type = str(row.get("event_type") or "").lower()
+        if event_type in {"snapshot", ""}:
+            continue
+        items.append({
+            "time": row.get("created_at") or row.get("updated_at"),
+            "type": event_type,
+            "zone": row.get("risk_zone") or row.get("zone") or "info",
+            "title": event_type.replace("_", " ").title(),
+            "message": row.get("message") or "",
+            "balance": row.get("balance"),
+            "equity": row.get("equity"),
+            "drawdown_percent": row.get("drawdown_percent"),
+        })
+
+    for row in trades or []:
+        opened = _nic_trade_time(row, "opened_at", "open_time", "created_at")
+        closed = _nic_trade_time(row, "closed_at", "close_time")
+        if opened:
+            items.append({
+                "time": opened,
+                "type": "trade_opened",
+                "zone": "trade",
+                "title": f"{_nic_trade_side(row)} {row.get('symbol') or 'Trade'} opened",
+                "message": f"{_nic_float(row.get('volume'), _nic_float(row.get('lots'), 0))} lot · Ticket {row.get('ticket') or '—'}",
+                "ticket": row.get("ticket"),
+            })
+        if closed:
+            p = _nic_float(row.get("profit"), 0) + _nic_float(row.get("commission"), 0) + _nic_float(row.get("swap"), 0)
+            items.append({
+                "time": closed,
+                "type": "trade_closed",
+                "zone": "profit" if p >= 0 else "loss",
+                "title": f"{row.get('symbol') or 'Trade'} closed",
+                "message": f"Result: ₦{p:,.2f}",
+                "profit": p,
+                "ticket": row.get("ticket"),
+            })
+
+    items = [x for x in items if x.get("time")]
+    items.sort(key=lambda x: str(x.get("time")))
+    return items[-250:]
+
+
+@app.route("/trader_intelligence", methods=["GET", "OPTIONS"])
+def trader_intelligence():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    account_id = str(request.args.get("account_id") or "").strip()
+    trader_id_arg = str(request.args.get("trader_id") or "").strip()
+    admin = _request_admin_auth()
+
+    if admin:
+        trader_id = trader_id_arg
+    else:
+        trader_id, auth_error = _authenticated_trader_id_for_request(trader_id_arg or None)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+
+    try:
+        account = None
+        if account_id:
+            rows = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+            account = rows[0] if rows else None
+        elif trader_id:
+            rows = (
+                supabase.table("trader_accounts")
+                .select("*")
+                .eq("trader_id", trader_id)
+                .order("created_at", desc=True)
+                .limit(100)
+                .execute()
+                .data
+                or []
+            )
+            terminal = [r for r in rows if any(w in str(r.get("account_status") or "").lower() for w in ("breach", "locked", "archived"))]
+            account = terminal[0] if terminal else (rows[0] if rows else None)
+
+        if not account:
+            return _np_fail("Trading account not found", 404)
+
+        if not admin and not _nic_account_owned_by_trader(account, trader_id):
+            return _np_fail("This account does not belong to the authenticated trader", 403)
+
+        trader_id = str(account.get("trader_id") or trader_id or "")
+        trader_rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+        trader = trader_rows[0] if trader_rows else {}
+
+        snapshots = (
+            supabase.table("monitoring_snapshots")
+            .select("*")
+            .eq("trader_account_id", account.get("id"))
+            .order("created_at", desc=False)
+            .limit(1000)
+            .execute()
+            .data
+            or []
+        )
+        if not snapshots and account.get("mt5_login"):
+            snapshots = (
+                supabase.table("monitoring_snapshots")
+                .select("*")
+                .eq("mt5_login", str(account.get("mt5_login")))
+                .order("created_at", desc=False)
+                .limit(1000)
+                .execute()
+                .data
+                or []
+            )
+
+        events = (
+            supabase.table("monitoring_events")
+            .select("*")
+            .eq("trader_account_id", account.get("id"))
+            .order("created_at", desc=False)
+            .limit(1000)
+            .execute()
+            .data
+            or []
+        )
+
+        trades = (
+            supabase.table("trader_trades")
+            .select("*")
+            .eq("trader_account_id", account.get("id"))
+            .order("opened_at", desc=False)
+            .limit(2000)
+            .execute()
+            .data
+            or []
+        )
+        if not trades and account.get("mt5_login"):
+            trades = (
+                supabase.table("trader_trades")
+                .select("*")
+                .eq("mt5_login", str(account.get("mt5_login")))
+                .order("opened_at", desc=False)
+                .limit(2000)
+                .execute()
+                .data
+                or []
+            )
+
+        start_balance = _nic_float(account.get("start_balance"), _nic_float(account.get("account_size"), 0))
+        current_balance = _nic_float(account.get("current_balance"), start_balance)
+        current_equity = _nic_float(account.get("current_equity"), current_balance)
+        dd_limit = _nic_float(account.get("dd_limit_percent"), 20) or 20
+
+        snapshot_equities = [_nic_float(x.get("equity"), _nic_float(x.get("current_equity"), 0)) for x in snapshots]
+        snapshot_balances = [_nic_float(x.get("balance"), _nic_float(x.get("current_balance"), 0)) for x in snapshots]
+        valid_equities = [x for x in snapshot_equities if x > 0]
+        valid_balances = [x for x in snapshot_balances if x > 0]
+
+        highest_equity = max(valid_equities + [_nic_float(account.get("highest_equity"), current_equity)])
+        lowest_equity = min(valid_equities + [_nic_float(account.get("lowest_equity"), current_equity)]) if valid_equities else _nic_float(account.get("lowest_equity"), current_equity)
+        highest_balance = max(valid_balances + [start_balance, current_balance])
+        lowest_balance = min(valid_balances + [current_balance]) if valid_balances else current_balance
+
+        dd_absolute = _nic_float(account.get("absolute_drawdown_percent"), 0)
+        if start_balance > 0:
+            dd_absolute = max(dd_absolute, max(0, ((start_balance - min(current_equity, lowest_equity, lowest_balance)) / start_balance) * 100))
+        dd_used = min(999, max(0, (dd_absolute / dd_limit) * 100 if dd_limit else 0))
+        breach_level = _nic_float(account.get("breach_equity_level"), start_balance * (1 - dd_limit / 100) if start_balance else 0)
+        exceeded_amount = max(0, breach_level - min(current_equity, lowest_equity))
+        status = str(account.get("account_status") or trader.get("status") or "active")
+        reason = account.get("breach_reason") or account.get("archive_reason") or trader.get("breach_reason") or "Maximum drawdown rule reached"
+
+        statistics = _nic_statistics(trades)
+        timeline = _nic_build_timeline(account, snapshots, events, trades)
+
+        chart = []
+        for row in snapshots[-500:]:
+            chart.append({
+                "time": row.get("created_at") or row.get("updated_at"),
+                "balance": _nic_float(row.get("balance"), _nic_float(row.get("current_balance"), 0)),
+                "equity": _nic_float(row.get("equity"), _nic_float(row.get("current_equity"), 0)),
+                "drawdown_percent": _nic_float(row.get("drawdown_percent"), _nic_float(row.get("absolute_drawdown_percent"), 0)),
+                "risk_zone": row.get("risk_zone") or row.get("zone") or "safe",
+            })
+
+        response = {
+            "success": True,
+            "generated_at": now_iso(),
+            "trader": {
+                "id": trader.get("id"),
+                "name": trader.get("name") or trader.get("full_name") or "Trader",
+                "email": trader.get("email"),
+            },
+            "account": {
+                "id": account.get("id"),
+                "trader_id": trader_id,
+                "mt5_login": account.get("mt5_login"),
+                "mt5_server": account.get("mt5_server"),
+                "stage": account.get("stage"),
+                "status": status,
+                "account_size": _nic_float(account.get("account_size"), start_balance),
+                "started_at": account.get("started_at") or account.get("created_at"),
+                "breached_at": account.get("breached_at") or account.get("updated_at"),
+                "breach_reason": reason,
+            },
+            "risk": {
+                "status": "BREACHED" if "breach" in status.lower() else status.upper(),
+                "health_score": _nic_health_score(dd_absolute, dd_limit, status),
+                "start_balance": start_balance,
+                "current_balance": current_balance,
+                "current_equity": current_equity,
+                "highest_balance": highest_balance,
+                "lowest_balance": lowest_balance,
+                "highest_equity": highest_equity,
+                "lowest_equity": lowest_equity,
+                "dd_limit_percent": dd_limit,
+                "drawdown_percent": round(dd_absolute, 4),
+                "dd_limit_used_percent": round(dd_used, 2),
+                "drawdown_remaining_percent": round(max(0, dd_limit - dd_absolute), 4),
+                "breach_equity_level": round(breach_level, 2),
+                "exceeded_amount": round(exceeded_amount, 2),
+            },
+            "statistics": statistics,
+            "timeline": timeline,
+            "chart": chart,
+            "trades": [_trader_safe_trade_row(x) for x in trades[-1000:]],
+            "events": [_trader_safe_monitoring_row(x) for x in events[-250:]],
+            "snapshots": [_trader_safe_monitoring_row(x) for x in snapshots[-500:]],
+        }
+        return _np_ok(response)
+    except Exception as e:
+        print("TRADER INTELLIGENCE ERROR:", e)
+        return _np_fail(str(e), 500)
+
+
+@app.route("/submit_breach_dispute", methods=["POST", "OPTIONS"])
+def submit_breach_dispute():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    data = request.get_json(silent=True) or {}
+    requested_trader_id = str(data.get("trader_id") or "").strip()
+    trader_id, auth_error = _authenticated_trader_id_for_request(requested_trader_id or None)
+    if auth_error:
+        return _np_fail(auth_error, 401)
+
+    account_id = str(data.get("account_id") or "").strip()
+    message = str(data.get("message") or "").strip()
+    if not account_id:
+        return _np_fail("account_id is required", 400)
+    if len(message) < 10:
+        return _np_fail("Please explain the dispute in at least 10 characters", 400)
+
+    try:
+        rows = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+        account = rows[0] if rows else None
+        if not _nic_account_owned_by_trader(account, trader_id):
+            return _np_fail("This account does not belong to the authenticated trader", 403)
+
+        trader_rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+        trader = trader_rows[0] if trader_rows else {}
+
+        subject = f"Breach dispute — MT5 {account.get('mt5_login') or '—'}"
+        evidence_note = (
+            f"\n\nAccount ID: {account_id}"
+            f"\nMT5 Login: {account.get('mt5_login') or '—'}"
+            f"\nStage: {account.get('stage') or '—'}"
+            f"\nRecorded Status: {account.get('account_status') or '—'}"
+            f"\nBreach Reason: {account.get('breach_reason') or account.get('archive_reason') or '—'}"
+        )
+        row = {
+            "trader_id": trader_id,
+            "trader_name": trader.get("name") or trader.get("full_name") or "Trader",
+            "email": trader.get("email") or "",
+            "phone": trader.get("phone") or "",
+            "subject": subject,
+            "message": message + evidence_note,
+            "status": "open",
+            "priority": "high",
+            "admin_reply": "",
+            "created_at": now_iso(),
+            "last_updated_at": now_iso(),
+        }
+        created = supabase.table("support_tickets").insert(row).execute().data or []
+        _audit_safe("breach_intelligence", "submit_dispute", f"Account {account_id}", {"name": "trader", "username": trader.get("email") or trader_id, "role": "trader"}, account_id)
+        return _np_ok({"success": True, "ticket": created[0] if created else row}, 201)
+    except Exception as e:
+        print("BREACH DISPUTE ERROR:", e)
+        return _np_fail(str(e), 500)
+
