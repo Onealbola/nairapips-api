@@ -9,7 +9,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "LIFECYCLE_COORDINATED_R2"
+NAIRAPIPS_RELEASE = "PAYOUT_DATA_CONSISTENCY_FIXED_2026_07_23"
 CORS(app)
 
 REGISTER_RATE_WINDOW_SECONDS = 15 * 60
@@ -1069,6 +1069,22 @@ def _payout_eligibility(trader):
         return False, "Trader not found", None
     state = str(trader.get("challenge_state") or "").strip().lower()
     account = _get_active_account(trader.get("id"), trader)
+
+    # REGRESSION FIX: payout calculations must use the same latest monitoring
+    # evidence used by the Trader Dashboard and enriched Admin account feed.
+    # trader_accounts remains lifecycle authority; monitoring only supplies the
+    # latest balance/equity/profit for this exact trader_account_id.
+    if account:
+        try:
+            enriched = _enrich_accounts_with_latest_monitoring(
+                trader.get("id"),
+                [account],
+            )
+            if enriched:
+                account = enriched[0]
+        except Exception as e:
+            print("PAYOUT ACCOUNT MONITORING ENRICH ERROR:", e)
+
     if state != "funded_active":
         return False, "Payouts require funded_active lifecycle state.", account
     if not account:
