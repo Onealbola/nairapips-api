@@ -9,7 +9,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "LIVE_METRIC_PRECEDENCE_FIXED_2026_07_23"
+NAIRAPIPS_RELEASE = "MULTI_ACCOUNT_GOLDEN_TICKET_FIXED_2026_07_23"
 CORS(app)
 
 REGISTER_RATE_WINDOW_SECONDS = 15 * 60
@@ -950,22 +950,10 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
                 if not str(snap.get("trader_account_id") or "").strip():
                     row["_legacy_snapshot_matches_account"] = True
                 row["latest_monitoring_snapshot"] = snap
-                live_balance = snap.get("current_balance")
-                if live_balance in [None, ""]:
-                    live_balance = snap.get("balance")
-                live_equity = snap.get("current_equity")
-                if live_equity in [None, ""]:
-                    live_equity = snap.get("equity")
-                live_profit = snap.get("current_profit")
-                if live_profit in [None, ""]:
-                    live_profit = snap.get("profit")
-                live_profit_percent = snap.get("current_profit_percent")
-                if live_profit_percent in [None, ""]:
-                    live_profit_percent = snap.get("profit_percent")
-                row["current_balance"] = clean(live_balance if live_balance not in [None, ""] else row.get("current_balance") or row.get("account_size"))
-                row["current_equity"] = clean(live_equity if live_equity not in [None, ""] else row.get("current_equity") or row.get("current_balance") or row.get("account_size"))
-                row["profit"] = clean(live_profit if live_profit not in [None, ""] else row.get("profit"))
-                row["profit_percent"] = clean(live_profit_percent if live_profit_percent not in [None, ""] else row.get("profit_percent"))
+                row["current_balance"] = clean(snap.get("balance") or row.get("current_balance") or row.get("account_size"))
+                row["current_equity"] = clean(snap.get("equity") or row.get("current_equity") or row.get("current_balance") or row.get("account_size"))
+                row["profit"] = clean(snap.get("profit") or row.get("profit"))
+                row["profit_percent"] = clean(snap.get("profit_percent") or row.get("profit_percent"))
                 row["absolute_drawdown_percent"] = clean(snap.get("drawdown_percent") or row.get("absolute_drawdown_percent"))
                 row["drawdown_percent"] = row["absolute_drawdown_percent"]
                 row["max_drawdown_used"] = clean(snap.get("max_drawdown_used") or row.get("max_drawdown_used") or row.get("dd_used_percent"))
@@ -10538,24 +10526,10 @@ def admin_trader_accounts_feed():
                 if snap:
                     # Prefer monitoring truth for live metrics, especially newly-fixed
                     # accounts like Fatoba where trader_accounts may still show defaults.
-                    # LIVE METRIC AUTHORITY:
-                    # New monitoring rows carry current_* fields alongside legacy fields.
-                    # Always prefer current_* so a legacy starting/stale balance cannot
-                    # overwrite the live MT5 balance after Admin refresh.
-                    bal = snap.get("current_balance")
-                    if bal in [None, ""]:
-                        bal = snap.get("balance")
-                    eq = snap.get("current_equity")
-                    if eq in [None, ""]:
-                        eq = snap.get("equity")
-                    if eq in [None, ""]:
-                        eq = bal
-                    profit = snap.get("current_profit")
-                    if profit in [None, ""]:
-                        profit = snap.get("profit")
-                    profit_pct = snap.get("current_profit_percent")
-                    if profit_pct in [None, ""]:
-                        profit_pct = snap.get("profit_percent")
+                    bal = snap.get("balance") or snap.get("current_balance")
+                    eq = snap.get("equity") or snap.get("current_equity") or bal
+                    profit = snap.get("profit") or snap.get("current_profit")
+                    profit_pct = snap.get("profit_percent") or snap.get("current_profit_percent")
                     if bal not in [None, ""]:
                         row["current_balance"] = bal
                         row["balance"] = bal
@@ -13446,8 +13420,26 @@ def assign_golden_ticket_account():
             )
         if not trader:
             return _np_fail("Golden Ticket lead/trader not found", 404)
-        if _get_active_account(trader.get("id"), trader):
-            return _np_fail("This Golden Ticket trader already has an active account.", 409)
+
+        # MULTI-ACCOUNT AUTHORITY:
+        # A NairaPips trader may own multiple independent active accounts.
+        # Do not block a new Golden Ticket/manual assignment merely because another
+        # trader_accounts row is active. Safety remains account-scoped: the selected
+        # MT5 must be fresh, unique and create its own trader_accounts row.
+        existing_active_accounts = []
+        try:
+            existing_active_accounts = (
+                supabase.table("trader_accounts")
+                .select("id,stage,account_status,mt5_login,account_size")
+                .eq("trader_id", trader.get("id"))
+                .in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
+                .limit(100)
+                .execute()
+                .data
+                or []
+            )
+        except Exception as e:
+            print("GOLDEN TICKET EXISTING ACTIVE ACCOUNT AUDIT SKIPPED:", e)
 
         mt5 = _get_mt5_account(mt5_id=mt5_id)
         if not mt5:
