@@ -9,7 +9,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "PAYOUT_DATA_CONSISTENCY_FIXED_2026_07_23"
+NAIRAPIPS_RELEASE = "LIVE_BALANCE_SWITCHING_FIXED_2026_07_23"
 CORS(app)
 
 REGISTER_RATE_WINDOW_SECONDS = 15 * 60
@@ -980,10 +980,16 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
                 row["max_drawdown_used"] = used
                 row["absolute_drawdown_percent"] = round((used / 100) * limit, 4)
                 row["drawdown_percent"] = row["absolute_drawdown_percent"]
-                row["current_balance"] = clean(risk_record.get("balance") or row.get("current_balance") or row.get("account_size"))
-                row["current_equity"] = clean(risk_record.get("equity") or row.get("current_equity") or row.get("current_balance") or row.get("account_size"))
+
+                # LIVE-METRIC REGRESSION FIX:
+                # Historical strongest-risk evidence may preserve drawdown protection,
+                # but it must never replace the newest MT5 balance, equity or profit.
+                # Those values remain sourced from the latest account-specific snapshot.
                 row["risk_zone"] = risk_record.get("risk_zone") or row.get("risk_zone") or _risk_zone(used)
-                row["last_sync_at"] = risk_record.get("created_at") or row.get("last_sync_at") or row.get("updated_at")
+
+                # Keep last_sync_at tied to the newest live snapshot/account update.
+                # Store historical risk time separately for audit visibility.
+                row["risk_evidence_at"] = risk_record.get("created_at") or risk_record.get("updated_at")
             start_balance = clean(row.get("start_balance") or row.get("account_size") or 0)
             current_equity = clean(row.get("current_equity") or row.get("current_balance") or start_balance)
             if current_equity and start_balance:
@@ -1069,22 +1075,6 @@ def _payout_eligibility(trader):
         return False, "Trader not found", None
     state = str(trader.get("challenge_state") or "").strip().lower()
     account = _get_active_account(trader.get("id"), trader)
-
-    # REGRESSION FIX: payout calculations must use the same latest monitoring
-    # evidence used by the Trader Dashboard and enriched Admin account feed.
-    # trader_accounts remains lifecycle authority; monitoring only supplies the
-    # latest balance/equity/profit for this exact trader_account_id.
-    if account:
-        try:
-            enriched = _enrich_accounts_with_latest_monitoring(
-                trader.get("id"),
-                [account],
-            )
-            if enriched:
-                account = enriched[0]
-        except Exception as e:
-            print("PAYOUT ACCOUNT MONITORING ENRICH ERROR:", e)
-
     if state != "funded_active":
         return False, "Payouts require funded_active lifecycle state.", account
     if not account:
