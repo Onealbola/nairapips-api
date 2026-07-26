@@ -9,8 +9,49 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "MULTI_ACCOUNT_GOLDEN_TICKET_FIXED_2026_07_23"
+NAIRAPIPS_RELEASE = "TRADERS_LEAGUE_GLOBAL_CORS_FIXED_2026_07_26"
 CORS(app)
+
+# ============================================================
+# NAIRAPIPS GLOBAL CORS AUTHORITY
+# Ensures every Flask response — including admin auth failures,
+# League routes, exceptions handled by Flask, and preflight
+# requests — carries the headers required by nairapips.com.
+# ============================================================
+NAIRAPIPS_ALLOWED_ORIGINS = {
+    "https://nairapips.com",
+    "https://www.nairapips.com",
+    "http://nairapips.com",
+    "http://www.nairapips.com",
+    "http://localhost",
+    "http://127.0.0.1",
+}
+
+@app.before_request
+def _nairapips_global_preflight():
+    if request.method == "OPTIONS":
+        response = jsonify({"success": True, "preflight": True})
+        response.status_code = 200
+        return response
+    return None
+
+@app.after_request
+def _nairapips_global_cors_headers(response):
+    origin = str(request.headers.get("Origin") or "").strip()
+    if origin in NAIRAPIPS_ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    elif not origin:
+        # Server-to-server and direct browser navigation.
+        response.headers.setdefault("Access-Control-Allow-Origin", "*")
+    response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Authorization, Content-Type, Accept, Origin, X-Requested-With"
+    )
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    )
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
 
 REGISTER_RATE_WINDOW_SECONDS = 15 * 60
 REGISTER_RATE_MAX = 5
