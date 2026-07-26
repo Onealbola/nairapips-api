@@ -208,6 +208,10 @@ def _is_truthy(value):
 
 
 def _is_funded_trader(row):
+    # Traders League V1: League competition accounts are NEVER "funded" in the paid sense.
+    # A League account with programme_type='traders_league' must not be eligible for paid payouts.
+    if str(row.get("programme_type") or "").strip().lower() == "traders_league":
+        return False
     status = str(row.get("status") or "").strip().lower()
     phase = str(row.get("phase") or "").strip().lower()
     return status in {"funded", "live"} or phase in {"funded", "live"} or bool(row.get("funded_at"))
@@ -1069,6 +1073,9 @@ def _payout_eligibility(trader):
         return False, "Trader not found", None
     state = str(trader.get("challenge_state") or "").strip().lower()
     account = _get_active_account(trader.get("id"), trader)
+    # Traders League V1: League competition accounts are never eligible for paid payouts.
+    if account and str(account.get("programme_type") or "").strip().lower() == "traders_league":
+        return False, "League competition accounts are not eligible for paid payouts. Use the League reward system.", account
     if state != "funded_active":
         return False, "Payouts require funded_active lifecycle state.", account
     if not account:
@@ -1354,25 +1361,45 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         trader_email = trader.get('email')
         trader_name = trader.get('name') or 'Trader'
         if trader_email:
+            # Traders League V1: detect League assignments and use a League-styled
+            # email body so the trader doesn't think they got a paid Phase 1 slot.
+            is_league_assignment = _is_league_assignment_note(note)
+            if is_league_assignment:
+                assignment_label = "TRADERS LEAGUE"
+                subject = f'NairaPips — Your {assignment_label} MT5 credentials'
+                intro = f'Hello {trader_name}, your Traders League competition MT5 account has been assigned by NairaPips.'
+                dashboard_url = 'https://nairapips.com/?utm_source=league_email#league-leaderboard'
+                closing = (
+                    '\n\nThis is a NairaPips Traders League competition account. '
+                    'It is NOT a paid Phase 1 account and is not eligible for paid payouts. '
+                    'Top 3 traders at the end of the season will be rewarded through the League reward system. '
+                    'Climb the live leaderboard and good luck.\n\n'
+                )
+            else:
+                assignment_label = stage_label
+                subject = f'NairaPips — Your {stage_label} MT5 credentials'
+                intro = f'Hello {trader_name}, your {stage_label} MT5 account has been assigned by NairaPips.'
+                dashboard_url = 'https://nairapips.com/dashboard/trader_clean.html'
+                closing = '\n\nYou can now download MT5, log in with these credentials, and start trading.\n\n'
             details = (
-                f'Your {stage_label} MT5 account has been assigned:\n\n'
+                f'Your {assignment_label} MT5 account has been assigned:\n\n'
                 f'MT5 Login: {mt5.get("mt5_login")}\n'
                 f'MT5 Server: {mt5.get("mt5_server")}\n'
                 f'Master Password: {mt5.get("mt5_master_password")}\n'
                 f'Investor Password: {mt5.get("mt5_investor_password")}\n'
                 f'Account Size: {account_size:,.0f}\n\n'
-                f'You can now download MT5, log in with these credentials, and start trading.\n\n'
-                f'Your dashboard: https://nairapips.com/dashboard/trader_clean.html'
+                f'{closing}'
+                f'Your dashboard: {dashboard_url}'
             )
             send_account_status_email(
                 trader,
-                f'NairaPips — Your {stage_label} MT5 credentials',
-                f'Hello {trader_name}, your {stage_label} MT5 account has been assigned by NairaPips.',
+                subject,
+                intro,
                 details
             )
             send_admin_alert(
-                f'NairaPips {stage_label} MT5 assigned',
-                f'MT5 {mt5.get("mt5_login")} assigned to {trader_name} ({trader_email}) for {stage_label}. Emailed credentials to trader.'
+                f'NairaPips {assignment_label} MT5 assigned',
+                f'MT5 {mt5.get("mt5_login")} assigned to {trader_name} ({trader_email}) for {assignment_label}. Emailed credentials to trader.'
             )
     except Exception as _email_err:
         print('MT5 ASSIGN EMAIL ERROR:', str(_email_err))
@@ -3487,11 +3514,44 @@ def public_activity():
     except Exception as e:
         print("PUBLIC ACTIVITY CHALLENGES ERROR:", str(e))
 
+    # Traders League V1: include recent public League activity events.
+    if LEAGUE_ENABLED and LEAGUE_ACTIVITY_ENABLED:
+        try:
+            rows = supabase.table("league_activity").select("public_message,created_at,event_type,is_public").eq("is_public", True).order("created_at", desc=True).limit(20).execute().data or []
+            for row in rows:
+                activity.append({
+                    "type": "league",
+                    "event_type": row.get("event_type"),
+                    "message": row.get("public_message") or "",
+                    "_score": public_activity_time(row)
+                })
+        except Exception as e:
+            print("PUBLIC ACTIVITY LEAGUE ERROR:", str(e))
+
     activity.sort(key=lambda item: item.get("_score", 0), reverse=True)
     public_rows = [{k: v for k, v in item.items() if k != "_score"} for item in activity]
     if len(public_rows) < 20:
         public_rows.extend(nairapips_system_activity())
     return jsonify(public_rows[:20])
+
+
+@app.route("/public/league/legacy_activity", methods=["GET"])
+def public_league_legacy_activity():
+    """Traders League V1: public-facing League activity feed (new endpoint)."""
+    try:
+        rows = supabase.table("league_activity").select("public_message,created_at,event_type,is_public").eq("is_public", True).order("created_at", desc=True).limit(20).execute().data or []
+        out = []
+        for row in rows:
+            out.append({
+                "type": "league",
+                "event_type": row.get("event_type"),
+                "message": row.get("public_message") or "",
+                "created_at": row.get("created_at"),
+            })
+        return _np_ok(out, "league activity loaded")
+    except Exception as e:
+        print("PUBLIC LEAGUE ACTIVITY ERROR:", str(e))
+        return _np_ok([], "league activity unavailable")
 
 @app.route("/upload_payment_proof", methods=["POST"])
 def upload_payment_proof():
@@ -4358,8 +4418,23 @@ def trader_bootstrap():
             "latest_trades": [],
             "latest_monitoring": None,
             "payout_eligibility": {
-                "eligible": bool(account and str(account.get("stage") or account.get("phase") or "").lower() in {"funded", "live", "funded_live"}),
-                "reason": "Funded/live account required" if not account else "Check payout rules from admin"
+                # Traders League V1: League competition accounts are never paid-payout eligible,
+                # even if their stage happens to read "funded" or "live".
+                "eligible": bool(
+                    account
+                    and str(account.get("programme_type") or "").strip().lower() != "traders_league"
+                    and str(account.get("stage") or account.get("phase") or "").lower() in {"funded", "live", "funded_live"}
+                ),
+                "reason": (
+                    "League competition accounts are not eligible for paid payouts. Use the League reward system."
+                    if (account and str(account.get("programme_type") or "").strip().lower() == "traders_league")
+                    else ("Funded/live account required" if not account else "Check payout rules from admin")
+                ),
+                "blocked_reason": (
+                    "league_competition_account"
+                    if (account and str(account.get("programme_type") or "").strip().lower() == "traders_league")
+                    else None
+                ),
             }
         }
         if account:
@@ -14057,4 +14132,1525 @@ def submit_breach_dispute():
     except Exception as e:
         print("BREACH DISPUTE ERROR:", e)
         return _np_fail(str(e), 500)
+
+
+# ============================================================
+# NAIRAPIPS TRADERS LEAGUE V1
+# Step 2 — backend routes appended; zero existing routes modified
+# (only the 3 surgical multi-account safety patches above).
+# All League accounts are normal trader_accounts rows tagged with
+# programme_type='traders_league' and competition_id=<season_uuid>.
+# trader_accounts remains the only financial source of truth.
+# ============================================================
+
+LEAGUE_ENABLED = os.getenv("LEAGUE_ENABLED", "0") == "1"
+LEAGUE_PUBLIC_ENABLED = os.getenv("LEAGUE_PUBLIC_ENABLED", "0") == "1"
+LEAGUE_REGISTRATION_ENABLED = os.getenv("LEAGUE_REGISTRATION_ENABLED", "0") == "1"
+LEAGUE_LEADERBOARD_ENABLED = os.getenv("LEAGUE_LEADERBOARD_ENABLED", "0") == "1"
+LEAGUE_ACTIVITY_ENABLED = os.getenv("LEAGUE_ACTIVITY_ENABLED", "0") == "1"
+
+LEAGUE_PROGRAMME_TYPE = "traders_league"
+LEAGUE_ACCOUNT_STAGE = "phase1"  # re-uses existing stage machinery
+LEAGUE_RANKING_METHODS = {"current_balance_growth", "current_equity_growth"}
+# Convenience alias for safe numeric parsing in League helpers.
+num = _np_number
+LEAGUE_STATUSES = {
+    "draft", "registration_open", "selection_in_progress", "ready",
+    "live", "under_review", "completed", "cancelled", "archived",
+}
+LEAGUE_REGISTRATION_STATUSES = {
+    "registered", "eligible", "ineligible", "selected",
+    "waitlisted", "declined", "withdrawn", "disqualified",
+}
+LEAGUE_SELECTION_STATUSES = {"pending", "selected", "waitlisted", "declined"}
+LEAGUE_QUALIFICATION_STATUSES = {
+    "qualified", "provisional", "under_review", "breached", "disqualified", "completed",
+}
+LEAGUE_REWARD_TYPES = {
+    "cash", "challenge_account", "funded_opportunity", "badge", "certificate", "other",
+}
+LEAGUE_NICKNAME_DENYLIST = {
+    "admin", "nairapips", "tradersleague", "founder", "support",
+    "trader1", "trader2", "trader3", "demo", "test", "sample",
+    "lagosbull", "lagos", "abuja", "fct",
+}
+# Nickname regex: 3-20 chars, letters/digits/space/underscore.
+LEAGUE_NICKNAME_RE = re.compile(r"^[A-Za-z0-9_ ]{3,20}$")
+
+# Public response cache (process-local, 30s).
+_LEAGUE_PUBLIC_CACHE = {"payload": None, "ts": 0.0}
+_LEAGUE_PUBLIC_TTL = 30.0
+
+
+# ---------- helpers ----------
+
+def _is_league_account(account):
+    if not account:
+        return False
+    return str(account.get("programme_type") or "").strip().lower() == LEAGUE_PROGRAMME_TYPE
+
+
+def _default_league_nickname(registration, mt5_login, trader_id):
+    """Pick a default public_nickname for a freshly-assigned League account.
+    Priority: registration's already-approved nickname > "Trader <last4 of mt5_login>"
+    > "Trader <last4 of trader_id>". Never returns empty.
+    """
+    if registration and registration.get("nickname_approved") and registration.get("public_nickname"):
+        return str(registration["public_nickname"])[:20]
+    login = str(mt5_login or "")
+    if login:
+        return "Trader " + login[-4:]
+    tid = str(trader_id or "")
+    if tid:
+        return "Trader " + tid[-4:]
+    return "League Trader"
+
+
+def _is_league_assignment_note(note):
+    """Detect whether an _assign_mt5_to_trader call is for a League slot.
+    V1 detection: the note param starts with 'Traders League' or contains the word 'league'.
+    """
+    return "league" in str(note or "").lower()
+
+
+def _is_league_season_id(season_id):
+    if not season_id:
+        return False
+    try:
+        rows = supabase.table("league_seasons").select("id").eq("id", season_id).limit(1).execute().data or []
+        return bool(rows)
+    except Exception as e:
+        print("LEAGUE SEASON LOOKUP ERROR:", str(e))
+        return False
+
+
+def _guard_league_not_paid_payout(account, trader=None):
+    if _is_league_account(account):
+        raise ValueError(
+            "League competition accounts are not eligible for paid payouts. "
+            "Use the League reward system."
+        )
+
+
+def _league_public_payload(row, season=None, rank=None, total_traders=0):
+    """
+    Strict public field limiter. Returns ONLY the fields the brief
+    permits for the public leaderboard. NEVER raw account row.
+    """
+    if not row:
+        return {}
+    start_balance = num(row.get("start_balance") or row.get("account_size") or 0)
+    current_balance = num(row.get("current_balance") or row.get("balance") or 0)
+    current_equity = num(row.get("current_equity") or row.get("equity") or 0)
+    growth = 0.0
+    if start_balance > 0:
+        growth = round(((current_balance - start_balance) / start_balance) * 100, 2)
+    risk_zone = str(row.get("risk_zone") or "").strip().lower() or None
+    out = {
+        "rank": rank,
+        "public_nickname": row.get("public_nickname") or "League Trader",
+        "qualified_growth_percent": growth,
+        "current_balance": current_balance,
+        "trading_days": int(row.get("trading_days") or 0),
+        "qualification_status": row.get("qualification_status") or "provisional",
+        "risk_zone": risk_zone,
+        "last_updated": row.get("last_updated") or row.get("last_sync_at") or row.get("updated_at"),
+    }
+    # Only include equity if the season's ranking method allows it.
+    if season and str(season.get("ranking_method") or "").strip().lower() == "current_equity_growth":
+        out["current_equity"] = current_equity
+    if season:
+        out["season_name"] = season.get("name")
+        out["season_slug"] = season.get("slug")
+    out["total_traders_in_season"] = total_traders
+    return out
+
+
+def _season_qualified_growth(account):
+    start_balance = num(account.get("start_balance") or account.get("account_size") or 0)
+    if start_balance <= 0:
+        return 0.0
+    current = num(account.get("current_balance") or account.get("balance") or 0)
+    return round(((current - start_balance) / start_balance) * 100, 2)
+
+
+def _season_trading_days(account):
+    # The trader_accounts row doesn't store trading days directly. The monitoring system writes
+    # 'trading_days' in some versions. Fall back to 0 when unknown.
+    try:
+        v = account.get("trading_days")
+        if v is None:
+            return 0
+        return max(0, int(v))
+    except Exception:
+        return 0
+
+
+def _season_qualification_status(account):
+    status = str(account.get("account_status") or "").strip().lower()
+    risk_zone = str(account.get("risk_zone") or "").strip().lower()
+    monitoring_enabled = not _is_truthy(account.get("monitoring_enabled") is False)
+    if not monitoring_enabled and risk_zone == "breached":
+        return "breached"
+    if risk_zone == "breached":
+        return "breached"
+    if status in ("disqualified", "banned"):
+        return "disqualified"
+    if status in ("passed", "completed", "archived_passed", "passed_review"):
+        return "completed"
+    if risk_zone in ("critical", "danger") or status in ("under_review",):
+        return "under_review"
+    return "provisional"
+
+
+def _get_active_season():
+    try:
+        rows = (supabase.table("league_seasons")
+                .select("*")
+                .in_("status", ["registration_open", "selection_in_progress", "ready", "live", "under_review"])
+                .order("season_number", desc=True)
+                .limit(1)
+                .execute().data or [])
+        if rows:
+            return rows[0]
+        rows = (supabase.table("league_seasons")
+                .select("*")
+                .order("season_number", desc=True)
+                .limit(1)
+                .execute().data or [])
+        return rows[0] if rows else None
+    except Exception as e:
+        print("LEAGUE ACTIVE SEASON ERROR:", str(e))
+        return None
+
+
+def _get_season_by_slug(slug):
+    try:
+        rows = supabase.table("league_seasons").select("*").eq("slug", slug).limit(1).execute().data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        print("LEAGUE SEASON BY SLUG ERROR:", str(e))
+        return None
+
+
+def _get_season_by_id(season_id):
+    try:
+        rows = supabase.table("league_seasons").select("*").eq("id", season_id).limit(1).execute().data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        print("LEAGUE SEASON BY ID ERROR:", str(e))
+        return None
+
+
+def _season_to_public_summary(season, registered_count=0, selected_count=0, active_count=0):
+    if not season:
+        return None
+    capacity = int(season.get("capacity") or 0)
+    places_remaining = max(0, capacity - registered_count) if capacity else 0
+    return {
+        "id": season.get("id"),
+        "name": season.get("name"),
+        "slug": season.get("slug"),
+        "season_number": season.get("season_number"),
+        "season_type": season.get("season_type") or "founding",
+        "status": season.get("status"),
+        "capacity": capacity,
+        "places_remaining": places_remaining,
+        "registered_count": registered_count,
+        "account_size": num(season.get("account_size") or 0),
+        "currency": season.get("currency") or "NGN",
+        "max_drawdown_percent": num(season.get("max_drawdown_percent") or 0),
+        "minimum_trading_days": int(season.get("minimum_trading_days") or 0),
+        "ranking_method": season.get("ranking_method") or "current_balance_growth",
+        "registration_open_at": season.get("registration_open_at"),
+        "registration_close_at": season.get("registration_close_at"),
+        "trading_start_at": season.get("trading_start_at"),
+        "trading_end_at": season.get("trading_end_at"),
+        "hero_kicker": season.get("hero_kicker") or "Season",
+        "hero_title": season.get("hero_title") or season.get("name"),
+        "hero_subtitle": season.get("hero_subtitle") or "",
+        "cta_join_label": season.get("cta_join_label") or "Join Season One",
+        "cta_watch_label": season.get("cta_watch_label") or "Watch Leaderboard",
+        "rewards_published": bool(season.get("rewards_published")),
+        "show_public_leaderboard": bool(season.get("show_public_leaderboard")),
+        "show_activity_feed": bool(season.get("show_activity_feed")),
+        "registration_enabled": bool(season.get("registration_enabled")),
+    }
+
+
+def _season_registration_counts(season_id):
+    """Returns (registered_count, selected_count, active_count) for a season."""
+    registered = 0
+    selected = 0
+    active = 0
+    try:
+        rows = supabase.table("league_registrations").select("id,selection_status").eq("season_id", season_id).limit(5000).execute().data or []
+        registered = len(rows)
+        selected = sum(1 for r in rows if str(r.get("selection_status") or "").lower() == "selected")
+    except Exception as e:
+        print("LEAGUE REGISTRATION COUNTS ERROR:", str(e))
+    try:
+        active = supabase.table("trader_accounts").select("id", count="exact").eq("programme_type", LEAGUE_PROGRAMME_TYPE).eq("competition_id", season_id).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).execute().count or 0
+    except Exception as e:
+        print("LEAGUE ACTIVE COUNT ERROR:", str(e))
+    return registered, selected, active
+
+
+def _compute_leaderboard_metrics(season, limit=20):
+    """Returns top-N league accounts by qualified growth percent."""
+    if not season:
+        return [], 0
+    season_id = season.get("id")
+    try:
+        rows = (supabase.table("trader_accounts")
+                .select("*")
+                .eq("programme_type", LEAGUE_PROGRAMME_TYPE)
+                .eq("competition_id", season_id)
+                .in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
+                .limit(500)
+                .execute().data or [])
+    except Exception as e:
+        print("LEAGUE ACCOUNTS QUERY ERROR:", str(e))
+        rows = []
+    # Compute growth for each.
+    enriched = []
+    for r in rows:
+        growth = _season_qualified_growth(r)
+        r["qualified_growth_percent"] = growth
+        r["trading_days"] = _season_trading_days(r)
+        r["qualification_status"] = _season_qualification_status(r)
+        enriched.append(r)
+    # Exclude breached and disqualified from the live leaderboard.
+    eligible = [r for r in enriched if r.get("qualification_status") not in ("breached", "disqualified")]
+    # Sort by growth desc, ties broken by created_at asc.
+    eligible.sort(key=lambda r: (-float(r.get("qualified_growth_percent") or 0), str(r.get("created_at") or "")))
+    total_traders = len(eligible)
+    top = eligible[:limit]
+    out = []
+    for idx, row in enumerate(top, start=1):
+        out.append(_league_public_payload(row, season=season, rank=idx, total_traders=total_traders))
+    return out, total_traders
+
+
+def _recent_league_activity(season_id, limit=20):
+    try:
+        rows = (supabase.table("league_activity")
+                .select("event_type,public_message,created_at,public_nickname")
+                .eq("season_id", season_id)
+                .eq("is_public", True)
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute().data or [])
+        out = []
+        for r in rows:
+            out.append({
+                "event_type": r.get("event_type"),
+                "public_message": r.get("public_message") or "",
+                "public_nickname": r.get("public_nickname"),
+                "created_at": r.get("created_at"),
+            })
+        return out
+    except Exception as e:
+        print("LEAGUE ACTIVITY FETCH ERROR:", str(e))
+        return []
+
+
+def _league_champions(season_id):
+    try:
+        rows = (supabase.table("league_champions")
+                .select("position,public_nickname,final_qualified_growth_percent,final_balance,final_equity,reward_summary,completed_at,verification_badge,approved_image_url")
+                .eq("season_id", season_id)
+                .order("position")
+                .limit(20)
+                .execute().data or [])
+        return rows
+    except Exception as e:
+        print("LEAGUE CHAMPIONS FETCH ERROR:", str(e))
+        return []
+
+
+def _league_rewards_public(season_id):
+    try:
+        rows = (supabase.table("league_rewards")
+                .select("position,title,reward_type,reward_value,challenge_size,description,visible,enabled")
+                .eq("season_id", season_id)
+                .eq("enabled", True)
+                .eq("visible", True)
+                .order("position")
+                .limit(10)
+                .execute().data or [])
+        return rows
+    except Exception as e:
+        print("LEAGUE REWARDS FETCH ERROR:", str(e))
+        return []
+
+
+def _record_league_activity(season_id, league_account_id, public_nickname, event_type, public_message, metadata=None, is_public=True):
+    try:
+        payload = {
+            "season_id": season_id,
+            "league_account_id": str(league_account_id) if league_account_id else None,
+            "public_nickname": str(public_nickname)[:80] if public_nickname else None,
+            "event_type": str(event_type)[:60],
+            "public_message": str(public_message)[:500],
+            "metadata": metadata or {},
+            "is_public": bool(is_public),
+            "created_at": now_iso(),
+        }
+        supabase.table("league_activity").insert(payload).execute()
+    except Exception as e:
+        print("LEAGUE ACTIVITY WRITE ERROR:", str(e))
+
+
+def _log_league_audit(admin, action, details=""):
+    """V1 audit trail: stdout only. league_audit_log table is V2."""
+    try:
+        admin_id = (admin or {}).get("id") if admin else "anonymous"
+        print(f"LEAGUE_AUDIT admin={admin_id} action={action} details={details}", flush=True)
+    except Exception:
+        pass
+
+
+def _public_disabled():
+    return _np_fail("League public surface is disabled", 404)
+
+
+# ---------- public routes ----------
+
+@app.route("/public/league/bootstrap", methods=["GET", "OPTIONS"])
+def public_league_bootstrap():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    if not LEAGUE_ENABLED or not LEAGUE_PUBLIC_ENABLED:
+        return _public_disabled()
+    now = time.time()
+    cached = _LEAGUE_PUBLIC_CACHE.get("payload") if isinstance(_LEAGUE_PUBLIC_CACHE, dict) else None
+    cached_ts = float(_LEAGUE_PUBLIC_CACHE.get("ts") or 0) if isinstance(_LEAGUE_PUBLIC_CACHE, dict) else 0
+    if cached and (now - cached_ts) <= _LEAGUE_PUBLIC_TTL and not request.args.get("fresh"):
+        return _np_ok({**cached, "cached": True, "generated_at": cached.get("generated_at")})
+    season = _get_active_season()
+    summary = _season_to_public_summary(season) if season else None
+    if not season:
+        return _np_ok({
+            "current_season": None,
+            "state_message": "Season begins after trader selection.",
+            "pulse": {
+                "registered": 0,
+                "selected": 0,
+                "active": 0,
+                "current_leader_nickname": None,
+                "highest_growth": None,
+                "time_remaining": None,
+            },
+            "leaderboard": [],
+            "activity": [],
+            "champions": [],
+            "rewards": [],
+            "generated_at": now_iso(),
+            "cached_for_seconds": int(_LEAGUE_PUBLIC_TTL),
+        })
+    season_id = season.get("id")
+    registered, selected, active = _season_registration_counts(season_id)
+    summary = _season_to_public_summary(season, registered, selected, active)
+    leaderboard, total_traders = _compute_leaderboard_metrics(season, limit=20) if LEAGUE_LEADERBOARD_ENABLED else ([], 0)
+    activity = _recent_league_activity(season_id, limit=20) if LEAGUE_ACTIVITY_ENABLED else []
+    champions = _league_champions(season_id)
+    rewards = _league_rewards_public(season_id)
+    # Pulse
+    pulse = {
+        "registered": registered,
+        "selected": selected,
+        "active": active,
+        "current_leader_nickname": (leaderboard[0].get("public_nickname") if leaderboard else None),
+        "highest_growth": (leaderboard[0].get("qualified_growth_percent") if leaderboard else None),
+        "time_remaining": _format_time_remaining(season.get("trading_end_at")),
+        "total_traders": total_traders,
+    }
+    payload = {
+        "current_season": summary,
+        "pulse": pulse,
+        "leaderboard": leaderboard,
+        "activity": activity,
+        "champions": champions,
+        "rewards": rewards,
+        "generated_at": now_iso(),
+        "cached_for_seconds": int(_LEAGUE_PUBLIC_TTL),
+    }
+    _LEAGUE_PUBLIC_CACHE["payload"] = payload
+    _LEAGUE_PUBLIC_CACHE["ts"] = now
+    return _np_ok(payload, "league bootstrap loaded")
+
+
+def _format_time_remaining(end_iso):
+    if not end_iso:
+        return None
+    try:
+        from datetime import datetime as _dt
+        if isinstance(end_iso, str):
+            end = _dt.fromisoformat(end_iso.replace("Z", "+00:00"))
+        else:
+            return None
+        now = _dt.now(timezone.utc)
+        delta = end - now
+        if delta.total_seconds() <= 0:
+            return None
+        days = delta.days
+        hours = delta.seconds // 3600
+        if days >= 1:
+            return f"{days} day{'s' if days != 1 else ''} {hours}h"
+        return f"{hours}h {delta.seconds // 60 % 60}m"
+    except Exception:
+        return None
+
+
+@app.route("/public/league/<slug>/leaderboard", methods=["GET", "OPTIONS"])
+def public_league_leaderboard(slug):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    if not LEAGUE_ENABLED or not LEAGUE_PUBLIC_ENABLED or not LEAGUE_LEADERBOARD_ENABLED:
+        return _public_disabled()
+    season = _get_season_by_slug(slug)
+    if not season:
+        return _np_fail("Season not found", 404)
+    try:
+        limit = max(1, min(100, int(request.args.get("limit") or 20)))
+    except Exception:
+        limit = 20
+    leaderboard, total = _compute_leaderboard_metrics(season, limit=limit)
+    return _np_ok({
+        "season": _season_to_public_summary(season),
+        "leaderboard": leaderboard,
+        "total_traders": total,
+        "generated_at": now_iso(),
+    }, "leaderboard loaded")
+
+
+@app.route("/public/league/<slug>/activity", methods=["GET", "OPTIONS"])
+def public_league_activity(slug):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    if not LEAGUE_ENABLED or not LEAGUE_PUBLIC_ENABLED or not LEAGUE_ACTIVITY_ENABLED:
+        return _public_disabled()
+    season = _get_season_by_slug(slug)
+    if not season:
+        return _np_fail("Season not found", 404)
+    try:
+        limit = max(1, min(100, int(request.args.get("limit") or 20)))
+    except Exception:
+        limit = 20
+    return _np_ok({
+        "season": _season_to_public_summary(season),
+        "activity": _recent_league_activity(season.get("id"), limit=limit),
+        "generated_at": now_iso(),
+    }, "activity loaded")
+
+
+@app.route("/public/league/<slug>/champions", methods=["GET", "OPTIONS"])
+def public_league_champions(slug):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    if not LEAGUE_ENABLED or not LEAGUE_PUBLIC_ENABLED:
+        return _public_disabled()
+    season = _get_season_by_slug(slug)
+    if not season:
+        return _np_fail("Season not found", 404)
+    return _np_ok({
+        "season": _season_to_public_summary(season),
+        "champions": _league_champions(season.get("id")),
+    }, "champions loaded")
+
+
+@app.route("/public/league/stats", methods=["GET", "OPTIONS"])
+def public_league_stats():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    if not LEAGUE_ENABLED or not LEAGUE_PUBLIC_ENABLED:
+        return _public_disabled()
+    season = _get_active_season()
+    if not season:
+        return _np_ok({
+            "total_registrations": 0,
+            "total_seasons": 0,
+            "active_season_slug": None,
+            "active_season_status": None,
+            "season_capacity": 0,
+            "season_places_remaining": 0,
+            "registration_open": False,
+        })
+    registered, selected, active = _season_registration_counts(season.get("id"))
+    capacity = int(season.get("capacity") or 0)
+    return _np_ok({
+        "total_registrations": registered,
+        "total_seasons": 1,  # total over time; counts may grow in V2
+        "active_season_slug": season.get("slug"),
+        "active_season_status": season.get("status"),
+        "season_capacity": capacity,
+        "season_places_remaining": max(0, capacity - registered),
+        "registration_open": str(season.get("status") or "").lower() == "registration_open" and bool(season.get("registration_enabled")),
+    })
+
+
+# ---------- trader routes ----------
+
+@app.route("/trader/league_accounts", methods=["GET", "OPTIONS"])
+def trader_league_accounts():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    if not LEAGUE_ENABLED:
+        return _public_disabled()
+    trader_id = _authenticated_trader_id_for_request()
+    if not trader_id:
+        return _np_fail("Trader authentication required", 401)
+    try:
+        rows = (supabase.table("trader_accounts")
+                .select("*")
+                .eq("programme_type", LEAGUE_PROGRAMME_TYPE)
+                .eq("trader_id", trader_id)
+                .order("updated_at", desc=True)
+                .limit(50)
+                .execute().data or [])
+    except Exception as e:
+        print("TRADER LEAGUE ACCOUNTS ERROR:", str(e))
+        rows = []
+    out = []
+    for r in rows:
+        season = _get_season_by_id(r.get("competition_id"))
+        safe = _trader_safe_account_row(r) if r else {}
+        safe.update({
+            "public_nickname": (r.get("public_nickname") if r else None),
+            "season_name": (season.get("name") if season else None),
+            "season_slug": (season.get("slug") if season else None),
+            "rank_in_season": None,  # filled below
+            "qualified_growth_percent": _season_qualified_growth(r),
+        })
+        out.append(safe)
+    return _np_ok({"accounts": out, "count": len(out)}, "trader league accounts loaded")
+
+
+@app.route("/trader/league/<season_id>/profile", methods=["GET", "OPTIONS"])
+def trader_league_profile(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    if not LEAGUE_ENABLED:
+        return _public_disabled()
+    trader_id = _authenticated_trader_id_for_request()
+    if not trader_id:
+        return _np_fail("Trader authentication required", 401)
+    season = _get_season_by_id(season_id)
+    if not season:
+        return _np_fail("Season not found", 404)
+    try:
+        rows = (supabase.table("trader_accounts")
+                .select("*")
+                .eq("programme_type", LEAGUE_PROGRAMME_TYPE)
+                .eq("trader_id", trader_id)
+                .eq("competition_id", season_id)
+                .limit(1)
+                .execute().data or [])
+    except Exception as e:
+        print("TRADER LEAGUE PROFILE ERROR:", str(e))
+        rows = []
+    if not rows:
+        return _np_fail("No League account in this season", 403)
+    account = rows[0]
+    leaderboard, _ = _compute_leaderboard_metrics(season, limit=20)
+    rank = None
+    public_nickname = account.get("public_nickname")
+    for row in leaderboard:
+        if row.get("public_nickname") == public_nickname:
+            rank = row.get("rank")
+            break
+    payload = {
+        "season": _season_to_public_summary(season),
+        "account": _trader_safe_account_row(account),
+        "rank_in_season": rank,
+        "public_nickname": public_nickname,
+        "qualified_growth_percent": _season_qualified_growth(account),
+        "qualification_status": _season_qualification_status(account),
+        "rewards": _league_rewards_public(season_id),
+    }
+    return _np_ok(payload, "trader league profile loaded")
+
+
+@app.route("/trader/league/<season_id>/nickname", methods=["POST", "OPTIONS"])
+def trader_league_nickname(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    if not LEAGUE_ENABLED:
+        return _public_disabled()
+    trader_id = _authenticated_trader_id_for_request()
+    if not trader_id:
+        return _np_fail("Trader authentication required", 401)
+    data = request.get_json(silent=True) or {}
+    nickname = str(data.get("public_nickname") or "").strip()
+    if not LEAGUE_NICKNAME_RE.match(nickname):
+        return _np_fail("Nickname must be 3-20 characters: letters, digits, spaces, or underscores.", 400)
+    norm = nickname.lower().replace(" ", "")
+    for bad in LEAGUE_NICKNAME_DENYLIST:
+        if bad in norm or norm in bad:
+            return _np_fail("This nickname is not allowed.", 400)
+    # Reject email/phone patterns.
+    if "@" in nickname or re.search(r"\d{7,}", nickname):
+        return _np_fail("Nickname must not contain email or phone patterns.", 400)
+    season = _get_season_by_id(season_id)
+    if not season:
+        return _np_fail("Season not found", 404)
+    # Confirm the trader has a League account in this season.
+    try:
+        rows = (supabase.table("trader_accounts")
+                .select("id")
+                .eq("programme_type", LEAGUE_PROGRAMME_TYPE)
+                .eq("trader_id", trader_id)
+                .eq("competition_id", season_id)
+                .limit(1)
+                .execute().data or [])
+    except Exception as e:
+        print("TRADER LEAGUE NICKNAME LOOKUP ERROR:", str(e))
+        rows = []
+    if not rows:
+        return _np_fail("You are not in this League season.", 403)
+    # Find the registration row and update it. If multiple rows exist, update the most recent.
+    try:
+        regs = (supabase.table("league_registrations")
+                .select("id")
+                .eq("season_id", season_id)
+                .eq("trader_id", trader_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute().data or [])
+    except Exception as e:
+        print("TRADER LEAGUE NICKNAME REG LOOKUP ERROR:", str(e))
+        regs = []
+    if not regs:
+        return _np_fail("No registration found for this season.", 404)
+    supabase.table("league_registrations").update({
+        "public_nickname": nickname,
+        "nickname_approved": False,
+        "updated_at": now_iso(),
+    }).eq("id", regs[0]["id"]).execute()
+    # Also propagate to the trader_accounts row so the public leaderboard picks it up.
+    try:
+        supabase.table("trader_accounts").update({
+            "public_nickname": nickname,
+        }).eq("id", rows[0]["id"]).execute()
+    except Exception as e:
+        print("TRADER LEAGUE NICKNAME ACCOUNT UPDATE ERROR:", str(e))
+    _log_league_audit({"id": trader_id}, "trader_set_nickname", f"season={season_id} nickname={nickname}")
+    return _np_ok({
+        "public_nickname": nickname,
+        "nickname_approved": False,
+        "message": "Nickname submitted. Admin approval required before public display.",
+    })
+
+
+# ---------- admin routes ----------
+
+@app.route("/admin/league/seasons", methods=["GET", "OPTIONS"])
+def admin_league_seasons_list():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    try:
+        rows = supabase.table("league_seasons").select("*").order("season_number", desc=True).limit(200).execute().data or []
+    except Exception as e:
+        print("ADMIN LEAGUE SEASONS LIST ERROR:", str(e))
+        rows = []
+    return _np_ok({"seasons": rows, "count": len(rows)}, "seasons loaded")
+
+
+@app.route("/admin/league/seasons", methods=["POST", "OPTIONS"])
+def admin_league_seasons_create():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    d = request.get_json(silent=True) or {}
+    name = str(d.get("name") or "").strip()
+    slug = str(d.get("slug") or "").strip().lower()
+    if not name or not slug:
+        return _np_fail("name and slug are required", 400)
+    if not re.match(r"^[a-z0-9\-]{3,80}$", slug):
+        return _np_fail("slug must be 3-80 chars: lowercase letters, digits, dashes", 400)
+    try:
+        season_number = int(d.get("season_number") or 1)
+        capacity = int(d.get("capacity") or 50)
+        account_size = num(d.get("account_size") or 1000000)
+        max_dd = num(d.get("max_drawdown_percent") or 20)
+        min_days = int(d.get("minimum_trading_days") or 5)
+    except (TypeError, ValueError):
+        return _np_fail("season_number, capacity, account_size, max_drawdown_percent, minimum_trading_days must be numeric", 400)
+    if capacity <= 0 or account_size <= 0 or not (0 <= max_dd <= 100) or min_days < 0:
+        return _np_fail("Invalid numeric values", 400)
+    status = str(d.get("status") or "draft")
+    if status not in LEAGUE_STATUSES:
+        return _np_fail(f"Invalid status; must be one of {sorted(LEAGUE_STATUSES)}", 400)
+    ranking_method = str(d.get("ranking_method") or "current_balance_growth")
+    if ranking_method not in LEAGUE_RANKING_METHODS:
+        return _np_fail(f"Invalid ranking_method; must be one of {sorted(LEAGUE_RANKING_METHODS)}", 400)
+    season_type = str(d.get("season_type") or "founding")
+    payload = {
+        "name": name,
+        "slug": slug,
+        "season_number": season_number,
+        "season_type": season_type,
+        "status": status,
+        "registration_open_at": d.get("registration_open_at"),
+        "registration_close_at": d.get("registration_close_at"),
+        "trading_start_at": d.get("trading_start_at"),
+        "trading_end_at": d.get("trading_end_at"),
+        "capacity": capacity,
+        "account_size": account_size,
+        "currency": str(d.get("currency") or "NGN"),
+        "max_drawdown_percent": max_dd,
+        "daily_drawdown_percent": d.get("daily_drawdown_percent"),
+        "minimum_trading_days": min_days,
+        "ranking_method": ranking_method,
+        "show_public_leaderboard": bool(d.get("show_public_leaderboard", True)),
+        "show_activity_feed": bool(d.get("show_activity_feed", True)),
+        "registration_enabled": bool(d.get("registration_enabled", True)),
+        "selection_enabled": bool(d.get("selection_enabled", True)),
+        "rewards_published": bool(d.get("rewards_published", False)),
+        "description": str(d.get("description") or ""),
+        "rules_summary": str(d.get("rules_summary") or ""),
+        "rules_url": str(d.get("rules_url") or ""),
+        "hero_kicker": str(d.get("hero_kicker") or "Season"),
+        "hero_title": str(d.get("hero_title") or name),
+        "hero_subtitle": str(d.get("hero_subtitle") or ""),
+        "cta_join_label": str(d.get("cta_join_label") or "Join Season One"),
+        "cta_watch_label": str(d.get("cta_watch_label") or "Watch Leaderboard"),
+        "created_by": str((admin or {}).get("id") or "admin"),
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    try:
+        created = supabase.table("league_seasons").insert(payload).execute().data or []
+    except Exception as e:
+        print("ADMIN LEAGUE SEASON CREATE ERROR:", str(e))
+        return _np_fail(f"Failed to create season: {e}", 500)
+    if not created:
+        return _np_fail("Failed to create season", 500)
+    _log_league_audit(admin, "season_create", f"slug={slug} id={created[0].get('id')}")
+    return _np_ok({"season": created[0]}, 201)
+
+
+@app.route("/admin/league/seasons/<season_id>", methods=["PATCH", "OPTIONS"])
+def admin_league_seasons_patch(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    d = request.get_json(silent=True) or {}
+    allowed = {
+        "name", "status", "registration_open_at", "registration_close_at",
+        "trading_start_at", "trading_end_at", "capacity", "account_size",
+        "max_drawdown_percent", "daily_drawdown_percent", "minimum_trading_days",
+        "ranking_method", "show_public_leaderboard", "show_activity_feed",
+        "registration_enabled", "selection_enabled", "rewards_published",
+        "description", "rules_summary", "rules_url", "hero_kicker",
+        "hero_title", "hero_subtitle", "cta_join_label", "cta_watch_label",
+        "season_type",
+    }
+    update = {k: v for k, v in d.items() if k in allowed}
+    if "status" in update and update["status"] not in LEAGUE_STATUSES:
+        return _np_fail("Invalid status", 400)
+    if "ranking_method" in update and update["ranking_method"] not in LEAGUE_RANKING_METHODS:
+        return _np_fail("Invalid ranking_method", 400)
+    if not update:
+        return _np_fail("Nothing to update", 400)
+    update["updated_at"] = now_iso()
+    try:
+        rows = supabase.table("league_seasons").update(update).eq("id", season_id).execute().data or []
+    except Exception as e:
+        print("ADMIN LEAGUE SEASON PATCH ERROR:", str(e))
+        return _np_fail(str(e), 500)
+    if not rows:
+        return _np_fail("Season not found", 404)
+    _log_league_audit(admin, "season_patch", f"id={season_id} fields={list(update.keys())}")
+    return _np_ok({"season": rows[0]})
+
+
+def _admin_league_season_status(season_id, new_status, audit_action):
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return None, auth_response
+    season = _get_season_by_id(season_id)
+    if not season:
+        return None, _np_fail("Season not found", 404)
+    update = {"status": new_status, "updated_at": now_iso()}
+    if new_status == "registration_open" and not season.get("registration_open_at"):
+        update["registration_open_at"] = now_iso()
+    if new_status == "live" and not season.get("trading_start_at"):
+        update["trading_start_at"] = now_iso()
+    if new_status == "completed":
+        update["trading_end_at"] = now_iso()
+    try:
+        rows = supabase.table("league_seasons").update(update).eq("id", season_id).execute().data or []
+    except Exception as e:
+        print(f"ADMIN LEAGUE STATUS {new_status} ERROR:", str(e))
+        return None, _np_fail(str(e), 500)
+    _log_league_audit(admin, audit_action, f"id={season_id}")
+    if new_status == "completed":
+        _record_league_activity(season_id, None, None, "league_season_completed",
+                                 f"Season '{season.get('name')}' has been completed.", is_public=True)
+    return rows[0], None
+
+
+@app.route("/admin/league/seasons/<season_id>/open-registration", methods=["POST", "OPTIONS"])
+def admin_league_open_registration(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    season, err = _admin_league_season_status(season_id, "registration_open", "open_registration")
+    if err:
+        return err
+    return _np_ok({"season": season})
+
+
+@app.route("/admin/league/seasons/<season_id>/close-registration", methods=["POST", "OPTIONS"])
+def admin_league_close_registration(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    season, err = _admin_league_season_status(season_id, "selection_in_progress", "close_registration")
+    if err:
+        return err
+    return _np_ok({"season": season})
+
+
+@app.route("/admin/league/seasons/<season_id>/start", methods=["POST", "OPTIONS"])
+def admin_league_start(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    season, err = _admin_league_season_status(season_id, "live", "start")
+    if err:
+        return err
+    return _np_ok({"season": season})
+
+
+@app.route("/admin/league/seasons/<season_id>/end", methods=["POST", "OPTIONS"])
+def admin_league_end(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    season, err = _admin_league_season_status(season_id, "under_review", "end")
+    if err:
+        return err
+    return _np_ok({"season": season})
+
+
+@app.route("/admin/league/seasons/<season_id>/complete", methods=["POST", "OPTIONS"])
+def admin_league_complete(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    season, err = _admin_league_season_status(season_id, "completed", "complete")
+    if err:
+        return err
+    return _np_ok({"season": season})
+
+
+@app.route("/admin/league/seasons/<season_id>/archive", methods=["POST", "OPTIONS"])
+def admin_league_archive(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    season, err = _admin_league_season_status(season_id, "archived", "archive")
+    if err:
+        return err
+    return _np_ok({"season": season})
+
+
+@app.route("/admin/league/<season_id>/registrations", methods=["GET", "OPTIONS"])
+def admin_league_registrations(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    if not _is_league_season_id(season_id):
+        return _np_fail("Season not found", 404)
+    try:
+        status_filter = request.args.get("status")
+        q = supabase.table("league_registrations").select("*").eq("season_id", season_id).order("created_at", desc=True).limit(500)
+        if status_filter:
+            q = q.eq("registration_status", status_filter)
+        rows = q.execute().data or []
+    except Exception as e:
+        print("ADMIN LEAGUE REGISTRATIONS ERROR:", str(e))
+        rows = []
+    return _np_ok({"registrations": rows, "count": len(rows)})
+
+
+def _admin_league_select_or_waitlist(season_id, target_status, action_label):
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    d = request.get_json(silent=True) or {}
+    ids = d.get("registration_ids") or []
+    if not isinstance(ids, list) or not ids:
+        return _np_fail("registration_ids must be a non-empty list", 400)
+    if target_status not in ("selected", "waitlisted"):
+        return _np_fail("Invalid target status", 400)
+    success = 0
+    failed = []
+    for rid in ids:
+        try:
+            reg = supabase.table("league_registrations").select("id,registration_status,season_id,public_nickname").eq("id", rid).limit(1).execute().data or []
+            if not reg or reg[0].get("season_id") != season_id:
+                failed.append({"registration_id": rid, "reason": "not found or wrong season"})
+                continue
+            if reg[0].get("registration_status") not in ("registered", "eligible"):
+                failed.append({"registration_id": rid, "reason": f"cannot {action_label} from status {reg[0].get('registration_status')}"})
+                continue
+            supabase.table("league_registrations").update({
+                "selection_status": target_status,
+                "selected_at": now_iso(),
+                "selected_by": str((admin or {}).get("id") or "admin"),
+                "registration_status": "selected" if target_status == "selected" else "waitlisted",
+                "updated_at": now_iso(),
+            }).eq("id", rid).execute()
+            success += 1
+            if target_status == "selected":
+                _record_league_activity(season_id, None, reg[0].get("public_nickname"),
+                                         "league_trader_selected", "A new trader entered the selection pool.", is_public=True)
+        except Exception as e:
+            print(f"ADMIN LEAGUE {action_label.upper()} ERROR for {rid}:", str(e))
+            failed.append({"registration_id": rid, "reason": str(e)})
+    _log_league_audit(admin, action_label, f"season={season_id} success={success} failed={len(failed)}")
+    return _np_ok({"success": success, "failed": failed})
+
+
+@app.route("/admin/league/<season_id>/select", methods=["POST", "OPTIONS"])
+def admin_league_select(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    return _admin_league_select_or_waitlist(season_id, "selected", "select")
+
+
+@app.route("/admin/league/<season_id>/waitlist", methods=["POST", "OPTIONS"])
+def admin_league_waitlist(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    return _admin_league_select_or_waitlist(season_id, "waitlisted", "waitlist")
+
+
+@app.route("/admin/league/<season_id>/disqualify", methods=["POST", "OPTIONS"])
+def admin_league_disqualify(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    d = request.get_json(silent=True) or {}
+    rid = d.get("registration_id")
+    reason = str(d.get("reason") or "").strip()[:500]
+    if not rid:
+        return _np_fail("registration_id is required", 400)
+    try:
+        reg = supabase.table("league_registrations").select("id,season_id").eq("id", rid).limit(1).execute().data or []
+        if not reg or reg[0].get("season_id") != season_id:
+            return _np_fail("Registration not found in this season", 404)
+        supabase.table("league_registrations").update({
+            "registration_status": "disqualified",
+            "selection_status": "declined",
+            "updated_at": now_iso(),
+        }).eq("id", rid).execute()
+    except Exception as e:
+        print("ADMIN LEAGUE DISQUALIFY ERROR:", str(e))
+        return _np_fail(str(e), 500)
+    _log_league_audit(admin, "disqualify", f"season={season_id} registration={rid} reason={reason}")
+    return _np_ok({"registration_id": rid, "status": "disqualified"})
+
+
+@app.route("/admin/league/<season_id>/assign-mt5", methods=["POST", "OPTIONS"])
+def admin_league_assign_mt5(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    d = request.get_json(silent=True) or {}
+    rid = d.get("registration_id")
+    mt5_id = d.get("mt5_id")
+    if not rid or not mt5_id:
+        return _np_fail("registration_id and mt5_id are required", 400)
+    season = _get_season_by_id(season_id)
+    if not season:
+        return _np_fail("Season not found", 404)
+    if str(season.get("status") or "") not in ("ready", "selection_in_progress", "live"):
+        return _np_fail(f"Cannot assign MT5 in status {season.get('status')}", 409)
+    try:
+        reg = supabase.table("league_registrations").select("*").eq("id", rid).limit(1).execute().data or []
+    except Exception as e:
+        print("ADMIN LEAGUE ASSIGN REG LOOKUP ERROR:", str(e))
+        return _np_fail(str(e), 500)
+    if not reg or reg[0].get("season_id") != season_id:
+        return _np_fail("Registration not found in this season", 404)
+    if reg[0].get("trader_account_id"):
+        return _np_fail("This registration already has a League account assigned.", 409)
+    if str(reg[0].get("selection_status") or "").lower() != "selected":
+        return _np_fail("Only selected registrants can receive a League account.", 409)
+    mt5 = _get_mt5_account(mt5_id=mt5_id)
+    if not mt5:
+        return _np_fail("MT5 account not found", 404)
+    expected_size = num(season.get("account_size") or 1000000)
+    mt5_size = num(mt5.get("account_size") or 0)
+    if mt5_size and mt5_size != expected_size:
+        return _np_fail(f"MT5 account size {mt5_size} does not match season size {expected_size}", 400)
+    # Get or create a trader row from the lead.
+    trader_id = reg[0].get("trader_id")
+    trader = None
+    if trader_id:
+        trader = get_trader_by_id(trader_id)
+    if not trader:
+        # Synthesise a minimal trader payload from the registration's lead data.
+        lead_email = None
+        lead_phone = None
+        lead_name = None
+        if reg[0].get("golden_ticket_lead_id"):
+            try:
+                lead_rows = supabase.table("landing_leads").select("full_name,email,whatsapp").eq("id", reg[0]["golden_ticket_lead_id"]).limit(1).execute().data or []
+                if lead_rows:
+                    lead_name = lead_rows[0].get("full_name")
+                    lead_email = lead_rows[0].get("email")
+                    lead_phone = lead_rows[0].get("whatsapp")
+            except Exception as e:
+                print("ADMIN LEAGUE ASSIGN LEAD LOOKUP ERROR:", str(e))
+        if not lead_email:
+            return _np_fail("Cannot determine trader email for this registration.", 400)
+        existing = _find_existing_trader(lead_email, lead_phone or "")
+        if existing:
+            trader = existing
+            trader_id = existing.get("id")
+        else:
+            new_trader = {
+                "name": lead_name or "League Trader",
+                "email": lead_email,
+                "phone": lead_phone or "",
+                "status": "new_signup",
+                "phase": "no_account",
+                "payment_status": "none",
+                "source": "traders_league",
+                "registration_source": "traders_league",
+                "account_reference": ref(),
+                "engine_group": "engine_1",
+            }
+            try:
+                created = supabase.table("traders").insert(new_trader).execute().data or []
+            except Exception as e:
+                print("ADMIN LEAGUE ASSIGN TRADER CREATE ERROR:", str(e))
+                return _np_fail(str(e), 500)
+            if not created:
+                return _np_fail("Failed to create trader for this registration.", 500)
+            trader = created[0]
+            trader_id = trader.get("id")
+    # Call the existing _assign_mt5_to_trader flow. This enforces single-use MT5, account-size
+    # matching, no duplicate assignment, and writes a clean trader_accounts row.
+    try:
+        account, trader_row = _assign_mt5_to_trader(
+            trader,
+            mt5,
+            LEAGUE_ACCOUNT_STAGE,
+            None,
+            _admin_from_payload(d),
+            f"Traders League — {season.get('name') or season.get('slug')}",
+        )
+    except Exception as e:
+        print("ADMIN LEAGUE ASSIGN MT5 ERROR:", str(e))
+        return _np_fail(str(e), 500)
+    if not account or not account.get("id"):
+        return _np_fail("MT5 assignment failed", 500)
+    # Default public_nickname so the leaderboard always has a name to show.
+    default_nickname = _default_league_nickname(reg[0], mt5.get("mt5_login"), trader_id)
+    # Tag the new trader_accounts row with the League discriminator fields.
+    try:
+        supabase.table("trader_accounts").update({
+            "programme_type": LEAGUE_PROGRAMME_TYPE,
+            "account_origin": "golden_ticket" if reg[0].get("golden_ticket_lead_id") else "league_manual",
+            "competition_id": season_id,
+            "source_type": "league_season",
+            "monitoring_enabled": True,
+            "payment_status": "gift",
+            "public_nickname": default_nickname,
+        }).eq("id", account["id"]).execute()
+    except Exception as e:
+        print("ADMIN LEAGUE ASSIGN TAG ERROR:", str(e))
+    # Update the registration row: point at the new account + set the default nickname.
+    try:
+        supabase.table("league_registrations").update({
+            "trader_account_id": account["id"],
+            "registration_status": "selected",
+            "public_nickname": default_nickname,
+            "updated_at": now_iso(),
+        }).eq("id", rid).execute()
+    except Exception as e:
+        print("ADMIN LEAGUE ASSIGN REG UPDATE ERROR:", str(e))
+    # Record a public activity event. NEVER expose trader's full name, email, phone, or MT5 login.
+    public_nickname = reg[0].get("public_nickname") or "A League trader"
+    if reg[0].get("nickname_approved") and reg[0].get("public_nickname"):
+        public_message = f"{reg[0]['public_nickname']} just received a ₦1,000,000 League account."
+    else:
+        public_message = "A new League trader just received a ₦1,000,000 competition account."
+    _record_league_activity(season_id, account["id"], public_nickname,
+                             "league_mt5_assigned", public_message, is_public=True)
+    _log_league_audit(admin, "assign_mt5", f"season={season_id} registration={rid} account={account['id']}")
+    return _np_ok({
+        "account_id": account["id"],
+        "trader_id": trader_id,
+        "mt5_login": mt5.get("mt5_login"),
+    }, 201)
+
+
+@app.route("/admin/league/<season_id>/review-ranking", methods=["POST", "OPTIONS"])
+def admin_league_review_ranking(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    d = request.get_json(silent=True) or {}
+    account_id = d.get("trader_account_id")
+    action = str(d.get("action") or "").strip().lower()
+    reason = str(d.get("reason") or "").strip()[:500]
+    if not account_id or action not in ("qualify", "provisional", "disqualify"):
+        return _np_fail("trader_account_id and action (qualify|provisional|disqualify) are required", 400)
+    if not _is_league_season_id(season_id):
+        return _np_fail("Season not found", 404)
+    try:
+        account = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+        if not account:
+            return _np_fail("Account not found", 404)
+        account = account[0]
+        if account.get("competition_id") != season_id:
+            return _np_fail("Account does not belong to this season", 409)
+        if action == "disqualify":
+            supabase.table("trader_accounts").update({
+                "account_status": "disqualified",
+                "monitoring_enabled": False,
+                "archive_reason": reason or "Disqualified by admin review",
+                "archived_at": now_iso(),
+            }).eq("id", account_id).execute()
+        elif action == "qualify":
+            supabase.table("trader_accounts").update({
+                "account_status": "assigned_active",
+                "monitoring_enabled": True,
+            }).eq("id", account_id).execute()
+        else:  # provisional
+            supabase.table("trader_accounts").update({
+                "account_status": "under_review",
+            }).eq("id", account_id).execute()
+    except Exception as e:
+        print("ADMIN LEAGUE REVIEW RANKING ERROR:", str(e))
+        return _np_fail(str(e), 500)
+    try:
+        reg = supabase.table("league_registrations").select("id,public_nickname").eq("trader_account_id", account_id).limit(1).execute().data or []
+    except Exception as e:
+        print("ADMIN LEAGUE REVIEW REG LOOKUP ERROR:", str(e))
+        reg = []
+    public_nickname = (reg[0].get("public_nickname") if reg else None) or "A League trader"
+    _record_league_activity(season_id, account_id, public_nickname,
+                             "league_review_action", f"Admin review action: {action}.", is_public=False)
+    _log_league_audit(admin, "review_ranking", f"season={season_id} account={account_id} action={action}")
+    return _np_ok({"account_id": account_id, "action": action})
+
+
+@app.route("/admin/league/<season_id>/confirm-winners", methods=["POST", "OPTIONS"])
+def admin_league_confirm_winners(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    d = request.get_json(silent=True) or {}
+    positions = d.get("positions") or []
+    if not isinstance(positions, list) or not positions:
+        return _np_fail("positions must be a non-empty list", 400)
+    if not _is_league_season_id(season_id):
+        return _np_fail("Season not found", 404)
+    # Load the season once. Used for account_size in the champion growth calc.
+    season = _get_season_by_id(season_id)
+    if not season:
+        return _np_fail("Season not found", 404)
+    confirmed = 0
+    failed = []
+    for entry in positions:
+        try:
+            rid = entry.get("registration_id")
+            position = entry.get("position")
+            reward_id = entry.get("reward_id")
+            # The admin modal may submit trader_account_id instead of registration_id
+            # (the leaderboard shows accounts, not registrations). Support both.
+            account_id_hint = entry.get("trader_account_id")
+            if not rid and account_id_hint:
+                try:
+                    reg_rows = (supabase.table("league_registrations")
+                                .select("id")
+                                .eq("trader_account_id", account_id_hint)
+                                .eq("season_id", season_id)
+                                .order("created_at", desc=True)
+                                .limit(1).execute().data or [])
+                except Exception as _e:
+                    print("ADMIN LEAGUE CONFIRM REG LOOKUP BY ACCOUNT ERROR:", str(_e))
+                    reg_rows = []
+                if reg_rows:
+                    rid = reg_rows[0].get("id")
+            if not rid or not isinstance(position, int) or not reward_id:
+                failed.append({"entry": entry, "reason": "registration_id (or trader_account_id), position (int), reward_id required"})
+                continue
+            reg = supabase.table("league_registrations").select("*").eq("id", rid).limit(1).execute().data or []
+            if not reg or reg[0].get("season_id") != season_id:
+                failed.append({"entry": entry, "reason": "registration not in this season"})
+                continue
+            account_id = reg[0].get("trader_account_id")
+            if not account_id:
+                failed.append({"entry": entry, "reason": "registration has no League account"})
+                continue
+            # Use the REAL account for the qualification check, not a fake dict.
+            try:
+                account_rows = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+            except Exception as _e:
+                print("ADMIN LEAGUE CONFIRM ACCOUNT FETCH ERROR:", str(_e))
+                account_rows = []
+            if not account_rows:
+                failed.append({"entry": entry, "reason": "trader account not found"})
+                continue
+            real_account = account_rows[0]
+            if real_account.get("competition_id") != season_id:
+                failed.append({"entry": entry, "reason": "account does not belong to this season"})
+                continue
+            qual = _season_qualification_status(real_account)
+            if qual not in ("qualified", "provisional", "completed"):
+                failed.append({"entry": entry, "reason": f"qualification status is {qual}"})
+                continue
+            reward = supabase.table("league_rewards").select("*").eq("id", reward_id).limit(1).execute().data or []
+            if not reward or reward[0].get("season_id") != season_id:
+                failed.append({"entry": entry, "reason": "reward not in this season"})
+                continue
+            supabase.table("league_rewards").update({
+                "winner_registration_id": rid,
+                "winner_trader_id": reg[0].get("trader_id"),
+                "winner_trader_account_id": account_id,
+                "status": "awarded",
+                "approved_at": now_iso(),
+                "updated_at": now_iso(),
+            }).eq("id", reward_id).execute()
+            # Persist to league_champions (idempotent via season_id+position unique).
+            try:
+                final_balance = _np_number(real_account.get("current_balance") or 0)
+                final_equity = _np_number(real_account.get("current_equity") or 0)
+                start_balance = num(real_account.get("start_balance") or season.get("account_size") or 1000000)
+                growth = _season_qualified_growth({"start_balance": start_balance, "current_balance": final_balance})
+                # Public nickname: prefer approved nickname, else fall back to mt5_login last 4.
+                champion_nick = reg[0].get("public_nickname") or ("Trader " + str(real_account.get("mt5_login") or "")[-4:]) or "League Champion"
+                supabase.table("league_champions").upsert({
+                    "season_id": season_id,
+                    "position": position,
+                    "public_nickname": champion_nick,
+                    "final_qualified_growth_percent": growth,
+                    "final_balance": final_balance,
+                    "final_equity": final_equity,
+                    "reward_id": reward_id,
+                    "reward_summary": reward[0].get("title"),
+                    "verification_badge": True,
+                    "completed_at": now_iso(),
+                    "created_at": now_iso(),
+                }, on_conflict="season_id,position").execute()
+            except Exception as e:
+                print("ADMIN LEAGUE CHAMPION UPSERT ERROR:", str(e))
+            public_nickname = reg[0].get("public_nickname") or "A League champion"
+            _record_league_activity(season_id, account_id, public_nickname,
+                                     "league_winner_confirmed",
+                                     f"{public_nickname} confirmed as position #{position}.",
+                                     is_public=True)
+            confirmed += 1
+        except Exception as e:
+            print("ADMIN LEAGUE CONFIRM WINNER ENTRY ERROR:", str(e))
+            failed.append({"entry": entry, "reason": str(e)})
+    _log_league_audit(admin, "confirm_winners", f"season={season_id} confirmed={confirmed} failed={len(failed)}")
+    return _np_ok({"confirmed": confirmed, "failed": failed})
+
+
+@app.route("/admin/league/<season_id>/record-reward", methods=["POST", "OPTIONS"])
+def admin_league_record_reward(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    d = request.get_json(silent=True) or {}
+    reward_id = d.get("reward_id")
+    payment_reference = str(d.get("payment_reference") or "").strip()[:200]
+    status = str(d.get("status") or "paid").lower()
+    if not reward_id or status not in ("paid", "declined"):
+        return _np_fail("reward_id and status (paid|declined) are required", 400)
+    if not _is_league_season_id(season_id):
+        return _np_fail("Season not found", 404)
+    update = {
+        "status": status,
+        "payment_reference": payment_reference,
+        "updated_at": now_iso(),
+    }
+    if status == "paid":
+        update["paid_at"] = now_iso()
+    try:
+        rows = supabase.table("league_rewards").update(update).eq("id", reward_id).eq("season_id", season_id).execute().data or []
+    except Exception as e:
+        print("ADMIN LEAGUE RECORD REWARD ERROR:", str(e))
+        return _np_fail(str(e), 500)
+    if not rows:
+        return _np_fail("Reward not found in this season", 404)
+    reward = rows[0]
+    if reward.get("winner_registration_id"):
+        try:
+            reg = supabase.table("league_registrations").select("public_nickname,trader_account_id").eq("id", reward["winner_registration_id"]).limit(1).execute().data or []
+        except Exception as e:
+            print("ADMIN LEAGUE REWARD REG LOOKUP ERROR:", str(e))
+            reg = []
+        if reg:
+            public_nickname = reg[0].get("public_nickname") or "A League champion"
+            _record_league_activity(season_id, reg[0].get("trader_account_id"), public_nickname,
+                                     "league_reward_paid",
+                                     f"{public_nickname} reward recorded as {status}.",
+                                     is_public=True)
+    _log_league_audit(admin, "record_reward", f"season={season_id} reward={reward_id} status={status}")
+    return _np_ok({"reward": reward})
+
+
+@app.route("/admin/league/<season_id>/approve-nickname", methods=["POST", "OPTIONS"])
+def admin_league_approve_nickname(season_id):
+    """Traders League V1: approve or reject a trader's public nickname.
+
+    Body: { trader_account_id: str, approved: bool }
+    Side effects:
+      - league_registrations.nickname_approved = approved
+      - league_registrations.nickname_approved_by = admin id
+      - trader_accounts.public_nickname: kept as-is on approve, blanked on reject
+    The trader's nickname was previously validated against LEAGUE_NICKNAME_RE + denylist.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    d = request.get_json(silent=True) or {}
+    account_id = d.get("trader_account_id")
+    approved = bool(d.get("approved"))
+    if not account_id:
+        return _np_fail("trader_account_id is required", 400)
+    if not _is_league_season_id(season_id):
+        return _np_fail("Season not found", 404)
+    try:
+        reg = (supabase.table("league_registrations")
+                .select("id,public_nickname,trader_account_id,season_id")
+                .eq("trader_account_id", account_id)
+                .eq("season_id", season_id)
+                .order("created_at", desc=True)
+                .limit(1).execute().data or [])
+    except Exception as e:
+        print("ADMIN LEAGUE APPROVE NICKNAME REG ERROR:", str(e))
+        return _np_fail(str(e), 500)
+    if not reg:
+        return _np_fail("No registration found for this account in this season", 404)
+    registration = reg[0]
+    new_nickname = registration.get("public_nickname") if approved else ""
+    try:
+        supabase.table("league_registrations").update({
+            "nickname_approved": approved,
+            "nickname_approved_by": str((admin or {}).get("id") or "admin"),
+            "public_nickname": new_nickname,
+            "updated_at": now_iso(),
+        }).eq("id", registration["id"]).execute()
+    except Exception as e:
+        print("ADMIN LEAGUE APPROVE NICKNAME REG UPDATE ERROR:", str(e))
+        return _np_fail(str(e), 500)
+    # Mirror the approved nickname to trader_accounts so the public leaderboard
+    # picks it up. On reject, blank it (leaderboard shows "League Trader" default).
+    try:
+        supabase.table("trader_accounts").update({
+            "public_nickname": new_nickname,
+        }).eq("id", account_id).execute()
+    except Exception as e:
+        print("ADMIN LEAGUE APPROVE NICKNAME ACCOUNT UPDATE ERROR:", str(e))
+    _log_league_audit(admin, "approve_nickname", f"season={season_id} account={account_id} approved={approved}")
+    return _np_ok({
+        "trader_account_id": account_id,
+        "approved": approved,
+        "public_nickname": new_nickname,
+    })
+
+
+# ---------- reward + champion admin endpoints (used by admin_clean.html) ----------
+
+@app.route("/admin/league/<season_id>/rewards", methods=["GET", "OPTIONS"])
+def admin_league_rewards_list(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    if not _is_league_season_id(season_id):
+        return _np_fail("Season not found", 404)
+    try:
+        rows = supabase.table("league_rewards").select("*").eq("season_id", season_id).order("position").limit(20).execute().data or []
+    except Exception as e:
+        print("ADMIN LEAGUE REWARDS LIST ERROR:", str(e))
+        rows = []
+    return _np_ok({"rewards": rows, "count": len(rows)})
+
+
+@app.route("/admin/league/seasons/<season_id>/rewards/<int:position>", methods=["PUT", "OPTIONS"])
+def admin_league_reward_upsert(season_id, position):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    if not _is_league_season_id(season_id):
+        return _np_fail("Season not found", 404)
+    if position < 1 or position > 99:
+        return _np_fail("Invalid position", 400)
+    d = request.get_json(silent=True) or {}
+    reward_type = str(d.get("reward_type") or "cash").strip().lower()
+    if reward_type not in LEAGUE_REWARD_TYPES:
+        return _np_fail("Invalid reward_type", 400)
+    payload = {
+        "season_id": season_id,
+        "position": position,
+        "title": str(d.get("title") or ["First Place","Second Place","Third Place"][position-1] if position <= 3 else f"Position {position}"),
+        "reward_type": reward_type,
+        "reward_value": d.get("reward_value"),
+        "challenge_size": d.get("challenge_size"),
+        "description": str(d.get("description") or "")[:500],
+        "enabled": bool(d.get("enabled", False)),
+        "visible": bool(d.get("visible", False)),
+        "updated_at": now_iso(),
+    }
+    try:
+        # Try update first, then insert if not found (upsert by season_id+position).
+        existing = supabase.table("league_rewards").select("id").eq("season_id", season_id).eq("position", position).limit(1).execute().data or []
+        if existing:
+            payload.pop("season_id", None)
+            payload.pop("position", None)
+            rows = supabase.table("league_rewards").update(payload).eq("id", existing[0]["id"]).execute().data or []
+        else:
+            payload["created_at"] = now_iso()
+            rows = supabase.table("league_rewards").insert(payload).execute().data or []
+    except Exception as e:
+        print("ADMIN LEAGUE REWARD UPSERT ERROR:", str(e))
+        return _np_fail(str(e), 500)
+    if not rows:
+        return _np_fail("Failed to save reward", 500)
+    _log_league_audit(admin, "reward_save", f"season={season_id} position={position} reward_type={reward_type}")
+    return _np_ok({"reward": rows[0]})
+
+
+@app.route("/admin/league/<season_id>/champions", methods=["GET", "OPTIONS"])
+def admin_league_champions_list(season_id):
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    if not _is_league_season_id(season_id):
+        return _np_fail("Season not found", 404)
+    return _np_ok({"champions": _league_champions(season_id)})
 
