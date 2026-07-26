@@ -9,7 +9,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "TRADERS_LEAGUE_COMBINED_CORS_SERVICE_ROLE_FIX_2026_07_26"
+NAIRAPIPS_RELEASE = "TRADERS_LEAGUE_502_STATUS_FIXED_2026_07_26"
 CORS(app)
 
 # ============================================================
@@ -95,8 +95,31 @@ def _effective_payout_split(*values):
 # ================================
 
 def _np_ok(data=None, status=200):
-    res = jsonify(data or {"success": True})
-    res.status_code = status
+    """Return a safe JSON response.
+
+    Compatibility note:
+    Some existing routes pass a success message as the second argument
+    (for example: _np_ok(payload, "seasons loaded")). Flask expects an
+    integer HTTP status code, so treating that string as status_code causes
+    the League endpoint to fail upstream. Preserve those legacy calls by
+    converting the string to a JSON message and using HTTP 200.
+    """
+    payload = data if data is not None else {"success": True}
+    status_code = status
+
+    if isinstance(status, str):
+        status_code = 200
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            payload.setdefault("message", status)
+
+    try:
+        status_code = int(status_code)
+    except (TypeError, ValueError):
+        status_code = 200
+
+    res = jsonify(payload)
+    res.status_code = status_code
     res.headers["Access-Control-Allow-Origin"] = "*"
     res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
