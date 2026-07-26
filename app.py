@@ -9,49 +9,8 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "TRADERS_LEAGUE_GLOBAL_CORS_FIXED_2026_07_26"
+NAIRAPIPS_RELEASE = "TRADERS_LEAGUE_ADMIN_SERVICE_ROLE_FIXED_2026_07_26"
 CORS(app)
-
-# ============================================================
-# NAIRAPIPS GLOBAL CORS AUTHORITY
-# Ensures every Flask response — including admin auth failures,
-# League routes, exceptions handled by Flask, and preflight
-# requests — carries the headers required by nairapips.com.
-# ============================================================
-NAIRAPIPS_ALLOWED_ORIGINS = {
-    "https://nairapips.com",
-    "https://www.nairapips.com",
-    "http://nairapips.com",
-    "http://www.nairapips.com",
-    "http://localhost",
-    "http://127.0.0.1",
-}
-
-@app.before_request
-def _nairapips_global_preflight():
-    if request.method == "OPTIONS":
-        response = jsonify({"success": True, "preflight": True})
-        response.status_code = 200
-        return response
-    return None
-
-@app.after_request
-def _nairapips_global_cors_headers(response):
-    origin = str(request.headers.get("Origin") or "").strip()
-    if origin in NAIRAPIPS_ALLOWED_ORIGINS:
-        response.headers["Access-Control-Allow-Origin"] = origin
-    elif not origin:
-        # Server-to-server and direct browser navigation.
-        response.headers.setdefault("Access-Control-Allow-Origin", "*")
-    response.headers["Vary"] = "Origin"
-    response.headers["Access-Control-Allow-Headers"] = (
-        "Authorization, Content-Type, Accept, Origin, X-Requested-With"
-    )
-    response.headers["Access-Control-Allow-Methods"] = (
-        "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-    )
-    response.headers["Access-Control-Max-Age"] = "86400"
-    return response
 
 REGISTER_RATE_WINDOW_SECONDS = 15 * 60
 REGISTER_RATE_MAX = 5
@@ -14894,7 +14853,7 @@ def admin_league_seasons_list():
     if auth_response:
         return auth_response
     try:
-        rows = supabase.table("league_seasons").select("*").order("season_number", desc=True).limit(200).execute().data or []
+        rows = _staff_db().table("league_seasons").select("*").order("season_number", desc=True).limit(200).execute().data or []
     except Exception as e:
         print("ADMIN LEAGUE SEASONS LIST ERROR:", str(e))
         rows = []
@@ -14967,7 +14926,7 @@ def admin_league_seasons_create():
         "updated_at": now_iso(),
     }
     try:
-        created = supabase.table("league_seasons").insert(payload).execute().data or []
+        created = _staff_db().table("league_seasons").insert(payload).execute().data or []
     except Exception as e:
         print("ADMIN LEAGUE SEASON CREATE ERROR:", str(e))
         return _np_fail(f"Failed to create season: {e}", 500)
@@ -15004,7 +14963,7 @@ def admin_league_seasons_patch(season_id):
         return _np_fail("Nothing to update", 400)
     update["updated_at"] = now_iso()
     try:
-        rows = supabase.table("league_seasons").update(update).eq("id", season_id).execute().data or []
+        rows = _staff_db().table("league_seasons").update(update).eq("id", season_id).execute().data or []
     except Exception as e:
         print("ADMIN LEAGUE SEASON PATCH ERROR:", str(e))
         return _np_fail(str(e), 500)
@@ -15029,7 +14988,7 @@ def _admin_league_season_status(season_id, new_status, audit_action):
     if new_status == "completed":
         update["trading_end_at"] = now_iso()
     try:
-        rows = supabase.table("league_seasons").update(update).eq("id", season_id).execute().data or []
+        rows = _staff_db().table("league_seasons").update(update).eq("id", season_id).execute().data or []
     except Exception as e:
         print(f"ADMIN LEAGUE STATUS {new_status} ERROR:", str(e))
         return None, _np_fail(str(e), 500)
@@ -15111,7 +15070,7 @@ def admin_league_registrations(season_id):
         return _np_fail("Season not found", 404)
     try:
         status_filter = request.args.get("status")
-        q = supabase.table("league_registrations").select("*").eq("season_id", season_id).order("created_at", desc=True).limit(500)
+        q = _staff_db().table("league_registrations").select("*").eq("season_id", season_id).order("created_at", desc=True).limit(500)
         if status_filter:
             q = q.eq("registration_status", status_filter)
         rows = q.execute().data or []
@@ -15135,14 +15094,14 @@ def _admin_league_select_or_waitlist(season_id, target_status, action_label):
     failed = []
     for rid in ids:
         try:
-            reg = supabase.table("league_registrations").select("id,registration_status,season_id,public_nickname").eq("id", rid).limit(1).execute().data or []
+            reg = _staff_db().table("league_registrations").select("id,registration_status,season_id,public_nickname").eq("id", rid).limit(1).execute().data or []
             if not reg or reg[0].get("season_id") != season_id:
                 failed.append({"registration_id": rid, "reason": "not found or wrong season"})
                 continue
             if reg[0].get("registration_status") not in ("registered", "eligible"):
                 failed.append({"registration_id": rid, "reason": f"cannot {action_label} from status {reg[0].get('registration_status')}"})
                 continue
-            supabase.table("league_registrations").update({
+            _staff_db().table("league_registrations").update({
                 "selection_status": target_status,
                 "selected_at": now_iso(),
                 "selected_by": str((admin or {}).get("id") or "admin"),
@@ -15187,10 +15146,10 @@ def admin_league_disqualify(season_id):
     if not rid:
         return _np_fail("registration_id is required", 400)
     try:
-        reg = supabase.table("league_registrations").select("id,season_id").eq("id", rid).limit(1).execute().data or []
+        reg = _staff_db().table("league_registrations").select("id,season_id").eq("id", rid).limit(1).execute().data or []
         if not reg or reg[0].get("season_id") != season_id:
             return _np_fail("Registration not found in this season", 404)
-        supabase.table("league_registrations").update({
+        _staff_db().table("league_registrations").update({
             "registration_status": "disqualified",
             "selection_status": "declined",
             "updated_at": now_iso(),
@@ -15220,7 +15179,7 @@ def admin_league_assign_mt5(season_id):
     if str(season.get("status") or "") not in ("ready", "selection_in_progress", "live"):
         return _np_fail(f"Cannot assign MT5 in status {season.get('status')}", 409)
     try:
-        reg = supabase.table("league_registrations").select("*").eq("id", rid).limit(1).execute().data or []
+        reg = _staff_db().table("league_registrations").select("*").eq("id", rid).limit(1).execute().data or []
     except Exception as e:
         print("ADMIN LEAGUE ASSIGN REG LOOKUP ERROR:", str(e))
         return _np_fail(str(e), 500)
@@ -15249,7 +15208,7 @@ def admin_league_assign_mt5(season_id):
         lead_name = None
         if reg[0].get("golden_ticket_lead_id"):
             try:
-                lead_rows = supabase.table("landing_leads").select("full_name,email,whatsapp").eq("id", reg[0]["golden_ticket_lead_id"]).limit(1).execute().data or []
+                lead_rows = _staff_db().table("landing_leads").select("full_name,email,whatsapp").eq("id", reg[0]["golden_ticket_lead_id"]).limit(1).execute().data or []
                 if lead_rows:
                     lead_name = lead_rows[0].get("full_name")
                     lead_email = lead_rows[0].get("email")
@@ -15276,7 +15235,7 @@ def admin_league_assign_mt5(season_id):
                 "engine_group": "engine_1",
             }
             try:
-                created = supabase.table("traders").insert(new_trader).execute().data or []
+                created = _staff_db().table("traders").insert(new_trader).execute().data or []
             except Exception as e:
                 print("ADMIN LEAGUE ASSIGN TRADER CREATE ERROR:", str(e))
                 return _np_fail(str(e), 500)
@@ -15304,7 +15263,7 @@ def admin_league_assign_mt5(season_id):
     default_nickname = _default_league_nickname(reg[0], mt5.get("mt5_login"), trader_id)
     # Tag the new trader_accounts row with the League discriminator fields.
     try:
-        supabase.table("trader_accounts").update({
+        _staff_db().table("trader_accounts").update({
             "programme_type": LEAGUE_PROGRAMME_TYPE,
             "account_origin": "golden_ticket" if reg[0].get("golden_ticket_lead_id") else "league_manual",
             "competition_id": season_id,
@@ -15317,7 +15276,7 @@ def admin_league_assign_mt5(season_id):
         print("ADMIN LEAGUE ASSIGN TAG ERROR:", str(e))
     # Update the registration row: point at the new account + set the default nickname.
     try:
-        supabase.table("league_registrations").update({
+        _staff_db().table("league_registrations").update({
             "trader_account_id": account["id"],
             "registration_status": "selected",
             "public_nickname": default_nickname,
@@ -15357,33 +15316,33 @@ def admin_league_review_ranking(season_id):
     if not _is_league_season_id(season_id):
         return _np_fail("Season not found", 404)
     try:
-        account = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+        account = _staff_db().table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
         if not account:
             return _np_fail("Account not found", 404)
         account = account[0]
         if account.get("competition_id") != season_id:
             return _np_fail("Account does not belong to this season", 409)
         if action == "disqualify":
-            supabase.table("trader_accounts").update({
+            _staff_db().table("trader_accounts").update({
                 "account_status": "disqualified",
                 "monitoring_enabled": False,
                 "archive_reason": reason or "Disqualified by admin review",
                 "archived_at": now_iso(),
             }).eq("id", account_id).execute()
         elif action == "qualify":
-            supabase.table("trader_accounts").update({
+            _staff_db().table("trader_accounts").update({
                 "account_status": "assigned_active",
                 "monitoring_enabled": True,
             }).eq("id", account_id).execute()
         else:  # provisional
-            supabase.table("trader_accounts").update({
+            _staff_db().table("trader_accounts").update({
                 "account_status": "under_review",
             }).eq("id", account_id).execute()
     except Exception as e:
         print("ADMIN LEAGUE REVIEW RANKING ERROR:", str(e))
         return _np_fail(str(e), 500)
     try:
-        reg = supabase.table("league_registrations").select("id,public_nickname").eq("trader_account_id", account_id).limit(1).execute().data or []
+        reg = _staff_db().table("league_registrations").select("id,public_nickname").eq("trader_account_id", account_id).limit(1).execute().data or []
     except Exception as e:
         print("ADMIN LEAGUE REVIEW REG LOOKUP ERROR:", str(e))
         reg = []
@@ -15423,7 +15382,7 @@ def admin_league_confirm_winners(season_id):
             account_id_hint = entry.get("trader_account_id")
             if not rid and account_id_hint:
                 try:
-                    reg_rows = (supabase.table("league_registrations")
+                    reg_rows = (_staff_db().table("league_registrations")
                                 .select("id")
                                 .eq("trader_account_id", account_id_hint)
                                 .eq("season_id", season_id)
@@ -15437,7 +15396,7 @@ def admin_league_confirm_winners(season_id):
             if not rid or not isinstance(position, int) or not reward_id:
                 failed.append({"entry": entry, "reason": "registration_id (or trader_account_id), position (int), reward_id required"})
                 continue
-            reg = supabase.table("league_registrations").select("*").eq("id", rid).limit(1).execute().data or []
+            reg = _staff_db().table("league_registrations").select("*").eq("id", rid).limit(1).execute().data or []
             if not reg or reg[0].get("season_id") != season_id:
                 failed.append({"entry": entry, "reason": "registration not in this season"})
                 continue
@@ -15447,7 +15406,7 @@ def admin_league_confirm_winners(season_id):
                 continue
             # Use the REAL account for the qualification check, not a fake dict.
             try:
-                account_rows = supabase.table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
+                account_rows = _staff_db().table("trader_accounts").select("*").eq("id", account_id).limit(1).execute().data or []
             except Exception as _e:
                 print("ADMIN LEAGUE CONFIRM ACCOUNT FETCH ERROR:", str(_e))
                 account_rows = []
@@ -15462,11 +15421,11 @@ def admin_league_confirm_winners(season_id):
             if qual not in ("qualified", "provisional", "completed"):
                 failed.append({"entry": entry, "reason": f"qualification status is {qual}"})
                 continue
-            reward = supabase.table("league_rewards").select("*").eq("id", reward_id).limit(1).execute().data or []
+            reward = _staff_db().table("league_rewards").select("*").eq("id", reward_id).limit(1).execute().data or []
             if not reward or reward[0].get("season_id") != season_id:
                 failed.append({"entry": entry, "reason": "reward not in this season"})
                 continue
-            supabase.table("league_rewards").update({
+            _staff_db().table("league_rewards").update({
                 "winner_registration_id": rid,
                 "winner_trader_id": reg[0].get("trader_id"),
                 "winner_trader_account_id": account_id,
@@ -15482,7 +15441,7 @@ def admin_league_confirm_winners(season_id):
                 growth = _season_qualified_growth({"start_balance": start_balance, "current_balance": final_balance})
                 # Public nickname: prefer approved nickname, else fall back to mt5_login last 4.
                 champion_nick = reg[0].get("public_nickname") or ("Trader " + str(real_account.get("mt5_login") or "")[-4:]) or "League Champion"
-                supabase.table("league_champions").upsert({
+                _staff_db().table("league_champions").upsert({
                     "season_id": season_id,
                     "position": position,
                     "public_nickname": champion_nick,
@@ -15533,7 +15492,7 @@ def admin_league_record_reward(season_id):
     if status == "paid":
         update["paid_at"] = now_iso()
     try:
-        rows = supabase.table("league_rewards").update(update).eq("id", reward_id).eq("season_id", season_id).execute().data or []
+        rows = _staff_db().table("league_rewards").update(update).eq("id", reward_id).eq("season_id", season_id).execute().data or []
     except Exception as e:
         print("ADMIN LEAGUE RECORD REWARD ERROR:", str(e))
         return _np_fail(str(e), 500)
@@ -15542,7 +15501,7 @@ def admin_league_record_reward(season_id):
     reward = rows[0]
     if reward.get("winner_registration_id"):
         try:
-            reg = supabase.table("league_registrations").select("public_nickname,trader_account_id").eq("id", reward["winner_registration_id"]).limit(1).execute().data or []
+            reg = _staff_db().table("league_registrations").select("public_nickname,trader_account_id").eq("id", reward["winner_registration_id"]).limit(1).execute().data or []
         except Exception as e:
             print("ADMIN LEAGUE REWARD REG LOOKUP ERROR:", str(e))
             reg = []
@@ -15580,7 +15539,7 @@ def admin_league_approve_nickname(season_id):
     if not _is_league_season_id(season_id):
         return _np_fail("Season not found", 404)
     try:
-        reg = (supabase.table("league_registrations")
+        reg = (_staff_db().table("league_registrations")
                 .select("id,public_nickname,trader_account_id,season_id")
                 .eq("trader_account_id", account_id)
                 .eq("season_id", season_id)
@@ -15594,7 +15553,7 @@ def admin_league_approve_nickname(season_id):
     registration = reg[0]
     new_nickname = registration.get("public_nickname") if approved else ""
     try:
-        supabase.table("league_registrations").update({
+        _staff_db().table("league_registrations").update({
             "nickname_approved": approved,
             "nickname_approved_by": str((admin or {}).get("id") or "admin"),
             "public_nickname": new_nickname,
@@ -15606,7 +15565,7 @@ def admin_league_approve_nickname(season_id):
     # Mirror the approved nickname to trader_accounts so the public leaderboard
     # picks it up. On reject, blank it (leaderboard shows "League Trader" default).
     try:
-        supabase.table("trader_accounts").update({
+        _staff_db().table("trader_accounts").update({
             "public_nickname": new_nickname,
         }).eq("id", account_id).execute()
     except Exception as e:
@@ -15631,7 +15590,7 @@ def admin_league_rewards_list(season_id):
     if not _is_league_season_id(season_id):
         return _np_fail("Season not found", 404)
     try:
-        rows = supabase.table("league_rewards").select("*").eq("season_id", season_id).order("position").limit(20).execute().data or []
+        rows = _staff_db().table("league_rewards").select("*").eq("season_id", season_id).order("position").limit(20).execute().data or []
     except Exception as e:
         print("ADMIN LEAGUE REWARDS LIST ERROR:", str(e))
         rows = []
@@ -15667,14 +15626,14 @@ def admin_league_reward_upsert(season_id, position):
     }
     try:
         # Try update first, then insert if not found (upsert by season_id+position).
-        existing = supabase.table("league_rewards").select("id").eq("season_id", season_id).eq("position", position).limit(1).execute().data or []
+        existing = _staff_db().table("league_rewards").select("id").eq("season_id", season_id).eq("position", position).limit(1).execute().data or []
         if existing:
             payload.pop("season_id", None)
             payload.pop("position", None)
-            rows = supabase.table("league_rewards").update(payload).eq("id", existing[0]["id"]).execute().data or []
+            rows = _staff_db().table("league_rewards").update(payload).eq("id", existing[0]["id"]).execute().data or []
         else:
             payload["created_at"] = now_iso()
-            rows = supabase.table("league_rewards").insert(payload).execute().data or []
+            rows = _staff_db().table("league_rewards").insert(payload).execute().data or []
     except Exception as e:
         print("ADMIN LEAGUE REWARD UPSERT ERROR:", str(e))
         return _np_fail(str(e), 500)
