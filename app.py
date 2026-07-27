@@ -14206,11 +14206,47 @@ def submit_breach_dispute():
 # trader_accounts remains the only financial source of truth.
 # ============================================================
 
-LEAGUE_ENABLED = os.getenv("LEAGUE_ENABLED", "0") == "1"
-LEAGUE_PUBLIC_ENABLED = os.getenv("LEAGUE_PUBLIC_ENABLED", "0") == "1"
-LEAGUE_REGISTRATION_ENABLED = os.getenv("LEAGUE_REGISTRATION_ENABLED", "0") == "1"
-LEAGUE_LEADERBOARD_ENABLED = os.getenv("LEAGUE_LEADERBOARD_ENABLED", "0") == "1"
-LEAGUE_ACTIVITY_ENABLED = os.getenv("LEAGUE_ACTIVITY_ENABLED", "0") == "1"
+LEAGUE_FLAG_NAMES = [
+    "LEAGUE_ENABLED",
+    "LEAGUE_PUBLIC_ENABLED",
+    "LEAGUE_REGISTRATION_ENABLED",
+    "LEAGUE_LEADERBOARD_ENABLED",
+    "LEAGUE_ACTIVITY_ENABLED",
+]
+_RUNTIME_FLAG_CACHE = {}  # name -> bool; populated lazily
+
+def _load_runtime_flags():
+    """Traders League V1: read runtime flag overrides from app_runtime_flags
+    table. Env vars are the default; DB rows override them. Allows the admin
+    UI to flip flags without redeploying."""
+    global _RUNTIME_FLAG_CACHE
+    try:
+        rows = supabase.table("app_runtime_flags").select("flag_name,enabled").execute().data or []
+        _RUNTIME_FLAG_CACHE = {r["flag_name"]: bool(r.get("enabled")) for r in rows}
+    except Exception as e:
+        print("LEAGUE RUNTIME FLAGS LOAD ERROR:", str(e))
+        # leave cache as-is on transient errors
+    return _RUNTIME_FLAG_CACHE
+
+def _runtime_flag(name, env_default):
+    """Returns the effective boolean for a feature flag. Priority:
+    1. admin_runtime_flags override (if loaded)
+    2. env var
+    3. fallback default
+    """
+    if name in _RUNTIME_FLAG_CACHE:
+        return _RUNTIME_FLAG_CACHE[name]
+    return os.getenv(name, env_default) == "1"
+
+# Load overrides once at import time. Admin endpoints can call _load_runtime_flags()
+# again to refresh after the user toggles a flag in the admin UI.
+_load_runtime_flags()
+
+LEAGUE_ENABLED = _runtime_flag("LEAGUE_ENABLED", "0")
+LEAGUE_PUBLIC_ENABLED = _runtime_flag("LEAGUE_PUBLIC_ENABLED", "0")
+LEAGUE_REGISTRATION_ENABLED = _runtime_flag("LEAGUE_REGISTRATION_ENABLED", "0")
+LEAGUE_LEADERBOARD_ENABLED = _runtime_flag("LEAGUE_LEADERBOARD_ENABLED", "0")
+LEAGUE_ACTIVITY_ENABLED = _runtime_flag("LEAGUE_ACTIVITY_ENABLED", "0")
 
 LEAGUE_PROGRAMME_TYPE = "traders_league"
 LEAGUE_ACCOUNT_STAGE = "phase1"  # re-uses existing stage machinery
@@ -15716,4 +15752,88 @@ def admin_league_champions_list(season_id):
     if not _is_league_season_id(season_id):
         return _np_fail("Season not found", 404)
     return _np_ok({"champions": _league_champions(season_id)})
+
+
+@app.route("/admin/league/flags", methods=["GET", "OPTIONS"])
+def admin_league_flags_get():
+    """Return the current effective value of all 5 League feature flags.
+    Reads the app_runtime_flags table (admin overrides) and falls back to
+    env-var defaults. No season_id needed; flags are global.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    out = []
+    for name in LEAGUE_FLAG_NAMES:
+        try:
+            rows = supabase.table("app_runtime_flags").select("enabled,updated_at,updated_by").eq("flag_name", name).limit(1).execute().data or []
+        except Exception as e:
+            print("ADMIN LEAGUE FLAGS GET ERROR:", str(e))
+            rows = []
+        if rows:
+            enabled = bool(rows[0].get("enabled"))
+            source = "override"
+            updated_at = rows[0].get("updated_at")
+            updated_by = rows[0].get("updated_by")
+        else:
+            enabled = os.getenv(name, "0") == "1"
+            source = "env"
+            updated_at = None
+            updated_by = None
+        out.append({
+            "flag": name,
+            "enabled": enabled,
+            "source": source,
+            "updated_at": updated_at,
+            "updated_by": updated_by,
+        })
+    return _np_ok({"flags": out}, "flags loaded")
+
+
+@app.route("/admin/league/flags", methods=["POST", "OPTIONS"])
+def admin_league_flags_set():
+    """Toggle a League feature flag from the admin UI. Stores in
+    app_runtime_flags. The running process picks up the change within
+    5 seconds via the TTL cache.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    global LEAGUE_ENABLED, LEAGUE_PUBLIC_ENABLED, LEAGUE_REGISTRATION_ENABLED
+    global LEAGUE_LEADERBOARD_ENABLED, LEAGUE_ACTIVITY_ENABLED
+    d = request.get_json(silent=True) or {}
+    flag = str(d.get("flag") or "").strip()
+    enabled = bool(d.get("enabled"))
+    if flag not in LEAGUE_FLAG_NAMES:
+        return _np_fail(f"Invalid flag; must be one of {sorted(LEAGUE_FLAG_NAMES)}", 400)
+    admin_id = str((admin or {}).get("id") or "admin")
+    now = now_iso()
+    try:
+        supabase.table("app_runtime_flags").upsert({
+            "flag_name": flag,
+            "enabled": enabled,
+            "updated_at": now,
+            "updated_by": admin_id,
+        }, on_conflict="flag_name").execute()
+    except Exception as e:
+        print("ADMIN LEAGUE FLAGS SET ERROR:", str(e))
+        return _np_fail(str(e), 500)
+    # Update module-level globals so this process sees the change immediately.
+    if flag == "LEAGUE_ENABLED":
+        LEAGUE_ENABLED = enabled
+    elif flag == "LEAGUE_PUBLIC_ENABLED":
+        LEAGUE_PUBLIC_ENABLED = enabled
+    elif flag == "LEAGUE_REGISTRATION_ENABLED":
+        LEAGUE_REGISTRATION_ENABLED = enabled
+    elif flag == "LEAGUE_LEADERBOARD_ENABLED":
+        LEAGUE_LEADERBOARD_ENABLED = enabled
+    elif flag == "LEAGUE_ACTIVITY_ENABLED":
+        LEAGUE_ACTIVITY_ENABLED = enabled
+    _RUNTIME_FLAG_CACHE[flag] = enabled
+    _log_league_audit(admin, "flag_toggle", f"flag={flag} enabled={enabled}")
+    return _np_ok({"flag": flag, "enabled": enabled}, "flag updated")
 
