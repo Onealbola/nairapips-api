@@ -309,19 +309,174 @@ TERMINAL_ACCOUNT_STATUSES = {
     "locked", "disabled", "profit_protected",
 }
 ACCOUNT_STAGES = {"phase1", "phase2", "funded"}
+DEFAULT_CHALLENGE_JOURNEY = ("phase1", "phase2", "funded")
+ONE_PHASE_CHALLENGE_JOURNEY = ("phase1", "funded")
+
+
+def _normalize_lifecycle_stage(stage, default="phase1"):
+    text = str(stage or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if "funded" in text or text in {"live", "funded_live"}:
+        return "funded"
+    if "phase_2" in text or "phase2" in text:
+        return "phase2"
+    if "phase_1" in text or "phase1" in text:
+        return "phase1"
+    return default
+
+
+def _journey_from_text(*values):
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            stages = tuple(_normalize_lifecycle_stage(v, "") for v in value)
+            stages = tuple(v for v in stages if v in ACCOUNT_STAGES)
+            if stages:
+                return stages
+    text = " ".join(str(v or "") for v in values).strip().lower().replace("-", "_").replace(" ", "_")
+    if not text:
+        return None
+    if any(token in text for token in ("direct_funded", "one_phase", "1phase", "1_phase", "funded_after_phase1")):
+        return ONE_PHASE_CHALLENGE_JOURNEY
+    if "phase2" in text or "phase_2" in text or "two_phase" in text or "2phase" in text or "2_phase" in text:
+        return DEFAULT_CHALLENGE_JOURNEY
+    return None
+
+
+def _journey_source_value(*values):
+    journey = _journey_from_text(*values)
+    return list(journey or DEFAULT_CHALLENGE_JOURNEY)
+
+
+def _journey_from_plan(plan):
+    if not plan:
+        return None
+    hinted = _journey_from_text(
+        plan.get("journey"), plan.get("challenge_journey"), plan.get("challenge_type"),
+        plan.get("route"), plan.get("progression_route"), plan.get("model"),
+        plan.get("name"), plan.get("plan_name"),
+    )
+    if hinted:
+        return hinted
+    if "phase2_target" in plan:
+        try:
+            if float(plan.get("phase2_target") or 0) <= 0:
+                return ONE_PHASE_CHALLENGE_JOURNEY
+        except Exception:
+            pass
+    return None
+
+
+def _safe_plan_for_purchase(purchase):
+    if not purchase:
+        return None
+    try:
+        plan_id = str(purchase.get("plan_id") or purchase.get("challenge_plan_id") or "").strip()
+        if plan_id:
+            rows = supabase.table("challenge_plans").select("*").eq("id", plan_id).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+        plan_name = str(purchase.get("plan_name") or purchase.get("selected_plan") or "").strip()
+        if plan_name:
+            rows = supabase.table("challenge_plans").select("*").eq("name", plan_name).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+            rows = supabase.table("challenge_plans").select("*").eq("plan_name", plan_name).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+    except Exception as e:
+        print("LIFECYCLE PLAN LOOKUP ERROR:", e)
+    return None
+
+
+def _safe_purchase_for_account(account):
+    if not account:
+        return None
+    try:
+        purchase_id = str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip()
+        if purchase_id:
+            rows = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+    except Exception as e:
+        print("LIFECYCLE PURCHASE LOOKUP ERROR:", e)
+    return None
+
+
+def _journey_for_lifecycle(account=None, purchase=None, plan=None, trader=None):
+    """Single journey authority: each account follows the route its purchase/plan started with.
+
+    Legacy rows usually do not store route metadata, so the production-safe default
+    remains the original Phase 1 -> Phase 2 -> Funded journey.
+    """
+    account = account or {}
+    purchase = purchase or {}
+    plan = plan or {}
+    account_journey = _journey_from_text(account.get("journey_stages"), account.get("challenge_journey"), account.get("journey"))
+    if account_journey:
+        return account_journey
+    purchase_journey = _journey_from_text(purchase.get("journey_stages"), purchase.get("challenge_journey"), purchase.get("journey"))
+    if purchase_journey:
+        return purchase_journey
+    account_hint = _journey_from_text(account.get("challenge_type"), account.get("route"), account.get("progression_route"))
+    if account_hint:
+        return account_hint
+    purchase_hint = _journey_from_text(purchase.get("challenge_type"), purchase.get("route"), purchase.get("progression_route"))
+    if purchase_hint:
+        return purchase_hint
+    plan_journey = _journey_from_plan(plan) or _journey_from_plan(_safe_plan_for_purchase(purchase))
+    if plan_journey:
+        return plan_journey
+    trader_hint = _journey_from_text((trader or {}).get("challenge_type"), (trader or {}).get("progression_route"))
+    return trader_hint or DEFAULT_CHALLENGE_JOURNEY
+
+
+def _next_stage_for_lifecycle(stage, account=None, purchase=None, plan=None, trader=None):
+    stage = _normalize_lifecycle_stage(stage)
+    journey = list(_journey_for_lifecycle(account, purchase, plan, trader))
+    if stage not in journey:
+        return None
+    index = journey.index(stage)
+    return journey[index + 1] if index + 1 < len(journey) else None
+
+
+def _waiting_state_for_stage(stage):
+    stage = _normalize_lifecycle_stage(stage)
+    return f"{stage}_waiting_mt5"
+
+
+def _phase_value_for_waiting_stage(stage):
+    stage = _normalize_lifecycle_stage(stage)
+    return "funded_waiting" if stage == "funded" else stage
+
+
+def _decorate_lifecycle_authority(row, purchase=None, plan=None, trader=None):
+    if not row:
+        return row
+    out = dict(row)
+    stage = _normalize_lifecycle_stage(out.get("stage") or out.get("phase"))
+    journey = _journey_for_lifecycle(out, purchase, plan, trader)
+    next_stage = _next_stage_for_lifecycle(stage, out, purchase, plan, trader)
+    out["stage"] = stage
+    out["journey_stages"] = list(journey)
+    out["next_stage"] = next_stage
+    out["next_waiting_state"] = _waiting_state_for_stage(next_stage) if next_stage else None
+    out["waiting_for_stage"] = out.get("waiting_for_stage") or (
+        _normalize_lifecycle_stage(out.get("lifecycle_state") or out.get("status")) if "waiting" in str(out.get("lifecycle_state") or out.get("status") or "").lower() else None
+    )
+    return out
 
 
 def _target_for_stage(stage):
-    return {"phase1": 10, "phase2": 8, "funded": None}.get(str(stage or "").lower())
+    return {"phase1": 10, "phase2": 8, "funded": None}.get(_normalize_lifecycle_stage(stage))
 
 
 def _active_state_for_stage(stage):
-    stage = str(stage or "").lower()
+    stage = _normalize_lifecycle_stage(stage)
     return "funded_active" if stage == "funded" else f"{stage}_active"
 
 
-def _next_waiting_after_pass(stage):
-    return {"phase1": "phase2_waiting_mt5", "phase2": "funded_waiting_mt5"}.get(str(stage or "").lower())
+def _next_waiting_after_pass(stage, account=None, purchase=None, plan=None, trader=None):
+    next_stage = _next_stage_for_lifecycle(stage, account, purchase, plan, trader)
+    return _waiting_state_for_stage(next_stage) if next_stage else None
 
 
 def _archive_status_for_stage(stage, breached=False):
@@ -419,7 +574,7 @@ def _account_display_assigned_at(account):
 def _decorate_account_for_api(account):
     if not account:
         return account
-    row = dict(account)
+    row = _decorate_lifecycle_authority(account)
     row["display_assigned_at"] = _account_display_assigned_at(row)
     row["assignment_date"] = row.get("display_assigned_at")
     absolute_dd = _num(row.get("absolute_drawdown_percent"), _num(row.get("drawdown_percent"), 0))
@@ -505,7 +660,8 @@ _TRADER_ACCOUNT_RESPONSE_FIELDS = {
     "master_password", "mt5_investor_password", "investor_password",
     "monitoring_enabled", "started_at", "assigned_at", "created_at",
     "updated_at", "display_assigned_at", "assignment_date", "last_sync_at",
-    "latest_monitoring_snapshot", "latest_monitoring_event", "_source"
+    "latest_monitoring_snapshot", "latest_monitoring_event", "journey_stages",
+    "next_stage", "next_waiting_state", "waiting_for_stage", "_source"
 }
 
 _TRADER_PURCHASE_RESPONSE_FIELDS = {
@@ -519,7 +675,8 @@ _TRADER_PURCHASE_RESPONSE_FIELDS = {
     "assigned_at", "approved_at", "created_at", "updated_at",
     "rejected_at", "purchase_month", "purchase_year", "account_origin",
     "source_type", "programme_type", "campaign_id", "grant_id",
-    "referral_reward_id", "competition_id"
+    "referral_reward_id", "competition_id", "challenge_journey", "journey_stages",
+    "journey_source"
 }
 
 _TRADER_PAYOUT_RESPONSE_FIELDS = {
@@ -752,10 +909,18 @@ def _purchase_accounts_for_trader(trader, purchases=None):
             is_waiting = "waiting" in stage_text and "mt5" in stage_text and not login
             if not is_waiting:
                 continue
-            stage = "funded" if "funded" in stage_text else ("phase2" if "phase2" in stage_text or "phase_2" in stage_text else "phase1")
+            plan = _safe_plan_for_purchase(p)
+            stage = _normalize_lifecycle_stage(
+                p.get("waiting_for_stage")
+                or p.get("active_stage")
+                or p.get("assigned_phase")
+                or p.get("phase")
+                or p.get("lifecycle_state")
+                or p.get("status")
+            )
             account_size = clean(p.get("account_size") or p.get("challenge_size") or 0)
             assigned_at = p.get("updated_at") or p.get("approved_at") or p.get("created_at") or now_iso()
-            accounts.append(_decorate_account_for_api({
+            accounts.append(_decorate_account_for_api(_decorate_lifecycle_authority({
                 "id": f"waiting:{pid}",
                 "trader_id": (trader or {}).get("id") or p.get("trader_id"),
                 "purchase_id": pid,
@@ -775,7 +940,7 @@ def _purchase_accounts_for_trader(trader, purchases=None):
                 "started_at": assigned_at, "assigned_at": assigned_at,
                 "created_at": assigned_at, "updated_at": assigned_at,
                 "_source": "challenge_purchase_waiting",
-            }))
+            }, p, plan, trader)))
     except Exception as e:
         print("PURCHASE WAITING BRIDGE ERROR:", e)
     return accounts
@@ -788,15 +953,20 @@ def _get_active_accounts(trader_id, trader=None, purchases=None):
         visible_statuses = {
             "assigned_active", "active", "current_active",
             "archived_phase1", "archived_phase2", "archived_funded",
+            "archived", "passed",
             "breached_archived", "breached", "locked", "closed",
             "waiting_mt5", "phase1_waiting_mt5", "phase2_waiting_mt5", "funded_waiting_mt5"
         }
+        purchase_by_id = {str(p.get("id") or "").strip(): p for p in (purchases or []) if str(p.get("id") or "").strip()}
         rows = []
         for row in raw_rows:
             status = str(row.get("account_status") or "").strip().lower()
             if status in visible_statuses or str(row.get("mt5_login") or "").strip():
                 rows.append(row)
-        decorated = [_decorate_account_for_api(row) for row in rows]
+        decorated = []
+        for row in rows:
+            purchase = purchase_by_id.get(str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip())
+            decorated.append(_decorate_account_for_api(_decorate_lifecycle_authority(row, purchase, None, trader)))
         purchase_accounts = _purchase_accounts_for_trader(trader, purchases)
 
         real_purchase_ids = {
@@ -1347,11 +1517,15 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
     if existing_login:
         raise ValueError("MT5 login already has an active trader account")
     now = now_iso()
+    plan = _safe_plan_for_purchase(purchase)
+    challenge_journey = _journey_source_value(_journey_for_lifecycle({"stage": stage}, purchase, plan, trader))
     account_row = {
         "trader_id": trader.get("id"),
         "purchase_id": purchase_id,
         "mt5_pool_id": mt5.get("id"),
         "stage": stage,
+        "challenge_journey": challenge_journey,
+        "journey_source": "purchase_or_plan_snapshot" if purchase_id else "account_assignment_default",
         "account_status": "assigned_active",
         "mt5_login": mt5.get("mt5_login"),
         "mt5_server": mt5.get("mt5_server"),
@@ -1390,6 +1564,8 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
             "payment_status": "approved",
             "status": "approved_active",
             "lifecycle_state": _active_state_for_stage(stage),
+            "challenge_journey": challenge_journey,
+            "journey_source": "assigned_account_snapshot",
             "trader_account_id": account.get("id"),
             "assigned_mt5_id": mt5.get("id"),
             "mt5_login": mt5.get("mt5_login"),
@@ -1584,8 +1760,13 @@ def _pass_specific_account(trader, account, pass_status, staff=None, note="Stage
         pass_status = "phase1_passed"
     if stage not in {"phase1", "phase2"}:
         raise ValueError("Only Phase 1 or Phase 2 accounts can be passed")
-    next_state = "phase2_waiting_mt5" if stage == "phase1" else "funded_waiting_mt5"
-    next_phase = "phase2" if stage == "phase1" else "funded_waiting"
+    purchase = _safe_purchase_for_account(account)
+    plan = _safe_plan_for_purchase(purchase)
+    next_stage = _next_stage_for_lifecycle(stage, account, purchase, plan, trader)
+    if not next_stage:
+        raise ValueError("This account journey has no next stage to assign")
+    next_state = _waiting_state_for_stage(next_stage)
+    next_phase = _phase_value_for_waiting_stage(next_stage)
     archived = _archive_specific_account(account, note, staff, breached=False, archive_status=_archive_status_for_stage(stage))
     _log_lifecycle_event(trader.get("id"), account.get("id"), stage, next_state, f"pass_specific_{stage}", note, staff)
     if _account_is_current_for_trader(trader, account):
@@ -1676,10 +1857,15 @@ def _pass_stage(trader_id, stage, staff=None, note="Stage passed"):
     if clean(account.get("dd_used_percent")) >= 100:
         raise ValueError("Account has breached maximum drawdown")
     _archive_active_account(trader, note, staff)
-    next_state = _next_waiting_after_pass(stage)
+    purchase = _safe_purchase_for_account(account)
+    plan = _safe_plan_for_purchase(purchase)
+    next_stage = _next_stage_for_lifecycle(stage, account, purchase, plan, trader)
+    if not next_stage:
+        raise ValueError("This account journey has no next stage to assign")
+    next_state = _waiting_state_for_stage(next_stage)
     extra = {
         "status": "active",
-        "phase": "phase2" if stage == "phase1" else "funded_waiting",
+        "phase": _phase_value_for_waiting_stage(next_stage),
         "phase_pass_status": f"{stage}_passed",
         "mt5_login": "",
         "mt5_server": "",
@@ -2651,7 +2837,10 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
                 seen.add(account_id)
             trader_id = str(acc.get("trader_id") or "").strip()
             trader = traders_by_id.get(trader_id) or {}
-            target_stage = "funded" if phase2_passed else "phase2"
+            passed_stage = "phase2" if phase2_passed else "phase1"
+            target_stage = acc.get("next_stage") or _next_stage_for_lifecycle(passed_stage, acc, None, None, trader)
+            if not target_stage:
+                continue
             if has_target_active(trader_id, target_stage):
                 continue
             rows.append({
@@ -2665,8 +2854,8 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
                 "account_reference": trader.get("account_reference") or acc.get("account_reference") or "",
                 "old_mt5_login": acc.get("mt5_login") or "",
                 "completed_mt5_login": acc.get("mt5_login") or "",
-                "completed_stage": "phase2" if phase2_passed else "phase1",
-                "passed_stage": "phase2" if phase2_passed else "phase1",
+                "completed_stage": passed_stage,
+                "passed_stage": passed_stage,
                 "target_phase": target_stage,
                 "target_stage": target_stage,
                 "assignment_label": "Assign Funded MT5" if target_stage == "funded" else "Assign Phase 2 MT5",
@@ -4785,9 +4974,15 @@ def create_plan():
         d=request.json or {}; name=str(d.get("name","")).strip()
         if not name: return bad("Plan name is required")
         mt5_server = d.get("mt5_server") or d.get("default_server") or ""
+        phase2_target = float(d.get("phase2_target") or 8)
+        challenge_journey = _journey_source_value(
+            d.get("challenge_journey"), d.get("journey_stages"), d.get("route"),
+            d.get("progression_route"), "one_phase" if phase2_target <= 0 else "two_phase"
+        )
         row={"name":name,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
-             "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":float(d.get("phase2_target") or 8),
+             "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":phase2_target,
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
+             "challenge_journey": challenge_journey, "journey_source": "plan_create",
              "payout_split":_effective_payout_split(d.get("payout_split")),"description":d.get("description",""),
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
              "status":d.get("status","active"),"created_at":now_iso(),"updated_at":now_iso()}
@@ -4813,6 +5008,14 @@ def update_plan():
             if k in d: upd[k]=clean(d[k])
         for k in ["phase1_target","phase2_target","max_drawdown"]:
             if k in d: upd[k]=float(d.get(k) or 0)
+        if "challenge_journey" in d or "journey_stages" in d or "route" in d or "progression_route" in d or "phase2_target" in d:
+            phase2_target = upd.get("phase2_target", d.get("phase2_target"))
+            route_hint = "one_phase" if phase2_target is not None and float(phase2_target or 0) <= 0 else "two_phase"
+            upd["challenge_journey"] = _journey_source_value(
+                d.get("challenge_journey"), d.get("journey_stages"), d.get("route"),
+                d.get("progression_route"), route_hint
+            )
+            upd["journey_source"] = "plan_update"
         return ok(supabase.table("challenge_plans").update(upd).eq("id",pid).execute().data, "Challenge plan updated")
     except Exception as e: return bad(e)
 
@@ -4882,11 +5085,14 @@ def create_purchase():
         if quote.get("code") and not quote.get("valid"):
             return bad(quote.get("message") or "Invalid promo/referral code", 400)
 
+        plan_row = _safe_plan_for_purchase({"plan_id": d.get("plan_id"), "plan_name": plan})
+        challenge_journey = _journey_source_value(_journey_for_lifecycle({}, {}, plan_row, None))
         row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
              "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":quote.get("final_fee", original_fee),
              "original_fee":quote.get("original_fee", original_fee),"discount_percent":quote.get("discount_percent",0),"discount_amount":quote.get("discount_amount",0),
              "final_fee":quote.get("final_fee", original_fee),"amount_due":quote.get("final_fee", original_fee),
              "payment_proof_url":proof,"payment_status":"pending","status":"pending_review","admin_note":"",
+             "challenge_journey": challenge_journey, "journey_source": "purchase_plan_snapshot",
              "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
         row.update(_affiliate_purchase_fields(d, original_fee))
         created = supabase.table("challenge_purchases").insert(row).execute().data
@@ -5374,12 +5580,32 @@ def assign_phase_mt5():
         if not trader:
             return bad("Trader not found", 404)
         target_stage = "funded" if phase in ["funded", "live"] else "phase2"
+        completed_account = None
+        completed_account_id = str(d.get("completed_account_id") or d.get("trader_account_id") or d.get("passed_account_id") or "").strip()
+        if completed_account_id and not completed_account_id.startswith("waiting:"):
+            rows = supabase.table("trader_accounts").select("*").eq("id", completed_account_id).eq("trader_id", trader_id).limit(1).execute().data or []
+            completed_account = rows[0] if rows else None
+            if not completed_account:
+                return bad("Completed trader account was not found for this trader", 404)
+            completed_stage = _normalize_lifecycle_stage(completed_account.get("stage") or completed_account.get("phase"))
+            expected_stage = _next_stage_for_lifecycle(
+                completed_stage,
+                completed_account,
+                _safe_purchase_for_account(completed_account),
+                None,
+                trader
+            )
+            if expected_stage and target_stage != expected_stage:
+                return bad(f"Lifecycle authority requires {expected_stage} assignment for this completed account, not {target_stage}", 409)
+            if expected_stage:
+                target_stage = expected_stage
         mt5_acc = _get_mt5_account(mt5_id=mt5_id)
+        purchase = _safe_purchase_for_account(completed_account) if completed_account else None
         account, updated = _assign_mt5_to_trader(
             trader,
             mt5_acc,
             target_stage,
-            None,
+            purchase,
             _admin_from_payload(d),
             d.get("admin_note") or f"{target_stage.title()} MT5 assigned"
         )
@@ -6743,14 +6969,16 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
     if passed_status:
         zone = "passed"
         priority = "passed"
-        next_phase = "phase2"
-        next_status = "phase2_waiting_mt5"
-        admin_note = payload.get("reason") or "Phase 1 passed. Assign a fresh Phase 2 MT5 account."
-
-        if passed_status == "phase2_passed":
-            next_phase = "funded_waiting"
-            next_status = "funded_waiting_mt5"
-            admin_note = payload.get("reason") or "Phase 2 passed. Assign funded/live account after admin review."
+        pass_stage = "phase2" if passed_status == "phase2_passed" else "phase1"
+        purchase = _safe_purchase_for_account(active_account)
+        plan = _safe_plan_for_purchase(purchase)
+        next_stage = _next_stage_for_lifecycle(pass_stage, active_account, purchase, plan, trader)
+        if not next_stage:
+            next_stage = "funded"
+        next_phase = _phase_value_for_waiting_stage(next_stage)
+        next_status = _waiting_state_for_stage(next_stage)
+        next_label = "Funded" if next_stage == "funded" else ("Phase 2" if next_stage == "phase2" else "Phase 1")
+        admin_note = payload.get("reason") or f"{pass_stage.replace('phase', 'Phase ')} passed. Assign {next_label} MT5 account after admin review."
 
         update_data.update({
             "status": next_status,
@@ -13756,12 +13984,20 @@ def repair_phase_pass_handoff():
             {"name": "admin_repair", "username": "admin_repair", "role": "super_admin"},
             f"{pass_status.upper()} repaired from MT5 engine pass evidence. Waiting for next MT5 assignment."
         )
+        next_stage = _next_stage_for_lifecycle(
+            "phase2" if pass_status == "phase2_passed" else "phase1",
+            account,
+            _safe_purchase_for_account(account),
+            None,
+            trader
+        )
+        next_action = "Assign funded/live MT5" if next_stage == "funded" else "Assign fresh Phase 2 MT5"
         return _np_ok({
             "success": True,
             "message": "Phase pass handoff repaired. Trader is now waiting for next MT5 assignment.",
             "trader": updated,
             "archived_account": archived,
-            "next_action": "Assign fresh Phase 2 MT5" if pass_status == "phase1_passed" else "Assign funded/live MT5"
+            "next_action": next_action
         })
     except Exception as e:
         return _np_fail(e, 500)
