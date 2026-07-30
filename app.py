@@ -9631,6 +9631,24 @@ def _aff_unique_partner_code(base):
             return code
     return _aff_code(f"{candidate}{int(datetime.now(timezone.utc).timestamp()) % 10000}")
 
+def _affiliate_default_rates():
+    defaults = {"commission_percent": 10, "discount_percent": 0}
+    try:
+        row = {}
+        try:
+            rows = supabase.table("referral_settings").select("*").eq("id", "main").limit(1).execute().data or []
+            row = rows[0] if rows else {}
+        except Exception:
+            row = {}
+        fallback = referral_settings_default()
+        commission = clean(row.get("rebate_value") if row else fallback.get("rebateValue"))
+        discount = clean(row.get("customer_bonus") if row else fallback.get("customerBonus"))
+        defaults["commission_percent"] = max(0, min(100, commission))
+        defaults["discount_percent"] = max(0, min(100, discount))
+    except Exception as e:
+        print("AFFILIATE DEFAULT RATE ERROR:", e)
+    return defaults
+
 def _aff_norm_email(value):
     return str(value or "").strip().lower()
 
@@ -10174,6 +10192,7 @@ def affiliate_signup():
                 "affiliate_link": row.get("affiliate_link") or _aff_link_for_code(row.get("code")),
             }, "Affiliate partner already registered")
 
+        rates = _affiliate_default_rates()
         requested_code = _aff_code(d.get("code") or d.get("preferred_code"))
         code = _aff_unique_partner_code(requested_code or _aff_code_from_identity(name, email, phone))
         row = {
@@ -10184,8 +10203,8 @@ def affiliate_signup():
             "partner_type": d.get("partner_type") or "marketer",
             "code": code,
             "affiliate_link": _aff_link_for_code(code),
-            "commission_percent": clean(d.get("commission_percent") or 20),
-            "discount_percent": clean(d.get("discount_percent") or 10),
+            "commission_percent": clean(d.get("commission_percent") if d.get("commission_percent") not in [None, ""] else rates["commission_percent"]),
+            "discount_percent": clean(d.get("discount_percent") if d.get("discount_percent") not in [None, ""] else rates["discount_percent"]),
             "status": "active",
             "created_at": now_iso(),
             "updated_at": now_iso(),
@@ -10221,6 +10240,7 @@ def trader_affiliate_profile():
         name = trader.get("name") or trader.get("full_name") or trader.get("email") or "Trader"
         email = str(trader.get("email") or email or "").strip().lower()
         phone = str(trader.get("phone") or trader.get("whatsapp") or "").strip()
+        rates = _affiliate_default_rates()
 
         existing = []
         if email:
@@ -10236,20 +10256,32 @@ def trader_affiliate_profile():
                 "partner_type": "trader_referral",
                 "code": code,
                 "affiliate_link": _aff_link_for_code(code),
-                "commission_percent": clean(d.get("commission_percent") or 20),
-                "discount_percent": clean(d.get("discount_percent") or 10),
+                "commission_percent": rates["commission_percent"],
+                "discount_percent": rates["discount_percent"],
                 "status": "active",
                 "created_at": now_iso(),
                 "updated_at": now_iso(),
             }
             existing = supabase.table("affiliate_partners").insert(row).execute().data or [row]
         partner = existing[0]
+        if str(partner.get("partner_type") or "").strip().lower() == "trader_referral":
+            if clean(partner.get("commission_percent")) != rates["commission_percent"] or clean(partner.get("discount_percent")) != rates["discount_percent"]:
+                try:
+                    updated = supabase.table("affiliate_partners").update({
+                        "commission_percent": rates["commission_percent"],
+                        "discount_percent": rates["discount_percent"],
+                        "updated_at": now_iso(),
+                    }).eq("id", partner.get("id")).execute().data or []
+                    if updated:
+                        partner = updated[0]
+                except Exception as sync_error:
+                    print("TRADER REFERRAL RATE SYNC SKIPPED:", sync_error)
         return ok({
             "partner": partner,
             "code": partner.get("code"),
             "affiliate_link": partner.get("affiliate_link") or _aff_link_for_code(partner.get("code")),
-            "commission_percent": partner.get("commission_percent") or 20,
-            "discount_percent": partner.get("discount_percent") or 10,
+            "commission_percent": partner.get("commission_percent") if partner.get("commission_percent") is not None else rates["commission_percent"],
+            "discount_percent": partner.get("discount_percent") if partner.get("discount_percent") is not None else rates["discount_percent"],
         }, "Trader referral profile ready")
     except Exception as e:
         return bad(e, 500)
@@ -10271,6 +10303,7 @@ def create_affiliate_partner():
         if not code: return bad("Affiliate code is required")
         existing = supabase.table("affiliate_partners").select("id").eq("code", code).limit(1).execute().data or []
         if existing: return bad("Affiliate partner code already exists", 409)
+        rates = _affiliate_default_rates()
         row = {
             "name": name,
             "email": d.get("email") or "",
@@ -10279,8 +10312,8 @@ def create_affiliate_partner():
             "partner_type": d.get("partner_type") or "affiliate",
             "code": code,
             "affiliate_link": d.get("affiliate_link") or _aff_link_for_code(code),
-            "commission_percent": clean(d.get("commission_percent") or 20),
-            "discount_percent": clean(d.get("discount_percent") or 0),
+            "commission_percent": clean(d.get("commission_percent") if d.get("commission_percent") not in [None, ""] else rates["commission_percent"]),
+            "discount_percent": clean(d.get("discount_percent") if d.get("discount_percent") not in [None, ""] else rates["discount_percent"]),
             "status": d.get("status") or "active",
             "created_at": now_iso(),
             "updated_at": now_iso(),
