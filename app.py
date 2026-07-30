@@ -9602,6 +9602,120 @@ def _aff_status_active(row):
     status = str((row or {}).get("status") or "active").strip().lower()
     return status in {"active", "live", "enabled"}
 
+def _aff_base_url():
+    return (os.environ.get("NAIRAPIPS_PUBLIC_URL") or "https://nairapips.com").rstrip("/")
+
+def _aff_link_for_code(code):
+    code = _aff_code(code)
+    return f"{_aff_base_url()}/?ref={code}" if code else _aff_base_url()
+
+def _aff_code_from_identity(name="", email="", phone=""):
+    seed = re.sub(r"[^A-Z0-9]", "", str(name or "").upper())
+    if not seed:
+        seed = re.sub(r"[^A-Z0-9]", "", str((email or "").split("@")[0]).upper())
+    if not seed:
+        seed = re.sub(r"[^0-9]", "", str(phone or ""))[-6:]
+    seed = (seed or "NP_PARTNER")[:18]
+    return _aff_code(seed)
+
+def _aff_unique_partner_code(base):
+    base = _aff_code(base) or "NP_PARTNER"
+    candidate = base[:28]
+    for i in range(0, 25):
+        code = candidate if i == 0 else _aff_code(f"{candidate}{i+1}")
+        try:
+            rows = supabase.table("affiliate_partners").select("id").eq("code", code).limit(1).execute().data or []
+            if not rows:
+                return code
+        except Exception:
+            return code
+    return _aff_code(f"{candidate}{int(datetime.now(timezone.utc).timestamp()) % 10000}")
+
+def _aff_norm_email(value):
+    return str(value or "").strip().lower()
+
+def _aff_norm_phone(value):
+    return re.sub(r"\D", "", str(value or ""))[-11:]
+
+def _aff_norm_name(value):
+    return re.sub(r"[^a-z0-9]", "", str(value or "").strip().lower())
+
+def _aff_owner_identity(source):
+    source = source or {}
+    return {
+        "email": _aff_norm_email(source.get("email") or source.get("owner_email") or source.get("partner_email")),
+        "phone": _aff_norm_phone(source.get("phone") or source.get("owner_phone") or source.get("partner_phone")),
+        "name": _aff_norm_name(source.get("name") or source.get("owner_name") or source.get("partner_name")),
+        "code": _aff_code(source.get("code") or source.get("partner_code") or source.get("affiliate_code")),
+    }
+
+def _aff_buyer_identity(d):
+    d = d or {}
+    trader_id = str(d.get("trader_id") or d.get("buyer_trader_id") or d.get("customer_trader_id") or "").strip()
+    email = _aff_norm_email(d.get("email") or d.get("customer_email") or d.get("buyer_email"))
+    phone = _aff_norm_phone(d.get("phone") or d.get("customer_phone") or d.get("buyer_phone"))
+    name = _aff_norm_name(d.get("name") or d.get("trader_name") or d.get("customer_name") or d.get("buyer_name"))
+    trader = None
+    try:
+        rows = []
+        if trader_id:
+            rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+        if not rows and email:
+            rows = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
+        if not rows and phone:
+            rows = supabase.table("traders").select("*").eq("phone", phone).limit(1).execute().data or []
+        trader = rows[0] if rows else None
+    except Exception as e:
+        print("AFFILIATE BUYER IDENTITY LOOKUP ERROR:", e)
+    if trader:
+        trader_id = trader_id or str(trader.get("id") or "")
+        email = email or _aff_norm_email(trader.get("email"))
+        phone = phone or _aff_norm_phone(trader.get("phone") or trader.get("whatsapp"))
+        name = name or _aff_norm_name(trader.get("name") or trader.get("full_name"))
+    return {"trader_id": trader_id, "email": email, "phone": phone, "name": name, "trader": trader}
+
+def _affiliate_abuse_check(d, source):
+    """Server-side referral abuse guard. Frontend checks are advisory only."""
+    buyer = _aff_buyer_identity(d)
+    owner = _aff_owner_identity(source)
+    code = owner.get("code")
+
+    if buyer["email"] and owner["email"] and buyer["email"] == owner["email"]:
+        return False, "Self-referral is not allowed: buyer email matches affiliate owner"
+    if buyer["phone"] and owner["phone"] and buyer["phone"] == owner["phone"]:
+        return False, "Self-referral is not allowed: buyer phone matches affiliate owner"
+    if buyer["name"] and owner["name"] and buyer["name"] == owner["name"] and (buyer["email"] or buyer["phone"]):
+        return False, "Self-referral is not allowed: buyer identity matches affiliate owner"
+
+    # If this buyer/trader already owns the same affiliate code, block it even
+    # when they changed checkout email/phone.
+    try:
+        owned = []
+        if buyer["email"]:
+            owned += supabase.table("affiliate_partners").select("*").eq("email", buyer["email"]).limit(3).execute().data or []
+        if buyer["phone"]:
+            owned += supabase.table("affiliate_partners").select("*").eq("phone", buyer["phone"]).limit(3).execute().data or []
+        for row in owned:
+            if _aff_code(row.get("code") or row.get("partner_code")) == code:
+                return False, "Self-referral is not allowed: buyer owns this affiliate code"
+    except Exception as e:
+        print("AFFILIATE OWNED CODE CHECK ERROR:", e)
+
+    # Cross-check trader record against partner owner. This blocks using another
+    # email in checkout while logged in as the affiliate owner.
+    trader = buyer.get("trader") or {}
+    trader_email = _aff_norm_email(trader.get("email"))
+    trader_phone = _aff_norm_phone(trader.get("phone") or trader.get("whatsapp"))
+    trader_name = _aff_norm_name(trader.get("name") or trader.get("full_name"))
+    if trader_email and owner["email"] and trader_email == owner["email"]:
+        return False, "Self-referral is not allowed: trader account owns this affiliate code"
+    if trader_phone and owner["phone"] and trader_phone == owner["phone"]:
+        return False, "Self-referral is not allowed: trader account owns this affiliate code"
+    if trader_name and owner["name"] and trader_name == owner["name"] and (trader_email or trader_phone):
+        return False, "Self-referral is not allowed: trader account identity matches affiliate owner"
+
+    return True, "Referral accepted"
+
 def _aff_parse_date(value):
     """Parse Supabase date/timestamp values and always return timezone-aware UTC datetime.
     This prevents Python errors when comparing date-only values like 2026-06-02
@@ -9876,16 +9990,9 @@ def _affiliate_quote_details(d, base_fee):
         result.update({"valid": False, "message": reason or "Code is not active"})
         return result
 
-    # Self-referral protection by email/phone when partner identity exists.
-    buyer_email = str((d or {}).get("email") or (d or {}).get("customer_email") or "").strip().lower()
-    buyer_phone = re.sub(r"\D", "", str((d or {}).get("phone") or (d or {}).get("customer_phone") or ""))
-    owner_email = str(source.get("email") or source.get("owner_email") or "").strip().lower()
-    owner_phone = re.sub(r"\D", "", str(source.get("phone") or source.get("owner_phone") or ""))
-    if buyer_email and owner_email and buyer_email == owner_email:
-        result.update({"valid": False, "message": "Self-referral is not allowed"})
-        return result
-    if buyer_phone and owner_phone and buyer_phone == owner_phone:
-        result.update({"valid": False, "message": "Self-referral is not allowed"})
+    referral_ok, referral_reason = _affiliate_abuse_check(d or {}, source)
+    if not referral_ok:
+        result.update({"valid": False, "message": referral_reason})
         return result
 
     discount_pct = max(0, min(100, clean(source.get("discount_percent"))))
@@ -9993,6 +10100,24 @@ def _affiliate_create_commission_from_purchase(purchase, admin_payload=None):
         source = _aff_get_code(code) or _aff_get_partner_by_code(code)
         if not source:
             return None
+        ok_referral, reason = _affiliate_abuse_check({
+            "trader_id": p.get("trader_id"),
+            "email": p.get("email"),
+            "phone": p.get("phone"),
+            "name": p.get("trader_name") or p.get("name"),
+        }, source)
+        if not ok_referral:
+            try:
+                supabase.table("challenge_purchases").update({
+                    "affiliate_status": reason,
+                    "commission_percent": 0,
+                    "commission_amount": 0,
+                    "updated_at": now_iso(),
+                }).eq("id", p.get("id")).execute()
+            except Exception:
+                pass
+            _audit_safe("affiliates", "commission_blocked", f"{reason}; code={code}", _admin_from_payload(admin_payload or {}))
+            return None
         commission_pct = clean(p.get("commission_percent") or source.get("commission_percent"))
         sale_amount = clean(p.get("fee"))
         if commission_pct <= 0 or sale_amount <= 0:
@@ -10020,6 +10145,115 @@ def _affiliate_create_commission_from_purchase(purchase, admin_payload=None):
         print("AFFILIATE COMMISSION CREATE ERROR:", str(e))
         return None
 
+@app.route("/affiliate_signup", methods=["POST", "OPTIONS"])
+def affiliate_signup():
+    """Public marketer signup. Creates an active partner referral link/code."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        name = str(d.get("name") or d.get("full_name") or d.get("partner_name") or "").strip()
+        email = str(d.get("email") or "").strip().lower()
+        phone = str(d.get("phone") or d.get("whatsapp") or "").strip()
+        company = str(d.get("company") or "").strip()
+        if not name:
+            return bad("Name is required")
+        if not email and not phone:
+            return bad("Email or phone is required")
+
+        existing = []
+        if email:
+            existing = supabase.table("affiliate_partners").select("*").eq("email", email).limit(1).execute().data or []
+        if not existing and phone:
+            existing = supabase.table("affiliate_partners").select("*").eq("phone", phone).limit(1).execute().data or []
+        if existing:
+            row = existing[0]
+            return ok({
+                "partner": row,
+                "code": row.get("code"),
+                "affiliate_link": row.get("affiliate_link") or _aff_link_for_code(row.get("code")),
+            }, "Affiliate partner already registered")
+
+        requested_code = _aff_code(d.get("code") or d.get("preferred_code"))
+        code = _aff_unique_partner_code(requested_code or _aff_code_from_identity(name, email, phone))
+        row = {
+            "name": name,
+            "email": email,
+            "phone": phone,
+            "company": company,
+            "partner_type": d.get("partner_type") or "marketer",
+            "code": code,
+            "affiliate_link": _aff_link_for_code(code),
+            "commission_percent": clean(d.get("commission_percent") or 20),
+            "discount_percent": clean(d.get("discount_percent") or 10),
+            "status": "active",
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        created = supabase.table("affiliate_partners").insert(row).execute().data or [row]
+        _audit_safe("affiliates", "public_partner_signup", f"Affiliate partner signup: {code}", {})
+        partner = created[0] if isinstance(created, list) and created else row
+        return ok({
+            "partner": partner,
+            "code": partner.get("code") or code,
+            "affiliate_link": partner.get("affiliate_link") or _aff_link_for_code(code),
+        }, "Affiliate partner registered")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/trader_affiliate_profile", methods=["GET", "POST", "OPTIONS"])
+def trader_affiliate_profile():
+    """Ensure an existing trader has a working referral/affiliate code."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = dict(request.args) if request.method == "GET" else (request.get_json(silent=True) or {})
+        trader_id = str(d.get("trader_id") or d.get("id") or "").strip()
+        email = str(d.get("email") or "").strip().lower()
+        rows = []
+        if trader_id:
+            rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+        if not rows and email:
+            rows = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
+        if not rows:
+            return bad("Trader not found", 404)
+        trader = rows[0]
+        name = trader.get("name") or trader.get("full_name") or trader.get("email") or "Trader"
+        email = str(trader.get("email") or email or "").strip().lower()
+        phone = str(trader.get("phone") or trader.get("whatsapp") or "").strip()
+
+        existing = []
+        if email:
+            existing = supabase.table("affiliate_partners").select("*").eq("email", email).limit(1).execute().data or []
+        if not existing:
+            preferred = trader.get("referral_code") or trader.get("affiliate_code") or trader.get("account_reference") or name
+            code = _aff_unique_partner_code(preferred)
+            row = {
+                "name": name,
+                "email": email,
+                "phone": phone,
+                "company": "NairaPips Trader",
+                "partner_type": "trader_referral",
+                "code": code,
+                "affiliate_link": _aff_link_for_code(code),
+                "commission_percent": clean(d.get("commission_percent") or 20),
+                "discount_percent": clean(d.get("discount_percent") or 10),
+                "status": "active",
+                "created_at": now_iso(),
+                "updated_at": now_iso(),
+            }
+            existing = supabase.table("affiliate_partners").insert(row).execute().data or [row]
+        partner = existing[0]
+        return ok({
+            "partner": partner,
+            "code": partner.get("code"),
+            "affiliate_link": partner.get("affiliate_link") or _aff_link_for_code(partner.get("code")),
+            "commission_percent": partner.get("commission_percent") or 20,
+            "discount_percent": partner.get("discount_percent") or 10,
+        }, "Trader referral profile ready")
+    except Exception as e:
+        return bad(e, 500)
+
 @app.route("/affiliate_partners", methods=["GET"])
 def affiliate_partners():
     try:
@@ -10044,7 +10278,7 @@ def create_affiliate_partner():
             "company": d.get("company") or "",
             "partner_type": d.get("partner_type") or "affiliate",
             "code": code,
-            "affiliate_link": d.get("affiliate_link") or f"https://nairapips.com/?ref={code}",
+            "affiliate_link": d.get("affiliate_link") or _aff_link_for_code(code),
             "commission_percent": clean(d.get("commission_percent") or 20),
             "discount_percent": clean(d.get("discount_percent") or 0),
             "status": d.get("status") or "active",
@@ -10109,7 +10343,7 @@ def create_affiliate_code():
             "usage_limit": int(clean(d.get("usage_limit") or 0)),
             "total_uses": 0,
             "status": d.get("status") or "active",
-            "affiliate_link": d.get("affiliate_link") or f"https://nairapips.com/?ref={code}",
+            "affiliate_link": d.get("affiliate_link") or _aff_link_for_code(code),
             "created_at": now_iso(),
             "updated_at": now_iso(),
         }
@@ -10205,6 +10439,200 @@ def update_affiliate_commission():
         if status == "paid": upd["paid_at"] = now_iso()
         result = supabase.table("affiliate_commissions").update(upd).eq("id", cid).execute().data
         return ok(result, "Affiliate commission updated")
+    except Exception as e:
+        return bad(e, 500)
+
+def _affiliate_commission_rows_for_code(code):
+    code = _aff_code(code)
+    if not code:
+        return []
+    try:
+        return supabase.table("affiliate_commissions").select("*").eq("partner_code", code).order("created_at", desc=True).limit(500).execute().data or []
+    except Exception as e:
+        print("AFFILIATE COMMISSION ROWS ERROR:", e)
+        return []
+
+def _affiliate_open_payout_requests_for_code(code):
+    code = _aff_code(code)
+    if not code:
+        return []
+    try:
+        rows = supabase.table("affiliate_payout_requests").select("*").eq("partner_code", code).order("created_at", desc=True).limit(100).execute().data or []
+        return [r for r in rows if str(r.get("status") or "pending").strip().lower() in {"pending", "approved"}]
+    except Exception:
+        return []
+
+@app.route("/affiliate_payout_quote", methods=["GET", "POST", "OPTIONS"])
+def affiliate_payout_quote():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = dict(request.args) if request.method == "GET" else (request.get_json(silent=True) or {})
+        code = _aff_code(d.get("partner_code") or d.get("code") or d.get("affiliate_code"))
+        if not code:
+            return bad("Affiliate code is required")
+        partner = _aff_get_partner_by_code(code) or _aff_get_code(code)
+        if not partner:
+            return bad("Affiliate code not found", 404)
+        rows = _affiliate_commission_rows_for_code(code)
+        open_requests = _affiliate_open_payout_requests_for_code(code)
+        approved = [r for r in rows if str(r.get("status") or "").strip().lower() == "approved"]
+        pending = [r for r in rows if str(r.get("status") or "pending").strip().lower() == "pending"]
+        paid = [r for r in rows if str(r.get("status") or "").strip().lower() == "paid"]
+        return ok({
+            "partner": partner,
+            "code": code,
+            "approved_available": round(sum(clean(r.get("commission_amount")) for r in approved), 2),
+            "pending_review": round(sum(clean(r.get("commission_amount")) for r in pending), 2),
+            "paid_total": round(sum(clean(r.get("commission_amount")) for r in paid), 2),
+            "approved_count": len(approved),
+            "pending_count": len(pending),
+            "paid_count": len(paid),
+            "open_payout_request": open_requests[0] if open_requests else None,
+        }, "Affiliate payout quote ready")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/request_affiliate_payout", methods=["POST", "OPTIONS"])
+def request_affiliate_payout():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        code = _aff_code(d.get("partner_code") or d.get("code") or d.get("affiliate_code"))
+        if not code:
+            return bad("Affiliate code is required")
+        partner = _aff_get_partner_by_code(code) or _aff_get_code(code)
+        if not partner:
+            return bad("Affiliate partner/code not found", 404)
+        owner = _aff_owner_identity(partner)
+        requester_email = _aff_norm_email(d.get("email") or d.get("partner_email"))
+        requester_phone = _aff_norm_phone(d.get("phone") or d.get("partner_phone"))
+        if owner["email"] and requester_email and owner["email"] != requester_email:
+            return bad("Payout email does not match this affiliate account", 403)
+        if owner["phone"] and requester_phone and owner["phone"] != requester_phone:
+            return bad("Payout phone does not match this affiliate account", 403)
+
+        method = str(d.get("payment_method") or d.get("method") or "bank").strip().lower()
+        bank_name = str(d.get("bank_name") or "").strip()
+        account_number = str(d.get("account_number") or d.get("wallet_address") or "").strip()
+        account_name = str(d.get("account_name") or "").strip()
+        if method == "bank" and (not bank_name or not account_number or not account_name):
+            return bad("Bank name, account number and account name are required")
+        if method != "bank" and (not bank_name or not account_number):
+            return bad("Wallet network/name and wallet address are required")
+
+        open_requests = _affiliate_open_payout_requests_for_code(code)
+        if open_requests:
+            return bad("This affiliate already has a pending payout request. Admin must approve, pay, or reject it before another request can be submitted.", 409)
+
+        rows = _affiliate_commission_rows_for_code(code)
+        approved = [r for r in rows if str(r.get("status") or "").strip().lower() == "approved"]
+        available = round(sum(clean(r.get("commission_amount")) for r in approved), 2)
+        requested = clean(d.get("amount") or available)
+        if available <= 0:
+            return bad("No approved affiliate commission is available for payout", 403)
+        if requested <= 0 or requested > available:
+            return bad(f"Requested amount must be between 1 and approved available commission {email_money(available)}", 403)
+
+        row = {
+            "partner_code": code,
+            "partner_name": partner.get("name") or partner.get("owner_name") or partner.get("partner_name") or "",
+            "partner_email": requester_email or owner["email"],
+            "partner_phone": requester_phone or owner["phone"],
+            "amount": requested,
+            "available_commission": available,
+            "payment_method": method,
+            "bank_name": bank_name,
+            "account_number": account_number,
+            "account_name": account_name,
+            "status": "pending",
+            "note": str(d.get("note") or "").strip(),
+            "commission_ids": [r.get("id") for r in approved if r.get("id")],
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        try:
+            created = supabase.table("affiliate_payout_requests").insert(row).execute().data or [row]
+        except Exception as insert_error:
+            # Fallback keeps a visible admin trail even before the SQL table is added.
+            print("AFFILIATE PAYOUT REQUEST TABLE MISSING:", insert_error)
+            created = supabase.table("support_tickets").insert({
+                "trader_id": None,
+                "name": row["partner_name"] or code,
+                "email": row["partner_email"],
+                "subject": f"Affiliate payout request {code}",
+                "message": f"Amount: {email_money(requested)}\nMethod: {method}\nBank/Wallet: {bank_name}\nAccount: {account_number}\nName: {account_name}\nCode: {code}",
+                "status": "open",
+                "created_at": now_iso(),
+            }).execute().data or [row]
+        _audit_safe("affiliates", "affiliate_payout_requested", f"{code} requested {email_money(requested)}", {})
+        return ok(created[0] if isinstance(created, list) and created else row, "Affiliate payout request submitted")
+    except Exception as e:
+        return bad(e, 500)
+
+@app.route("/affiliate_payout_requests", methods=["GET", "OPTIONS"])
+def affiliate_payout_requests():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        q = supabase.table("affiliate_payout_requests").select("*").order("created_at", desc=True)
+        status = str(request.args.get("status") or "").strip().lower()
+        code = _aff_code(request.args.get("partner_code") or request.args.get("code") or "")
+        limit = int(clean(request.args.get("limit") or 500) or 500)
+        if status:
+            q = q.eq("status", status)
+        if code:
+            q = q.eq("partner_code", code)
+        rows = q.limit(max(1, min(limit, 2000))).execute().data or []
+        return ok({"requests": rows}, "Affiliate payout requests ready")
+    except Exception as e:
+        print("AFFILIATE PAYOUT REQUEST LIST ERROR:", e)
+        return ok({"requests": []}, "Affiliate payout request table not ready")
+
+@app.route("/update_affiliate_payout_request", methods=["POST", "OPTIONS"])
+def update_affiliate_payout_request():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        rid = str(d.get("id") or "").strip()
+        status = str(d.get("status") or "").strip().lower()
+        if not rid:
+            return bad("Payout request id is required")
+        if status not in {"pending", "approved", "paid", "rejected"}:
+            return bad("Invalid payout request status")
+        upd = {
+            "status": status,
+            "admin_note": str(d.get("admin_note") or "").strip(),
+            "updated_at": now_iso(),
+        }
+        if status == "approved":
+            upd["approved_at"] = now_iso()
+        elif status == "paid":
+            upd["paid_at"] = now_iso()
+        elif status == "rejected":
+            upd["rejected_at"] = now_iso()
+        result = supabase.table("affiliate_payout_requests").update(upd).eq("id", rid).execute().data or []
+
+        if status == "paid" and result:
+            commission_ids = result[0].get("commission_ids") or []
+            if isinstance(commission_ids, list):
+                for cid in commission_ids:
+                    if not cid:
+                        continue
+                    try:
+                        supabase.table("affiliate_commissions").update({
+                            "status": "paid",
+                            "paid_at": now_iso(),
+                            "admin_note": upd["admin_note"],
+                            "updated_at": now_iso(),
+                        }).eq("id", cid).execute()
+                    except Exception as commission_error:
+                        print("AFFILIATE COMMISSION PAID MARK ERROR:", commission_error)
+
+        _audit_safe("affiliates", f"affiliate_payout_{status}", f"Affiliate payout request {rid}", _admin_from_payload(d))
+        return ok(result, "Affiliate payout request updated")
     except Exception as e:
         return bad(e, 500)
 
