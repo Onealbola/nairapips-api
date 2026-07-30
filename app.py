@@ -8681,13 +8681,57 @@ def referral_settings_default():
         'payoutRule': 'Rebate is approved only after a referred trader pays and passes payment verification.'
     }
 
+def _referral_settings_row_from_payload(body, default=None, include_id=False):
+    default = default or referral_settings_default()
+    row = {
+        'program_name': body.get('programName') or body.get('program_name') or default['programName'],
+        'base_url': body.get('baseUrl') or body.get('base_url') or default['baseUrl'],
+        'default_code': body.get('defaultCode') or body.get('default_code') or default['defaultCode'],
+        'rebate_type': body.get('rebateType') or body.get('rebate_type') or default['rebateType'],
+        'rebate_value': body.get('rebateValue') or body.get('rebate_percent') or body.get('rebate_value') or default['rebateValue'],
+        'customer_bonus': body.get('customerBonus') or body.get('customer_bonus') or default['customerBonus'],
+        'cookie_days': int(body.get('cookieDays') or body.get('cookie_days') or default['cookie_days']),
+        'min_payout': body.get('minPayout') or body.get('min_payout') or default['minPayout'],
+        'status': body.get('status') or default['status'],
+        'public_message': body.get('publicMessage') or body.get('public_message') or default['publicMessage'],
+        'payout_rule': body.get('payoutRule') or body.get('payout_rule') or default['payoutRule'],
+    }
+    if include_id:
+        row['id'] = 'main'
+    return row
+
+def _referral_settings_select_row():
+    try:
+        rows = supabase.table('referral_settings').select('*').limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception as e:
+        print('REFERRAL SETTINGS SELECT ANY ERROR:', str(e))
+        return {}
+
+def _referral_settings_save_row(row):
+    current = _referral_settings_select_row()
+    if current and current.get('id') is not None:
+        try:
+            return supabase.table('referral_settings').update(row).eq('id', current.get('id')).execute().data or []
+        except Exception as update_error:
+            print('REFERRAL SETTINGS UPDATE BY ID ERROR:', str(update_error))
+    try:
+        return supabase.table('referral_settings').insert(row).execute().data or []
+    except Exception as insert_error:
+        print('REFERRAL SETTINGS INSERT WITHOUT ID ERROR:', str(insert_error))
+        try:
+            row_with_text_id = dict(row)
+            row_with_text_id['id'] = 'main'
+            return supabase.table('referral_settings').upsert(row_with_text_id, on_conflict='id').execute().data or []
+        except Exception as upsert_error:
+            print('REFERRAL SETTINGS TEXT ID UPSERT ERROR:', str(upsert_error))
+            raise upsert_error
+
 @app.get('/referral_settings')
 def get_referral_settings():
     default = referral_settings_default()
     try:
-        res = supabase.table('referral_settings').select('*').eq('id', 'main').limit(1).execute()
-        rows = getattr(res, 'data', None) or []
-        row = rows[0] if rows else {}
+        row = _referral_settings_select_row()
         data = dict(default)
         if row:
             rebate_value = row.get('rebate_value') if row.get('rebate_value') is not None else default['rebateValue']
@@ -8717,22 +8761,9 @@ def update_referral_settings():
     body = request.get_json(silent=True) or {}
     default = referral_settings_default()
     try:
-        row = {
-            'id': 'main',
-            'program_name': body.get('programName') or default['programName'],
-            'base_url': body.get('baseUrl') or default['baseUrl'],
-            'default_code': body.get('defaultCode') or default['defaultCode'],
-            'rebate_type': body.get('rebateType') or default['rebateType'],
-            'rebate_value': body.get('rebateValue') or body.get('rebate_percent') or default['rebateValue'],
-            'customer_bonus': body.get('customerBonus') or default['customerBonus'],
-            'cookie_days': int(body.get('cookieDays') or body.get('cookie_days') or default['cookie_days']),
-            'min_payout': body.get('minPayout') or default['minPayout'],
-            'status': body.get('status') or default['status'],
-            'public_message': body.get('publicMessage') or default['publicMessage'],
-            'payout_rule': body.get('payoutRule') or default['payoutRule']
-        }
+        row = _referral_settings_row_from_payload(body, default)
         try:
-            supabase.table('referral_settings').upsert(row, on_conflict='id').execute()
+            _referral_settings_save_row(row)
             return get_referral_settings()
         except Exception as e:
             print('REFERRAL SETTINGS SAVE ERROR:', str(e))
@@ -8760,22 +8791,9 @@ def update_referral_settings():
 @app.post('/referral_settings/reset')
 def reset_referral_settings():
     default = referral_settings_default()
-    default_row = {
-        'id': 'main',
-        'program_name': default['programName'],
-        'base_url': default['baseUrl'],
-        'default_code': default['defaultCode'],
-        'rebate_type': default['rebateType'],
-        'rebate_value': default['rebateValue'],
-        'customer_bonus': default['customerBonus'],
-        'cookie_days': default['cookie_days'],
-        'min_payout': default['minPayout'],
-        'status': default['status'],
-        'public_message': default['publicMessage'],
-        'payout_rule': default['payoutRule']
-    }
+    default_row = _referral_settings_row_from_payload({}, default)
     try:
-        supabase.table('referral_settings').upsert(default_row, on_conflict='id').execute()
+        _referral_settings_save_row(default_row)
     except Exception as e:
         print('REFERRAL SETTINGS RESET SAVE ERROR:', str(e))
     return jsonify({'success': True, 'data': default})
@@ -9636,8 +9654,7 @@ def _affiliate_default_rates():
     try:
         row = {}
         try:
-            rows = supabase.table("referral_settings").select("*").eq("id", "main").limit(1).execute().data or []
-            row = rows[0] if rows else {}
+            row = _referral_settings_select_row()
         except Exception:
             row = {}
         fallback = referral_settings_default()
