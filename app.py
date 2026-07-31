@@ -4660,17 +4660,58 @@ def trader_bootstrap():
 
         account = _get_active_account(trader.get("id"), trader)
         purchase = _latest_purchase_for_trader(trader)
+        purchases = _dedupe_by_id(_safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100))
+        active_accounts = _get_active_accounts(trader.get("id"), trader, purchases)
+        active_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), active_accounts)
+        all_accounts = list(active_accounts or [])
+        try:
+            raw_all_accounts = (
+                supabase.table("trader_accounts")
+                .select("*")
+                .eq("trader_id", trader.get("id"))
+                .order("updated_at", desc=True)
+                .order("started_at", desc=True)
+                .order("created_at", desc=True)
+                .limit(200)
+                .execute()
+                .data
+                or []
+            )
+            all_accounts = _enrich_accounts_with_latest_monitoring(
+                trader.get("id"),
+                [_decorate_account_for_api(row) for row in raw_all_accounts]
+            )
+        except Exception as all_account_error:
+            print("TRADER BOOTSTRAP ALL ACCOUNTS ERROR:", all_account_error)
+
+        if account:
+            account_id = str(account.get("id") or "").strip()
+            account_login = str(account.get("mt5_login") or "").strip()
+            enriched_current = None
+            for candidate in active_accounts or []:
+                if account_id and str(candidate.get("id") or "").strip() == account_id:
+                    enriched_current = candidate
+                    break
+                if account_login and str(candidate.get("mt5_login") or "").strip() == account_login:
+                    enriched_current = candidate
+                    break
+            if enriched_current:
+                account = enriched_current
+
         pending_replacements = [
             row for row in _purchase_accounts_for_trader(trader)
             if str(row.get("account_status") or "").strip().lower() == "waiting_mt5"
         ]
         payload = {
             "success": True,
-            "source": "trader_bootstrap_light",
+            "source": "trader_bootstrap_portfolio_v2",
             "generated_at": now_iso(),
             "duration_ms": int((time.time() - started) * 1000),
             "trader": _public_trader_payload(trader),
             "current_account": _trader_safe_account_row(account) if account else None,
+            "active_accounts": [_trader_safe_account_row(row) for row in (active_accounts or [])],
+            "accounts": [_trader_safe_account_row(row) for row in (active_accounts or [])],
+            "all_accounts": [_trader_safe_account_row(row) for row in (all_accounts or [])],
             "active_purchase": _trader_safe_purchase_row(purchase) if purchase else None,
             "pending_replacements": [_trader_safe_account_row(row) for row in pending_replacements],
             "latest_trades": [],
