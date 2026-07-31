@@ -6556,15 +6556,60 @@ def support_tickets():
     try: return jsonify(supabase.table("support_tickets").select("*").order("created_at", desc=True).execute().data)
     except Exception as e: return bad(e)
 
+@app.route("/trader_support_tickets", methods=["GET", "OPTIONS"])
+def trader_support_tickets():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        trader_id = str(request.args.get("trader_id") or "").strip()
+        authed_id, auth_error = _authenticated_trader_id_for_request(trader_id)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+        rows = (
+            supabase.table("support_tickets")
+            .select("*")
+            .eq("trader_id", authed_id)
+            .order("last_updated_at", desc=True)
+            .order("created_at", desc=True)
+            .limit(100)
+            .execute()
+            .data
+            or []
+        )
+        return _np_ok({"tickets": rows, "support_tickets": rows, "count": len(rows)})
+    except Exception as e:
+        return _np_fail(e, 500)
+
 @app.route("/create_support_ticket", methods=["POST"])
 def create_ticket():
     try:
         d=request.json or {}; subject=str(d.get("subject","")).strip(); message=str(d.get("message","")).strip()
         if not subject or not message: return bad("Subject and message are required")
-        row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
-             "subject":subject,"message":message,"status":"open","priority":d.get("priority","normal"),"admin_reply":"",
+        account_label = str(d.get("account_label") or "").strip()
+        mt5_login = str(d.get("mt5_login") or "").strip()
+        context_lines = []
+        if account_label:
+            context_lines.append(f"Account: {account_label}")
+        if mt5_login:
+            context_lines.append(f"MT5: {mt5_login}")
+        if d.get("trader_account_id"):
+            context_lines.append(f"Account ID: {d.get('trader_account_id')}")
+        enriched_message = message if not context_lines else "\n".join(context_lines) + "\n\n" + message
+        row={"trader_id":d.get("trader_id"),"trader_account_id":d.get("trader_account_id"),"mt5_login":mt5_login,
+             "account_label":account_label,"trader_name":d.get("trader_name",""),"email":d.get("email") or d.get("trader_email") or "",
+             "phone":d.get("phone") or d.get("trader_phone") or "",
+             "subject":subject,"message":enriched_message,"status":"open","priority":d.get("priority","normal"),"admin_reply":"",
              "created_at":now_iso(),"last_updated_at":now_iso()}
-        created = supabase.table("support_tickets").insert(row).execute().data
+        try:
+            created = supabase.table("support_tickets").insert(row).execute().data
+        except Exception as insert_error:
+            safe_row = dict(row)
+            for optional_key in ("trader_account_id", "mt5_login", "account_label"):
+                safe_row.pop(optional_key, None)
+            try:
+                created = supabase.table("support_tickets").insert(safe_row).execute().data
+            except Exception:
+                raise insert_error
 
         send_admin_alert(
             "New NairaPips support ticket",
@@ -6574,10 +6619,12 @@ Trader: {row.get("trader_name") or "Trader"}
 Email: {row.get("email") or "Not provided"}
 Phone: {row.get("phone") or "Not provided"}
 Subject: {subject}
+Account: {account_label or "Not selected"}
+MT5: {mt5_login or "Not selected"}
 Priority: {row.get("priority")}
 
 Message:
-{message}"""
+{enriched_message}"""
         )
 
         return ok(created, "Support ticket created")
