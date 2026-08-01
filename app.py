@@ -16644,4 +16644,3 @@ def admin_league_flags_set():
     _RUNTIME_FLAG_CACHE[flag] = enabled
     _log_league_audit(admin, "flag_toggle", f"flag={flag} enabled={enabled}")
     return _np_ok({"flag": flag, "enabled": enabled}, "flag updated")
-
