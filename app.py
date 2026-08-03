@@ -3194,6 +3194,11 @@ def _admin_view_request_ok(data):
     - No trader password is revealed, reset, or required.
     """
     try:
+        # Current Admin source-of-truth authenticates with a signed bearer token.
+        # Accept that same verified session for support dashboard viewing.
+        if _request_admin_auth():
+            return True
+
         secret = data.get("admin_view_secret") or request.headers.get("X-Admin-View-Secret") or ""
         if _admin_view_secret_ok(secret):
             return True
