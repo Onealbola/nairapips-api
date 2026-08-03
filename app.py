@@ -4779,39 +4779,163 @@ def trader_bootstrap():
     except Exception as e:
         return bad(e)
 
+
+def _trader_login_candidates(lookup):
+    """Return identity-compatible trader rows without changing lifecycle authority."""
+    lookup = str(lookup or "").strip().lower()
+    if not lookup:
+        return []
+
+    try:
+        normalized_phone = _normalize_phone_value(lookup)
+    except Exception:
+        normalized_phone = lookup
+
+    queries = [
+        ("canonical_email", lookup),
+        ("email", lookup),
+        ("canonical_phone", normalized_phone),
+        ("phone", lookup),
+        ("account_reference", lookup),
+        ("id", lookup),
+    ]
+
+    matches = []
+    for column, value in queries:
+        if not value:
+            continue
+        try:
+            rows = (
+                supabase.table("traders")
+                .select("*")
+                .eq(column, value)
+                .limit(25)
+                .execute()
+                .data
+                or []
+            )
+            matches.extend(rows)
+        except Exception as e:
+            print(f"LOGIN CANDIDATE LOOKUP SKIPPED {column}:", e)
+
+    try:
+        account = _get_active_account_by_login(lookup)
+        if account and account.get("trader_id"):
+            owner = get_trader_by_id(account.get("trader_id"))
+            if owner:
+                matches.append(owner)
+    except Exception as e:
+        print("LOGIN MT5 OWNER LOOKUP SKIPPED:", e)
+
+    return sorted(_dedupe_by_id(matches), key=_row_score, reverse=True)
+
+
+def _reconcile_verified_login_credential(canonical, credential_row):
+    """After successful verification, copy only the credential to the canonical row."""
+    if not canonical or not credential_row:
+        return canonical
+
+    canonical_id = str(canonical.get("id") or "").strip()
+    credential_id = str(credential_row.get("id") or "").strip()
+    if not canonical_id or canonical_id == credential_id:
+        return canonical
+
+    password_hash = str(credential_row.get("password_hash") or "").strip()
+    legacy_password = str(credential_row.get("password") or "").strip()
+
+    if not password_hash and legacy_password:
+        password_hash = _hash_trader_password(legacy_password)
+
+    if not password_hash:
+        return canonical
+
+    payload = {
+        "password_hash": password_hash,
+        "password_set_at": (
+            credential_row.get("password_set_at")
+            or canonical.get("password_set_at")
+            or now_iso()
+        ),
+        "password_reset_required": False,
+        "updated_at": now_iso(),
+    }
+
+    try:
+        updated = (
+            supabase.table("traders")
+            .update(payload)
+            .eq("id", canonical_id)
+            .execute()
+            .data
+            or []
+        )
+        if updated:
+            repaired = dict(canonical)
+            repaired.update(updated[0])
+            return repaired
+    except Exception as e:
+        print("LOGIN CREDENTIAL RECONCILIATION SKIPPED:", e)
+
+    repaired = dict(canonical)
+    repaired.update(payload)
+    return repaired
+
+
 @app.route("/login_trader", methods=["POST"])
 def login_trader():
-    """FAST AUTH ONLY.
-    Login must never wait for MT5/account intelligence. The dashboard opens from
-    this lightweight response, then calls /trader_bootstrap in the background.
-    """
+    """Fast login with duplicate-identity credential reconciliation."""
     try:
         data = request.json or {}
         lookup = str(data.get("lookup", "")).strip().lower()
         password = str(data.get("password") or "")
+
         if not lookup:
             return bad("Missing lookup")
         if not password:
             return bad("Password is required", 401)
 
-        trader = _latest_trader_for_lookup(lookup)
-        if not trader:
-            return bad("Invalid email/phone or password", 401)
-        if not (trader.get("password_hash") or trader.get("password")):
-            return bad("Password not set. Please verify your email and create a password.", 403)
-        if not _check_trader_password(trader, password):
+        candidates = _trader_login_candidates(lookup)
+        if not candidates:
             return bad("Invalid email/phone or password", 401)
 
-        t = now_iso()
+        canonical = candidates[0]
+        credential_row = next(
+            (row for row in candidates if _check_trader_password(row, password)),
+            None,
+        )
+
+        if not credential_row:
+            has_any_credential = any(
+                str(row.get("password_hash") or "").strip()
+                or str(row.get("password") or "").strip()
+                for row in candidates
+            )
+            if not has_any_credential:
+                return bad(
+                    "Password not set. Please verify your email and create a password.",
+                    403,
+                )
+            return bad("Invalid email/phone or password", 401)
+
+        canonical = _reconcile_verified_login_credential(
+            canonical,
+            credential_row,
+        )
+
+        login_time = now_iso()
         try:
-            supabase.table("traders").update({"last_login_at": t}).eq("id", trader["id"]).execute()
+            supabase.table("traders").update(
+                {"last_login_at": login_time}
+            ).eq("id", canonical["id"]).execute()
         except Exception as e:
             print("LOGIN LAST_LOGIN UPDATE SKIPPED:", e)
 
-        public = _public_trader_payload(trader)
-        public["last_login_at"] = t
-        public["auth_token"] = _make_trader_auth_token(trader.get("id"))
-        public["bootstrap_url"] = f"/trader_bootstrap?lookup={lookup}"
+        public = _public_trader_payload(canonical)
+        public["last_login_at"] = login_time
+        public["auth_token"] = _make_trader_auth_token(canonical.get("id"))
+        public["bootstrap_url"] = (
+            f"/trader_bootstrap?trader_id={canonical.get('id')}"
+        )
         return ok(public, "Login successful")
     except Exception as e:
         return bad(e)
