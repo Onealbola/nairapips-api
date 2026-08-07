@@ -9,7 +9,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "TRADERS_LEAGUE_502_STATUS_FIXED_2026_07_26"
+NAIRAPIPS_RELEASE = "SURGICAL_PROOF_PASSWORD_FIX_2026_08_07"
 CORS(app)
 
 # ============================================================
@@ -673,6 +673,7 @@ _TRADER_PURCHASE_RESPONSE_FIELDS = {
     "current_mt5_server", "mt5_master_password", "mt5_password",
     "master_password", "mt5_investor_password", "investor_password",
     "assigned_at", "approved_at", "created_at", "updated_at",
+    "payment_proof_url",
     "rejected_at", "purchase_month", "purchase_year", "account_origin",
     "source_type", "programme_type", "campaign_id", "grant_id",
     "referral_reward_id", "competition_id", "challenge_journey", "journey_stages",
@@ -3816,25 +3817,38 @@ def public_league_legacy_activity():
         print("PUBLIC LEAGUE ACTIVITY ERROR:", str(e))
         return _np_ok([], "league activity unavailable")
 
-@app.route("/upload_payment_proof", methods=["POST"])
+@app.route("/upload_payment_proof", methods=["POST", "OPTIONS"])
 def upload_payment_proof():
+    if request.method == "OPTIONS":
+        return _np_ok({})
     try:
         f = request.files.get("file")
         if not f or not f.filename:
             return bad("No file uploaded")
-        bucket = request.form.get("bucket","payment-proofs")
-        folder = request.form.get("folder","challenge-purchases")
+        bucket = "payment-proofs"
+        folder = secure_filename(request.form.get("folder") or "challenge-purchases") or "challenge-purchases"
         name = secure_filename(f.filename)
         ext = name.rsplit(".",1)[-1].lower() if "." in name else "bin"
         if ext not in {"jpg","jpeg","png","webp","pdf"}:
             return bad("Only JPG, PNG, WEBP and PDF proof files are allowed")
+        raw_file = f.read()
+        if not raw_file:
+            return bad("Uploaded payment proof is empty")
+        if len(raw_file) > 10 * 1024 * 1024:
+            return bad("Payment proof is too large. Maximum size is 10MB")
         path = f"{folder}/{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex}.{ext}"
-        supabase.storage.from_(bucket).upload(path, f.read(), {"content-type": f.content_type or "application/octet-stream", "upsert": "false"})
-        url = supabase.storage.from_(bucket).get_public_url(path)
-        return jsonify({"success": True, "url": url, "path": path})
+        storage_client = supabase_admin if supabase_admin else supabase
+        storage_client.storage.from_(bucket).upload(path, raw_file, {"content-type": f.content_type or "application/octet-stream", "upsert": "false"})
+        url = storage_client.storage.from_(bucket).get_public_url(path)
+        if isinstance(url, dict):
+            url = url.get("publicUrl") or url.get("public_url") or (url.get("data") or {}).get("publicUrl") or ""
+        url = str(url or "").strip()
+        if not url:
+            raise RuntimeError("Payment proof uploaded but no public URL was returned")
+        return jsonify({"success": True, "url": url, "file_url": url, "payment_proof_url": url, "path": path})
     except Exception as e:
         print("UPLOAD PAYMENT PROOF ERROR:", repr(e))
-        return jsonify({"success": False, "error": str(e), "hint": "Create a PUBLIC Supabase Storage bucket named payment-proofs."}), 400
+        return jsonify({"success": False, "error": str(e), "hint": "Confirm the PUBLIC Supabase Storage bucket payment-proofs exists and the service-role key is configured."}), 400
 
 @app.route("/traders_raw", methods=["GET"])
 def get_traders_raw():
@@ -4209,6 +4223,9 @@ def set_trader_password():
 def admin_reset_trader_password():
     if request.method == 'OPTIONS':
         return _np_ok({})
+    admin_auth, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     try:
         d = request.get_json(silent=True) or {}
         trader_id = str(d.get('id') or d.get('trader_id') or '').strip()
@@ -5250,7 +5267,7 @@ def trader_challenge_purchases():
 @app.route("/create_challenge_purchase", methods=["POST"])
 def create_purchase():
     try:
-        d=request.json or {}; plan=str(d.get("plan_name","")).strip(); proof=str(d.get("payment_proof_url","")).strip()
+        d=request.json or {}; plan=str(d.get("plan_name","")).strip(); proof=str(d.get("payment_proof_url") or d.get("file_url") or d.get("url") or "").strip()
         if not plan: return bad("Plan name is required")
         if not proof: return bad("Payment proof is required")
         original_fee = clean(d.get("fee"))
@@ -5271,7 +5288,11 @@ def create_purchase():
              "challenge_journey": challenge_journey, "journey_source": "purchase_plan_snapshot",
              "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
         row.update(_affiliate_purchase_fields(d, original_fee))
-        created = supabase.table("challenge_purchases").insert(row).execute().data
+        created = supabase.table("challenge_purchases").insert(row).execute().data or []
+        if not created:
+            raise RuntimeError("Purchase could not be saved")
+        if not str((created[0] or {}).get("payment_proof_url") or "").strip():
+            raise RuntimeError("Purchase saved without payment proof URL")
         try:
             if d.get("trader_id"):
                 supabase.table("traders").update({
