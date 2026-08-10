@@ -9,7 +9,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "SURGICAL_PROOF_PASSWORD_FIX_2026_08_07"
+NAIRAPIPS_RELEASE = "STAFF_LOGIN_USERNAME_EMAIL_FIXED_2026_08_10"
 CORS(app)
 
 # ============================================================
@@ -9058,23 +9058,45 @@ def staff_members():
 def staff_login():
     try:
         data = request.get_json() or {}
-        username = (data.get('username') or '').strip()
-        password = data.get('password') or ''
+        login = str(data.get('username') or data.get('email') or '').strip()
+        password = str(data.get('password') or '')
 
-        # First use the real staff table. This remains the normal production path.
-        res = _staff_db().table('admin_staff_members').select('*').eq('username', username).eq('password', password).limit(1).execute()
-        rows = res.data or []
+        if not login or not password:
+            return jsonify({'success': False, 'error': 'Enter username/email and password'}), 400
+
+        # Staff may sign in with either their username or registered email.
+        # Password verification and active status remain authoritative.
+        db = _staff_db()
+        rows = (
+            db.table('admin_staff_members')
+            .select('*')
+            .eq('username', login)
+            .eq('password', password)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+
+        if not rows and '@' in login:
+            rows = (
+                db.table('admin_staff_members')
+                .select('*')
+                .eq('email', login.lower())
+                .eq('password', password)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+
         staff = rows[0] if rows else None
 
-        # Compatibility path for the existing NairaPips super-admin login.
-        # The old frontend bypass created an admin session without a bearer token,
-        # which caused every newly protected private endpoint to return HTTP 401.
-        # This server-side path now issues the same signed, expiring admin token as
-        # a database-backed staff login. Environment variables can override it.
+        # Compatibility path for the existing NairaPips bootstrap super-admin.
         if not staff:
             bootstrap_username = os.getenv('NAIRAPIPS_BOOTSTRAP_ADMIN_USERNAME', 'admin')
             bootstrap_password = os.getenv('NAIRAPIPS_BOOTSTRAP_ADMIN_PASSWORD', 'nairapips123')
-            if hmac.compare_digest(username, bootstrap_username) and hmac.compare_digest(password, bootstrap_password):
+            if hmac.compare_digest(login, bootstrap_username) and hmac.compare_digest(password, bootstrap_password):
                 staff = {
                     'id': 'bootstrap-super-admin',
                     'username': bootstrap_username,
@@ -9085,22 +9107,33 @@ def staff_login():
                 }
 
         if not staff:
-            return jsonify({'success': False, 'error': 'Invalid login'}), 401
-        if (staff.get('status') or 'active') != 'active':
-            return jsonify({'success': False, 'error': 'Staff account is not active'}), 403
+            return jsonify({'success': False, 'error': 'Invalid username/email or password'}), 401
 
-        # Only update the database row when this is a real stored staff account.
+        staff_status = str(staff.get('status') or 'active').strip().lower()
+        if staff_status != 'active':
+            return jsonify({
+                'success': False,
+                'error': f"Staff account is not active ({staff_status or 'unknown'})"
+            }), 403
+
         if staff.get('id') != 'bootstrap-super-admin':
             try:
-                _staff_db().table('admin_staff_members').update({'last_login_at': 'now()'}).eq('id', staff['id']).execute()
+                db.table('admin_staff_members').update({
+                    'last_login_at': now_iso()
+                }).eq('id', staff['id']).execute()
             except Exception as update_error:
                 print('STAFF LAST LOGIN UPDATE ERROR:', str(update_error))
 
         audit_log(staff, 'auth', 'login', 'Staff logged in')
         safe_staff = dict(staff)
         safe_staff.pop('password', None)
-        return jsonify({'success': True, 'staff': safe_staff, 'token': _make_admin_auth_token(safe_staff)})
+        return jsonify({
+            'success': True,
+            'staff': safe_staff,
+            'token': _make_admin_auth_token(safe_staff)
+        })
     except Exception as e:
+        print('STAFF LOGIN ERROR:', repr(e))
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.post('/staff_members')
