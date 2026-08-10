@@ -9,7 +9,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "TRADER_SELF_PASSWORD_CHANGE_2026_08_10"
+NAIRAPIPS_RELEASE = "MOBILE_PASSWORD_RESET_VISIBLE_2026_08_10"
 CORS(app)
 
 # ============================================================
@@ -4647,7 +4647,8 @@ NP_SYNC_LOCK_TTL_SECONDS = int(os.getenv("NP_SYNC_LOCK_TTL_SECONDS", "900") or 9
 _PUBLIC_TRADER_FIELDS = [
     "id", "name", "email", "phone", "status", "role", "created_at", "last_login_at",
     "phase", "challenge_state", "account_size", "mt5_login", "mt5_server",
-    "current_account_id", "trader_account_id", "plan_name", "plan_id"
+    "current_account_id", "trader_account_id", "plan_name", "plan_id",
+    "password_reset_required"
 ]
 
 
@@ -4936,7 +4937,11 @@ def _reconcile_verified_login_credential(canonical, credential_row):
             or canonical.get("password_set_at")
             or now_iso()
         ),
-        "password_reset_required": False,
+        "password_reset_required": bool(
+            credential_row.get("password_reset_required")
+            if credential_row.get("password_reset_required") is not None
+            else canonical.get("password_reset_required")
+        ),
         "updated_at": now_iso(),
     }
 
