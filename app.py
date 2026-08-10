@@ -9,7 +9,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "STAFF_LOGIN_USERNAME_EMAIL_FIXED_2026_08_10"
+NAIRAPIPS_RELEASE = "TRADER_SELF_PASSWORD_CHANGE_2026_08_10"
 CORS(app)
 
 # ============================================================
@@ -4219,6 +4219,68 @@ def set_trader_password():
     except Exception as e:
         return bad(e, 500)
 
+
+@app.route('/change_trader_password', methods=['POST', 'OPTIONS'])
+def change_trader_password():
+    if request.method == 'OPTIONS':
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        trader_id, auth_error = _authenticated_trader_id_for_request(d.get('trader_id') or d.get('id'))
+        if auth_error:
+            return bad(auth_error, 401)
+
+        trader = get_trader_by_id(trader_id)
+        if not trader:
+            return bad('Trader not found', 404)
+
+        current_password = str(d.get('current_password') or '')
+        new_password = str(d.get('new_password') or d.get('password') or '')
+        confirm_password = str(d.get('confirm_password') or '')
+
+        if not current_password:
+            return bad('Current password is required')
+        if not _check_trader_password(trader, current_password):
+            return bad('Current password is incorrect', 401)
+        if not _valid_trader_password(new_password):
+            return bad('New password must be between 6 and 128 characters')
+        if confirm_password and confirm_password != new_password:
+            return bad('New passwords do not match')
+        if current_password == new_password:
+            return bad('Choose a new password different from the current password')
+
+        changed_at = now_iso()
+        payload = {
+            'password_hash': _hash_trader_password(new_password),
+            'password_set_at': changed_at,
+            'password_reset_required': False,
+            'updated_at': changed_at,
+        }
+        updated = (
+            supabase.table('traders')
+            .update(payload)
+            .eq('id', trader_id)
+            .execute()
+            .data
+            or []
+        )
+        if not updated:
+            raise RuntimeError('Password change was not saved')
+
+        _audit_safe(
+            'traders',
+            'trader_password_changed',
+            f'Trader changed own dashboard password for {trader_id}',
+            {'name': trader.get('name') or 'trader', 'username': trader.get('email') or trader_id, 'role': 'trader'},
+            trader_id,
+        )
+        return ok({
+            'changed_at': changed_at,
+            'password_reset_required': False,
+        }, 'Password changed successfully')
+    except Exception as e:
+        return bad(e, 500)
+
 @app.route('/admin_reset_trader_password', methods=['POST', 'OPTIONS'])
 def admin_reset_trader_password():
     if request.method == 'OPTIONS':
@@ -4243,7 +4305,7 @@ def admin_reset_trader_password():
         payload = {
             'password_hash': _hash_trader_password(temp_password),
             'password_set_at': now_iso(),
-            'password_reset_required': False,
+            'password_reset_required': True,
             'updated_at': now_iso()
         }
         updated = supabase.table('traders').update(payload).eq('id', trader.get('id')).execute().data or []
@@ -4270,6 +4332,7 @@ def admin_reset_trader_password():
             'email': row.get('email') if row else trader.get('email'),
             'phone': row.get('phone') if row else trader.get('phone'),
             'password_set_at': row.get('password_set_at') if row else payload['password_set_at'],
+            'password_reset_required': True,
         }
         return ok({'trader': safe_trader, 'temporary_password': temp_password}, 'Temporary password generated')
     except Exception as e:
