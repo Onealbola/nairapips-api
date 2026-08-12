@@ -4636,7 +4636,7 @@ def delete_trader():
 # ================================
 _TRADER_BOOTSTRAP_CACHE = {}
 _ADMIN_BOOTSTRAP_CACHE = {"ts": 0, "payload": None}
-TRADER_BOOTSTRAP_TTL_SECONDS = int(os.getenv("TRADER_BOOTSTRAP_TTL_SECONDS", "8") or 8)
+TRADER_BOOTSTRAP_TTL_SECONDS = 5
 ADMIN_BOOTSTRAP_TTL_SECONDS = 25
 _NP_SYNC_LOCK = __import__("threading").Lock()
 _NP_SYNC_STATE = {"running": False, "started_at": None, "finished_at": None, "last_result": None, "last_error": None}
@@ -4697,21 +4697,17 @@ def _safe_latest_rows(table, filters=None, order_col="created_at", limit=100):
 
 
 def _latest_purchase_for_trader(trader):
-    """Fast latest-purchase lookup; current rows use trader_id authority."""
     if not trader:
         return None
-
-    trader_id = str(trader.get("id") or "").strip()
-    if trader_id:
-        rows = _safe_latest_rows("challenge_purchases", [("trader_id", trader_id)], "created_at", 20)
-        if rows:
-            rows.sort(key=lambda r: str(r.get("approved_at") or r.get("created_at") or r.get("updated_at") or ""), reverse=True)
-            return rows[0]
-
     seen = {}
-    for col, val in (("email", trader.get("email")), ("phone", trader.get("phone"))):
-        if not val:
-            continue
+    probes = []
+    if trader.get("id"):
+        probes.append(("trader_id", trader.get("id")))
+    if trader.get("email"):
+        probes.append(("email", trader.get("email")))
+    if trader.get("phone"):
+        probes.append(("phone", trader.get("phone")))
+    for col, val in probes:
         for row in _safe_latest_rows("challenge_purchases", [(col, val)], "created_at", 20):
             rid = str(row.get("id") or row.get("purchase_id") or id(row))
             seen[rid] = row
@@ -4860,21 +4856,13 @@ def trader_bootstrap():
                 "drawdown_percent": account.get("absolute_drawdown_percent") or account.get("drawdown_percent") or 0,
                 "max_drawdown_used": account.get("dd_used_percent") or account.get("max_drawdown_used") or 0,
             })
-        duration_ms = int((time.time() - started) * 1000)
-        payload["duration_ms"] = duration_ms
-        if duration_ms >= 2500:
-            print(
-                f"SLOW TRADER BOOTSTRAP trader_id={trader.get('id')} duration={duration_ms}ms "
-                f"active_accounts={len(active_accounts or [])} all_accounts={len(all_accounts or [])}",
-                flush=True,
-            )
         return ok(_cache_set(_TRADER_BOOTSTRAP_CACHE, key, payload), "Trader bootstrap loaded")
     except Exception as e:
         return bad(e)
 
 
 def _trader_login_candidates(lookup):
-    """Fast identity lookup without changing lifecycle authority."""
+    """Return identity-compatible trader rows without changing lifecycle authority."""
     lookup = str(lookup or "").strip().lower()
     if not lookup:
         return []
@@ -4884,20 +4872,30 @@ def _trader_login_candidates(lookup):
     except Exception:
         normalized_phone = lookup
 
-    is_email = "@" in lookup
-    is_uuid_lookup = _is_uuid(lookup)
-    digits = "".join(ch for ch in lookup if ch.isdigit())
-    looks_phone = (not is_email and len(digits) >= 10)
-    looks_mt5 = (not is_email and lookup.isdigit() and 6 <= len(lookup) <= 12)
-
-    if is_email:
-        queries = [("canonical_email", lookup), ("email", lookup)]
-    elif is_uuid_lookup:
-        queries = [("id", lookup)]
-    elif looks_phone:
-        queries = [("canonical_phone", normalized_phone), ("phone", lookup)]
+    # LOGIN FAST PATH (2026-08-12):
+    # Do not make six sequential Supabase lookups for every login.
+    # Search only identity columns that can actually match the supplied value.
+    # This preserves duplicate-identity reconciliation while removing unrelated
+    # database round trips from the customer-facing authentication path.
+    if "@" in lookup:
+        queries = [
+            ("canonical_email", lookup),
+            ("email", lookup),
+        ]
+        check_mt5_owner = False
+    elif lookup.isdigit() or lookup.startswith("+"):
+        queries = [
+            ("canonical_phone", normalized_phone),
+            ("phone", lookup),
+            ("account_reference", lookup),
+        ]
+        check_mt5_owner = True
     else:
-        queries = [("account_reference", lookup)]
+        queries = [
+            ("account_reference", lookup),
+            ("id", lookup),
+        ]
+        check_mt5_owner = True
 
     matches = []
     for column, value in queries:
@@ -4908,18 +4906,16 @@ def _trader_login_candidates(lookup):
                 supabase.table("traders")
                 .select("*")
                 .eq(column, value)
-                .limit(10)
+                .limit(25)
                 .execute()
                 .data
                 or []
             )
             matches.extend(rows)
-            if rows and column in {"canonical_email", "canonical_phone", "id"}:
-                break
         except Exception as e:
             print(f"LOGIN CANDIDATE LOOKUP SKIPPED {column}:", e)
 
-    if looks_mt5:
+    if check_mt5_owner:
         try:
             account = _get_active_account_by_login(lookup)
             if account and account.get("trader_id"):
@@ -5029,12 +5025,25 @@ def login_trader():
         )
 
         login_time = now_iso()
+
+        # Authentication must not wait for a non-essential last-login write.
+        # The timestamp is returned immediately; persistence is best-effort.
+        def _persist_trader_last_login(trader_id, timestamp):
+            try:
+                supabase.table("traders").update(
+                    {"last_login_at": timestamp}
+                ).eq("id", trader_id).execute()
+            except Exception as e:
+                print("LOGIN LAST_LOGIN UPDATE SKIPPED:", e)
+
         try:
-            supabase.table("traders").update(
-                {"last_login_at": login_time}
-            ).eq("id", canonical["id"]).execute()
+            threading.Thread(
+                target=_persist_trader_last_login,
+                args=(canonical["id"], login_time),
+                daemon=True,
+            ).start()
         except Exception as e:
-            print("LOGIN LAST_LOGIN UPDATE SKIPPED:", e)
+            print("LOGIN LAST_LOGIN BACKGROUND START SKIPPED:", e)
 
         public = _public_trader_payload(canonical)
         public["last_login_at"] = login_time
@@ -9205,21 +9214,39 @@ def staff_login():
                 'error': f"Staff account is not active ({staff_status or 'unknown'})"
             }), 403
 
-        if staff.get('id') != 'bootstrap-super-admin':
-            try:
-                db.table('admin_staff_members').update({
-                    'last_login_at': now_iso()
-                }).eq('id', staff['id']).execute()
-            except Exception as update_error:
-                print('STAFF LAST LOGIN UPDATE ERROR:', str(update_error))
-
-        audit_log(staff, 'auth', 'login', 'Staff logged in')
         safe_staff = dict(staff)
         safe_staff.pop('password', None)
+        token = _make_admin_auth_token(safe_staff)
+
+        # LOGIN FAST PATH (2026-08-12):
+        # Successful authentication returns without waiting for last_login/audit
+        # Supabase writes. Those records remain best-effort background work.
+        def _record_staff_login(staff_snapshot):
+            try:
+                if staff_snapshot.get('id') != 'bootstrap-super-admin':
+                    _staff_db().table('admin_staff_members').update({
+                        'last_login_at': now_iso()
+                    }).eq('id', staff_snapshot['id']).execute()
+            except Exception as update_error:
+                print('STAFF LAST LOGIN UPDATE ERROR:', str(update_error))
+            try:
+                audit_log(staff_snapshot, 'auth', 'login', 'Staff logged in')
+            except Exception as audit_error:
+                print('STAFF LOGIN AUDIT ERROR:', str(audit_error))
+
+        try:
+            threading.Thread(
+                target=_record_staff_login,
+                args=(dict(safe_staff),),
+                daemon=True,
+            ).start()
+        except Exception as background_error:
+            print('STAFF LOGIN BACKGROUND START SKIPPED:', str(background_error))
+
         return jsonify({
             'success': True,
             'staff': safe_staff,
-            'token': _make_admin_auth_token(safe_staff)
+            'token': token
         })
     except Exception as e:
         print('STAFF LOGIN ERROR:', repr(e))
@@ -12394,6 +12421,12 @@ def _np_lock_expiry_iso(ttl_seconds=None):
 
 
 def _np_acquire_distributed_sync_lock():
+    # Protected backend coordination: use service-role access for np_system_locks.
+    # This prevents RLS from stranding an expired distributed sync lock.
+    try:
+        lock_db = _staff_db()
+    except Exception as e:
+        return None, f"distributed lock admin client unavailable: {e}"
     owner = uuid.uuid4().hex
     now = now_iso()
     expires_at = _np_lock_expiry_iso()
