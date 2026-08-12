@@ -12373,6 +12373,12 @@ def _np_lock_expiry_iso(ttl_seconds=None):
 
 
 def _np_acquire_distributed_sync_lock():
+    # Protected backend coordination: use service-role access for np_system_locks.
+    # This prevents RLS from stranding an expired distributed sync lock.
+    try:
+        lock_db = _staff_db()
+    except Exception as e:
+        return None, f"distributed lock admin client unavailable: {e}"
     owner = uuid.uuid4().hex
     now = now_iso()
     expires_at = _np_lock_expiry_iso()
@@ -12385,12 +12391,12 @@ def _np_acquire_distributed_sync_lock():
         "expires_at": expires_at,
     }
     try:
-        inserted = supabase.table(NP_SYNC_LOCK_TABLE).insert(row).execute().data or []
+        inserted = lock_db.table(NP_SYNC_LOCK_TABLE).insert(row).execute().data or []
         if inserted:
             return owner, None
     except Exception as insert_err:
         try:
-            existing = supabase.table(NP_SYNC_LOCK_TABLE).select("*").eq("lock_name", NP_SYNC_LOCK_NAME).limit(1).execute().data or []
+            existing = lock_db.table(NP_SYNC_LOCK_TABLE).select("*").eq("lock_name", NP_SYNC_LOCK_NAME).limit(1).execute().data or []
         except Exception as read_err:
             return None, f"distributed lock unavailable: {read_err}; create {NP_SYNC_LOCK_TABLE} before running production sync"
         current = existing[0] if existing else {}
@@ -12401,13 +12407,13 @@ def _np_acquire_distributed_sync_lock():
             return None, f"sync already running by {current_owner or 'another worker'} until {current_expires}"
         try:
             if current_status == "running":
-                refreshed = supabase.table(NP_SYNC_LOCK_TABLE).update(row).eq("lock_name", NP_SYNC_LOCK_NAME).lt("expires_at", now).execute().data or []
+                refreshed = lock_db.table(NP_SYNC_LOCK_TABLE).update(row).eq("lock_name", NP_SYNC_LOCK_NAME).lt("expires_at", now).execute().data or []
             else:
                 try:
-                    supabase.table(NP_SYNC_LOCK_TABLE).delete().eq("lock_name", NP_SYNC_LOCK_NAME).execute()
+                    lock_db.table(NP_SYNC_LOCK_TABLE).delete().eq("lock_name", NP_SYNC_LOCK_NAME).execute()
                 except Exception:
                     pass
-                refreshed = supabase.table(NP_SYNC_LOCK_TABLE).insert(row).execute().data or []
+                refreshed = lock_db.table(NP_SYNC_LOCK_TABLE).insert(row).execute().data or []
             if refreshed and str((refreshed[0] or {}).get("owner_token") or "") == owner:
                 return owner, None
         except Exception as update_err:
@@ -12420,7 +12426,7 @@ def _np_release_distributed_sync_lock(owner, status="complete", error=None):
     if not owner:
         return
     try:
-        supabase.table(NP_SYNC_LOCK_TABLE).delete().eq("lock_name", NP_SYNC_LOCK_NAME).eq("owner_token", owner).execute()
+        _staff_db().table(NP_SYNC_LOCK_TABLE).delete().eq("lock_name", NP_SYNC_LOCK_NAME).eq("owner_token", owner).execute()
     except Exception as e:
         print("NP SYNC LOCK RELEASE FAILED:", e)
 
