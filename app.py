@@ -6466,19 +6466,59 @@ def approve_payout():
         if payout_status(payout) != "pending":
             return bad("Only pending payouts can be approved",409)
 
+        # Approval operates on the exact funded account already verified and frozen
+        # when the trader submitted this payout. Do not re-run active-account
+        # eligibility here: the safe payout lock deliberately changes account_status
+        # to profit_protected, so a second active-only eligibility check would reject
+        # a correctly locked payout.
         trader_row = _resolve_trader_for_money_action(payout)
-        eligible, reason, account = _payout_eligibility(trader_row)
-        if not eligible:
-            return bad(reason, 403)
-        if payout.get("trader_account_id") and str(payout.get("trader_account_id")) != str(account.get("id")):
-            return bad("Payout is not attached to the current active funded account.", 403)
+        if not trader_row:
+            return bad("Trader could not be verified for this payout.", 409)
+
+        account_id = str(payout.get("trader_account_id") or "").strip()
+        if not account_id:
+            return bad("Payout has no exact funded account link.", 409)
+
+        account = _get_exact_trader_account(account_id)
+        if not account:
+            return bad("Exact funded account could not be verified.", 409)
+
+        if str(account.get("trader_id") or "").strip() != str(payout.get("trader_id") or "").strip():
+            return bad("Payout account ownership verification failed.", 403)
+
+        stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
+        account_status = str(account.get("account_status") or "").strip().lower()
+        funded_stage = stage in {"funded", "live", "funded_live"}
+        allowed_locked_states = {
+            "profit_protected", "funded_active", "assigned_active",
+            "active", "current_active"
+        }
+        if not funded_stage:
+            return bad("Payout is not attached to a funded account.", 403)
+        if account_status not in allowed_locked_states:
+            return bad(
+                f"Funded account is not in an approvable payout state: {account_status or 'unknown'}.",
+                409,
+            )
 
         note = d.get("admin_note","")
-        result = supabase.table("payouts").update({"status":"approved","approved_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+        result = _staff_db().table("payouts").update({
+            "status":"approved",
+            "approved_at":now_iso(),
+            "admin_note":note
+        }).eq("id",pid).eq("status","pending").execute().data or []
+        if not result:
+            return bad("Payout changed state before approval. Refresh Payouts and try again.", 409)
+
+        # Keep the exact account in the existing production-safe funded lock state
+        # while payment is being processed. This state is already accepted by the
+        # trader_accounts constraint and recognized by the MT5 watchdog.
         try:
             _staff_db().table("trader_accounts").update({
-                "account_status": "profit_protected", "monitoring_enabled": True, "updated_at": now_iso()
-            }).eq("id", account.get("id")).eq("trader_id", payout.get("trader_id")).execute()
+                "account_status": "profit_protected",
+                "monitoring_enabled": True,
+                "updated_at": now_iso()
+            }).eq("id", account_id).eq("trader_id", payout.get("trader_id")).execute()
         except Exception as e:
             print("APPROVED PAYOUT LOCK STATE UPDATE:", e)
 
