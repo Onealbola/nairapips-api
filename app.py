@@ -4985,26 +4985,40 @@ def _reconcile_verified_login_credential(canonical, credential_row):
 
 @app.route("/login_trader", methods=["POST"])
 def login_trader():
-    """Fast login with duplicate-identity credential reconciliation."""
+    """Fast login. Critical path is: lookup -> password verify -> token.
+    Non-essential work (duplicate-identity reconciliation, last_login
+    persistence) runs in daemon threads after the response is sent.
+    """
+    started = time.time()
+    t_lookup_ms = 0
+    t_pwd_ms = 0
+    t_token_ms = 0
     try:
         data = request.json or {}
         lookup = str(data.get("lookup", "")).strip().lower()
         password = str(data.get("password") or "")
 
         if not lookup:
+            print(f"PERF trader_login total_ms={int((time.time()-started)*1000)} result=missing_lookup")
             return bad("Missing lookup")
         if not password:
+            print(f"PERF trader_login total_ms={int((time.time()-started)*1000)} result=missing_password")
             return bad("Password is required", 401)
 
+        t_lookup_start = time.time()
         candidates = _trader_login_candidates(lookup)
+        t_lookup_ms = int((time.time() - t_lookup_start) * 1000)
         if not candidates:
+            print(f"PERF trader_login total_ms={int((time.time()-started)*1000)} lookup_ms={t_lookup_ms} result=no_candidates")
             return bad("Invalid email/phone or password", 401)
 
+        t_pwd_start = time.time()
         canonical = candidates[0]
         credential_row = next(
             (row for row in candidates if _check_trader_password(row, password)),
             None,
         )
+        t_pwd_ms = int((time.time() - t_pwd_start) * 1000)
 
         if not credential_row:
             has_any_credential = any(
@@ -5013,16 +5027,30 @@ def login_trader():
                 for row in candidates
             )
             if not has_any_credential:
+                print(f"PERF trader_login total_ms={int((time.time()-started)*1000)} lookup_ms={t_lookup_ms} pwd_ms={t_pwd_ms} result=no_credential_set")
                 return bad(
                     "Password not set. Please verify your email and create a password.",
                     403,
                 )
+            print(f"PERF trader_login total_ms={int((time.time()-started)*1000)} lookup_ms={t_lookup_ms} pwd_ms={t_pwd_ms} result=bad_password")
             return bad("Invalid email/phone or password", 401)
 
-        canonical = _reconcile_verified_login_credential(
-            canonical,
-            credential_row,
-        )
+        # MOVE RECONCILIATION OFF THE CRITICAL PATH.
+        # If the verified credential is on a duplicate-identity row, copy
+        # the password hash to the canonical row in a daemon thread. The
+        # response is built from the original canonical row immediately.
+        # The canonical row has its own valid `id`, `email`, `phone`, and
+        # all identity fields needed by /trader_bootstrap. Missing only
+        # the password_hash copy, which is corrected on the next login.
+        if str(canonical.get("id") or "") != str(credential_row.get("id") or ""):
+            try:
+                threading.Thread(
+                    target=_reconcile_verified_login_credential,
+                    args=(dict(canonical), dict(credential_row)),
+                    daemon=True,
+                ).start()
+            except Exception as e:
+                print("LOGIN RECONCILIATION BACKGROUND START SKIPPED:", e)
 
         login_time = now_iso()
 
@@ -5045,14 +5073,20 @@ def login_trader():
         except Exception as e:
             print("LOGIN LAST_LOGIN BACKGROUND START SKIPPED:", e)
 
+        t_token_start = time.time()
         public = _public_trader_payload(canonical)
         public["last_login_at"] = login_time
         public["auth_token"] = _make_trader_auth_token(canonical.get("id"))
         public["bootstrap_url"] = (
             f"/trader_bootstrap?trader_id={canonical.get('id')}"
         )
+        t_token_ms = int((time.time() - t_token_start) * 1000)
+
+        total_ms = int((time.time() - started) * 1000)
+        print(f"PERF trader_login total_ms={total_ms} lookup_ms={t_lookup_ms} pwd_ms={t_pwd_ms} token_ms={t_token_ms} candidates={len(candidates)} result=ok")
         return ok(public, "Login successful")
     except Exception as e:
+        print(f"PERF trader_login total_ms={int((time.time()-started)*1000)} result=error error={type(e).__name__}")
         return bad(e)
 
 @app.route("/approve_payment", methods=["POST"])
