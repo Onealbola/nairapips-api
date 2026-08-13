@@ -645,6 +645,10 @@ def _decorate_account_for_api(account):
             zone = "safe"
     row["display_risk_zone"] = zone
     row["risk_zone"] = zone
+    if str(row.get("account_status") or "").strip().lower() in {
+        "payout_pending", "approved_payout_pending", "payment_processing"
+    }:
+        row["status"] = row.get("account_status")
     return row
 
 
@@ -6130,14 +6134,13 @@ def _set_funded_payout_trade_lock(trader_row, account, payout_id=None, reason="P
     account_payload = {
         "account_status": "payout_pending",
         "monitoring_enabled": True,
-        "mt5_access_disabled": True,
         "updated_at": now,
     }
     db.table("trader_accounts").update(account_payload).eq("id", account_id).eq("trader_id", trader_id).execute()
 
     locked = (
         db.table("trader_accounts")
-        .select("id,trader_id,account_status,monitoring_enabled,mt5_access_disabled")
+        .select("id,trader_id,account_status,monitoring_enabled")
         .eq("id", account_id).eq("trader_id", trader_id).limit(1).execute().data or []
     )
     if not locked or str(locked[0].get("account_status") or "").strip().lower() != "payout_pending":
@@ -6185,7 +6188,6 @@ def _release_funded_payout_trade_lock(trader_row, account, reason="Payout reques
     account_payload = {
         "account_status": "assigned_active",
         "monitoring_enabled": True,
-        "mt5_access_disabled": False,
         "updated_at": now,
     }
     db.table("trader_accounts").update(account_payload).eq("id", account_id).eq("trader_id", trader_id).execute()
@@ -6475,7 +6477,7 @@ def approve_payout():
         result = supabase.table("payouts").update({"status":"approved","approved_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
         try:
             _staff_db().table("trader_accounts").update({
-                "account_status": "approved_payout_pending", "monitoring_enabled": True, "mt5_access_disabled": True, "updated_at": now_iso()
+                "account_status": "approved_payout_pending", "monitoring_enabled": True, "updated_at": now_iso()
             }).eq("id", account.get("id")).eq("trader_id", payout.get("trader_id")).execute()
         except Exception as e:
             print("APPROVED PAYOUT LOCK STATE UPDATE:", e)
