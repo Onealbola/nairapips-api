@@ -6116,7 +6116,12 @@ def payouts():
 
 
 def _set_funded_payout_trade_lock(trader_row, account, payout_id=None, reason="Payout request pending"):
-    """Lock exact funded account while payout is open; separate from reset."""
+    """Lock exact funded account while payout is open; separate from reset.
+
+    trader_accounts is the account/lifecycle authority. Optional mirror fields on
+    traders are compatibility data and must not falsely cancel a payout after the
+    exact funded account has already been locked successfully.
+    """
     now = now_iso()
     account_id = str((account or {}).get("id") or "").strip()
     trader_id = str((trader_row or {}).get("id") or "").strip()
@@ -6139,6 +6144,19 @@ def _set_funded_payout_trade_lock(trader_row, account, payout_id=None, reason="P
         print("PAYOUT LOCK RICH ACCOUNT UPDATE FALLBACK:", e)
         supabase.table("trader_accounts").update(account_payload).eq("id", account_id).execute()
 
+    locked_rows = (
+        supabase.table("trader_accounts")
+        .select("id,status,monitoring_enabled")
+        .eq("id", account_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    locked_row = locked_rows[0] if locked_rows else {}
+    if str(locked_row.get("status") or "").strip().lower() != "payout_pending":
+        raise RuntimeError("Exact funded trader account did not enter payout_pending lock state")
+
     trader_payload = {
         "payout_blocked": True,
         "payout_eligible": False,
@@ -6155,9 +6173,12 @@ def _set_funded_payout_trade_lock(trader_row, account, payout_id=None, reason="P
     }
     try:
         supabase.table("traders").update({**trader_payload, **optional_trader}).eq("id", trader_id).execute()
-    except Exception as e:
-        print("PAYOUT LOCK RICH TRADER UPDATE FALLBACK:", e)
-        supabase.table("traders").update(trader_payload).eq("id", trader_id).execute()
+    except Exception as rich_error:
+        print("PAYOUT LOCK RICH TRADER UPDATE FALLBACK:", rich_error)
+        try:
+            supabase.table("traders").update(trader_payload).eq("id", trader_id).execute()
+        except Exception as legacy_error:
+            print("PAYOUT LOCK TRADER MIRROR SKIPPED; ACCOUNT LOCK VERIFIED:", legacy_error)
 
     _log_lifecycle_event(
         trader_id, account_id, "funded_active", "payout_pending",
