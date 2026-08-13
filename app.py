@@ -6124,22 +6124,27 @@ def _set_funded_payout_trade_lock(trader_row, account, payout_id=None, reason="P
     if not account_id or not trader_id:
         raise ValueError("Exact trader and funded account are required for payout lock")
 
-    account_payload = {"status": "payout_pending", "monitoring_enabled": True, "updated_at": now}
-    optional_account = {
-        "payout_required": True,
-        "payout_blocked": True,
+    # Production trader_accounts lifecycle field is account_status (not status).
+    # Keep the exact funded account monitorable so the MT5 watchdog can enforce
+    # the payout trading lock without disturbing independent accounts.
+    account_payload = {
+        "account_status": "payout_pending",
+        "monitoring_enabled": True,
         "mt5_access_disabled": True,
-        "trading_must_remain_locked_until_payout": True,
-        "payout_lock_reason": reason,
-        "active_payout_id": payout_id,
-        "payout_locked_at": now,
+        "updated_at": now,
     }
-    try:
-        db.table("trader_accounts").update({**account_payload, **optional_account}).eq("id", account_id).execute()
-    except Exception as e:
-        print("PAYOUT LOCK RICH ACCOUNT UPDATE FALLBACK:", e)
-        db.table("trader_accounts").update(account_payload).eq("id", account_id).execute()
+    db.table("trader_accounts").update(account_payload).eq("id", account_id).eq("trader_id", trader_id).execute()
 
+    locked = (
+        db.table("trader_accounts")
+        .select("id,trader_id,account_status,monitoring_enabled,mt5_access_disabled")
+        .eq("id", account_id).eq("trader_id", trader_id).limit(1).execute().data or []
+    )
+    if not locked or str(locked[0].get("account_status") or "").strip().lower() != "payout_pending":
+        raise RuntimeError("Exact funded trader account did not enter payout_pending lock state")
+
+    # Trader row remains a compatibility mirror. Do not require newer optional
+    # payout columns that are absent from the live production schema.
     trader_payload = {
         "payout_blocked": True,
         "payout_eligible": False,
@@ -6148,17 +6153,10 @@ def _set_funded_payout_trade_lock(trader_row, account, payout_id=None, reason="P
         "admin_note": reason,
         "updated_at": now,
     }
-    optional_trader = {
-        "payout_required": True,
-        "trading_must_remain_locked_until_payout": True,
-        "active_payout_id": payout_id,
-        "payout_locked_at": now,
-    }
     try:
-        db.table("traders").update({**trader_payload, **optional_trader}).eq("id", trader_id).execute()
-    except Exception as e:
-        print("PAYOUT LOCK RICH TRADER UPDATE FALLBACK:", e)
         db.table("traders").update(trader_payload).eq("id", trader_id).execute()
+    except Exception as e:
+        print("PAYOUT LOCK TRADER MIRROR WARNING:", e)
 
     _log_lifecycle_event(
         trader_id, account_id, "funded_active", "payout_pending",
@@ -6166,9 +6164,8 @@ def _set_funded_payout_trade_lock(trader_row, account, payout_id=None, reason="P
         {"name": "system", "username": "system"},
     )
 
-
 def _release_funded_payout_trade_lock(trader_row, account, reason="Payout request cancelled or rejected"):
-    """Release only payout-request lock; refuse to release other lock types."""
+    """Release only the exact payout-request lock; refuse other lifecycle states."""
     now = now_iso()
     db = _staff_db()
     account_id = str((account or {}).get("id") or "").strip()
@@ -6176,28 +6173,22 @@ def _release_funded_payout_trade_lock(trader_row, account, reason="Payout reques
     if not account_id or not trader_id:
         raise ValueError("Exact trader and funded account are required for payout unlock")
 
-    current_status = str((account or {}).get("status") or "").strip().lower()
+    current_status = str(
+        (account or {}).get("account_status") or (account or {}).get("status") or ""
+    ).strip().lower()
     if current_status and current_status not in {
         "payout_pending", "approved_payout_pending", "payment_processing",
         "funded_active", "active", "assigned_active"
     }:
         raise ValueError(f"Non-payout lock/status {current_status}; refusing automatic unlock")
 
-    account_payload = {"status": "funded_active", "monitoring_enabled": True, "updated_at": now}
-    optional_account = {
-        "payout_required": False,
-        "payout_blocked": False,
+    account_payload = {
+        "account_status": "assigned_active",
+        "monitoring_enabled": True,
         "mt5_access_disabled": False,
-        "trading_must_remain_locked_until_payout": False,
-        "payout_lock_reason": "",
-        "active_payout_id": None,
-        "payout_unlocked_at": now,
+        "updated_at": now,
     }
-    try:
-        db.table("trader_accounts").update({**account_payload, **optional_account}).eq("id", account_id).execute()
-    except Exception as e:
-        print("PAYOUT UNLOCK RICH ACCOUNT UPDATE FALLBACK:", e)
-        db.table("trader_accounts").update(account_payload).eq("id", account_id).execute()
+    db.table("trader_accounts").update(account_payload).eq("id", account_id).eq("trader_id", trader_id).execute()
 
     trader_payload = {
         "payout_blocked": False,
@@ -6207,24 +6198,16 @@ def _release_funded_payout_trade_lock(trader_row, account, reason="Payout reques
         "admin_note": reason,
         "updated_at": now,
     }
-    optional_trader = {
-        "payout_required": False,
-        "trading_must_remain_locked_until_payout": False,
-        "active_payout_id": None,
-        "payout_unlocked_at": now,
-    }
     try:
-        db.table("traders").update({**trader_payload, **optional_trader}).eq("id", trader_id).execute()
-    except Exception as e:
-        print("PAYOUT UNLOCK RICH TRADER UPDATE FALLBACK:", e)
         db.table("traders").update(trader_payload).eq("id", trader_id).execute()
+    except Exception as e:
+        print("PAYOUT UNLOCK TRADER MIRROR WARNING:", e)
 
     _log_lifecycle_event(
         trader_id, account_id, "payout_pending", "funded_active",
         "payout_request_trade_unlock", reason,
         {"name": "system", "username": "system"},
     )
-
 
 @app.route("/create_payout", methods=["POST"])
 def create_payout():
@@ -6491,9 +6474,9 @@ def approve_payout():
         note = d.get("admin_note","")
         result = supabase.table("payouts").update({"status":"approved","approved_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
         try:
-            supabase.table("trader_accounts").update({
-                "status": "approved_payout_pending", "monitoring_enabled": True, "updated_at": now_iso()
-            }).eq("id", account.get("id")).execute()
+            _staff_db().table("trader_accounts").update({
+                "account_status": "approved_payout_pending", "monitoring_enabled": True, "mt5_access_disabled": True, "updated_at": now_iso()
+            }).eq("id", account.get("id")).eq("trader_id", payout.get("trader_id")).execute()
         except Exception as e:
             print("APPROVED PAYOUT LOCK STATE UPDATE:", e)
 
