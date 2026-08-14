@@ -6593,17 +6593,27 @@ def mark_paid():
         except Exception as e:
             print("PAID PAYOUT LOCK STATE UPDATE:", e)
 
+        # Certificate availability follows the existing production authority:
+        # only an APPROVED payout that has now been successfully marked PAID earns it.
+        # The certificate itself is rendered from the paid payout record in the trader dashboard;
+        # no lifecycle, MT5, drawdown, reset, profit-share or funded-cycle state is changed here.
         send_email_safe(
             payout.get("email"),
-            "NairaPips payout marked paid",
+            "NairaPips payout received - your certificate is ready",
             f"""Hello {payout.get("trader_name") or "Trader"},
 
-Your payout has been marked as paid.
+Your NairaPips payout has been completed successfully.
 
-Amount: {email_money(payout.get("amount"))}
+Amount Received: {email_money(payout.get("amount"))}
+Status: PAID
 Admin Note: {note or "Payment completed."}
 
-NairaPips Team"""
+Your official NairaPips Payout Certificate is now available in your Trader Dashboard under Payouts. You can view, download and share it from there.
+
+TRADED. PROFITED. REWARDED.
+
+NairaPips Team
+Rewarding Nigerian Traders. Changing Trading Stories."""
         )
 
         _audit_safe("payouts", "payout_paid", f"Payout {pid} marked paid", _admin_from_payload(d))
