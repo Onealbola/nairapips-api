@@ -1,3 +1,4 @@
+import urllib.parse
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -5032,10 +5033,20 @@ def login_trader():
             )
             if not has_any_credential:
                 print(f"PERF trader_login total_ms={int((time.time()-started)*1000)} lookup_ms={t_lookup_ms} pwd_ms={t_pwd_ms} result=no_credential_set")
-                return bad(
-                    "Password not set. Please verify your email and create a password.",
-                    403,
-                )
+                canonical_email = str(canonical.get("email") or "").strip().lower()
+                lookup_is_email = bool("@" in lookup and canonical_email and lookup == canonical_email)
+                return jsonify({
+                    "success": False,
+                    "error": "Your NairaPips account is active but needs a login password. Verify your email once to create it.",
+                    "code": "PASSWORD_SETUP_REQUIRED",
+                    "password_setup_required": True,
+                    "golden_ticket_account": bool(
+                        canonical.get("golden_ticket")
+                        or str(canonical.get("source") or "").lower().startswith("golden_ticket")
+                        or str(canonical.get("challenge_state") or "").lower().startswith("golden_ticket")
+                    ),
+                    "setup_email": canonical_email if lookup_is_email else "",
+                }), 403
             print(f"PERF trader_login total_ms={int((time.time()-started)*1000)} lookup_ms={t_lookup_ms} pwd_ms={t_pwd_ms} result=bad_password")
             return bad("Invalid email/phone or password", 401)
 
@@ -14260,6 +14271,7 @@ def golden_ticket_access():
         now = now_iso()
 
         trader_row = None
+        created_new_trader = False
         try:
             if email:
                 found = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
@@ -14291,6 +14303,13 @@ def golden_ticket_access():
         }
 
         if trader_row:
+            # Preserve any existing password credential. For older Golden Ticket
+            # traders with no credential, explicitly flag the account for setup.
+            if not (
+                str(trader_row.get("password_hash") or "").strip()
+                or str(trader_row.get("password") or "").strip()
+            ):
+                gift_payload["password_reset_required"] = True
             try:
                 updated = supabase.table("traders").update(gift_payload).eq("id", trader_row.get("id")).execute().data or []
                 trader_row = updated[0] if updated else {**trader_row, **gift_payload}
@@ -14300,14 +14319,43 @@ def golden_ticket_access():
         else:
             create_payload = dict(gift_payload)
             create_payload["created_at"] = now
+            create_payload["password_reset_required"] = True
             try:
                 created = supabase.table("traders").insert(create_payload).execute().data or []
                 trader_row = created[0] if created else create_payload
+                created_new_trader = True
             except Exception as create_error:
                 print("GOLDEN TICKET TRADER CREATE ERROR:", create_error)
                 # Return a safe dashboard row even if traders table needs columns added.
                 trader_row = create_payload
                 trader_row["id"] = "lead-" + str(lead.get("id") or ticket)
+
+        if created_new_trader and email:
+            try:
+                setup_url = (
+                    LEAD_PUBLIC_BASE_URL
+                    + "/dashboard/trader_clean.html?setup_password=1&email="
+                    + urllib.parse.quote(email)
+                )
+                send_email_safe(
+                    email,
+                    "Secure your NairaPips Golden Ticket account",
+                    f"""Hello {full_name or 'Trader'},
+
+Your NairaPips Golden Ticket access is active.
+
+To make sure you can always sign in normally, create your personal dashboard password here:
+
+{setup_url}
+
+You will verify this email with a one-time code before the password is saved.
+
+Your Golden Ticket remains active.
+
+NairaPips Team"""
+                )
+            except Exception as setup_email_error:
+                print("GOLDEN TICKET PASSWORD SETUP EMAIL SKIPPED:", setup_email_error)
 
         try:
             supabase.table(LEAD_TABLE).update({
@@ -14335,12 +14383,19 @@ def golden_ticket_access():
         except Exception:
             pass
 
+        password_setup_required = not bool(
+            str(trader_row.get("password_hash") or "").strip()
+            or str(trader_row.get("password") or "").strip()
+        )
+
         return _np_ok({
             "success": True,
             "message": "Golden Ticket verified. Dashboard access opened.",
             "data": trader_row,
             "trader": trader_row,
             "golden_ticket": lead.get("golden_ticket") or ticket,
+            "password_setup_required": password_setup_required,
+            "setup_email": email if password_setup_required else "",
             "lead": {
                 "id": lead.get("id"),
                 "full_name": full_name,
