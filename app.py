@@ -13977,7 +13977,7 @@ def admin_test_notification_channels():
 
 LEAD_CAMPAIGN_DEFAULT = "capital_selection_founding_1000"
 LEAD_OFFER_DEFAULT = "10_monthly_1m_challenge_accounts"
-LEAD_FOUNDING_LIMIT = int(os.getenv("NAIRAPIPS_FOUNDING_LIMIT", "1000"))
+LEAD_FOUNDING_LIMIT = 50  # Global Golden Ticket monthly capacity. Do not allow stale Render env values to restore the retired 1,000-slot campaign.
 LEAD_COMMUNITY_URL = os.getenv("NAIRAPIPS_COMMUNITY_URL", "").strip()
 LEAD_PUBLIC_BASE_URL = os.getenv("NAIRAPIPS_PUBLIC_BASE_URL", "https://nairapips.com").rstrip("/")
 LEAD_TABLE = os.getenv("NAIRAPIPS_LEAD_TABLE", "landing_leads")
