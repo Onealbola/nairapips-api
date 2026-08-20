@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "MOBILE_PASSWORD_RESET_VISIBLE_2026_08_10"
+NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20"
 CORS(app)
 
 # ============================================================
@@ -5294,6 +5294,79 @@ Note: {upd["kyc_note"]}"""
     except Exception as e:
         return bad(e)
 
+# ============================================================
+# NAIRAPIPS SECOND LIFE — 2 LIVES / 1 PHASE
+# New purchases only. Legacy purchases remain unchanged unless their
+# purchase snapshot explicitly carries second_life_enabled=True.
+# ============================================================
+def _second_life_bool(value):
+    return value is True or str(value or "").strip().lower() in {"1", "true", "yes", "y", "enabled", "active"}
+
+
+def _second_life_plan_snapshot(plan):
+    plan = plan or {}
+    enabled = _second_life_bool(plan.get("second_life_enabled"))
+    total = 2 if enabled else 1
+    try:
+        configured = int(plan.get("lives_total") or total)
+        total = max(1, min(configured, 2 if enabled else 1))
+    except Exception:
+        pass
+    return {
+        "second_life_enabled": enabled,
+        "lives_total": total,
+        "life_number": 1,
+        "second_life_used": False,
+        "second_life_status": "available_on_eligible_breach" if enabled else "not_included",
+    }
+
+
+def _second_life_purchase_for_trader(purchase_id, trader_id):
+    if not purchase_id or not trader_id:
+        return None
+    rows = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
+    if not rows:
+        return None
+    p = rows[0]
+    if str(p.get("trader_id") or "") != str(trader_id):
+        return None
+    return p
+
+
+def _second_life_status_payload(purchase, trader_id=None):
+    p = purchase or {}
+    enabled = _second_life_bool(p.get("second_life_enabled"))
+    used = _second_life_bool(p.get("second_life_used"))
+    status = str(p.get("second_life_status") or ("available_on_eligible_breach" if enabled else "not_included")).strip().lower()
+    eligible = False
+    breached_account = None
+    if enabled and not used:
+        try:
+            q = supabase.table("trader_accounts").select("*").eq("purchase_id", p.get("id")).eq("trader_id", trader_id or p.get("trader_id")).order("created_at", desc=True).limit(50)
+            rows = q.execute().data or []
+            for a in rows:
+                ast = str(a.get("account_status") or a.get("status") or "").lower()
+                stage = _normalize_lifecycle_stage(a.get("stage") or a.get("phase"))
+                if stage == "phase1" and "breach" in ast:
+                    eligible = True
+                    breached_account = a
+                    break
+        except Exception as e:
+            print("SECOND LIFE STATUS ACCOUNT LOOKUP ERROR:", e)
+    if status in {"waiting_mt5", "activated", "life2_waiting_mt5"}:
+        eligible = False
+    return {
+        "purchase_id": p.get("id"),
+        "enabled": enabled,
+        "lives_total": int(p.get("lives_total") or (2 if enabled else 1)),
+        "life_number": int(p.get("life_number") or 1),
+        "used": used,
+        "status": status,
+        "eligible_now": bool(eligible),
+        "breached_account_id": (breached_account or {}).get("id"),
+        "activated_at": p.get("second_life_activated_at"),
+    }
+
 @app.route("/challenge_plans", methods=["GET"])
 def challenge_plans():
     try:
@@ -5301,6 +5374,8 @@ def challenge_plans():
         for row in rows:
             if "payout_split" in row:
                 row["payout_split"] = _effective_payout_split(row.get("payout_split"))
+            row["second_life_enabled"] = _second_life_bool(row.get("second_life_enabled"))
+            row["lives_total"] = int(row.get("lives_total") or (2 if row["second_life_enabled"] else 1))
         return jsonify(rows)
     except Exception as e: return bad(e)
 
@@ -5324,6 +5399,8 @@ def create_plan():
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
              "challenge_journey": challenge_journey, "journey_source": "plan_create",
              "payout_split":_effective_payout_split(d.get("payout_split")),"description":d.get("description",""),
+             "second_life_enabled":_second_life_bool(d.get("second_life_enabled")),
+             "lives_total":2 if _second_life_bool(d.get("second_life_enabled")) else 1,
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
              "status":d.get("status","active"),"created_at":now_iso(),"updated_at":now_iso()}
         return ok(supabase.table("challenge_plans").insert(row).execute().data, "Challenge plan created")
@@ -5339,6 +5416,9 @@ def update_plan():
             if k in d: upd[k]=d[k]
         if "payout_split" in d:
             upd["payout_split"] = _effective_payout_split(d.get("payout_split"))
+        if "second_life_enabled" in d:
+            upd["second_life_enabled"] = _second_life_bool(d.get("second_life_enabled"))
+            upd["lives_total"] = 2 if upd["second_life_enabled"] else 1
         upd["daily_drawdown"] = "None"
         if "mt5_server" in d and "default_server" not in d:
             upd["default_server"] = d.get("mt5_server")
@@ -5427,6 +5507,7 @@ def create_purchase():
 
         plan_row = _safe_plan_for_purchase({"plan_id": d.get("plan_id"), "plan_name": plan})
         challenge_journey = _journey_source_value(_journey_for_lifecycle({}, {}, plan_row, None))
+        second_life_snapshot = _second_life_plan_snapshot(plan_row)
         row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
              "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":quote.get("final_fee", original_fee),
              "original_fee":quote.get("original_fee", original_fee),"discount_percent":quote.get("discount_percent",0),"discount_amount":quote.get("discount_amount",0),
@@ -5434,6 +5515,7 @@ def create_purchase():
              "payment_proof_url":proof,"payment_status":"pending","status":"pending_review","admin_note":"",
              "challenge_journey": challenge_journey, "journey_source": "purchase_plan_snapshot",
              "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
+        row.update(second_life_snapshot)
         row.update(_affiliate_purchase_fields(d, original_fee))
         created = supabase.table("challenge_purchases").insert(row).execute().data or []
         if not created:
@@ -5499,6 +5581,93 @@ Proof URL: {proof}"""
 
         return ok(created, "Challenge purchase submitted")
     except Exception as e: return bad(e)
+
+@app.route("/second_life/status", methods=["GET", "OPTIONS"])
+def second_life_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    requested_id = str(request.args.get("trader_id") or "").strip()
+    authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
+    if auth_error:
+        return _np_fail(auth_error, 401)
+    try:
+        rows = supabase.table("challenge_purchases").select("*").eq("trader_id", authed_id).order("created_at", desc=True).limit(100).execute().data or []
+        items = [_second_life_status_payload(p, authed_id) for p in rows if _second_life_bool(p.get("second_life_enabled"))]
+        return _np_ok({"success": True, "items": items, "data": items})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/second_life/activate", methods=["POST", "OPTIONS"])
+def second_life_activate():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    data = request.get_json(silent=True) or {}
+    requested_id = str(data.get("trader_id") or "").strip()
+    authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
+    if auth_error:
+        return _np_fail(auth_error, 401)
+    purchase_id = str(data.get("purchase_id") or "").strip()
+    if not purchase_id:
+        return _np_fail("purchase_id is required", 400)
+    try:
+        p = _second_life_purchase_for_trader(purchase_id, authed_id)
+        if not p:
+            return _np_fail("Second Life purchase was not found for this trader", 404)
+        status = _second_life_status_payload(p, authed_id)
+        if not status.get("enabled"):
+            return _np_fail("Second Life is not included with this purchase", 409)
+        if status.get("used"):
+            return _np_fail("Second Life has already been used", 409)
+        if not status.get("eligible_now") or not status.get("breached_account_id"):
+            return _np_fail("Second Life activates only after an eligible Life 1 Phase 1 breach", 409)
+        # One-phase purchases only. Legacy two-phase journeys are intentionally excluded.
+        journey = _journey_from_text(p.get("challenge_journey"), p.get("journey_stages"), p.get("route"))
+        if journey != ONE_PHASE_CHALLENGE_JOURNEY:
+            return _np_fail("Second Life is only available on eligible 1-Phase purchases", 409)
+        now = now_iso()
+        purchase_update = {
+            "second_life_used": True,
+            "life_number": 2,
+            "second_life_status": "life2_waiting_mt5",
+            "second_life_activated_at": now,
+            "lifecycle_state": "phase1_waiting_mt5",
+            "updated_at": now,
+        }
+        supabase.table("challenge_purchases").update(purchase_update).eq("id", purchase_id).execute()
+        trader_update = {
+            "status": "phase1_waiting_mt5",
+            "phase": "phase1",
+            "challenge_state": "phase1_waiting_mt5",
+            "mt5_login": None,
+            "mt5_server": None,
+            "mt5_master_password": None,
+            "mt5_investor_password": None,
+            "updated_at": now,
+            "admin_note": "Second Life activated. Waiting for a fresh Life 2 Phase 1 MT5 account.",
+        }
+        supabase.table("traders").update(trader_update).eq("id", authed_id).execute()
+        _audit_safe("second_life", "activated", f"Purchase {purchase_id}; Life 2 awaiting fresh MT5", {"name":"trader","username":str(authed_id)[:12],"role":"trader"}, purchase_id)
+        trader = get_trader_by_id(authed_id) or {}
+        send_email_safe(
+            trader.get("email"),
+            "NairaPips Second Life activated",
+            f"""Hello {trader.get('name') or 'Trader'},
+
+Your NairaPips Second Life is now activated.
+
+Life: 2 of 2
+Stage: Phase 1
+Status: Waiting for fresh MT5 assignment
+
+Your breached Life 1 account remains locked as historical evidence. Life 2 starts fresh with the same eligible challenge terms.
+
+NairaPips Team"""
+        )
+        return _np_ok({"success": True, "purchase_id": purchase_id, "life_number": 2, "status": "life2_waiting_mt5", "breached_account_id": status.get("breached_account_id")})
+    except Exception as e:
+        return _np_fail(e, 500)
+
 
 @app.route("/approve_challenge_purchase", methods=["POST"])
 def approve_purchase():
@@ -5917,13 +6086,13 @@ def assign_phase_mt5():
             return bad("Missing trader_id")
         if not mt5_id:
             return bad("Choose an MT5 account from the pool")
-        if phase not in ["phase2", "funded", "live"]:
-            return bad("Phase must be phase2, funded or live")
+        if phase not in ["phase1", "phase2", "funded", "live"]:
+            return bad("Phase must be phase1, phase2, funded or live")
 
         trader = get_trader_by_id(trader_id)
         if not trader:
             return bad("Trader not found", 404)
-        target_stage = "funded" if phase in ["funded", "live"] else "phase2"
+        target_stage = "funded" if phase in ["funded", "live"] else ("phase1" if phase == "phase1" else "phase2")
         completed_account = None
         completed_account_id = str(d.get("completed_account_id") or d.get("trader_account_id") or d.get("passed_account_id") or "").strip()
         if completed_account_id and not completed_account_id.startswith("waiting:"):
@@ -5932,19 +6101,33 @@ def assign_phase_mt5():
             if not completed_account:
                 return bad("Completed trader account was not found for this trader", 404)
             completed_stage = _normalize_lifecycle_stage(completed_account.get("stage") or completed_account.get("phase"))
-            expected_stage = _next_stage_for_lifecycle(
-                completed_stage,
-                completed_account,
-                _safe_purchase_for_account(completed_account),
-                None,
-                trader
+            linked_purchase = _safe_purchase_for_account(completed_account)
+            second_life_reentry = bool(
+                target_stage == "phase1"
+                and linked_purchase
+                and _second_life_bool(linked_purchase.get("second_life_enabled"))
+                and _second_life_bool(linked_purchase.get("second_life_used"))
+                and str(linked_purchase.get("second_life_status") or "").lower() in {"life2_waiting_mt5", "waiting_mt5"}
+                and completed_stage == "phase1"
+                and "breach" in str(completed_account.get("account_status") or completed_account.get("status") or "").lower()
             )
-            if expected_stage and target_stage != expected_stage:
-                return bad(f"Lifecycle authority requires {expected_stage} assignment for this completed account, not {target_stage}", 409)
-            if expected_stage:
-                target_stage = expected_stage
+            if not second_life_reentry:
+                expected_stage = _next_stage_for_lifecycle(
+                    completed_stage,
+                    completed_account,
+                    linked_purchase,
+                    None,
+                    trader
+                )
+                if expected_stage and target_stage != expected_stage:
+                    return bad(f"Lifecycle authority requires {expected_stage} assignment for this completed account, not {target_stage}", 409)
+                if expected_stage:
+                    target_stage = expected_stage
         mt5_acc = _get_mt5_account(mt5_id=mt5_id)
         purchase = _safe_purchase_for_account(completed_account) if completed_account else None
+        if target_stage == "phase1":
+            if not purchase or not _second_life_bool(purchase.get("second_life_used")) or str(purchase.get("second_life_status") or "").lower() not in {"life2_waiting_mt5", "waiting_mt5"}:
+                return bad("Fresh Phase 1 assignment is reserved for an activated Second Life purchase", 409)
         account, updated = _assign_mt5_to_trader(
             trader,
             mt5_acc,
@@ -5953,9 +6136,22 @@ def assign_phase_mt5():
             _admin_from_payload(d),
             d.get("admin_note") or f"{target_stage.title()} MT5 assigned"
         )
+        if target_stage == "phase1" and purchase and _second_life_bool(purchase.get("second_life_used")):
+            try:
+                supabase.table("challenge_purchases").update({
+                    "second_life_status": "life2_active",
+                    "lifecycle_state": "phase1_active",
+                    "trader_account_id": account.get("id"),
+                    "assigned_mt5_id": mt5_acc.get("id"),
+                    "mt5_login": account.get("mt5_login"),
+                    "mt5_server": account.get("mt5_server"),
+                    "updated_at": now_iso(),
+                }).eq("id", purchase.get("id")).execute()
+            except Exception as e:
+                print("SECOND LIFE PURCHASE ACTIVE UPDATE ERROR:", e)
         send_email_safe(
             updated.get("email"),
-            f"NairaPips {target_stage.upper()} MT5 account assigned",
+            f"NairaPips {'LIFE 2 PHASE 1' if target_stage == 'phase1' and purchase and _second_life_bool(purchase.get('second_life_used')) else target_stage.upper()} MT5 account assigned",
             f"""Hello {updated.get("name") or "Trader"},
 
 Your fresh {target_stage.upper()} MT5 account has been assigned.
