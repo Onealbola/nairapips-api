@@ -9524,6 +9524,9 @@ def staff_members():
     except Exception as e:
         return jsonify([])
 
+
+_NP_STAFF_LOGIN_CACHE = {}
+
 @app.post('/staff_login')
 def staff_login():
     try:
