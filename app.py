@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json, json
 import html
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_LOGIN_RECOVERY_2026_08_23"
 CORS(app)
@@ -2968,10 +2969,10 @@ def _admin_rest_rows(table, order_col="created_at", desc=True, limit=500):
         if order_col:
             params["order"] = f"{order_col}.{'desc' if desc else 'asc'}"
         url = f"{base}/rest/v1/{table}"
-        r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
+        r = requests.get(url, headers=headers, params=params, timeout=(2, 4))
         if r.status_code >= 400 and order_col:
             params.pop("order", None)
-            r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
+            r = requests.get(url, headers=headers, params=params, timeout=(2, 4))
         if r.status_code >= 400:
             print(f"ADMIN BOOTSTRAP REST ERROR {table}:", r.status_code, r.text[:180])
             return []
@@ -3013,16 +3014,49 @@ def admin_bootstrap():
 
     # First screen only: keep this genuinely light. Full module data is lazy-loaded
     # through existing paginated/module endpoints when the admin opens that module.
-    traders_rows = _admin_rest_rows("traders", "created_at", True, 50)
-    plan_rows = _admin_rest_rows("challenge_plans", "created_at", True, 100)
-    purchase_rows = _admin_rest_rows("challenge_purchases", "created_at", True, 50)
-    account_rows = _admin_rest_rows("trader_accounts", "updated_at", True, 100)
-    payout_rows = _admin_rest_rows("payouts", "created_at", True, 25)
-    mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 100)
+    #
+    # PRODUCTION PERFORMANCE FIX 2026-08-23:
+    # These tables are independent. Loading them sequentially can multiply Supabase
+    # latency and hold a synchronous Gunicorn worker long enough to hit frontend or
+    # worker timeouts. Fetch them concurrently and allow any non-core table to fail
+    # without blocking the Admin shell.
+    admin_jobs = {
+        "traders": ("traders", "created_at", True, 50),
+        "plans": ("challenge_plans", "created_at", True, 100),
+        "purchases": ("challenge_purchases", "created_at", True, 50),
+        "accounts": ("trader_accounts", "updated_at", True, 100),
+        "payouts": ("payouts", "created_at", True, 25),
+        "mt5": ("mt5_pool", "created_at", True, 100),
+        "announcements": ("announcements", "created_at", True, 25),
+        "events": ("monitoring_events", "created_at", True, 50),
+    }
+    admin_results = {key: [] for key in admin_jobs}
+    try:
+        with ThreadPoolExecutor(max_workers=len(admin_jobs), thread_name_prefix="np-admin-bootstrap") as pool:
+            future_map = {
+                pool.submit(_admin_rest_rows, *args): key
+                for key, args in admin_jobs.items()
+            }
+            for future in as_completed(future_map):
+                key = future_map[future]
+                try:
+                    admin_results[key] = future.result() or []
+                except Exception as e:
+                    print(f"ADMIN BOOTSTRAP PARALLEL FETCH ERROR {key}:", e)
+                    admin_results[key] = []
+    except Exception as e:
+        print("ADMIN BOOTSTRAP PARALLEL LAYER ERROR:", e)
+
+    traders_rows = admin_results["traders"]
+    plan_rows = admin_results["plans"]
+    purchase_rows = admin_results["purchases"]
+    account_rows = admin_results["accounts"]
+    payout_rows = admin_results["payouts"]
+    mt5_rows = admin_results["mt5"]
     ticket_rows = []
-    announcement_rows = _admin_rest_rows("announcements", "created_at", True, 25)
+    announcement_rows = admin_results["announcements"]
     snapshot_rows = []
-    event_rows = _admin_rest_rows("monitoring_events", "created_at", True, 50)
+    event_rows = admin_results["events"]
 
     # Phase assignment is operational module data, not first-screen data.
     # Loading it here previously allowed a slow queue scan to block Admin startup.
@@ -3102,8 +3136,20 @@ def admin_bootstrap():
         ],
     }
     try:
-        _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
-        _ADMIN_BOOTSTRAP_CACHE["payload"] = payload
+        # Do not turn a transient Supabase/network failure into 25 seconds of fake
+        # zero-data Admin state. Cache only when at least one core business table
+        # returned rows.
+        core_rows_loaded = (
+            len(traders_rows) + len(purchase_rows) + len(account_rows)
+            + len(payout_rows) + len(mt5_rows)
+        )
+        if core_rows_loaded > 0:
+            _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
+            _ADMIN_BOOTSTRAP_CACHE["payload"] = payload
+        else:
+            _ADMIN_BOOTSTRAP_CACHE["ts"] = 0
+            _ADMIN_BOOTSTRAP_CACHE["payload"] = None
+            payload["bootstrap_warning"] = "core_data_temporarily_unavailable"
     except Exception:
         pass
     return _np_ok(payload)
