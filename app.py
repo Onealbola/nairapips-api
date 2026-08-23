@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20"
+NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_LOGIN_RECOVERY_2026_08_23"
 CORS(app)
 
 # ============================================================
@@ -4768,10 +4768,26 @@ def trader_bootstrap():
                 .data
                 or []
             )
-            all_accounts = _enrich_accounts_with_latest_monitoring(
-                trader.get("id"),
-                [_decorate_account_for_api(row) for row in raw_all_accounts]
-            )
+            # PERFORMANCE SAFETY: active_accounts above are already enriched with the
+            # latest monitoring evidence. Do not run the same expensive monitoring
+            # enrichment a second time for the full historical portfolio. Reuse the
+            # enriched active rows where possible and keep history decorated only.
+            decorated_all = [_decorate_account_for_api(row) for row in raw_all_accounts]
+            enriched_by_id = {
+                str(row.get("id") or "").strip(): row
+                for row in (active_accounts or [])
+                if str(row.get("id") or "").strip()
+            }
+            enriched_by_login = {
+                str(row.get("mt5_login") or "").strip(): row
+                for row in (active_accounts or [])
+                if str(row.get("mt5_login") or "").strip()
+            }
+            all_accounts = []
+            for row in decorated_all:
+                rid = str(row.get("id") or "").strip()
+                login = str(row.get("mt5_login") or "").strip()
+                all_accounts.append(enriched_by_id.get(rid) or enriched_by_login.get(login) or row)
         except Exception as all_account_error:
             print("TRADER BOOTSTRAP ALL ACCOUNTS ERROR:", all_account_error)
 
@@ -4864,6 +4880,140 @@ def trader_bootstrap():
         return ok(_cache_set(_TRADER_BOOTSTRAP_CACHE, key, payload), "Trader bootstrap loaded")
     except Exception as e:
         return bad(e)
+
+
+@app.route("/trader_account_recovery", methods=["GET", "OPTIONS"])
+def trader_account_recovery():
+    """Fast authenticated recovery feed for a trader whose full bootstrap is delayed.
+
+    Read-only production safety:
+    - trader identity comes from the signed trader token;
+    - trader_accounts remains the account source of truth;
+    - no lifecycle, MT5, drawdown, payout, reset or monitoring state is mutated;
+    - only the current account receives one lightweight latest-snapshot refresh.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    started = time.time()
+    try:
+        requested_id = str(request.args.get("trader_id") or "").strip()
+        trader_id, auth_error = _authenticated_trader_id_for_request(requested_id or None)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+
+        trader = _get_trader_by_id(trader_id) or {}
+        if not trader:
+            return _np_fail("Trader not found", 404)
+
+        raw_rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("trader_id", trader_id)
+            .order("updated_at", desc=True)
+            .order("started_at", desc=True)
+            .order("created_at", desc=True)
+            .limit(200)
+            .execute().data or []
+        )
+        rows = [_decorate_account_for_api(row) for row in raw_rows]
+
+        active_rows = [
+            row for row in rows
+            if str(row.get("account_status") or "").strip().lower() in ACTIVE_ACCOUNT_STATUSES
+        ]
+        current_id = str(trader.get("current_account_id") or "").strip()
+        current = next((row for row in active_rows if current_id and str(row.get("id") or "").strip() == current_id), None)
+        if not current and active_rows:
+            current = active_rows[0]
+
+        latest_monitoring = None
+        if current:
+            account_id = str(current.get("id") or "").strip()
+            login = str(current.get("mt5_login") or "").strip()
+            try:
+                q = (
+                    supabase.table("monitoring_snapshots")
+                    .select("id,trader_id,trader_account_id,mt5_login,balance,equity,profit,profit_percent,dd_used_percent,max_drawdown_used,drawdown_percent,risk_zone,created_at,updated_at")
+                    .order("created_at", desc=True)
+                    .limit(1)
+                )
+                if account_id:
+                    q = q.eq("trader_account_id", account_id)
+                elif login:
+                    q = q.eq("trader_id", trader_id).eq("mt5_login", login)
+                snap_rows = q.execute().data or []
+                latest_monitoring = snap_rows[0] if snap_rows else None
+            except Exception as e:
+                print("TRADER RECOVERY MONITORING WARNING:", e)
+
+            if latest_monitoring:
+                current = dict(current)
+                if latest_monitoring.get("balance") is not None:
+                    current["current_balance"] = latest_monitoring.get("balance")
+                    current["balance"] = latest_monitoring.get("balance")
+                if latest_monitoring.get("equity") is not None:
+                    current["current_equity"] = latest_monitoring.get("equity")
+                    current["equity"] = latest_monitoring.get("equity")
+                if latest_monitoring.get("profit") is not None:
+                    current["profit"] = latest_monitoring.get("profit")
+                if latest_monitoring.get("profit_percent") is not None:
+                    current["profit_percent"] = latest_monitoring.get("profit_percent")
+                if latest_monitoring.get("drawdown_percent") is not None:
+                    current["absolute_drawdown_percent"] = latest_monitoring.get("drawdown_percent")
+                if latest_monitoring.get("dd_used_percent") is not None:
+                    current["dd_used_percent"] = latest_monitoring.get("dd_used_percent")
+                elif latest_monitoring.get("max_drawdown_used") is not None:
+                    current["dd_used_percent"] = latest_monitoring.get("max_drawdown_used")
+                if latest_monitoring.get("risk_zone"):
+                    current["risk_zone"] = latest_monitoring.get("risk_zone")
+                current["last_sync_at"] = latest_monitoring.get("created_at") or latest_monitoring.get("updated_at") or current.get("last_sync_at")
+                current = _decorate_account_for_api(current)
+
+                cid = str(current.get("id") or "").strip()
+                clogin = str(current.get("mt5_login") or "").strip()
+                rows = [
+                    current if ((cid and str(row.get("id") or "").strip() == cid) or (not cid and clogin and str(row.get("mt5_login") or "").strip() == clogin)) else row
+                    for row in rows
+                ]
+                active_rows = [
+                    current if ((cid and str(row.get("id") or "").strip() == cid) or (not cid and clogin and str(row.get("mt5_login") or "").strip() == clogin)) else row
+                    for row in active_rows
+                ]
+
+        payout_rows = _safe_fetch("payouts", "trader_id", trader_id, 100)
+        purchase = _latest_purchase_for_trader(trader)
+
+        public_trader = _public_trader_payload(trader)
+        if current:
+            public_trader.update({
+                "current_account_id": current.get("id"),
+                "trader_account_id": current.get("id"),
+                "phase": current.get("stage") or current.get("phase") or public_trader.get("phase"),
+                "mt5_login": current.get("mt5_login"),
+                "mt5_server": current.get("mt5_server"),
+                "account_size": current.get("account_size") or current.get("start_balance"),
+            })
+
+        payload = {
+            "success": True,
+            "source": "trader_account_recovery_v1",
+            "generated_at": now_iso(),
+            "duration_ms": int((time.time() - started) * 1000),
+            "trader": public_trader,
+            "current_account": _trader_safe_account_row(current) if current else None,
+            "active_accounts": [_trader_safe_account_row(row) for row in active_rows],
+            "accounts": [_trader_safe_account_row(row) for row in active_rows],
+            "all_accounts": [_trader_safe_account_row(row) for row in rows],
+            "active_purchase": _trader_safe_purchase_row(purchase) if purchase else None,
+            "payouts": [_trader_safe_payout_row(row) for row in payout_rows],
+            "latest_monitoring": _trader_safe_monitoring_row(latest_monitoring) if latest_monitoring else None,
+        }
+        print(f"PERF trader_account_recovery trader_id={trader_id} duration_ms={payload['duration_ms']} accounts={len(rows)}")
+        return ok(payload, "Trader account recovery loaded")
+    except Exception as e:
+        print("TRADER ACCOUNT RECOVERY ERROR:", e)
+        return _np_fail("Unable to recover trader account data", 503)
 
 
 def _trader_login_candidates(lookup):
