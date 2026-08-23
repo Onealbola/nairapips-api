@@ -6314,77 +6314,111 @@ def payouts():
             admin, auth_response = _require_admin()
             if auth_response:
                 return auth_response
-        # PERMANENT TRADER PAYOUT HISTORY AUTHORITY:
-        # Historical payout rows may come from older production generations where
-        # trader_id was missing/stale but the verified trader email was preserved.
-        # For an authenticated trader, retrieve BOTH identity paths and merge them.
-        # Never use an unverified email supplied by the browser as authority.
-        if trader_id:
-            merged = []
-            seen = set()
-
-            try:
-                id_rows = (
-                    supabase.table("payouts")
-                    .select("*")
-                    .eq("trader_id", trader_id)
-                    .order("created_at", desc=True)
-                    .limit(limit)
-                    .execute().data or []
-                )
-            except Exception as e:
-                print("TRADER PAYOUT HISTORY ID FETCH ERROR:", e)
-                id_rows = []
-
-            email_rows = []
-            if email:
-                try:
-                    email_rows = (
-                        supabase.table("payouts")
-                        .select("*")
-                        .eq("email", email)
-                        .order("created_at", desc=True)
-                        .limit(limit)
-                        .execute().data or []
-                    )
-                except Exception as e:
-                    print("TRADER PAYOUT HISTORY EMAIL FETCH ERROR:", e)
-
-            for row in list(id_rows) + list(email_rows):
-                key = str(
-                    (row or {}).get("id")
-                    or "|".join([
-                        str((row or {}).get("trader_id") or ""),
-                        str((row or {}).get("email") or "").lower(),
-                        str((row or {}).get("mt5_login") or ""),
-                        str((row or {}).get("amount") or ""),
-                        str((row or {}).get("requested_at") or (row or {}).get("created_at") or ""),
-                    ])
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append(row)
-
-            merged.sort(
-                key=lambda r: str(
-                    (r or {}).get("requested_at")
-                    or (r or {}).get("created_at")
-                    or (r or {}).get("updated_at")
-                    or ""
-                ),
-                reverse=True,
-            )
-            rows = [_trader_safe_payout_row(r) for r in merged[:limit]]
-            return jsonify(rows)
-
-        # Admin behaviour remains unchanged.
         q = supabase.table("payouts").select("*")
+        if trader_id:
+            q = q.eq("trader_id", trader_id)
+        elif email:
+            q = q.eq("email", email)
         rows = q.order("created_at", desc=True).limit(limit).execute().data or []
+        if trader_id:
+            rows = [_trader_safe_payout_row(r) for r in rows]
         return jsonify(rows)
     except Exception as e:
         return bad(e)
 
+
+@app.route("/trader_payout_history", methods=["GET", "OPTIONS"])
+def trader_payout_history():
+    """Fast permanent payout-request history for the authenticated trader.
+
+    A request belongs in history immediately when submitted. Approval/payment
+    only changes the status of the same payout row.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    try:
+        requested_id = str(request.args.get("trader_id") or "").strip()
+        authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+
+        trader = _get_trader_by_id(authed_id) or {}
+        verified_email = str(trader.get("email") or "").strip().lower()
+        limit = max(1, min(int(request.args.get("limit") or 200), 300))
+
+        collected = []
+
+        # Fast canonical lookup: current authenticated trader id.
+        try:
+            collected.extend(
+                supabase.table("payouts").select("*")
+                .eq("trader_id", authed_id)
+                .order("created_at", desc=True).limit(limit)
+                .execute().data or []
+            )
+        except Exception as e:
+            print("TRADER PAYOUT HISTORY ID ERROR:", e)
+
+        # Historical compatibility: old payout rows may retain the trader email
+        # while their trader_id is absent/stale. This is a verified DB email,
+        # never an email trusted from the browser request.
+        if verified_email:
+            try:
+                collected.extend(
+                    supabase.table("payouts").select("*")
+                    .eq("email", verified_email)
+                    .order("created_at", desc=True).limit(limit)
+                    .execute().data or []
+                )
+            except Exception as e:
+                print("TRADER PAYOUT HISTORY EMAIL ERROR:", e)
+
+        # Only if canonical identity returned nothing, use a small owned-account
+        # fallback. Do not scan monitoring or every MT5 on normal page opening.
+        if not collected:
+            try:
+                owned = (
+                    supabase.table("trader_accounts")
+                    .select("id")
+                    .eq("trader_id", authed_id)
+                    .order("updated_at", desc=True).limit(100)
+                    .execute().data or []
+                )
+                account_ids=[str(r.get("id") or "").strip() for r in owned if str(r.get("id") or "").strip()]
+                if account_ids:
+                    collected.extend(
+                        supabase.table("payouts").select("*")
+                        .in_("trader_account_id", account_ids)
+                        .order("created_at", desc=True).limit(limit)
+                        .execute().data or []
+                    )
+            except Exception as e:
+                print("TRADER PAYOUT HISTORY ACCOUNT FALLBACK ERROR:", e)
+
+        merged={}
+        for row in collected:
+            row=row or {}
+            key=str(row.get("id") or "|".join([
+                str(row.get("trader_id") or ""),
+                str(row.get("email") or "").lower(),
+                str(row.get("mt5_login") or ""),
+                str(row.get("amount") or ""),
+                str(row.get("requested_at") or row.get("created_at") or ""),
+            ]))
+            merged[key]={**(merged.get(key) or {}), **row}
+
+        rows=list(merged.values())
+        rows.sort(key=lambda r: str(r.get("requested_at") or r.get("created_at") or r.get("updated_at") or ""), reverse=True)
+        safe_rows=[_trader_safe_payout_row(r) for r in rows[:limit]]
+        return _np_ok({
+            "payouts": safe_rows,
+            "data": safe_rows,
+            "count": len(safe_rows),
+            "includes_pending_requests": True,
+        })
+    except Exception as e:
+        return _np_fail(e, 500)
 
 def _set_funded_payout_trade_lock(trader_row, account, payout_id=None, reason="Payout request pending"):
     """Lock exact funded account while payout is open; separate from reset."""
