@@ -6576,14 +6576,62 @@ def create_payout():
         if amount<=0:
             return bad("Invalid payout amount")
 
-        trader_row = _resolve_trader_for_money_action(d)
-        eligible, reason, account = _payout_eligibility(trader_row)
-        if not eligible:
-            return bad(reason, 403)
+        # PAYOUT ACCOUNT AUTHORITY (2026-08-23):
+        # A trader may own multiple funded accounts. The exact trader_account_id sent
+        # by the dashboard is the financial authority for this payout; never silently
+        # substitute the trader's current/default account.
+        requested_trader_id = str(d.get("trader_id") or d.get("id") or "").strip()
+        authed_trader_id, auth_error = _authenticated_trader_id_for_request(requested_trader_id or None)
+        if auth_error:
+            return bad(auth_error, 401 if "required" in str(auth_error).lower() else 403)
+
+        trader_row = get_trader_by_id(authed_trader_id)
+        if not trader_row:
+            return bad("Trader not found", 404)
+
+        requested_account_id = str(d.get("trader_account_id") or d.get("account_id") or "").strip()
+        if not requested_account_id:
+            return bad("A funded trader account is required for payout.", 400)
+
+        account_rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("id", requested_account_id)
+            .eq("trader_id", authed_trader_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not account_rows:
+            return bad("The selected payout account does not belong to this trader.", 403)
+
+        account = _decorate_account_for_api(account_rows[0])
+        try:
+            enriched = _enrich_accounts_with_latest_monitoring(authed_trader_id, [account])
+            if enriched:
+                account = enriched[0]
+        except Exception as payout_enrich_error:
+            print("PAYOUT EXACT ACCOUNT MONITORING ENRICH WARNING:", payout_enrich_error)
+
+        account_stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
+        account_status = str(account.get("account_status") or account.get("status") or "").strip().lower()
+        if str(account.get("programme_type") or "").strip().lower() == "traders_league":
+            return bad("League competition accounts are not eligible for paid payouts.", 403)
+        if account_stage not in {"funded", "live", "funded_live"}:
+            return bad("Payouts require the selected account to be funded stage.", 403)
+        if account_status not in ACTIVE_ACCOUNT_STATUSES:
+            return bad("The selected funded account is not active for payout.", 403)
+        if _is_truthy(account.get("mt5_access_disabled")):
+            return bad("The selected funded account is currently restricted.", 403)
 
         # Standalone payout safety: one open request per exact funded account.
         # This does not call, modify, or share logic with the breach/reset system.
-        open_payout_statuses = ["pending", "approved", "processing", "payment_processing"]
+        open_payout_statuses = [
+            "pending", "requested", "submitted", "request_pending",
+            "pending_review", "awaiting_review", "under_review",
+            "approved", "approved_payout_pending", "processing", "payment_processing"
+        ]
         try:
             open_rows = (
                 supabase.table("payouts")
