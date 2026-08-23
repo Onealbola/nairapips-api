@@ -9,9 +9,8 @@ from datetime import datetime, timezone
 import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json, json
 import html
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_LOGIN_RECOVERY_2026_08_23"
+NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20"
 CORS(app)
 
 # ============================================================
@@ -687,12 +686,13 @@ _TRADER_PURCHASE_RESPONSE_FIELDS = {
 }
 
 _TRADER_PAYOUT_RESPONSE_FIELDS = {
-    "id", "trader_id", "trader_account_id", "trader_name", "mt5_login",
+    "id", "trader_id", "trader_account_id", "trader_name", "email", "mt5_login",
     "mt5_server", "account_size", "start_balance", "current_balance",
     "current_equity", "verified_profit", "payout_split", "available_payout",
     "amount", "profit_share_amount", "payment_method", "method", "bank_name",
-    "account_number", "account_name", "status", "note", "created_at",
-    "updated_at", "approved_at", "rejected_at", "paid_at"
+    "account_number", "account_name", "status", "note", "admin_note",
+    "requested_at", "created_at", "updated_at", "approved_at", "rejected_at",
+    "cancelled_at", "paid_at"
 }
 
 _TRADER_MONITORING_RESPONSE_FIELDS = {
@@ -2969,10 +2969,10 @@ def _admin_rest_rows(table, order_col="created_at", desc=True, limit=500):
         if order_col:
             params["order"] = f"{order_col}.{'desc' if desc else 'asc'}"
         url = f"{base}/rest/v1/{table}"
-        r = requests.get(url, headers=headers, params=params, timeout=(2, 4))
+        r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
         if r.status_code >= 400 and order_col:
             params.pop("order", None)
-            r = requests.get(url, headers=headers, params=params, timeout=(2, 4))
+            r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
         if r.status_code >= 400:
             print(f"ADMIN BOOTSTRAP REST ERROR {table}:", r.status_code, r.text[:180])
             return []
@@ -3014,49 +3014,16 @@ def admin_bootstrap():
 
     # First screen only: keep this genuinely light. Full module data is lazy-loaded
     # through existing paginated/module endpoints when the admin opens that module.
-    #
-    # PRODUCTION PERFORMANCE FIX 2026-08-23:
-    # These tables are independent. Loading them sequentially can multiply Supabase
-    # latency and hold a synchronous Gunicorn worker long enough to hit frontend or
-    # worker timeouts. Fetch them concurrently and allow any non-core table to fail
-    # without blocking the Admin shell.
-    admin_jobs = {
-        "traders": ("traders", "created_at", True, 50),
-        "plans": ("challenge_plans", "created_at", True, 100),
-        "purchases": ("challenge_purchases", "created_at", True, 50),
-        "accounts": ("trader_accounts", "updated_at", True, 100),
-        "payouts": ("payouts", "created_at", True, 25),
-        "mt5": ("mt5_pool", "created_at", True, 100),
-        "announcements": ("announcements", "created_at", True, 25),
-        "events": ("monitoring_events", "created_at", True, 50),
-    }
-    admin_results = {key: [] for key in admin_jobs}
-    try:
-        with ThreadPoolExecutor(max_workers=len(admin_jobs), thread_name_prefix="np-admin-bootstrap") as pool:
-            future_map = {
-                pool.submit(_admin_rest_rows, *args): key
-                for key, args in admin_jobs.items()
-            }
-            for future in as_completed(future_map):
-                key = future_map[future]
-                try:
-                    admin_results[key] = future.result() or []
-                except Exception as e:
-                    print(f"ADMIN BOOTSTRAP PARALLEL FETCH ERROR {key}:", e)
-                    admin_results[key] = []
-    except Exception as e:
-        print("ADMIN BOOTSTRAP PARALLEL LAYER ERROR:", e)
-
-    traders_rows = admin_results["traders"]
-    plan_rows = admin_results["plans"]
-    purchase_rows = admin_results["purchases"]
-    account_rows = admin_results["accounts"]
-    payout_rows = admin_results["payouts"]
-    mt5_rows = admin_results["mt5"]
+    traders_rows = _admin_rest_rows("traders", "created_at", True, 50)
+    plan_rows = _admin_rest_rows("challenge_plans", "created_at", True, 100)
+    purchase_rows = _admin_rest_rows("challenge_purchases", "created_at", True, 50)
+    account_rows = _admin_rest_rows("trader_accounts", "updated_at", True, 100)
+    payout_rows = _admin_rest_rows("payouts", "created_at", True, 25)
+    mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 100)
     ticket_rows = []
-    announcement_rows = admin_results["announcements"]
+    announcement_rows = _admin_rest_rows("announcements", "created_at", True, 25)
     snapshot_rows = []
-    event_rows = admin_results["events"]
+    event_rows = _admin_rest_rows("monitoring_events", "created_at", True, 50)
 
     # Phase assignment is operational module data, not first-screen data.
     # Loading it here previously allowed a slow queue scan to block Admin startup.
@@ -3136,20 +3103,8 @@ def admin_bootstrap():
         ],
     }
     try:
-        # Do not turn a transient Supabase/network failure into 25 seconds of fake
-        # zero-data Admin state. Cache only when at least one core business table
-        # returned rows.
-        core_rows_loaded = (
-            len(traders_rows) + len(purchase_rows) + len(account_rows)
-            + len(payout_rows) + len(mt5_rows)
-        )
-        if core_rows_loaded > 0:
-            _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
-            _ADMIN_BOOTSTRAP_CACHE["payload"] = payload
-        else:
-            _ADMIN_BOOTSTRAP_CACHE["ts"] = 0
-            _ADMIN_BOOTSTRAP_CACHE["payload"] = None
-            payload["bootstrap_warning"] = "core_data_temporarily_unavailable"
+        _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
+        _ADMIN_BOOTSTRAP_CACHE["payload"] = payload
     except Exception:
         pass
     return _np_ok(payload)
@@ -4799,14 +4754,7 @@ def trader_bootstrap():
         purchase = _latest_purchase_for_trader(trader)
         purchases = _dedupe_by_id(_safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100))
         active_accounts = _get_active_accounts(trader.get("id"), trader, purchases)
-        # BOOTSTRAP LATENCY SAFETY (2026-08-23):
-        # Do NOT scan monitoring_snapshots / monitoring_events history while opening
-        # the trader dashboard. That enrichment performs several potentially large
-        # Supabase queries and has been observed to hold a sync Gunicorn worker until
-        # WORKER TIMEOUT. trader_accounts remains lifecycle/account authority here;
-        # the exact current account receives a single targeted latest-monitoring query
-        # later in this route. Full monitoring history stays lazy-loaded by its modules.
-        active_accounts = [_decorate_account_for_api(row) for row in (active_accounts or [])]
+        active_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), active_accounts)
         all_accounts = list(active_accounts or [])
         try:
             raw_all_accounts = (
@@ -4821,26 +4769,10 @@ def trader_bootstrap():
                 .data
                 or []
             )
-            # PERFORMANCE SAFETY: active_accounts above are already enriched with the
-            # latest monitoring evidence. Do not run the same expensive monitoring
-            # enrichment a second time for the full historical portfolio. Reuse the
-            # enriched active rows where possible and keep history decorated only.
-            decorated_all = [_decorate_account_for_api(row) for row in raw_all_accounts]
-            enriched_by_id = {
-                str(row.get("id") or "").strip(): row
-                for row in (active_accounts or [])
-                if str(row.get("id") or "").strip()
-            }
-            enriched_by_login = {
-                str(row.get("mt5_login") or "").strip(): row
-                for row in (active_accounts or [])
-                if str(row.get("mt5_login") or "").strip()
-            }
-            all_accounts = []
-            for row in decorated_all:
-                rid = str(row.get("id") or "").strip()
-                login = str(row.get("mt5_login") or "").strip()
-                all_accounts.append(enriched_by_id.get(rid) or enriched_by_login.get(login) or row)
+            all_accounts = _enrich_accounts_with_latest_monitoring(
+                trader.get("id"),
+                [_decorate_account_for_api(row) for row in raw_all_accounts]
+            )
         except Exception as all_account_error:
             print("TRADER BOOTSTRAP ALL ACCOUNTS ERROR:", all_account_error)
 
@@ -4859,7 +4791,7 @@ def trader_bootstrap():
                 account = enriched_current
 
         pending_replacements = [
-            row for row in _purchase_accounts_for_trader(trader, purchases)
+            row for row in _purchase_accounts_for_trader(trader)
             if str(row.get("account_status") or "").strip().lower() == "waiting_mt5"
         ]
         payload = {
@@ -4933,140 +4865,6 @@ def trader_bootstrap():
         return ok(_cache_set(_TRADER_BOOTSTRAP_CACHE, key, payload), "Trader bootstrap loaded")
     except Exception as e:
         return bad(e)
-
-
-@app.route("/trader_account_recovery", methods=["GET", "OPTIONS"])
-def trader_account_recovery():
-    """Fast authenticated recovery feed for a trader whose full bootstrap is delayed.
-
-    Read-only production safety:
-    - trader identity comes from the signed trader token;
-    - trader_accounts remains the account source of truth;
-    - no lifecycle, MT5, drawdown, payout, reset or monitoring state is mutated;
-    - only the current account receives one lightweight latest-snapshot refresh.
-    """
-    if request.method == "OPTIONS":
-        return _np_ok({"success": True})
-
-    started = time.time()
-    try:
-        requested_id = str(request.args.get("trader_id") or "").strip()
-        trader_id, auth_error = _authenticated_trader_id_for_request(requested_id or None)
-        if auth_error:
-            return _np_fail(auth_error, 401)
-
-        trader = _get_trader_by_id(trader_id) or {}
-        if not trader:
-            return _np_fail("Trader not found", 404)
-
-        raw_rows = (
-            supabase.table("trader_accounts")
-            .select("*")
-            .eq("trader_id", trader_id)
-            .order("updated_at", desc=True)
-            .order("started_at", desc=True)
-            .order("created_at", desc=True)
-            .limit(200)
-            .execute().data or []
-        )
-        rows = [_decorate_account_for_api(row) for row in raw_rows]
-
-        active_rows = [
-            row for row in rows
-            if str(row.get("account_status") or "").strip().lower() in ACTIVE_ACCOUNT_STATUSES
-        ]
-        current_id = str(trader.get("current_account_id") or "").strip()
-        current = next((row for row in active_rows if current_id and str(row.get("id") or "").strip() == current_id), None)
-        if not current and active_rows:
-            current = active_rows[0]
-
-        latest_monitoring = None
-        if current:
-            account_id = str(current.get("id") or "").strip()
-            login = str(current.get("mt5_login") or "").strip()
-            try:
-                q = (
-                    supabase.table("monitoring_snapshots")
-                    .select("id,trader_id,trader_account_id,mt5_login,balance,equity,profit,profit_percent,dd_used_percent,max_drawdown_used,drawdown_percent,risk_zone,created_at,updated_at")
-                    .order("created_at", desc=True)
-                    .limit(1)
-                )
-                if account_id:
-                    q = q.eq("trader_account_id", account_id)
-                elif login:
-                    q = q.eq("trader_id", trader_id).eq("mt5_login", login)
-                snap_rows = q.execute().data or []
-                latest_monitoring = snap_rows[0] if snap_rows else None
-            except Exception as e:
-                print("TRADER RECOVERY MONITORING WARNING:", e)
-
-            if latest_monitoring:
-                current = dict(current)
-                if latest_monitoring.get("balance") is not None:
-                    current["current_balance"] = latest_monitoring.get("balance")
-                    current["balance"] = latest_monitoring.get("balance")
-                if latest_monitoring.get("equity") is not None:
-                    current["current_equity"] = latest_monitoring.get("equity")
-                    current["equity"] = latest_monitoring.get("equity")
-                if latest_monitoring.get("profit") is not None:
-                    current["profit"] = latest_monitoring.get("profit")
-                if latest_monitoring.get("profit_percent") is not None:
-                    current["profit_percent"] = latest_monitoring.get("profit_percent")
-                if latest_monitoring.get("drawdown_percent") is not None:
-                    current["absolute_drawdown_percent"] = latest_monitoring.get("drawdown_percent")
-                if latest_monitoring.get("dd_used_percent") is not None:
-                    current["dd_used_percent"] = latest_monitoring.get("dd_used_percent")
-                elif latest_monitoring.get("max_drawdown_used") is not None:
-                    current["dd_used_percent"] = latest_monitoring.get("max_drawdown_used")
-                if latest_monitoring.get("risk_zone"):
-                    current["risk_zone"] = latest_monitoring.get("risk_zone")
-                current["last_sync_at"] = latest_monitoring.get("created_at") or latest_monitoring.get("updated_at") or current.get("last_sync_at")
-                current = _decorate_account_for_api(current)
-
-                cid = str(current.get("id") or "").strip()
-                clogin = str(current.get("mt5_login") or "").strip()
-                rows = [
-                    current if ((cid and str(row.get("id") or "").strip() == cid) or (not cid and clogin and str(row.get("mt5_login") or "").strip() == clogin)) else row
-                    for row in rows
-                ]
-                active_rows = [
-                    current if ((cid and str(row.get("id") or "").strip() == cid) or (not cid and clogin and str(row.get("mt5_login") or "").strip() == clogin)) else row
-                    for row in active_rows
-                ]
-
-        payout_rows = _safe_fetch("payouts", "trader_id", trader_id, 100)
-        purchase = _latest_purchase_for_trader(trader)
-
-        public_trader = _public_trader_payload(trader)
-        if current:
-            public_trader.update({
-                "current_account_id": current.get("id"),
-                "trader_account_id": current.get("id"),
-                "phase": current.get("stage") or current.get("phase") or public_trader.get("phase"),
-                "mt5_login": current.get("mt5_login"),
-                "mt5_server": current.get("mt5_server"),
-                "account_size": current.get("account_size") or current.get("start_balance"),
-            })
-
-        payload = {
-            "success": True,
-            "source": "trader_account_recovery_v1",
-            "generated_at": now_iso(),
-            "duration_ms": int((time.time() - started) * 1000),
-            "trader": public_trader,
-            "current_account": _trader_safe_account_row(current) if current else None,
-            "active_accounts": [_trader_safe_account_row(row) for row in active_rows],
-            "accounts": [_trader_safe_account_row(row) for row in active_rows],
-            "all_accounts": [_trader_safe_account_row(row) for row in rows],
-            "active_purchase": _trader_safe_purchase_row(purchase) if purchase else None,
-            "payouts": [_trader_safe_payout_row(row) for row in payout_rows],
-            "latest_monitoring": _trader_safe_monitoring_row(latest_monitoring) if latest_monitoring else None,
-        }
-        print(f"PERF trader_account_recovery trader_id={trader_id} duration_ms={payload['duration_ms']} accounts={len(rows)}")
-        return ok(payload, "Trader account recovery loaded")
-    except Exception as e:
-        print("TRADER ACCOUNT RECOVERY ERROR:", e)
-        return _np_fail("Unable to recover trader account data", 503)
 
 
 def _trader_login_candidates(lookup):
@@ -6516,14 +6314,73 @@ def payouts():
             admin, auth_response = _require_admin()
             if auth_response:
                 return auth_response
+        # PERMANENT TRADER PAYOUT HISTORY AUTHORITY:
+        # Historical payout rows may come from older production generations where
+        # trader_id was missing/stale but the verified trader email was preserved.
+        # For an authenticated trader, retrieve BOTH identity paths and merge them.
+        # Never use an unverified email supplied by the browser as authority.
+        if trader_id:
+            merged = []
+            seen = set()
+
+            try:
+                id_rows = (
+                    supabase.table("payouts")
+                    .select("*")
+                    .eq("trader_id", trader_id)
+                    .order("created_at", desc=True)
+                    .limit(limit)
+                    .execute().data or []
+                )
+            except Exception as e:
+                print("TRADER PAYOUT HISTORY ID FETCH ERROR:", e)
+                id_rows = []
+
+            email_rows = []
+            if email:
+                try:
+                    email_rows = (
+                        supabase.table("payouts")
+                        .select("*")
+                        .eq("email", email)
+                        .order("created_at", desc=True)
+                        .limit(limit)
+                        .execute().data or []
+                    )
+                except Exception as e:
+                    print("TRADER PAYOUT HISTORY EMAIL FETCH ERROR:", e)
+
+            for row in list(id_rows) + list(email_rows):
+                key = str(
+                    (row or {}).get("id")
+                    or "|".join([
+                        str((row or {}).get("trader_id") or ""),
+                        str((row or {}).get("email") or "").lower(),
+                        str((row or {}).get("mt5_login") or ""),
+                        str((row or {}).get("amount") or ""),
+                        str((row or {}).get("requested_at") or (row or {}).get("created_at") or ""),
+                    ])
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(row)
+
+            merged.sort(
+                key=lambda r: str(
+                    (r or {}).get("requested_at")
+                    or (r or {}).get("created_at")
+                    or (r or {}).get("updated_at")
+                    or ""
+                ),
+                reverse=True,
+            )
+            rows = [_trader_safe_payout_row(r) for r in merged[:limit]]
+            return jsonify(rows)
+
+        # Admin behaviour remains unchanged.
         q = supabase.table("payouts").select("*")
-        if trader_id:
-            q = q.eq("trader_id", trader_id)
-        elif email:
-            q = q.eq("email", email)
         rows = q.order("created_at", desc=True).limit(limit).execute().data or []
-        if trader_id:
-            rows = [_trader_safe_payout_row(r) for r in rows]
         return jsonify(rows)
     except Exception as e:
         return bad(e)
@@ -6629,62 +6486,14 @@ def create_payout():
         if amount<=0:
             return bad("Invalid payout amount")
 
-        # PAYOUT ACCOUNT AUTHORITY (2026-08-23):
-        # A trader may own multiple funded accounts. The exact trader_account_id sent
-        # by the dashboard is the financial authority for this payout; never silently
-        # substitute the trader's current/default account.
-        requested_trader_id = str(d.get("trader_id") or d.get("id") or "").strip()
-        authed_trader_id, auth_error = _authenticated_trader_id_for_request(requested_trader_id or None)
-        if auth_error:
-            return bad(auth_error, 401 if "required" in str(auth_error).lower() else 403)
-
-        trader_row = get_trader_by_id(authed_trader_id)
-        if not trader_row:
-            return bad("Trader not found", 404)
-
-        requested_account_id = str(d.get("trader_account_id") or d.get("account_id") or "").strip()
-        if not requested_account_id:
-            return bad("A funded trader account is required for payout.", 400)
-
-        account_rows = (
-            supabase.table("trader_accounts")
-            .select("*")
-            .eq("id", requested_account_id)
-            .eq("trader_id", authed_trader_id)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
-        if not account_rows:
-            return bad("The selected payout account does not belong to this trader.", 403)
-
-        account = _decorate_account_for_api(account_rows[0])
-        try:
-            enriched = _enrich_accounts_with_latest_monitoring(authed_trader_id, [account])
-            if enriched:
-                account = enriched[0]
-        except Exception as payout_enrich_error:
-            print("PAYOUT EXACT ACCOUNT MONITORING ENRICH WARNING:", payout_enrich_error)
-
-        account_stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
-        account_status = str(account.get("account_status") or account.get("status") or "").strip().lower()
-        if str(account.get("programme_type") or "").strip().lower() == "traders_league":
-            return bad("League competition accounts are not eligible for paid payouts.", 403)
-        if account_stage not in {"funded", "live", "funded_live"}:
-            return bad("Payouts require the selected account to be funded stage.", 403)
-        if account_status not in ACTIVE_ACCOUNT_STATUSES:
-            return bad("The selected funded account is not active for payout.", 403)
-        if _is_truthy(account.get("mt5_access_disabled")):
-            return bad("The selected funded account is currently restricted.", 403)
+        trader_row = _resolve_trader_for_money_action(d)
+        eligible, reason, account = _payout_eligibility(trader_row)
+        if not eligible:
+            return bad(reason, 403)
 
         # Standalone payout safety: one open request per exact funded account.
         # This does not call, modify, or share logic with the breach/reset system.
-        open_payout_statuses = [
-            "pending", "requested", "submitted", "request_pending",
-            "pending_review", "awaiting_review", "under_review",
-            "approved", "approved_payout_pending", "processing", "payment_processing"
-        ]
+        open_payout_statuses = ["pending", "approved", "processing", "payment_processing"]
         try:
             open_rows = (
                 supabase.table("payouts")
@@ -12252,69 +12061,12 @@ def admin_trader_accounts_feed():
             query = query.in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
         rows = query.execute().data or []
 
-        # PRODUCTION SAFETY: Admin must not show stale 0 values when MT5 monitoring
-        # has already synced newer balance/equity/profit evidence. This is read-only
-        # enrichment for the admin/trader account feed; it does not change trading logic.
-        try:
-            logins = []
-            for r in rows:
-                lg = str((r or {}).get("mt5_login") or "").strip()
-                if lg and lg not in logins:
-                    logins.append(lg)
-            latest_by_account = {}
-            snapshots_by_login = {}
-            for i in range(0, len(logins), 100):
-                batch = logins[i:i+100]
-                if not batch:
-                    continue
-                snaps = supabase.table("monitoring_snapshots").select("*").in_("mt5_login", batch).order("created_at", desc=True).limit(1000).execute().data or []
-                for snap in snaps:
-                    aid = str((snap or {}).get("trader_account_id") or "").strip()
-                    lg = str((snap or {}).get("mt5_login") or "").strip()
-                    if aid and aid not in latest_by_account:
-                        latest_by_account[aid] = snap
-                    if lg:
-                        snapshots_by_login.setdefault(lg, []).append(snap)
-            enriched = []
-            for r in rows:
-                row = dict(r or {})
-                account_id = str(row.get("id") or "").strip()
-                trader_owner = str(row.get("trader_id") or "").strip()
-                lg = str(row.get("mt5_login") or "").strip()
-                snap = latest_by_account.get(account_id)
-                # Legacy fallback is allowed only when exactly one snapshot candidate belongs
-                # to the same trader. Login alone is never lifecycle authority.
-                if not snap and lg:
-                    candidates = [x for x in snapshots_by_login.get(lg, []) if str((x or {}).get("trader_id") or "").strip() == trader_owner]
-                    accountless = [x for x in candidates if not str((x or {}).get("trader_account_id") or "").strip()]
-                    if len(accountless) == 1:
-                        snap = accountless[0]
-                if snap:
-                    # Prefer monitoring truth for live metrics, especially newly-fixed
-                    # accounts like Fatoba where trader_accounts may still show defaults.
-                    bal = snap.get("balance") or snap.get("current_balance")
-                    eq = snap.get("equity") or snap.get("current_equity") or bal
-                    profit = snap.get("profit") or snap.get("current_profit")
-                    profit_pct = snap.get("profit_percent") or snap.get("current_profit_percent")
-                    if bal not in [None, ""]:
-                        row["current_balance"] = bal
-                        row["balance"] = bal
-                    if eq not in [None, ""]:
-                        row["current_equity"] = eq
-                        row["equity"] = eq
-                    if profit not in [None, ""]:
-                        row["profit"] = profit
-                    if profit_pct not in [None, ""]:
-                        row["profit_percent"] = profit_pct
-                    for k in ["dd_used_percent", "max_drawdown_used", "drawdown_percent", "risk_zone", "highest_equity", "lowest_equity", "phase_pass_status", "target_percent", "target_equity"]:
-                        if snap.get(k) not in [None, ""]:
-                            row[k] = snap.get(k)
-                    row["latest_monitoring_snapshot"] = snap
-                    row["last_sync_at"] = snap.get("created_at") or row.get("last_sync_at")
-                enriched.append(row)
-            rows = enriched
-        except Exception as enrich_err:
-            print("ADMIN ACCOUNT FEED MONITORING ENRICH ERROR:", enrich_err)
+        # STABILITY RECOVERY 2026-08-23:
+        # Keep /trader_accounts a fast lifecycle/account-authority feed.
+        # Do NOT scan monitoring_snapshots here. Render logs proved that enrichment
+        # could hit PostgreSQL statement_timeout and hold a Gunicorn worker.
+        # Live monitoring remains available through dedicated monitoring/bootstrap
+        # paths and the MT5 engine; no trading rule or stored account data is changed.
 
         rows = [_decorate_account_for_api(r) if "_decorate_account_for_api" in globals() else r for r in rows]
         if trader_id:
@@ -15380,16 +15132,14 @@ def founding_social_action():
         note=f"{platform} button clicked"
     ))
 
-# Scheduler compatibility guard.
-# This production file currently has no start_scheduler definition; calling it at
-# module load only creates a misleading boot error on every Gunicorn worker start.
-# If a scheduler implementation is added by another build, start it safely.
+# Auto-start only when a scheduler implementation exists.
+# Production stability: do not raise/log a NameError on every Gunicorn worker boot.
 try:
-    _np_start_scheduler = globals().get("start_scheduler")
-    if callable(_np_start_scheduler):
-        _np_start_scheduler()
+    _np_scheduler = globals().get("start_scheduler")
+    if callable(_np_scheduler):
+        _np_scheduler()
 except Exception as e:
-    print("[BOOT] Scheduler start skipped safely:", e)
+    print("[BOOT] Scheduler start skipped:", e)
 
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
@@ -15977,7 +15727,11 @@ _LEAGUE_PUBLIC_TTL = 30.0
 def _is_league_account(account):
     if not account:
         return False
-    return str(account.get("programme_type") or "").strip().lower() == LEAGUE_PROGRAMME_TYPE
+    # Production compatibility: current trader_accounts may not expose
+    # programme_type. League assignments are already tied to a season through
+    # competition_id, so that is sufficient authority for this compatibility path.
+    programme = str(account.get("programme_type") or "").strip().lower()
+    return programme == LEAGUE_PROGRAMME_TYPE or bool(str(account.get("competition_id") or "").strip())
 
 
 def _default_league_nickname(registration, mt5_login, trader_id):
@@ -16180,7 +15934,7 @@ def _season_registration_counts(season_id):
     except Exception as e:
         print("LEAGUE REGISTRATION COUNTS ERROR:", str(e))
     try:
-        active = supabase.table("trader_accounts").select("id", count="exact").eq("programme_type", LEAGUE_PROGRAMME_TYPE).eq("competition_id", season_id).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).execute().count or 0
+        active = supabase.table("trader_accounts").select("id", count="exact").eq("competition_id", season_id).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).execute().count or 0
     except Exception as e:
         print("LEAGUE ACTIVE COUNT ERROR:", str(e))
     return registered, selected, active
@@ -16194,7 +15948,6 @@ def _compute_leaderboard_metrics(season, limit=20):
     try:
         rows = (supabase.table("trader_accounts")
                 .select("*")
-                .eq("programme_type", LEAGUE_PROGRAMME_TYPE)
                 .eq("competition_id", season_id)
                 .in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
                 .limit(500)
@@ -16488,17 +16241,17 @@ def trader_league_accounts():
         return _np_ok({})
     if not LEAGUE_ENABLED:
         return _public_disabled()
-    trader_id = _authenticated_trader_id_for_request()
-    if not trader_id:
-        return _np_fail("Trader authentication required", 401)
+    trader_id, auth_error = _authenticated_trader_id_for_request()
+    if auth_error:
+        return _np_fail(auth_error, 401)
     try:
         rows = (supabase.table("trader_accounts")
                 .select("*")
-                .eq("programme_type", LEAGUE_PROGRAMME_TYPE)
                 .eq("trader_id", trader_id)
                 .order("updated_at", desc=True)
-                .limit(50)
+                .limit(100)
                 .execute().data or [])
+        rows = [r for r in rows if str((r or {}).get("competition_id") or "").strip()]
     except Exception as e:
         print("TRADER LEAGUE ACCOUNTS ERROR:", str(e))
         rows = []
@@ -16523,16 +16276,15 @@ def trader_league_profile(season_id):
         return _np_ok({})
     if not LEAGUE_ENABLED:
         return _public_disabled()
-    trader_id = _authenticated_trader_id_for_request()
-    if not trader_id:
-        return _np_fail("Trader authentication required", 401)
+    trader_id, auth_error = _authenticated_trader_id_for_request()
+    if auth_error:
+        return _np_fail(auth_error, 401)
     season = _get_season_by_id(season_id)
     if not season:
         return _np_fail("Season not found", 404)
     try:
         rows = (supabase.table("trader_accounts")
                 .select("*")
-                .eq("programme_type", LEAGUE_PROGRAMME_TYPE)
                 .eq("trader_id", trader_id)
                 .eq("competition_id", season_id)
                 .limit(1)
@@ -16568,9 +16320,9 @@ def trader_league_nickname(season_id):
         return _np_ok({})
     if not LEAGUE_ENABLED:
         return _public_disabled()
-    trader_id = _authenticated_trader_id_for_request()
-    if not trader_id:
-        return _np_fail("Trader authentication required", 401)
+    trader_id, auth_error = _authenticated_trader_id_for_request()
+    if auth_error:
+        return _np_fail(auth_error, 401)
     data = request.get_json(silent=True) or {}
     nickname = str(data.get("public_nickname") or "").strip()
     if not LEAGUE_NICKNAME_RE.match(nickname):
@@ -16589,7 +16341,6 @@ def trader_league_nickname(season_id):
     try:
         rows = (supabase.table("trader_accounts")
                 .select("id")
-                .eq("programme_type", LEAGUE_PROGRAMME_TYPE)
                 .eq("trader_id", trader_id)
                 .eq("competition_id", season_id)
                 .limit(1)
