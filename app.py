@@ -2960,9 +2960,13 @@ def _admin_rest_rows(table, order_col="created_at", desc=True, limit=500):
     """
     try:
         base = (SUPABASE_URL or "").rstrip("/")
+        # Protected Admin feed: use the same server-side authority intended for
+        # staff/Admin operations. The anon/public key may be restricted by RLS and
+        # can legitimately return empty rows even when the data exists.
+        admin_rest_key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
         headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "apikey": admin_rest_key,
+            "Authorization": f"Bearer {admin_rest_key}",
             "Accept": "application/json",
         }
         params = {"select": "*", "limit": str(limit)}
@@ -3128,8 +3132,21 @@ def admin_bootstrap():
         ],
     }
     try:
-        _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
-        _ADMIN_BOOTSTRAP_CACHE["payload"] = payload
+        core_rows_loaded = (
+            len(traders_rows)
+            + len(purchase_rows)
+            + len(account_rows)
+            + len(payout_rows)
+            + len(mt5_rows)
+        )
+        if core_rows_loaded > 0:
+            _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
+            _ADMIN_BOOTSTRAP_CACHE["payload"] = payload
+        else:
+            # Never preserve a transient outage as "0 traders / 0 accounts".
+            _ADMIN_BOOTSTRAP_CACHE["ts"] = 0
+            _ADMIN_BOOTSTRAP_CACHE["payload"] = None
+            payload["bootstrap_warning"] = "core_admin_data_temporarily_unavailable"
     except Exception:
         pass
     return _np_ok(payload)
