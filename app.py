@@ -3143,10 +3143,13 @@ def admin_bootstrap():
             _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
             _ADMIN_BOOTSTRAP_CACHE["payload"] = payload
         else:
-            # Never preserve a transient outage as "0 traders / 0 accounts".
+            # Never preserve or return a transient outage as genuine
+            # "0 traders / 0 accounts". The Admin HTML already has proven
+            # fallback endpoints; returning a non-2xx response here makes its
+            # loadAll() fallback path activate automatically.
             _ADMIN_BOOTSTRAP_CACHE["ts"] = 0
             _ADMIN_BOOTSTRAP_CACHE["payload"] = None
-            payload["bootstrap_warning"] = "core_admin_data_temporarily_unavailable"
+            return _np_fail("Admin bootstrap core data temporarily unavailable", 503)
     except Exception:
         pass
     return _np_ok(payload)
