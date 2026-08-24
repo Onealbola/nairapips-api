@@ -2955,35 +2955,34 @@ def phase_assignment_queue():
 # ================================
 
 def _admin_rest_rows(table, order_col="created_at", desc=True, limit=500):
-    """Fetch a Supabase table directly with a hard timeout.
-    This prevents /admin_bootstrap from hanging forever when one table is slow.
+    """Stable NairaPips Admin table reader.
+
+    Restored from the last proven Admin data-loading path. This uses the same
+    Supabase key/REST visibility that the working production Admin used before
+    the recent bootstrap experiments.
     """
     try:
         base = (SUPABASE_URL or "").rstrip("/")
-        # Protected Admin feed: use the same server-side authority intended for
-        # staff/Admin operations. The anon/public key may be restricted by RLS and
-        # can legitimately return empty rows even when the data exists.
-        admin_rest_key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
         headers = {
-            "apikey": admin_rest_key,
-            "Authorization": f"Bearer {admin_rest_key}",
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
             "Accept": "application/json",
         }
         params = {"select": "*", "limit": str(limit)}
         if order_col:
             params["order"] = f"{order_col}.{'desc' if desc else 'asc'}"
         url = f"{base}/rest/v1/{table}"
-        r = requests.get(url, headers=headers, params=params, timeout=(2, 3))
+        r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
         if r.status_code >= 400 and order_col:
             params.pop("order", None)
-            r = requests.get(url, headers=headers, params=params, timeout=(2, 3))
+            r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
         if r.status_code >= 400:
             print(f"ADMIN BOOTSTRAP REST ERROR {table}:", r.status_code, r.text[:180])
             return []
         data = r.json()
         return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"ADMIN BOOTSTRAP REST TIMEOUT/ERROR {table}:", e)
+    except Exception as exc:
+        print(f"ADMIN BOOTSTRAP REST TIMEOUT/ERROR {table}:", exc)
         return []
 
 
@@ -3005,66 +3004,72 @@ def _quick_available_mt5(rows):
 def admin_bootstrap():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
+
     admin, auth_response = _require_admin()
     if auth_response:
         return auth_response
-    force = str(request.args.get("force") or request.args.get("fresh") or "").lower() in {"1", "true", "yes", "manual"}
-    cached_payload = _ADMIN_BOOTSTRAP_CACHE.get("payload") if isinstance(_ADMIN_BOOTSTRAP_CACHE, dict) else None
-    cached_ts = float(_ADMIN_BOOTSTRAP_CACHE.get("ts") or 0) if isinstance(_ADMIN_BOOTSTRAP_CACHE, dict) else 0
-    if cached_payload and not force and (time.time() - cached_ts) <= ADMIN_BOOTSTRAP_TTL_SECONDS:
+
+    force = str(
+        request.args.get("force") or request.args.get("fresh") or ""
+    ).lower() in {"1", "true", "yes", "manual"}
+
+    cached_payload = (
+        _ADMIN_BOOTSTRAP_CACHE.get("payload")
+        if isinstance(_ADMIN_BOOTSTRAP_CACHE, dict)
+        else None
+    )
+    cached_ts = (
+        float(_ADMIN_BOOTSTRAP_CACHE.get("ts") or 0)
+        if isinstance(_ADMIN_BOOTSTRAP_CACHE, dict)
+        else 0
+    )
+    if cached_payload and not force and (time.time() - cached_ts) <= 25:
         cached_payload["cached"] = True
         return _np_ok(cached_payload)
+
     started = time.time()
 
-    # ADMIN FIRST-SCREEN DIRECT LOAD:
-    # These six datasets are independent, so loading them sequentially multiplies
-    # Supabase latency. Load them concurrently and defer decorative/nonessential
-    # announcements + monitoring events until their modules are opened.
-    jobs = {
-        "traders": ("traders", "created_at", True, 50),
-        "plans": ("challenge_plans", "created_at", True, 100),
-        "purchases": ("challenge_purchases", "created_at", True, 50),
-        "accounts": ("trader_accounts", "updated_at", True, 100),
-        "payouts": ("payouts", "created_at", True, 25),
-        "mt5": ("mt5_pool", "created_at", True, 100),
-    }
-    results = {k: [] for k in jobs}
-    try:
-        with ThreadPoolExecutor(max_workers=6, thread_name_prefix="np-admin-first-screen") as pool:
-            futures = {pool.submit(_admin_rest_rows, *args): key for key, args in jobs.items()}
-            for future in as_completed(futures):
-                key = futures[future]
-                try:
-                    results[key] = future.result() or []
-                except Exception as fetch_error:
-                    print(f"ADMIN FIRST SCREEN FETCH ERROR {key}:", fetch_error)
-                    results[key] = []
-    except Exception as parallel_error:
-        print("ADMIN FIRST SCREEN PARALLEL ERROR:", parallel_error)
+    # RECOVERY MODE:
+    # Restore the exact core table authority and practical row coverage used by
+    # the previously working Admin. Do NOT parallelize these queries. Recent
+    # concurrent bootstrap experiments could return a fast but empty dashboard.
+    traders_rows = _admin_rest_rows("traders", "created_at", True, 1200)
+    plan_rows = _admin_rest_rows("challenge_plans", "created_at", True, 500)
+    purchase_rows = _admin_rest_rows("challenge_purchases", "created_at", True, 1200)
+    account_rows = _admin_rest_rows("trader_accounts", "updated_at", True, 2500)
+    payout_rows = _admin_rest_rows("payouts", "created_at", True, 800)
+    mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 1200)
 
-    traders_rows = results["traders"]
-    plan_rows = results["plans"]
-    purchase_rows = results["purchases"]
-    account_rows = results["accounts"]
-    payout_rows = results["payouts"]
-    mt5_rows = results["mt5"]
-
+    # Nonessential/heavy modules must not block Overview.
     ticket_rows = []
     announcement_rows = []
     snapshot_rows = []
     event_rows = []
-
-    # Phase assignment is operational module data, not first-screen data.
-    # Loading it here previously allowed a slow queue scan to block Admin startup.
-    # The existing /np_assignment_center endpoint now loads it only when the
-    # Phase Assignment module is opened.
     phase_queue_rows = []
 
     available_mt5_rows = _quick_available_mt5(mt5_rows)
 
+    core_rows_loaded = (
+        len(traders_rows)
+        + len(purchase_rows)
+        + len(account_rows)
+        + len(payout_rows)
+        + len(mt5_rows)
+    )
+
+    # Never represent a failed data connection as a genuine all-zero business.
+    # Returning 503 activates the existing Admin HTML fallback loader.
+    if core_rows_loaded == 0:
+        try:
+            _ADMIN_BOOTSTRAP_CACHE["ts"] = 0
+            _ADMIN_BOOTSTRAP_CACHE["payload"] = None
+        except Exception:
+            pass
+        return _np_fail("Admin core data connection temporarily unavailable", 503)
+
     payload = {
         "success": True,
-        "source": "admin_bootstrap_fast",
+        "source": "admin_bootstrap_recovered_stable_authority",
         "generated_at": now_iso(),
         "duration_ms": int((time.time() - started) * 1000),
 
@@ -3085,8 +3090,6 @@ def admin_bootstrap():
         "phase_assignment_queue": phase_queue_rows,
         "assignment_queue": phase_queue_rows,
 
-        # First-screen bootstrap is intentionally small. Monitoring history is lazy-loaded
-        # by monitoring-specific views/endpoints instead of blocking Admin startup.
         "trader_trades": [],
         "trades": [],
         "monitoring_snapshots": snapshot_rows,
@@ -3110,48 +3113,17 @@ def admin_bootstrap():
             "payouts": len(payout_rows),
             "mt5_pool": len(mt5_rows),
             "available_mt5": len(available_mt5_rows),
-            "phase_assignment_queue": len(phase_queue_rows),
+            "phase_assignment_queue": 0,
         },
-        "bootstrap_scope": "first_screen_lightweight",
-        "rows_loaded": {
-            "traders": len(traders_rows),
-            "challenge_plans": len(plan_rows),
-            "challenge_purchases": len(purchase_rows),
-            "trader_accounts": len(account_rows),
-            "payouts": len(payout_rows),
-            "mt5_pool": len(mt5_rows),
-            "support_tickets": len(ticket_rows),
-            "announcements": len(announcement_rows),
-            "monitoring_snapshots": len(snapshot_rows),
-            "monitoring_events": len(event_rows),
-        },
-        "module_data_deferred": [
-            "support", "monitoring", "payouts", "mt5_pool", "users_database",
-            "announcements", "full_traders", "full_purchases", "landing_leads",
-            "affiliates"
-        ],
+        "bootstrap_scope": "recovered_stable_core_only",
     }
+
     try:
-        core_rows_loaded = (
-            len(traders_rows)
-            + len(purchase_rows)
-            + len(account_rows)
-            + len(payout_rows)
-            + len(mt5_rows)
-        )
-        if core_rows_loaded > 0:
-            _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
-            _ADMIN_BOOTSTRAP_CACHE["payload"] = payload
-        else:
-            # Never preserve or return a transient outage as genuine
-            # "0 traders / 0 accounts". The Admin HTML already has proven
-            # fallback endpoints; returning a non-2xx response here makes its
-            # loadAll() fallback path activate automatically.
-            _ADMIN_BOOTSTRAP_CACHE["ts"] = 0
-            _ADMIN_BOOTSTRAP_CACHE["payload"] = None
-            return _np_fail("Admin bootstrap core data temporarily unavailable", 503)
+        _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
+        _ADMIN_BOOTSTRAP_CACHE["payload"] = payload
     except Exception:
         pass
+
     return _np_ok(payload)
 
 @app.route("/trader_current_account/<path:lookup>", methods=["GET"])
