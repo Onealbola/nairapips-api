@@ -15744,15 +15744,19 @@ def _runtime_flag(name, env_default):
         return _RUNTIME_FLAG_CACHE[name]
     return os.getenv(name, env_default) == "1"
 
-# Load overrides once at import time. Admin endpoints can call _load_runtime_flags()
-# again to refresh after the user toggles a flag in the admin UI.
-_load_runtime_flags()
-
-LEAGUE_ENABLED = _runtime_flag("LEAGUE_ENABLED", "0")
-LEAGUE_PUBLIC_ENABLED = _runtime_flag("LEAGUE_PUBLIC_ENABLED", "0")
-LEAGUE_REGISTRATION_ENABLED = _runtime_flag("LEAGUE_REGISTRATION_ENABLED", "0")
-LEAGUE_LEADERBOARD_ENABLED = _runtime_flag("LEAGUE_LEADERBOARD_ENABLED", "0")
-LEAGUE_ACTIVITY_ENABLED = _runtime_flag("LEAGUE_ACTIVITY_ENABLED", "0")
+# PRODUCTION STABILITY 2026-08-24:
+# NEVER query Supabase while a Gunicorn worker is importing/booting.
+# Render logs proved app_runtime_flags could block worker startup until the
+# Gunicorn timeout killed the worker before it could serve /staff_login.
+#
+# League starts immediately from environment defaults. Database overrides are
+# read only by explicit League admin endpoints/actions, never by login/bootstrap
+# or worker startup.
+LEAGUE_ENABLED = os.getenv("LEAGUE_ENABLED", "0") == "1"
+LEAGUE_PUBLIC_ENABLED = os.getenv("LEAGUE_PUBLIC_ENABLED", "0") == "1"
+LEAGUE_REGISTRATION_ENABLED = os.getenv("LEAGUE_REGISTRATION_ENABLED", "0") == "1"
+LEAGUE_LEADERBOARD_ENABLED = os.getenv("LEAGUE_LEADERBOARD_ENABLED", "0") == "1"
+LEAGUE_ACTIVITY_ENABLED = os.getenv("LEAGUE_ACTIVITY_ENABLED", "0") == "1"
 
 LEAGUE_PROGRAMME_TYPE = "traders_league"
 LEAGUE_ACCOUNT_STAGE = "phase1"  # re-uses existing stage machinery
