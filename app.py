@@ -2969,10 +2969,10 @@ def _admin_rest_rows(table, order_col="created_at", desc=True, limit=500):
         if order_col:
             params["order"] = f"{order_col}.{'desc' if desc else 'asc'}"
         url = f"{base}/rest/v1/{table}"
-        r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
+        r = requests.get(url, headers=headers, params=params, timeout=(2, 3))
         if r.status_code >= 400 and order_col:
             params.pop("order", None)
-            r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
+            r = requests.get(url, headers=headers, params=params, timeout=(2, 3))
         if r.status_code >= 400:
             print(f"ADMIN BOOTSTRAP REST ERROR {table}:", r.status_code, r.text[:180])
             return []
@@ -3012,18 +3012,43 @@ def admin_bootstrap():
         return _np_ok(cached_payload)
     started = time.time()
 
-    # First screen only: keep this genuinely light. Full module data is lazy-loaded
-    # through existing paginated/module endpoints when the admin opens that module.
-    traders_rows = _admin_rest_rows("traders", "created_at", True, 50)
-    plan_rows = _admin_rest_rows("challenge_plans", "created_at", True, 100)
-    purchase_rows = _admin_rest_rows("challenge_purchases", "created_at", True, 50)
-    account_rows = _admin_rest_rows("trader_accounts", "updated_at", True, 100)
-    payout_rows = _admin_rest_rows("payouts", "created_at", True, 25)
-    mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 100)
+    # ADMIN FIRST-SCREEN DIRECT LOAD:
+    # These six datasets are independent, so loading them sequentially multiplies
+    # Supabase latency. Load them concurrently and defer decorative/nonessential
+    # announcements + monitoring events until their modules are opened.
+    jobs = {
+        "traders": ("traders", "created_at", True, 50),
+        "plans": ("challenge_plans", "created_at", True, 100),
+        "purchases": ("challenge_purchases", "created_at", True, 50),
+        "accounts": ("trader_accounts", "updated_at", True, 100),
+        "payouts": ("payouts", "created_at", True, 25),
+        "mt5": ("mt5_pool", "created_at", True, 100),
+    }
+    results = {k: [] for k in jobs}
+    try:
+        with ThreadPoolExecutor(max_workers=6, thread_name_prefix="np-admin-first-screen") as pool:
+            futures = {pool.submit(_admin_rest_rows, *args): key for key, args in jobs.items()}
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    results[key] = future.result() or []
+                except Exception as fetch_error:
+                    print(f"ADMIN FIRST SCREEN FETCH ERROR {key}:", fetch_error)
+                    results[key] = []
+    except Exception as parallel_error:
+        print("ADMIN FIRST SCREEN PARALLEL ERROR:", parallel_error)
+
+    traders_rows = results["traders"]
+    plan_rows = results["plans"]
+    purchase_rows = results["purchases"]
+    account_rows = results["accounts"]
+    payout_rows = results["payouts"]
+    mt5_rows = results["mt5"]
+
     ticket_rows = []
-    announcement_rows = _admin_rest_rows("announcements", "created_at", True, 25)
+    announcement_rows = []
     snapshot_rows = []
-    event_rows = _admin_rest_rows("monitoring_events", "created_at", True, 50)
+    event_rows = []
 
     # Phase assignment is operational module data, not first-screen data.
     # Loading it here previously allowed a slow queue scan to block Admin startup.
@@ -4643,7 +4668,7 @@ def delete_trader():
 _TRADER_BOOTSTRAP_CACHE = {}
 _ADMIN_BOOTSTRAP_CACHE = {"ts": 0, "payload": None}
 TRADER_BOOTSTRAP_TTL_SECONDS = 5
-ADMIN_BOOTSTRAP_TTL_SECONDS = 25
+ADMIN_BOOTSTRAP_TTL_SECONDS = 45
 _NP_SYNC_LOCK = __import__("threading").Lock()
 _NP_SYNC_STATE = {"running": False, "started_at": None, "finished_at": None, "last_result": None, "last_error": None}
 NP_SYNC_LOCK_TABLE = os.getenv("NP_SYNC_LOCK_TABLE", "np_system_locks")
@@ -9537,25 +9562,29 @@ def staff_login():
         if not login or not password:
             return jsonify({'success': False, 'error': 'Enter username/email and password'}), 400
 
-        # Staff may sign in with either their username or registered email.
-        # Password verification and active status remain authoritative.
-        db = _staff_db()
-        rows = (
-            db.table('admin_staff_members')
-            .select('*')
-            .eq('username', login)
-            .eq('password', password)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
+        # ADMIN LOGIN DIRECT FAST PATH:
+        # The built-in NairaPips super-admin is verified locally FIRST. It must never
+        # wait for Supabase just to prove credentials already held by the server.
+        bootstrap_username = os.getenv('NAIRAPIPS_BOOTSTRAP_ADMIN_USERNAME', 'admin')
+        bootstrap_password = os.getenv('NAIRAPIPS_BOOTSTRAP_ADMIN_PASSWORD', 'nairapips123')
+        staff = None
 
-        if not rows and '@' in login:
+        if hmac.compare_digest(login, bootstrap_username) and hmac.compare_digest(password, bootstrap_password):
+            staff = {
+                'id': 'bootstrap-super-admin',
+                'username': bootstrap_username,
+                'name': 'Super Admin',
+                'role': 'super_admin',
+                'permissions': 'all',
+                'status': 'active',
+            }
+        else:
+            # Database lookup is only for additional staff accounts.
+            db = _staff_db()
             rows = (
                 db.table('admin_staff_members')
                 .select('*')
-                .eq('email', login.lower())
+                .eq('username', login)
                 .eq('password', password)
                 .limit(1)
                 .execute()
@@ -9563,21 +9592,19 @@ def staff_login():
                 or []
             )
 
-        staff = rows[0] if rows else None
+            if not rows and '@' in login:
+                rows = (
+                    db.table('admin_staff_members')
+                    .select('*')
+                    .eq('email', login.lower())
+                    .eq('password', password)
+                    .limit(1)
+                    .execute()
+                    .data
+                    or []
+                )
 
-        # Compatibility path for the existing NairaPips bootstrap super-admin.
-        if not staff:
-            bootstrap_username = os.getenv('NAIRAPIPS_BOOTSTRAP_ADMIN_USERNAME', 'admin')
-            bootstrap_password = os.getenv('NAIRAPIPS_BOOTSTRAP_ADMIN_PASSWORD', 'nairapips123')
-            if hmac.compare_digest(login, bootstrap_username) and hmac.compare_digest(password, bootstrap_password):
-                staff = {
-                    'id': 'bootstrap-super-admin',
-                    'username': bootstrap_username,
-                    'name': 'Super Admin',
-                    'role': 'super_admin',
-                    'permissions': 'all',
-                    'status': 'active',
-                }
+            staff = rows[0] if rows else None
 
         if not staff:
             return jsonify({'success': False, 'error': 'Invalid username/email or password'}), 401
@@ -13306,6 +13333,7 @@ def admin_mark_notification_read():
 """In-process scheduler for auto-pilot revenue engine."""
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from datetime import datetime, timezone, timedelta
 
