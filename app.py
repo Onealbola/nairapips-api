@@ -4730,6 +4730,50 @@ def _cache_set(store, key, payload):
     return payload
 
 
+
+def _critical_rest_rows(table, filters=None, order_col="created_at", desc=True, limit=100):
+    """Bounded REST reader for login/bootstrap critical paths only.
+    Uses server-side service role when available and hard network timeouts so
+    Supabase latency can never monopolize a Gunicorn worker indefinitely.
+    """
+    try:
+        base = (SUPABASE_URL or "").rstrip("/")
+        key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
+        headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        }
+        params = {"select": "*", "limit": str(max(1, min(int(limit or 100), 500)))}
+        for col, val in (filters or []):
+            if val not in (None, ""):
+                params[str(col)] = f"eq.{val}"
+        if order_col:
+            params["order"] = f"{order_col}.{'desc' if desc else 'asc'}"
+        r = requests.get(
+            f"{base}/rest/v1/{table}",
+            headers=headers,
+            params=params,
+            timeout=(2, 4),
+        )
+        if r.status_code >= 400 and order_col:
+            params.pop("order", None)
+            r = requests.get(
+                f"{base}/rest/v1/{table}",
+                headers=headers,
+                params=params,
+                timeout=(2, 4),
+            )
+        if r.status_code >= 400:
+            print(f"CRITICAL REST ERROR {table}:", r.status_code, r.text[:180])
+            return []
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"CRITICAL REST TIMEOUT/ERROR {table}:", e)
+        return []
+
+
 def _safe_latest_rows(table, filters=None, order_col="created_at", limit=100):
     try:
         q = supabase.table(table).select("*")
@@ -4766,132 +4810,164 @@ def _latest_purchase_for_trader(trader):
 
 @app.route("/trader_bootstrap", methods=["GET", "OPTIONS"])
 def trader_bootstrap():
-    """One lightweight trader dashboard feed.
-    This replaces frontend fetching of /traders and direct monitoring API calls.
+    """Fast trader shell/account feed.
+
+    Critical-path rule: this endpoint must never scan monitoring history, trades,
+    League data, or perform account enrichment queries. Those modules load after
+    the dashboard becomes usable.
     """
     if request.method == "OPTIONS":
         return ok({"success": True})
     started = time.time()
     try:
-        lookup = str(request.args.get("lookup") or request.args.get("email") or request.args.get("phone") or request.args.get("id") or "").strip().lower()
-        trader_id = str(request.args.get("trader_id") or "").strip()
-        if trader_id:
-            rows = _safe_latest_rows("traders", [("id", trader_id)], "created_at", 1)
+        lookup = str(
+            request.args.get("lookup")
+            or request.args.get("email")
+            or request.args.get("phone")
+            or request.args.get("id")
+            or ""
+        ).strip().lower()
+        requested_trader_id = str(request.args.get("trader_id") or "").strip()
+
+        # Resolve the trader with one bounded request.
+        trader = None
+        if requested_trader_id:
+            rows = _critical_rest_rows(
+                "traders", [("id", requested_trader_id)], "created_at", True, 1
+            )
             trader = rows[0] if rows else None
-        else:
-            trader = _latest_trader_for_lookup(lookup) if lookup else None
+        elif lookup:
+            # Compatibility for login generations that only provide lookup.
+            probes = [("email", lookup), ("phone", lookup), ("account_reference", lookup)]
+            for col, value in probes:
+                rows = _critical_rest_rows("traders", [(col, value)], "created_at", True, 1)
+                if rows:
+                    trader = rows[0]
+                    break
+
         if not trader:
             return bad("Trader not found", 404)
+
         token = _request_trader_auth_token()
         if not _verify_trader_auth_token(token, trader.get("id")):
             return _np_fail("Trader authentication is required", 401)
 
-        key = _cache_key("trader_bootstrap", trader.get("id"), lookup)
+        key = _cache_key("trader_bootstrap_fast", trader.get("id"), lookup)
         cached = _cache_get(_TRADER_BOOTSTRAP_CACHE, key, TRADER_BOOTSTRAP_TTL_SECONDS)
         if cached:
             cached["cached"] = True
             return ok(cached, "Trader bootstrap cached")
 
-        account = _get_active_account(trader.get("id"), trader)
-        purchase = _latest_purchase_for_trader(trader)
-        purchases = _dedupe_by_id(_safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100))
-        active_accounts = _get_active_accounts(trader.get("id"), trader, purchases)
-        active_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), active_accounts)
-        all_accounts = list(active_accounts or [])
+        # Accounts and purchases are independent. Load only these two datasets.
+        account_rows = []
+        purchase_rows = []
         try:
-            raw_all_accounts = (
-                supabase.table("trader_accounts")
-                .select("*")
-                .eq("trader_id", trader.get("id"))
-                .order("updated_at", desc=True)
-                .order("started_at", desc=True)
-                .order("created_at", desc=True)
-                .limit(200)
-                .execute()
-                .data
-                or []
-            )
-            all_accounts = _enrich_accounts_with_latest_monitoring(
-                trader.get("id"),
-                [_decorate_account_for_api(row) for row in raw_all_accounts]
-            )
-        except Exception as all_account_error:
-            print("TRADER BOOTSTRAP ALL ACCOUNTS ERROR:", all_account_error)
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="np-trader-bootstrap") as pool:
+                account_future = pool.submit(
+                    _critical_rest_rows,
+                    "trader_accounts",
+                    [("trader_id", trader.get("id"))],
+                    "updated_at",
+                    True,
+                    150,
+                )
+                purchase_future = pool.submit(
+                    _critical_rest_rows,
+                    "challenge_purchases",
+                    [("trader_id", trader.get("id"))],
+                    "created_at",
+                    True,
+                    100,
+                )
+                account_rows = account_future.result() or []
+                purchase_rows = purchase_future.result() or []
+        except Exception as e:
+            print("TRADER BOOTSTRAP CORE PARALLEL ERROR:", e)
 
-        if account:
-            account_id = str(account.get("id") or "").strip()
-            account_login = str(account.get("mt5_login") or "").strip()
-            enriched_current = None
-            for candidate in active_accounts or []:
-                if account_id and str(candidate.get("id") or "").strip() == account_id:
-                    enriched_current = candidate
-                    break
-                if account_login and str(candidate.get("mt5_login") or "").strip() == account_login:
-                    enriched_current = candidate
-                    break
-            if enriched_current:
-                account = enriched_current
+        purchases = _dedupe_by_id(purchase_rows)
+        purchase_by_id = {
+            str(p.get("id") or "").strip(): p
+            for p in purchases
+            if str(p.get("id") or "").strip()
+        }
 
-        pending_replacements = [
-            row for row in _purchase_accounts_for_trader(trader)
-            if str(row.get("account_status") or "").strip().lower() == "waiting_mt5"
-        ]
+        all_accounts = []
+        for row in account_rows:
+            try:
+                purchase = purchase_by_id.get(
+                    str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip()
+                )
+                decorated = _decorate_account_for_api(
+                    _decorate_lifecycle_authority(row, purchase, None, trader)
+                )
+            except Exception:
+                decorated = _decorate_account_for_api(row)
+            all_accounts.append(decorated)
+
+        # Preserve account history. Frontend decides which records are selectable.
+        active_accounts = list(all_accounts)
+
+        # Current trading pointer: explicit trader pointer wins, then genuine live/funded,
+        # then latest account. This is display authority only.
+        current_account_id = str(trader.get("current_account_id") or "").strip()
+        account = None
+        if current_account_id:
+            account = next(
+                (r for r in all_accounts if str(r.get("id") or "").strip() == current_account_id),
+                None,
+            )
+        if not account:
+            live_statuses = {
+                "assigned_active", "active", "current_active", "funded",
+                "funded_active", "live", "profit_protected", "payout_pending",
+                "approved_payout_pending", "payment_processing"
+            }
+            account = next(
+                (
+                    r for r in all_accounts
+                    if str(r.get("account_status") or r.get("status") or "").strip().lower()
+                    in live_statuses
+                ),
+                None,
+            )
+        if not account and all_accounts:
+            account = all_accounts[0]
+
+        purchase = purchases[0] if purchases else None
+
         payload = {
             "success": True,
-            "source": "trader_bootstrap_portfolio_v2",
+            "source": "trader_bootstrap_critical_fast",
             "generated_at": now_iso(),
             "duration_ms": int((time.time() - started) * 1000),
             "trader": _public_trader_payload(trader),
             "current_account": _trader_safe_account_row(account) if account else None,
-            "active_accounts": [_trader_safe_account_row(row) for row in (active_accounts or [])],
-            "accounts": [_trader_safe_account_row(row) for row in (active_accounts or [])],
-            "all_accounts": [_trader_safe_account_row(row) for row in (all_accounts or [])],
+            "active_accounts": [_trader_safe_account_row(r) for r in active_accounts],
+            "accounts": [_trader_safe_account_row(r) for r in active_accounts],
+            "all_accounts": [_trader_safe_account_row(r) for r in all_accounts],
             "active_purchase": _trader_safe_purchase_row(purchase) if purchase else None,
-            "pending_replacements": [_trader_safe_account_row(row) for row in pending_replacements],
+            "pending_replacements": [],
             "latest_trades": [],
             "latest_monitoring": None,
             "payout_eligibility": {
-                # Traders League V1: League competition accounts are never paid-payout eligible,
-                # even if their stage happens to read "funded" or "live".
                 "eligible": bool(
                     account
                     and str(account.get("programme_type") or "").strip().lower() != "traders_league"
-                    and str(account.get("stage") or account.get("phase") or "").lower() in {"funded", "live", "funded_live"}
+                    and str(account.get("stage") or account.get("phase") or "").lower()
+                    in {"funded", "live", "funded_live"}
                 ),
                 "reason": (
                     "League competition accounts are not eligible for paid payouts. Use the League reward system."
-                    if (account and str(account.get("programme_type") or "").strip().lower() == "traders_league")
+                    if (
+                        account
+                        and str(account.get("programme_type") or "").strip().lower()
+                        == "traders_league"
+                    )
                     else ("Funded/live account required" if not account else "Check payout rules from admin")
                 ),
-                "blocked_reason": (
-                    "league_competition_account"
-                    if (account and str(account.get("programme_type") or "").strip().lower() == "traders_league")
-                    else None
-                ),
-            }
+            },
         }
-        if account:
-            account_id = str(account.get("id") or "").strip()
-            login = str(account.get("mt5_login") or "").strip()
-            try:
-                q = supabase.table("monitoring_snapshots").select("id,trader_id,trader_account_id,mt5_login,balance,equity,profit,dd_used_percent,max_drawdown_used,risk_zone,created_at,updated_at").order("created_at", desc=True).limit(1)
-                if account_id:
-                    q = q.eq("trader_account_id", account_id)
-                elif login:
-                    q = q.eq("mt5_login", login).eq("trader_id", trader.get("id"))
-                snap_rows = q.execute().data or []
-                payload["latest_monitoring"] = _trader_safe_monitoring_row(snap_rows[0]) if snap_rows else None
-            except Exception as e:
-                print("TRADER BOOTSTRAP LATEST MONITORING ERROR:", e)
-            try:
-                tq = supabase.table("trader_trades").select("*").order("opened_at", desc=True).limit(5)
-                if account_id:
-                    tq = tq.eq("trader_account_id", account_id)
-                elif login:
-                    tq = tq.eq("mt5_login", login).eq("trader_id", trader.get("id"))
-                payload["latest_trades"] = [_trader_safe_trade_row(r) for r in (tq.execute().data or [])]
-            except Exception as e:
-                print("TRADER BOOTSTRAP LATEST TRADES ERROR:", e)
+
         if account:
             payload["trader"].update({
                 "current_account_id": account.get("id"),
@@ -4904,7 +4980,11 @@ def trader_bootstrap():
                 "drawdown_percent": account.get("absolute_drawdown_percent") or account.get("drawdown_percent") or 0,
                 "max_drawdown_used": account.get("dd_used_percent") or account.get("max_drawdown_used") or 0,
             })
-        return ok(_cache_set(_TRADER_BOOTSTRAP_CACHE, key, payload), "Trader bootstrap loaded")
+
+        return ok(
+            _cache_set(_TRADER_BOOTSTRAP_CACHE, key, payload),
+            "Trader bootstrap loaded",
+        )
     except Exception as e:
         return bad(e)
 
