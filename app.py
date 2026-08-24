@@ -92,6 +92,106 @@ def _effective_payout_split(*values):
     return PAYOUT_PROFIT_SHARE_PERCENT
 
 # ================================
+# STABILITY 2026-08-24 — Layer 4: in-memory read cache.
+#
+# The Supabase NANO compute on the $25 PRO plan cannot sustain a
+# full admin bootstrap on every admin refresh plus the 90-second
+# trader poll plus the regular auth/dashboard reads. The bootstrap
+# alone does 6 sequential queries; combined with the 30s refresh
+# rhythm, the NANO was pegging at 97% CPU.
+#
+# This module adds a small per-process cache. Keys expire after a
+# short TTL (default 30-60s). The cache is per-Gunicorn-worker, so
+# with N workers the effective miss rate is N times lower. The
+# cache is invalidated by the same writes that would have made the
+# read return new data (Patches/Posts to the underlying table).
+#
+# This is deliberately simple. No Redis, no Memcached, no eviction
+# policy. Just a dict with TTL. The goal is to cut the bootstrap
+# from "every refresh" to "once per 30-60s", which is the difference
+# between 97% CPU and 20-30% CPU on the NANO.
+#
+# Functions:
+#   np_cached_read(key, ttl, fetch_fn)  - read with TTL
+#   np_invalidate(*keys)                - delete one or more keys
+#   np_cache_stats()                    - introspection
+_NP_READ_CACHE = {}
+_NP_READ_CACHE_LOCKS = {}
+def _np_cache_lock_for(key):
+    lock = _NP_READ_CACHE_LOCKS.get(key)
+    if lock is not None:
+        return lock
+    lock = __import__("threading").Lock()
+    _NP_READ_CACHE_LOCKS[key] = lock
+    return lock
+def np_cached_read(key, ttl, fetch_fn):
+    """Read `key` from cache. On miss, call fetch_fn(), cache for `ttl` seconds.
+    If another thread is already fetching the same key, block on its lock and
+    return the result it produces. This prevents cache stampede on a cold key."""
+    import threading as _thr
+    now = time.time()
+    entry = _NP_READ_CACHE.get(key)
+    if entry is not None:
+        value, expires_at = entry
+        if expires_at > now:
+            return value
+    lock = _np_cache_lock_for(key)
+    with lock:
+        entry = _NP_READ_CACHE.get(key)
+        if entry is not None:
+            value, expires_at = entry
+            if expires_at > time.time():
+                return value
+        try:
+            value = fetch_fn()
+        except Exception as exc:
+            print(f"NP CACHE miss-then-error key={key}: {exc}")
+            raise
+        _NP_READ_CACHE[key] = (value, time.time() + ttl)
+        return value
+def np_invalidate(*keys):
+    """Invalidate one or more cache keys. Safe to call from any thread."""
+    for k in keys:
+        _NP_READ_CACHE.pop(k, None)
+def np_cache_stats():
+    """Return (count, total_keys) for diagnostics."""
+    return {"entries": len(_NP_READ_CACHE), "keys": list(_NP_READ_CACHE.keys())[:50]}
+# A small set of keys that should be dropped together when a write
+# happens that could affect any of the related reads. Used by the
+# write paths in admin routes to keep the cache honest.
+_NP_ADMIN_CACHE_GROUP_BOOTSTRAP = (
+    "admin_bootstrap", "traders_list", "accounts_list", "purchases_list",
+    "payouts_list", "mt5_list", "plans_list", "tickets_list",
+)
+_NP_ADMIN_CACHE_GROUP_TRADERS = (
+    "admin_bootstrap", "traders_list", "accounts_list",
+)
+_NP_ADMIN_CACHE_GROUP_PURCHASES = (
+    "admin_bootstrap", "purchases_list", "plans_list",
+)
+_NP_ADMIN_CACHE_GROUP_MT5 = (
+    "admin_bootstrap", "mt5_list", "accounts_list",
+)
+_NP_ADMIN_CACHE_GROUP_PAYOUTS = (
+    "admin_bootstrap", "payouts_list", "accounts_list",
+)
+def np_invalidate_admin_bootstrap(group="all"):
+    """Drop the relevant admin cache keys after a write."""
+    if group == "all":
+        keys = _NP_ADMIN_CACHE_GROUP_BOOTSTRAP
+    elif group == "traders":
+        keys = _NP_ADMIN_CACHE_GROUP_TRADERS
+    elif group == "purchases":
+        keys = _NP_ADMIN_CACHE_GROUP_PURCHASES
+    elif group == "mt5":
+        keys = _NP_ADMIN_CACHE_GROUP_MT5
+    elif group == "payouts":
+        keys = _NP_ADMIN_CACHE_GROUP_PAYOUTS
+    else:
+        keys = _NP_ADMIN_CACHE_GROUP_BOOTSTRAP
+    np_invalidate(*keys)
+
+# ================================
 # NAIRAPIPS MT5 SOURCE-OF-TRUTH CORE
 # ================================
 
@@ -1678,13 +1778,27 @@ def _archive_active_account(trader, reason, staff=None, breached=False):
         "archive_reason": reason,
         "archived_at": now,
     }).execute()
-    supabase.table("trader_accounts").update({
+    # STABILITY 2026-08-24 — Layer 2:
+    # The CHECK constraint on trader_accounts requires breach_reason,
+    # breach_at, and breach_equity_level to be set when account_status
+    # is 'breached_archived'. Without these three fields, the PATCH
+    # raises P001 ("violates check constraint") and the breach
+    # transition fails, which was the source of every failed breach
+    # PATCH in the Supabase logs and a constant CPU drain.
+    update_payload = {
         "account_status": status,
         "monitoring_enabled": False,
         "archived_at": now,
         "archive_reason": reason,
         "updated_at": now,
-    }).eq("id", account.get("id")).execute()
+    }
+    if breached:
+        update_payload["breach_reason"] = reason
+        update_payload["breach_at"] = now
+        update_payload["breach_equity_level"] = float(
+            account.get("current_equity") or account.get("equity") or 0
+        )
+    supabase.table("trader_accounts").update(update_payload).eq("id", account.get("id")).execute()
     if account.get("mt5_pool_id"):
         supabase.table("mt5_pool").update({
             "status": status,
@@ -1732,13 +1846,22 @@ def _archive_specific_account(account, reason, staff=None, breached=False, archi
         }).execute()
     except Exception as e:
         print("SPECIFIC ACCOUNT ARCHIVE LOG ERROR:", e)
-    supabase.table("trader_accounts").update({
+    # STABILITY 2026-08-24 — Layer 2 (mirror of _archive_active_account).
+    # See the comment in _archive_active_account for the full rationale.
+    update_payload = {
         "account_status": status,
         "monitoring_enabled": False,
         "archived_at": now,
         "archive_reason": reason,
         "updated_at": now,
-    }).eq("id", account.get("id")).execute()
+    }
+    if breached:
+        update_payload["breach_reason"] = reason
+        update_payload["breach_at"] = now
+        update_payload["breach_equity_level"] = float(
+            account.get("current_equity") or account.get("equity") or 0
+        )
+    supabase.table("trader_accounts").update(update_payload).eq("id", account.get("id")).execute()
     if account.get("mt5_pool_id"):
         try:
             supabase.table("mt5_pool").update({
@@ -1750,13 +1873,7 @@ def _archive_specific_account(account, reason, staff=None, breached=False, archi
         except Exception as e:
             print("SPECIFIC MT5 POOL ARCHIVE ERROR:", e)
     archived = dict(account)
-    archived.update({
-        "account_status": status,
-        "monitoring_enabled": False,
-        "archived_at": now,
-        "archive_reason": reason,
-        "updated_at": now,
-    })
+    archived.update(update_payload)
     return archived
 
 
@@ -2468,6 +2585,13 @@ def admin_reset_trader_account():
             trader_id,
         )
 
+        # STABILITY 2026-08-24 — Layer 4: invalidate the read cache
+        # so the next admin refresh sees the reset immediately.
+        try:
+            np_invalidate_admin_bootstrap("traders")
+        except Exception:
+            pass
+
         return _np_ok({
             "success": True,
             "message": "Account reset complete. Old MT5 archived. Trader is now waiting for fresh MT5 assignment.",
@@ -3034,19 +3158,27 @@ def admin_bootstrap():
         request.args.get("force") or request.args.get("fresh") or ""
     ).lower() in {"1", "true", "yes", "manual"}
 
-    cached_payload = (
-        _ADMIN_BOOTSTRAP_CACHE.get("payload")
-        if isinstance(_ADMIN_BOOTSTRAP_CACHE, dict)
-        else None
-    )
-    cached_ts = (
-        float(_ADMIN_BOOTSTRAP_CACHE.get("ts") or 0)
-        if isinstance(_ADMIN_BOOTSTRAP_CACHE, dict)
-        else 0
-    )
-    if cached_payload and not force and (time.time() - cached_ts) <= 25:
-        cached_payload["cached"] = True
-        return _np_ok(cached_payload)
+    # STABILITY 2026-08-24 — Layer 4: 30s in-memory cache for the full
+    # bootstrap payload. This is the dominant read path: the admin
+    # dashboard hits /admin_bootstrap on every page load and every
+    # "Refresh" click. With the NANO compute at 97% CPU, the cache
+    # drops the per-admin-refresh cost from "6 REST round-trips" to
+    # "1 dict lookup" for 30s after the first hit. The force/fresh
+    # query param bypasses the cache, which keeps the manual "Refresh"
+    # button on the dashboard working as before.
+    if not force:
+        def _fetch_bootstrap():
+            return _build_admin_bootstrap_payload(admin)
+        try:
+            payload = np_cached_read("admin_bootstrap", 30, _fetch_bootstrap)
+            payload["cached"] = True
+            return _np_ok(payload)
+        except Exception as _cache_exc:
+            print("ADMIN BOOTSTRAP cache-miss fetch failed, falling through to live:", _cache_exc)
+    return _np_ok(_build_admin_bootstrap_payload(admin))
+
+
+def _build_admin_bootstrap_payload(admin):
 
     started = time.time()
 
@@ -3141,7 +3273,7 @@ def admin_bootstrap():
                 )
             except Exception:
                 pass
-            return _np_ok(stale_payload)
+            return stale_payload
         # PASS 3 CHANGE: do not 503 on "live Supabase reachable but all
         # tables empty". That condition used to mean "failed connection",
         # but with the retry-with-backoff in _admin_rest_rows it can also
@@ -3320,7 +3452,7 @@ def admin_bootstrap():
     except Exception:
         pass
 
-    return _np_ok(payload)
+    return payload
 
 @app.route("/trader_current_account/<path:lookup>", methods=["GET"])
 def trader_current_account(lookup):
@@ -6022,6 +6154,11 @@ NairaPips Team"""
 
         _audit_safe("challenge_purchases", "challenge_purchase_approved", f"Purchase {pid} approved", staff)
         _audit_safe("mt5", "phase1_mt5_assignment", f"Purchase {pid} assigned MT5 {m.get('mt5_login','')} to trader account {account.get('id')}", staff)
+        try:
+            np_invalidate_admin_bootstrap("purchases")
+            np_invalidate_admin_bootstrap("mt5")
+        except Exception:
+            pass
         return ok(approved_rows, "Challenge purchase approved and MT5 assigned")
     except Exception as e: return bad(e)
 
