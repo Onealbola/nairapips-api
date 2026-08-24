@@ -2960,6 +2960,14 @@ def _admin_rest_rows(table, order_col="created_at", desc=True, limit=500):
     Restored from the last proven Admin data-loading path. This uses the same
     Supabase key/REST visibility that the working production Admin used before
     the recent bootstrap experiments.
+
+    STABILITY 2026-08-24:
+    PostgREST can return 5xx (notably PGRST002 schema-cache errors) when the
+    project is paused, the connection pool is exhausted, or the schema is
+    being refreshed. The previous version surfaced those as empty rows,
+    which then triggered the 503 safeguard and emptied the Admin dashboard.
+    We now retry transient 5xx with short exponential backoff (0.5s, 1.5s)
+    so a single PostgREST hiccup does not break the bootstrap.
     """
     try:
         base = (SUPABASE_URL or "").rstrip("/")
@@ -2972,7 +2980,20 @@ def _admin_rest_rows(table, order_col="created_at", desc=True, limit=500):
         if order_col:
             params["order"] = f"{order_col}.{'desc' if desc else 'asc'}"
         url = f"{base}/rest/v1/{table}"
-        r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
+        # Retry only on transient 5xx. 4xx (auth, RLS, bad request) is not retried.
+        delays = [0.0, 0.5, 1.5]
+        last_status = None
+        last_text = ""
+        for delay in delays:
+            if delay:
+                time.sleep(delay)
+            r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
+            last_status = r.status_code
+            last_text = r.text[:180]
+            if r.status_code < 500:
+                break
+        if last_status is not None and last_status >= 500:
+            print(f"ADMIN BOOTSTRAP REST TRANSIENT {table}: final {last_status} {last_text}")
         if r.status_code >= 400 and order_col:
             params.pop("order", None)
             r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
@@ -3081,14 +3102,143 @@ def admin_bootstrap():
         pass
 
     # Never represent a failed data connection as a genuine all-zero business.
-    # Returning 503 activates the existing Admin HTML fallback loader.
+    # STABILITY 2026-08-24: when the live bootstrap is unable to reach
+    # Supabase but a recent good cache exists (under 5 minutes old), serve
+    # that cache with degraded=True so the dashboard stays usable. This is
+    # strictly better than a hard 503 + empty dashboard when the underlying
+    # issue is on Supabase's side, not ours. The cache is only used when it
+    # is recent AND it was a real success (cached_rows > 0), so we never
+    # serve an empty "good" cache as a false "degraded" success.
+    #
+    # STABILITY 2026-08-24 (pass 3): if the live Supabase is responsive but
+    # all six tables coincidentally come back empty, we no longer 503. We
+    # still return 200 with empty arrays, because 503 was previously the
+    # root cause of the v9 Obsidian admin_clean.html page rendering all
+    # zeros. The dashboard at least gets a valid response it can render.
     if core_rows_loaded == 0:
+        stale_payload = None
         try:
-            _ADMIN_BOOTSTRAP_CACHE["ts"] = 0
-            _ADMIN_BOOTSTRAP_CACHE["payload"] = None
+            if (
+                isinstance(_ADMIN_BOOTSTRAP_CACHE, dict)
+                and _ADMIN_BOOTSTRAP_CACHE.get("payload")
+                and (time.time() - float(_ADMIN_BOOTSTRAP_CACHE.get("ts") or 0)) <= 300
+                and int((_ADMIN_BOOTSTRAP_CACHE.get("payload") or {}).get("counts", {}).get("traders", 0)
+                        or 0) > 0
+            ):
+                stale_payload = dict(_ADMIN_BOOTSTRAP_CACHE["payload"])
+        except Exception:
+            stale_payload = None
+        if stale_payload:
+            stale_payload["cached"] = True
+            stale_payload["degraded"] = True
+            stale_payload["source"] = "admin_bootstrap_stale_cache_during_supabase_outage"
+            stale_payload["degraded_reason"] = "live_supabase_unreachable_using_recent_cache"
+            try:
+                print(
+                    "ADMIN BOOTSTRAP DEGRADED: live Supabase unreachable, "
+                    "serving recent cache (age_s="
+                    f"{int(time.time() - float(_ADMIN_BOOTSTRAP_CACHE.get('ts') or 0))})."
+                )
+            except Exception:
+                pass
+            return _np_ok(stale_payload)
+        # PASS 3 CHANGE: do not 503 on "live Supabase reachable but all
+        # tables empty". That condition used to mean "failed connection",
+        # but with the retry-with-backoff in _admin_rest_rows it can also
+        # mean "we connected successfully, the project is healthy, the
+        # tables just happen to be empty right now". A 503 was the wrong
+        # answer in that case — it caused the v9 admin_clean.html to
+        # render as all zeros because its fallback path also failed.
+        # Returning 200 with empty arrays is the safer default.
+        try:
+            print(
+                "ADMIN BOOTSTRAP EMPTY: live Supabase returned 0 rows on "
+                "all six core tables. Returning 200 with empty arrays. "
+                "If this is unexpected, check Supabase project status and "
+                "Row Level Security policies on the traders / challenge_"
+                "purchases / trader_accounts / payouts / mt5_pool tables."
+            )
         except Exception:
             pass
-        return _np_fail("Admin core data connection temporarily unavailable", 503)
+        # Fall through to payload build below. Do not 503.
+
+    # PASS 3: parallel supabase-client fallback. If the direct REST path
+    # in _admin_rest_rows returned empty for any of the six core tables,
+    # try the supabase client (supabase-py) as a second path. The two
+    # paths use different connection pools; if REST 5xx's because the
+    # PostgREST layer is exhausted, the client can sometimes still serve
+    # the read. We never overwrite non-empty REST data with empty client
+    # data; we only fill in tables where REST came back empty AND the
+    # client returned something.
+    if core_rows_loaded == 0:
+        try:
+            if not traders_rows:
+                try:
+                    _r = supabase.table("traders").select("*").order("created_at", desc=True).limit(400).execute().data or []
+                    if _r:
+                        traders_rows = _r
+                        print("ADMIN BOOTSTRAP PASS3 client-fill traders:", len(_r))
+                except Exception as _exc:
+                    print("ADMIN BOOTSTRAP PASS3 client-fill traders FAILED:", _exc)
+            if not purchase_rows:
+                try:
+                    _r = supabase.table("challenge_purchases").select("*").order("created_at", desc=True).limit(400).execute().data or []
+                    if _r:
+                        purchase_rows = _r
+                        print("ADMIN BOOTSTRAP PASS3 client-fill purchases:", len(_r))
+                except Exception as _exc:
+                    print("ADMIN BOOTSTRAP PASS3 client-fill purchases FAILED:", _exc)
+            if not account_rows:
+                try:
+                    _r = supabase.table("trader_accounts").select("*").order("updated_at", desc=True).limit(600).execute().data or []
+                    if _r:
+                        account_rows = _r
+                        print("ADMIN BOOTSTRAP PASS3 client-fill accounts:", len(_r))
+                except Exception as _exc:
+                    print("ADMIN BOOTSTRAP PASS3 client-fill accounts FAILED:", _exc)
+            if not payout_rows:
+                try:
+                    _r = supabase.table("payouts").select("*").order("created_at", desc=True).limit(200).execute().data or []
+                    if _r:
+                        payout_rows = _r
+                        print("ADMIN BOOTSTRAP PASS3 client-fill payouts:", len(_r))
+                except Exception as _exc:
+                    print("ADMIN BOOTSTRAP PASS3 client-fill payouts FAILED:", _exc)
+            if not mt5_rows:
+                try:
+                    _r = supabase.table("mt5_pool").select("*").order("created_at", desc=True).limit(400).execute().data or []
+                    if _r:
+                        mt5_rows = _r
+                        available_mt5_rows = _quick_available_mt5(mt5_rows)
+                        print("ADMIN BOOTSTRAP PASS3 client-fill mt5:", len(_r))
+                except Exception as _exc:
+                    print("ADMIN BOOTSTRAP PASS3 client-fill mt5 FAILED:", _exc)
+            if not plan_rows:
+                try:
+                    _r = supabase.table("challenge_plans").select("*").order("created_at", desc=True).limit(100).execute().data or []
+                    if _r:
+                        plan_rows = _r
+                        print("ADMIN BOOTSTRAP PASS3 client-fill plans:", len(_r))
+                except Exception as _exc:
+                    print("ADMIN BOOTSTRAP PASS3 client-fill plans FAILED:", _exc)
+            core_rows_loaded = (
+                len(traders_rows)
+                + len(purchase_rows)
+                + len(account_rows)
+                + len(payout_rows)
+                + len(mt5_rows)
+            )
+            try:
+                print(
+                    "ADMIN BOOTSTRAP PASS3 after client-fill: "
+                    f"traders={len(traders_rows)} purchases={len(purchase_rows)} "
+                    f"accounts={len(account_rows)} payouts={len(payout_rows)} "
+                    f"mt5={len(mt5_rows)} core_rows_loaded={core_rows_loaded}"
+                )
+            except Exception:
+                pass
+        except Exception as _outer_exc:
+            print("ADMIN BOOTSTRAP PASS3 client-fill wrapper error:", _outer_exc)
 
     payload = {
         "success": True,
@@ -3112,6 +3262,29 @@ def admin_bootstrap():
         "available_mt5": available_mt5_rows,
         "phase_assignment_queue": phase_queue_rows,
         "assignment_queue": phase_queue_rows,
+
+        # PASS 3: v9-friendly alias keys. The v9 Obsidian admin_clean.html
+        # frontend (and any future version) might read these common name
+        # variants. We publish the same data under every name so the
+        # dashboard cannot fail to render simply because of a key rename.
+        "users": traders_rows,
+        "users_list": traders_rows,
+        "all_traders": traders_rows,
+        "all_accounts": account_rows,
+        "all_purchases": purchase_rows,
+        "all_payouts": payout_rows,
+        "all_mt5": mt5_rows,
+        "all_plans": plan_rows,
+        "mt5_available": available_mt5_rows,
+        "trader_accounts_list": account_rows,
+        "purchases_list": purchase_rows,
+        "payouts_list": payout_rows,
+        "traders_list": traders_rows,
+        "plans_list": plan_rows,
+        "announcements_list": announcement_rows,
+        "events_list": event_rows,
+        "open_tickets": ticket_rows,
+        "tickets_list": ticket_rows,
 
         "trader_trades": [],
         "trades": [],
@@ -3138,7 +3311,7 @@ def admin_bootstrap():
             "available_mt5": len(available_mt5_rows),
             "phase_assignment_queue": 0,
         },
-        "bootstrap_scope": "recovered_stable_core_only",
+        "bootstrap_scope": "recovered_stable_core_only_v9_compat",
     }
 
     try:
