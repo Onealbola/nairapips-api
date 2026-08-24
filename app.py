@@ -3033,18 +3033,26 @@ def admin_bootstrap():
     # Restore the exact core table authority and practical row coverage used by
     # the previously working Admin. Do NOT parallelize these queries. Recent
     # concurrent bootstrap experiments could return a fast but empty dashboard.
-    traders_rows = _admin_rest_rows("traders", "created_at", True, 1200)
-    plan_rows = _admin_rest_rows("challenge_plans", "created_at", True, 500)
-    purchase_rows = _admin_rest_rows("challenge_purchases", "created_at", True, 1200)
-    account_rows = _admin_rest_rows("trader_accounts", "updated_at", True, 2500)
-    payout_rows = _admin_rest_rows("payouts", "created_at", True, 800)
-    mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 1200)
+    # STABILITY RECOVERY 2026-08-24:
+    # The previous pass raised every limit to 500-2500 rows. With the 7s
+    # Supabase REST read timeout, those payloads could not complete in
+    # time, every query returned [], the core_rows_loaded==0 guard fired
+    # 503, and the Admin dashboard rendered all zeros. These limits
+    # match the previously working first-screen scope (about 2-4x the
+    # original, but well inside the 7s timeout for the data sizes that
+    # this Admin's Overview actually uses).
+    traders_rows = _admin_rest_rows("traders", "created_at", True, 400)
+    plan_rows = _admin_rest_rows("challenge_plans", "created_at", True, 100)
+    purchase_rows = _admin_rest_rows("challenge_purchases", "created_at", True, 400)
+    account_rows = _admin_rest_rows("trader_accounts", "updated_at", True, 600)
+    payout_rows = _admin_rest_rows("payouts", "created_at", True, 200)
+    mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 400)
 
     # Nonessential/heavy modules must not block Overview.
     ticket_rows = []
-    announcement_rows = []
+    announcement_rows = _admin_rest_rows("announcements", "created_at", True, 25)
     snapshot_rows = []
-    event_rows = []
+    event_rows = _admin_rest_rows("monitoring_events", "created_at", True, 50)
     phase_queue_rows = []
 
     available_mt5_rows = _quick_available_mt5(mt5_rows)
@@ -3056,6 +3064,21 @@ def admin_bootstrap():
         + len(payout_rows)
         + len(mt5_rows)
     )
+
+    # Render-log diagnostic: one line per table, so empty / partial
+    # bootstrap is visible in production logs without having to
+    # reproduce the issue.
+    try:
+        print(
+            "ADMIN BOOTSTRAP rows: "
+            f"traders={len(traders_rows)} plans={len(plan_rows)} "
+            f"purchases={len(purchase_rows)} accounts={len(account_rows)} "
+            f"payouts={len(payout_rows)} mt5={len(mt5_rows)} "
+            f"announcements={len(announcement_rows)} events={len(event_rows)} "
+            f"core_rows_loaded={core_rows_loaded}"
+        )
+    except Exception:
+        pass
 
     # Never represent a failed data connection as a genuine all-zero business.
     # Returning 503 activates the existing Admin HTML fallback loader.
