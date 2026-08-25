@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20_RESET_WAITING_SELECTOR_FINAL_2026_08_25"
+NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20_RESET_WAITING_STALE_HISTORY_FILTER_2026_08_25"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1281,10 +1281,15 @@ def _pending_reset_replacements_from_accounts(account_rows, trader=None):
                     break
             else:
                 # Manual/free/legacy reset lineage has no purchase id.
-                # Match only the SAME stage and SAME account size after reset.
-                if c_stage != old_stage:
-                    continue
+                # A newer account of the SAME size at the SAME OR LATER lifecycle
+                # stage consumes an older reset. This prevents completed historical
+                # resets (for example Phase 2 -> later Funded) from reappearing as
+                # fresh waiting accounts, while a truly latest reset still remains
+                # pending until a newer continuation exists.
                 if old_size and c_size and int(old_size) != int(c_size):
+                    continue
+                stage_rank = {"phase1": 1, "phase2": 2, "funded": 3}
+                if stage_rank.get(c_stage, 0) < stage_rank.get(old_stage, 0):
                     continue
                 consumed = True
                 break
