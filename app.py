@@ -4905,6 +4905,9 @@ def register_trader():
             "equity": 0,
             "phase": "no_account",
             "status": d.get("status", "new_signup"),
+            # Preserve explicit signup marketing consent when the frontend supplies it.
+            # Never infer consent from registration alone.
+            "marketing_consent": True if (d.get("marketing_consent") is True or str(d.get("marketing_consent") or "").lower() in {"true","1","yes"}) else False,
             "engine_group": d.get("engine_group", "engine_1"),
             "profit": 0,
             "drawdown": 0,
@@ -14093,6 +14096,195 @@ def _np_weekly_cleanup():
 
 
 
+
+
+# ============================================================
+# NAIRAPIPS HUMAN LEAD FOLLOW-UP ENGINE — 2026-08-25
+# Behaviour-aware Nigerian follow-up. Uses existing traders,
+# landing_leads, challenge_purchases and email_logs only.
+# No lifecycle/trading/payout logic is modified.
+# ============================================================
+NP_LEAD_FOLLOWUP_VERSION = "HUMAN_NG_V1_2026_08_25"
+
+def _np_parse_iso(value):
+    try:
+        return datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def _np_days_since(value):
+    dt = _np_parse_iso(value)
+    if not dt:
+        return 99999
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0, (datetime.now(timezone.utc) - dt).days)
+
+def _np_first_name(name):
+    name = str(name or "").strip()
+    return name.split()[0].title() if name else "Legend"
+
+def _np_has_purchase(email, trader_id=None):
+    try:
+        q = supabase.table("challenge_purchases").select("id,status,payment_status,created_at").limit(20)
+        if trader_id:
+            rows = q.eq("trader_id", trader_id).execute().data or []
+        elif email:
+            rows = q.eq("email", str(email).strip().lower()).execute().data or []
+        else:
+            rows = []
+        paid = any(str(r.get("payment_status") or r.get("status") or "").lower() in {"approved","paid","active","approved_active"} for r in rows)
+        started = bool(rows)
+        return started, paid
+    except Exception:
+        return False, False
+
+def _np_followup_class(row, source_type):
+    email = str(row.get("email") or "").strip().lower()
+    tid = str(row.get("id") or "") if source_type == "trader" else None
+    started, paid = _np_has_purchase(email, tid)
+    status = str(row.get("status") or row.get("lead_status") or "").lower()
+    phase = str(row.get("phase") or "").lower()
+    if paid or status in {"active","funded","live","passed","breached"} or phase in {"phase1","phase2","funded","live"}:
+        return "customer"
+    if started:
+        return "abandoned_purchase"
+    if source_type == "golden":
+        return "golden_vip" if bool(row.get("vip_status")) else "golden_ticket"
+    days = _np_days_since(row.get("created_at"))
+    return "dormant_signup" if days >= 30 else "new_signup"
+
+NP_FOLLOWUP_SEQUENCES = {
+    "new_signup": {
+        0: ("Legend, welcome to NairaPips 🇳🇬", "Legend {name}, welcome to NairaPips.\n\nYou don enter our house now 😄. Before anything else, know this: NairaPips was built for traders who want a simpler route to opportunity — 1 Phase and Static Balance Drawdown.\n\nNo pressure to buy today. Look around, understand the rules, and if anything confuse you, reply this email. Human beings dey here.\n\n— NairaPips"),
+        1: ("Quick question, Legend", "Legend {name}, make we ask you one honest question.\n\nIf enough trading capital landed in your hand today, is your trading ready for it?\n\nCapital no dey repair bad risk management. It only makes the mistake bigger. That is why we care about discipline before size.\n\nThink am. We go talk again.\n\n— NairaPips"),
+        3: ("Why NairaPips made it 1 Phase", "Legend {name}, forex hard already. Why funding company go still add another mountain?\n\nThat is why NairaPips uses 1 Phase. Meet the target, respect the rules, move forward. And the drawdown is static balance-based — it no dey chase your profit up and down.\n\nFight the market. Not your funding company.\n\n— NairaPips"),
+        5: ("Static drawdown — make we explain am", "Legend {name}, this one confuses plenty traders, so make we make am simple.\n\nIf your challenge starts at a balance, the NairaPips maximum drawdown floor is based on that starting balance. Profit no make the floor begin pursue you.\n\nRisk limit should be a limit, not a moving trap.\n\n— NairaPips"),
+        7: ("You registered. You never start.", "Legend {name}, you registered with NairaPips but you never pick a challenge. No wahala. Maybe you were checking us out. Maybe timing never right.\n\nBut if capital is the thing holding your trading back, check the current NairaPips offers in your dashboard before you decide.\n\n— NairaPips"),
+        10: ("Wetin really dey hold you?", "Legend {name}, no sales grammar today 😄. Wetin really dey hold you from starting — price, trust, rules, or you never ready?\n\nReply with just one word if you like. We want to understand, not disturb you.\n\n— NairaPips"),
+        14: ("Should we leave you small? 😄", "Legend {name}, we don check on you a few times since you registered. We no wan become that friend wey no dey know when to go home 😂.\n\nIf you still want NairaPips opportunity, we dey here. If now is not your season, no problem — we will reduce the follow-up and only send important updates.\n\n— NairaPips"),
+    },
+    "golden_ticket": {
+        0: ("Your NairaPips Golden Ticket is alive 🎫", "Legend {name}, your Golden Ticket don land. Keep it safe.\n\nThis is not just another registration number — it keeps you inside the NairaPips Capital Selection opportunity. Watch your email and NairaPips updates.\n\n— NairaPips"),
+        2: ("Golden Ticket: small reminder", "Legend {name}, your Golden Ticket never disappear o 😄. Stay active and keep an eye on NairaPips updates.\n\nAnd if you referred people, those referrals matter to your Golden Ticket journey too.\n\n— NairaPips"),
+        4: ("While you wait, sharpen this", "Legend {name}, while you wait for Golden Ticket opportunities, work on the thing capital cannot fix: risk management.\n\nA bigger account with the same bad habit is just a bigger problem. Skill plus control first. Capital second.\n\n— NairaPips"),
+        7: ("You don't have to only wait", "Legend {name}, Golden Ticket gives you an opportunity to be selected. But make we tell you something: you don't have to put your whole trading journey on pause while waiting.\n\nNairaPips also has paid challenge opportunities for traders ready to move now. Check the current offer when you are ready. No pressure.\n\n— NairaPips"),
+        10: ("1 Phase. Static Drawdown.", "Legend {name}, if you decide to take the paid route while your Golden Ticket stays active, remember what makes NairaPips different: 1 Phase and Static Balance Drawdown.\n\nWe made the journey simpler because forex itself is already enough battle.\n\n— NairaPips"),
+        14: ("Something worth checking", "Legend {name}, before you continue waiting only for selection, check the latest NairaPips challenge offer. Sometimes opportunity no dey knock twice with the same price.\n\nOnly move if the challenge fits your trading and your pocket.\n\n— NairaPips"),
+        21: ("Legend, you still dey with us?", "Legend {name}, you entered NairaPips through Golden Ticket some weeks ago. You still dey trade? 😄\n\nReply and tell us where you are now: WAITING, READY, or JUST WATCHING. We will know how to talk to you from there.\n\n— NairaPips"),
+    },
+    "golden_vip": {
+        0: ("VIP Legend, we see you 👑", "Legend {name}, your Golden Ticket activity has put you in our VIP group. We see the effort.\n\nVIP no mean noise — it means we pay closer attention when opportunities open. Keep your details current and watch your NairaPips updates.\n\n— NairaPips"),
+        7: ("VIP opportunity check-in", "Legend {name}, quick VIP check-in. If you are ready to trade now instead of only waiting for selection, check the current NairaPips challenge opportunity.\n\nIf you have a question before moving, reply us directly.\n\n— NairaPips"),
+        14: ("VIP: where are you now?", "Legend {name}, make we know where you stand: READY, WAITING, or NOT NOW?\n\nReply with one of those three. We no need long story. 😄\n\n— NairaPips"),
+    },
+    "abandoned_purchase": {
+        0: ("Legend, wetin happen? 😄", "Legend {name}, you came close to starting your NairaPips challenge but stopped along the way.\n\nNo pressure o. We just want to know if something confused you, payment gave you issue, or you changed your mind.\n\nIf na question hold you, reply us. We dey here.\n\n— NairaPips"),
+        2: ("Still need help completing it?", "Legend {name}, quick one about the challenge you started. If payment or any step gave you wahala, reply this email and tell us where it stopped.\n\nIf you simply changed your mind, that one dey okay too.\n\n— NairaPips"),
+        5: ("We won't chase you 😄", "Legend {name}, we no go pursue you around internet because of challenge 😂. This is our last close follow-up for now.\n\nIf you still want to complete it, NairaPips is ready. If not, we will leave the door open.\n\n— NairaPips"),
+    },
+    "dormant_signup": {
+        30: ("Legend, you don forget us? 😂", "Legend {name}, you registered with NairaPips some time ago but never started a challenge.\n\nA lot can change in one trading month. Before we assume trading don tire you 😄, come see what NairaPips is offering traders now.\n\n— NairaPips"),
+        45: ("Are you still trading?", "Legend {name}, serious question: are you still trading?\n\nIf yes, reply YES. If you took a break, reply BREAK. We would rather know than keep throwing offers at you like robot.\n\n— NairaPips"),
+        60: ("One last check-in", "Legend {name}, this is a quiet check-in, not pressure. If funding is still part of your trading plan, NairaPips is here. If not, we will keep things light and only send important opportunities.\n\n— NairaPips"),
+    },
+}
+
+def _np_followup_step_for(row, lead_class):
+    seq = NP_FOLLOWUP_SEQUENCES.get(lead_class) or {}
+    age = _np_days_since(row.get("created_at"))
+    if lead_class == "abandoned_purchase":
+        # Purchase age is better when available; registration age is safe fallback.
+        email = str(row.get("email") or "").strip().lower()
+        try:
+            p = supabase.table("challenge_purchases").select("created_at").eq("email", email).order("created_at", desc=True).limit(1).execute().data or []
+            if p: age = _np_days_since(p[0].get("created_at"))
+        except Exception:
+            pass
+    return age if age in seq else None
+
+def _np_followup_already_sent(email, lead_class, day):
+    marker = f"[NPFOLLOW:{NP_LEAD_FOLLOWUP_VERSION}:{lead_class}:D{day}]"
+    try:
+        rows = supabase.table("email_logs").select("id").eq("recipient_email", str(email).strip().lower()).eq("email_type", "lead_followup").ilike("message_preview", f"%{marker}%").limit(1).execute().data or []
+        return bool(rows)
+    except Exception:
+        return False
+
+def _np_send_lead_followups(dry_run=False, limit=250):
+    candidates = []
+    # Golden Ticket / Capital Selection: explicit marketing consent exists.
+    try:
+        for r in supabase.table(LEAD_TABLE).select("*").eq("consent_marketing", True).order("created_at", desc=True).limit(2000).execute().data or []:
+            rr = dict(r); rr["_source_type"] = "golden"; candidates.append(rr)
+    except Exception as e:
+        print("FOLLOWUP golden fetch skipped:", e)
+    # Normal trader signups: only auto-send where marketing_consent is explicitly true.
+    try:
+        rows = supabase.table("traders").select("id,name,email,phone,status,phase,created_at,lead_status,marketing_consent").eq("marketing_consent", True).order("created_at", desc=True).limit(3000).execute().data or []
+        for r in rows:
+            rr = dict(r); rr["_source_type"] = "trader"; candidates.append(rr)
+    except Exception as e:
+        print("FOLLOWUP trader fetch skipped:", e)
+    # Dedupe by email; trader identity wins over landing lead when both exist.
+    by_email = {}
+    for r in candidates:
+        email = str(r.get("email") or "").strip().lower()
+        if not email:
+            continue
+        old = by_email.get(email)
+        if not old or r.get("_source_type") == "trader":
+            by_email[email] = r
+    due = []
+    for email, r in by_email.items():
+        cls = _np_followup_class(r, r.get("_source_type"))
+        if cls == "customer":
+            continue
+        day = _np_followup_step_for(r, cls)
+        if day is None or _np_followup_already_sent(email, cls, day):
+            continue
+        subject, body = NP_FOLLOWUP_SEQUENCES[cls][day]
+        name = _np_first_name(r.get("name") or r.get("full_name"))
+        body = body.format(name=name)
+        due.append({"email": email, "name": name, "class": cls, "day": day, "subject": subject, "body": body, "source": r.get("_source_type")})
+    due.sort(key=lambda x: (x["day"], x["email"]))
+    sent = 0
+    failed = 0
+    for item in due[:max(1, int(limit or 250))]:
+        if dry_run:
+            continue
+        marker = f"[NPFOLLOW:{NP_LEAD_FOLLOWUP_VERSION}:{item['class']}:D{item['day']}]"
+        html_body = text_to_html_content(item["body"] + "\n\n" + marker)
+        ok_send = bool(send_email_brevo(item["email"], item["subject"], html_body))
+        # send_email_brevo logs as general; add a dedicated best-effort marker log for deterministic dedupe.
+        _log_email_bank(item["email"], item["subject"], email_type="lead_followup", status="sent" if ok_send else "failed", message=marker + " " + item["body"][:800])
+        sent += 1 if ok_send else 0
+        failed += 0 if ok_send else 1
+    return {"version": NP_LEAD_FOLLOWUP_VERSION, "eligible_contacts": len(by_email), "due": len(due), "sent": sent, "failed": failed, "preview": [{k:v for k,v in x.items() if k != "body"} for x in due[:25]]}
+
+@app.route("/admin/lead_followup_status", methods=["GET", "OPTIONS"])
+def admin_lead_followup_status():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        return _np_ok({"success": True, **_np_send_lead_followups(dry_run=True)})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+@app.route("/admin/run_lead_followups", methods=["POST", "OPTIONS"])
+def admin_run_lead_followups():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        body = request.get_json(silent=True) or {}
+        limit = min(250, max(1, int(body.get("limit", 100) or 100)))
+        result = _np_send_lead_followups(dry_run=False, limit=limit)
+        _audit_safe("leads", "run_human_followups", f"due={result.get('due')} sent={result.get('sent')} failed={result.get('failed')}")
+        return _np_ok({"success": True, **result})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
 def _np_scheduler_loop():
     """Background thread that runs scheduled tasks."""
     while True:
@@ -14110,6 +14302,11 @@ def _np_scheduler_loop():
                             for rule in rules:
                                 _np_run_single_rule(rule)
                             print(f"[CRON] Daily run processed {len(rules)} rules")
+                            try:
+                                lead_result = _np_send_lead_followups(dry_run=False, limit=250)
+                                print(f"[CRON] Human lead follow-up due={lead_result.get('due')} sent={lead_result.get('sent')} failed={lead_result.get('failed')}")
+                            except Exception as lead_exc:
+                                print("[CRON] Human lead follow-up failed:", lead_exc)
                     except Exception as e:
                         print("[CRON] Daily run error:", e)
             
