@@ -1,4 +1,4 @@
-import urllib.parse
+# NAIRAPIPS RELEASE: GLOBAL_PER_ACCOUNT_RESET_AUTHORITY_2026_08_25
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -10,17 +10,8 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20"
+NAIRAPIPS_RELEASE = "MOBILE_PASSWORD_RESET_VISIBLE_2026_08_10"
 CORS(app)
-# SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
-# Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
-# to Lagos, costing 200-500ms on every page load. With gzip, ~60KB.
-try:
-    from flask_compress import Compress
-    Compress(app)
-    print("NP SPEED: flask_compress enabled (gzip on every JSON response)")
-except Exception as _compress_exc:
-    print("NP SPEED: flask_compress not available, gzip disabled:", _compress_exc)
 
 # ============================================================
 # NAIRAPIPS GLOBAL CORS AUTHORITY
@@ -99,210 +90,6 @@ def _effective_payout_split(*values):
     must not override the current global policy.
     """
     return PAYOUT_PROFIT_SHARE_PERCENT
-
-# ================================
-# STABILITY 2026-08-24 — Layer 4: in-memory read cache.
-#
-# The Supabase NANO compute on the $25 PRO plan cannot sustain a
-# full admin bootstrap on every admin refresh plus the 90-second
-# trader poll plus the regular auth/dashboard reads. The bootstrap
-# alone does 6 sequential queries; combined with the 30s refresh
-# rhythm, the NANO was pegging at 97% CPU.
-#
-# This module adds a small per-process cache. Keys expire after a
-# short TTL (default 30-60s). The cache is per-Gunicorn-worker, so
-# with N workers the effective miss rate is N times lower. The
-# cache is invalidated by the same writes that would have made the
-# read return new data (Patches/Posts to the underlying table).
-#
-# This is deliberately simple. No Redis, no Memcached, no eviction
-# policy. Just a dict with TTL. The goal is to cut the bootstrap
-# from "every refresh" to "once per 30-60s", which is the difference
-# between 97% CPU and 20-30% CPU on the NANO.
-#
-# Functions:
-#   np_cached_read(key, ttl, fetch_fn)  - read with TTL
-#   np_invalidate(*keys)                - delete one or more keys
-#   np_cache_stats()                    - introspection
-_NP_READ_CACHE = {}
-_NP_READ_CACHE_LOCKS = {}
-def _np_cache_lock_for(key):
-    lock = _NP_READ_CACHE_LOCKS.get(key)
-    if lock is not None:
-        return lock
-    lock = __import__("threading").Lock()
-    _NP_READ_CACHE_LOCKS[key] = lock
-    return lock
-def np_cached_read(key, ttl, fetch_fn):
-    """Read `key` from cache. On miss, call fetch_fn(), cache for `ttl` seconds.
-    If another thread is already fetching the same key, block on its lock and
-    return the result it produces. This prevents cache stampede on a cold key."""
-    import threading as _thr
-    now = time.time()
-    entry = _NP_READ_CACHE.get(key)
-    if entry is not None:
-        value, expires_at = entry
-        if expires_at > now:
-            return value
-    lock = _np_cache_lock_for(key)
-    with lock:
-        entry = _NP_READ_CACHE.get(key)
-        if entry is not None:
-            value, expires_at = entry
-            if expires_at > time.time():
-                return value
-        try:
-            value = fetch_fn()
-        except Exception as exc:
-            print(f"NP CACHE miss-then-error key={key}: {exc}")
-            raise
-        _NP_READ_CACHE[key] = (value, time.time() + ttl)
-        return value
-def np_invalidate(*keys):
-    """Invalidate one or more cache keys. Safe to call from any thread."""
-    for k in keys:
-        _NP_READ_CACHE.pop(k, None)
-def np_cache_stats():
-    """Return (count, total_keys) for diagnostics."""
-    return {"entries": len(_NP_READ_CACHE), "keys": list(_NP_READ_CACHE.keys())[:50]}
-# A small set of keys that should be dropped together when a write
-# happens that could affect any of the related reads. Used by the
-# write paths in admin routes to keep the cache honest.
-_NP_ADMIN_CACHE_GROUP_BOOTSTRAP = (
-    "admin_bootstrap", "traders_list", "accounts_list", "purchases_list",
-    "payouts_list", "mt5_list", "plans_list", "tickets_list",
-)
-_NP_ADMIN_CACHE_GROUP_TRADERS = (
-    "admin_bootstrap", "traders_list", "accounts_list",
-)
-_NP_ADMIN_CACHE_GROUP_PURCHASES = (
-    "admin_bootstrap", "purchases_list", "plans_list",
-)
-_NP_ADMIN_CACHE_GROUP_MT5 = (
-    "admin_bootstrap", "mt5_list", "accounts_list",
-)
-_NP_ADMIN_CACHE_GROUP_PAYOUTS = (
-    "admin_bootstrap", "payouts_list", "accounts_list",
-)
-def np_invalidate_admin_bootstrap(group="all"):
-    """Drop the relevant admin cache keys after a write."""
-    if group == "all":
-        keys = _NP_ADMIN_CACHE_GROUP_BOOTSTRAP
-    elif group == "traders":
-        keys = _NP_ADMIN_CACHE_GROUP_TRADERS
-    elif group == "purchases":
-        keys = _NP_ADMIN_CACHE_GROUP_PURCHASES
-    elif group == "mt5":
-        keys = _NP_ADMIN_CACHE_GROUP_MT5
-    elif group == "payouts":
-        keys = _NP_ADMIN_CACHE_GROUP_PAYOUTS
-    else:
-        keys = _NP_ADMIN_CACHE_GROUP_BOOTSTRAP
-    np_invalidate(*keys)
-
-
-# ================================
-# SPEED 2026-08-24 — Layer 4b: login security caches.
-#
-# Two small in-memory caches that target the customer-facing login
-# hot path. Both are safe because the cached state is short-lived
-# and the secrets (the password, the auth token) themselves are
-# never stored — only the verification result.
-#
-# (1) PASSWORD-VERIFY CACHE
-# werkzeug's pbkdf2 default of 600,000 iterations takes ~150ms per
-# verify. If the same trader logs in twice within 15 seconds, the
-# second verify is free. The cache key is (lookup, sha256_of_password)
-# so the plaintext password is never stored.
-#
-# (2) AUTH-TOKEN-VERIFY CACHE
-# Every bootstrap/dashboard request calls _verify_trader_auth_token
-# which does base64 decode + hmac + timestamp check. A single page
-# load fires 5-20 such calls. With 30s caching, the first call does
-# the work and the next 30 seconds of the same token are free.
-#
-# Both caches invalidate cleanly when a trader is updated
-# (np_invalidate_login_caches is called from the trader update path).
-# ================================
-_NP_PASSWORD_VERIFY_CACHE = {}   # key=(lookup, pwd_sha) -> (verified_bool, expires_at)
-_NP_AUTH_TOKEN_VERIFY_CACHE = {}  # key=token -> (trader_id, expires_at)
-_NP_LOGIN_CACHE_TTL_PASSWORD = 15  # seconds — short, so password changes propagate fast
-_NP_LOGIN_CACHE_TTL_TOKEN = 30     # seconds — same token may be re-verified many times per page load
-def _np_password_verify_cached(lookup, password, current_hash):
-    """Returns True/False from cache if the same (lookup, password) was verified
-    against the same current_hash within the last 15 seconds. Otherwise calls
-    check_password_hash and caches the result."""
-    import hashlib as _hl
-    lookup = str(lookup or "").strip().lower()
-    pwd_sha = _hl.sha256(str(password or "").encode()).hexdigest()
-    current_hash = str(current_hash or "")
-    key = (lookup, pwd_sha, current_hash)
-    now = time.time()
-    entry = _NP_PASSWORD_VERIFY_CACHE.get(key)
-    if entry is not None:
-        verified, expires_at = entry
-        if expires_at > now:
-            return verified
-    # Slow path
-    try:
-        verified = check_password_hash(current_hash, str(password or ""))
-    except Exception:
-        verified = False
-    _NP_PASSWORD_VERIFY_CACHE[key] = (verified, now + _NP_LOGIN_CACHE_TTL_PASSWORD)
-    # Lightweight eviction so the dict does not grow without bound.
-    # A long-running Render dyno with thousands of unique logins
-    # would otherwise accumulate entries forever.
-    if len(_NP_PASSWORD_VERIFY_CACHE) > 512:
-        cutoff = now - _NP_LOGIN_CACHE_TTL_PASSWORD
-        stale = [k for k, v in _NP_PASSWORD_VERIFY_CACHE.items() if v[1] < cutoff]
-        for k in stale[:256]:
-            _NP_PASSWORD_VERIFY_CACHE.pop(k, None)
-    return verified
-
-def _np_verify_auth_token_cached(token, trader_id):
-    """Wraps _verify_trader_auth_token with a 30s in-memory cache. Key is
-    the token itself; value is the (trader_id, expires_at) pair."""
-    token = str(token or "")
-    trader_id = str(trader_id or "")
-    if not token or not trader_id:
-        return False
-    now = time.time()
-    entry = _NP_AUTH_TOKEN_VERIFY_CACHE.get(token)
-    if entry is not None:
-        cached_tid, expires_at = entry
-        if cached_tid == trader_id and expires_at > now:
-            return True
-    verified = _verify_trader_auth_token(token, trader_id)
-    if verified:
-        _NP_AUTH_TOKEN_VERIFY_CACHE[token] = (trader_id, now + _NP_LOGIN_CACHE_TTL_TOKEN)
-        # Same eviction discipline
-        if len(_NP_AUTH_TOKEN_VERIFY_CACHE) > 1024:
-            cutoff = now - _NP_LOGIN_CACHE_TTL_TOKEN
-            stale = [k for k, v in _NP_AUTH_TOKEN_VERIFY_CACHE.items() if v[1] < cutoff]
-            for k in stale[:512]:
-                _NP_AUTH_TOKEN_VERIFY_CACHE.pop(k, None)
-    return verified
-
-def np_invalidate_login_caches(trader_id=None, lookup=None):
-    """Drop login caches. Called when a trader's password is changed, the
-    account is archived, or the auth secret is rotated. With no args,
-    drops everything (used by the admin password reset path)."""
-    if trader_id is None and lookup is None:
-        _NP_PASSWORD_VERIFY_CACHE.clear()
-        _NP_AUTH_TOKEN_VERIFY_CACHE.clear()
-        return
-    # Token cache: drop entries for this trader_id
-    if trader_id is not None:
-        trader_id = str(trader_id)
-        for k in list(_NP_AUTH_TOKEN_VERIFY_CACHE.keys()):
-            if _NP_AUTH_TOKEN_VERIFY_CACHE[k][0] == trader_id:
-                _NP_AUTH_TOKEN_VERIFY_CACHE.pop(k, None)
-    # Password cache: drop entries matching this lookup
-    if lookup is not None:
-        lookup = str(lookup or "").strip().lower()
-        for k in list(_NP_PASSWORD_VERIFY_CACHE.keys()):
-            if k[0] == lookup:
-                _NP_PASSWORD_VERIFY_CACHE.pop(k, None)
 
 # ================================
 # NAIRAPIPS MT5 SOURCE-OF-TRUTH CORE
@@ -879,7 +666,8 @@ _TRADER_ACCOUNT_RESPONSE_FIELDS = {
     "monitoring_enabled", "started_at", "assigned_at", "created_at",
     "updated_at", "display_assigned_at", "assignment_date", "last_sync_at",
     "latest_monitoring_snapshot", "latest_monitoring_event", "journey_stages",
-    "next_stage", "next_waiting_state", "waiting_for_stage", "_source"
+    "next_stage", "next_waiting_state", "waiting_for_stage",
+    "reset_source_account_id", "previous_mt5_login", "reset_at", "_source"
 }
 
 _TRADER_PURCHASE_RESPONSE_FIELDS = {
@@ -899,13 +687,12 @@ _TRADER_PURCHASE_RESPONSE_FIELDS = {
 }
 
 _TRADER_PAYOUT_RESPONSE_FIELDS = {
-    "id", "trader_id", "trader_account_id", "trader_name", "email", "mt5_login",
+    "id", "trader_id", "trader_account_id", "trader_name", "mt5_login",
     "mt5_server", "account_size", "start_balance", "current_balance",
     "current_equity", "verified_profit", "payout_split", "available_payout",
     "amount", "profit_share_amount", "payment_method", "method", "bank_name",
-    "account_number", "account_name", "status", "note", "admin_note",
-    "requested_at", "created_at", "updated_at", "approved_at", "rejected_at",
-    "cancelled_at", "paid_at"
+    "account_number", "account_name", "status", "note", "created_at",
+    "updated_at", "approved_at", "rejected_at", "paid_at"
 }
 
 _TRADER_MONITORING_RESPONSE_FIELDS = {
@@ -1187,7 +974,18 @@ def _get_active_accounts(trader_id, trader=None, purchases=None):
         for row in rows:
             purchase = purchase_by_id.get(str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip())
             decorated.append(_decorate_account_for_api(_decorate_lifecycle_authority(row, purchase, None, trader)))
-        purchase_accounts = _purchase_accounts_for_trader(trader, purchases)
+        canonical_waiting = _canonical_reset_waiting_accounts_for_trader(trader_id)
+        canonical_waiting_purchase_ids = {
+            str(row.get("purchase_id") or "").strip()
+            for row in canonical_waiting
+            if str(row.get("purchase_id") or "").strip()
+        }
+        purchase_accounts = [
+            row for row in _purchase_accounts_for_trader(trader, purchases)
+            if not str(row.get("purchase_id") or "").strip()
+            or str(row.get("purchase_id") or "").strip() not in canonical_waiting_purchase_ids
+        ]
+        decorated.extend(canonical_waiting)
 
         real_purchase_ids = {
             str(row.get("purchase_id") or "").strip()
@@ -1775,6 +1573,40 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
     account = (supabase.table("trader_accounts").insert(account_row).execute().data or [None])[0]
     if not account:
         raise RuntimeError("Could not create trader account")
+
+    # Consume only the matching canonical reset-waiting row. Do not touch other
+    # waiting/active accounts owned by the same trader.
+    try:
+        waiting_q = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("trader_id", trader.get("id"))
+            .in_("account_status", ["waiting_mt5", "phase1_waiting_mt5", "phase2_waiting_mt5", "funded_waiting_mt5"])
+        )
+        waiting_rows = waiting_q.limit(100).execute().data or []
+        matches=[]
+        for wr in waiting_rows:
+            wr_stage=str(wr.get("stage") or wr.get("phase") or "").strip().lower()
+            wr_purchase=str(wr.get("purchase_id") or "").strip()
+            if wr_stage != stage:
+                continue
+            if purchase_id and wr_purchase == str(purchase_id):
+                matches.append(wr)
+        if not purchase_id:
+            same_stage=[wr for wr in waiting_rows if str(wr.get("stage") or wr.get("phase") or "").strip().lower()==stage]
+            if len(same_stage)==1:
+                matches=same_stage
+        for wr in matches[:1]:
+            supabase.table("trader_accounts").update({
+                "account_status": "archived",
+                "monitoring_enabled": False,
+                "archived_at": now,
+                "archive_reason": f"Fresh {stage} MT5 assigned after reset",
+                "updated_at": now,
+            }).eq("id", wr.get("id")).execute()
+    except Exception as e:
+        print("RESET WAITING CONSUME WARNING:", e)
+
     supabase.table("mt5_pool").update({
         "status": "assigned",
         "assigned_trader_id": trader.get("id"),
@@ -1891,27 +1723,13 @@ def _archive_active_account(trader, reason, staff=None, breached=False):
         "archive_reason": reason,
         "archived_at": now,
     }).execute()
-    # STABILITY 2026-08-24 — Layer 2:
-    # The CHECK constraint on trader_accounts requires breach_reason,
-    # breach_at, and breach_equity_level to be set when account_status
-    # is 'breached_archived'. Without these three fields, the PATCH
-    # raises P001 ("violates check constraint") and the breach
-    # transition fails, which was the source of every failed breach
-    # PATCH in the Supabase logs and a constant CPU drain.
-    update_payload = {
+    supabase.table("trader_accounts").update({
         "account_status": status,
         "monitoring_enabled": False,
         "archived_at": now,
         "archive_reason": reason,
         "updated_at": now,
-    }
-    if breached:
-        update_payload["breach_reason"] = reason
-        update_payload["breach_at"] = now
-        update_payload["breach_equity_level"] = float(
-            account.get("current_equity") or account.get("equity") or 0
-        )
-    supabase.table("trader_accounts").update(update_payload).eq("id", account.get("id")).execute()
+    }).eq("id", account.get("id")).execute()
     if account.get("mt5_pool_id"):
         supabase.table("mt5_pool").update({
             "status": status,
@@ -1959,22 +1777,13 @@ def _archive_specific_account(account, reason, staff=None, breached=False, archi
         }).execute()
     except Exception as e:
         print("SPECIFIC ACCOUNT ARCHIVE LOG ERROR:", e)
-    # STABILITY 2026-08-24 — Layer 2 (mirror of _archive_active_account).
-    # See the comment in _archive_active_account for the full rationale.
-    update_payload = {
+    supabase.table("trader_accounts").update({
         "account_status": status,
         "monitoring_enabled": False,
         "archived_at": now,
         "archive_reason": reason,
         "updated_at": now,
-    }
-    if breached:
-        update_payload["breach_reason"] = reason
-        update_payload["breach_at"] = now
-        update_payload["breach_equity_level"] = float(
-            account.get("current_equity") or account.get("equity") or 0
-        )
-    supabase.table("trader_accounts").update(update_payload).eq("id", account.get("id")).execute()
+    }).eq("id", account.get("id")).execute()
     if account.get("mt5_pool_id"):
         try:
             supabase.table("mt5_pool").update({
@@ -1986,7 +1795,13 @@ def _archive_specific_account(account, reason, staff=None, breached=False, archi
         except Exception as e:
             print("SPECIFIC MT5 POOL ARCHIVE ERROR:", e)
     archived = dict(account)
-    archived.update(update_payload)
+    archived.update({
+        "account_status": status,
+        "monitoring_enabled": False,
+        "archived_at": now,
+        "archive_reason": reason,
+        "updated_at": now,
+    })
     return archived
 
 
@@ -2291,6 +2106,109 @@ def _dashboard_payload_for_trader(trader):
 
 
 
+
+def _ensure_canonical_reset_waiting_account(account, stage, waiting_state, now, reason):
+    """Create exactly one account-scoped WAITING row for the account being reset.
+
+    trader_accounts remains the lifecycle authority. This row represents only the
+    selected reset lineage. Other active/funded/phase accounts for the same trader
+    remain untouched and never inherit this waiting state.
+    """
+    if not account:
+        raise ValueError("Reset source account is required")
+
+    trader_id = str(account.get("trader_id") or "").strip()
+    source_id = str(account.get("id") or "").strip()
+    purchase_id = str(account.get("purchase_id") or "").strip()
+    stage = str(stage or "phase1").strip().lower()
+    if stage not in {"phase1", "phase2", "funded"}:
+        stage = "phase1"
+
+    waiting_status = {
+        "phase1": "phase1_waiting_mt5",
+        "phase2": "phase2_waiting_mt5",
+        "funded": "funded_waiting_mt5",
+    }[stage]
+
+    # Idempotency: only reuse a waiting row that belongs to THIS reset lineage.
+    # purchase_id is the strongest persisted link available in current schema.
+    try:
+        q = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id)
+        q = q.in_("account_status", ["waiting_mt5", "phase1_waiting_mt5", "phase2_waiting_mt5", "funded_waiting_mt5"])
+        rows = q.limit(100).execute().data or []
+        for row in rows:
+            same_purchase = bool(purchase_id) and str(row.get("purchase_id") or "").strip() == purchase_id
+            same_source = str(row.get("reset_source_account_id") or "").strip() == source_id
+            same_stage = str(row.get("stage") or row.get("phase") or "").strip().lower() == stage
+            if same_stage and (same_source or same_purchase):
+                out = dict(row)
+                out["reset_source_account_id"] = source_id
+                out["previous_mt5_login"] = account.get("mt5_login") or ""
+                out["reset_at"] = now
+                out["waiting_for_stage"] = stage
+                out["_source"] = "trader_accounts_reset_waiting"
+                return out
+    except Exception as e:
+        print("RESET WAITING LOOKUP WARNING:", e)
+
+    account_size = clean(account.get("account_size") or account.get("start_balance") or 0)
+    waiting_row = {
+        "trader_id": trader_id,
+        "purchase_id": purchase_id or None,
+        "stage": stage,
+        "account_status": waiting_status,
+        "account_size": account_size,
+        "start_balance": account_size,
+        "current_balance": account_size,
+        "current_equity": account_size,
+        "profit": 0,
+        "profit_percent": 0,
+        "absolute_drawdown_percent": 0,
+        "dd_limit_percent": clean(account.get("dd_limit_percent") or 20) or 20,
+        "dd_used_percent": 0,
+        "target_percent": _target_for_stage(stage),
+        "monitoring_enabled": False,
+        "started_at": now,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    inserted = supabase.table("trader_accounts").insert(waiting_row).execute().data or []
+    if not inserted:
+        raise RuntimeError("Could not create canonical reset waiting account")
+    out = dict(inserted[0])
+    # These lineage fields are response metadata; they do not require DB columns.
+    out["reset_source_account_id"] = source_id
+    out["previous_mt5_login"] = account.get("mt5_login") or ""
+    out["reset_at"] = now
+    out["waiting_for_stage"] = stage
+    out["_source"] = "trader_accounts_reset_waiting"
+    return out
+
+
+def _canonical_reset_waiting_accounts_for_trader(trader_id):
+    try:
+        rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("trader_id", trader_id)
+            .in_("account_status", ["waiting_mt5", "phase1_waiting_mt5", "phase2_waiting_mt5", "funded_waiting_mt5"])
+            .order("updated_at", desc=True)
+            .limit(100)
+            .execute().data or []
+        )
+        out=[]
+        for row in rows:
+            item=_decorate_account_for_api(_decorate_lifecycle_authority(row))
+            item["waiting_for_stage"] = item.get("waiting_for_stage") or _normalize_lifecycle_stage(item.get("stage") or item.get("account_status"))
+            item["_source"] = "trader_accounts_reset_waiting"
+            out.append(item)
+        return out
+    except Exception as e:
+        print("RESET WAITING FETCH ERROR:", e)
+        return []
+
+
 @app.route("/admin_reset_trader_account", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_account", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
@@ -2367,39 +2285,7 @@ def admin_reset_trader_account():
 
         account_status_before = str(account.get("account_status") or account.get("status") or "").strip().lower()
         trader_waiting_state = str(trader.get("challenge_state") or trader.get("status") or "").strip().lower()
-
-        # RESTORED NAIRAPIPS POST-PAYOUT FLOW (2026-08-24):
-        # PAID -> Reset exact funded account -> funded_waiting_mt5 -> fresh funded MT5.
-        # Do not make payout-protected states globally active. Permit this reset only
-        # when the exact selected account has a PAID payout and no open payout remains.
-        payout_protected_states = {
-            "profit_protected", "payout_pending", "approved_payout_pending",
-            "payment_processing", "payout_processing", "pending_payout"
-        }
-        paid_payout_reset_ok = False
-        if account_status_before in payout_protected_states:
-            try:
-                exact_payouts = (
-                    supabase.table("payouts")
-                    .select("id,status,trader_account_id,paid_at,created_at")
-                    .eq("trader_id", trader_id)
-                    .eq("trader_account_id", requested_account_id)
-                    .order("created_at", desc=True)
-                    .limit(20)
-                    .execute().data or []
-                )
-                open_payout_states = {
-                    "pending", "requested", "submitted", "approved", "processing",
-                    "payment_processing", "pending_review", "awaiting_review", "under_review"
-                }
-                has_paid_payout = any(str(p.get("status") or "").strip().lower() == "paid" for p in exact_payouts)
-                has_open_payout = any(str(p.get("status") or "").strip().lower() in open_payout_states for p in exact_payouts)
-                paid_payout_reset_ok = bool(has_paid_payout and not has_open_payout)
-            except Exception as e:
-                print("POST-PAYOUT RESET ELIGIBILITY CHECK ERROR:", e)
-                paid_payout_reset_ok = False
-
-        if account_status_before not in ACTIVE_ACCOUNT_STATUSES and not paid_payout_reset_ok:
+        if account_status_before not in ACTIVE_ACCOUNT_STATUSES:
             if (
                 account_status_before.startswith("archived_")
                 and "waiting" in trader_waiting_state
@@ -2414,8 +2300,6 @@ def admin_reset_trader_account():
                     "purchase_id": requested_purchase_id or account.get("purchase_id"),
                     "idempotent": True,
                 })
-            if account_status_before in payout_protected_states:
-                return _np_fail("Reset is blocked until the payout for this exact account is PAID.", 409)
             return _np_fail("Selected trader_account_id is not an active MT5 account. Reset cancelled.", 409)
 
         account_purchase_id = str(account.get("purchase_id") or "").strip()
@@ -2572,6 +2456,24 @@ def admin_reset_trader_account():
                 return _np_fail("Reset failed while clearing the linked purchase MT5 fields.", 500)
         else:
             reset_steps.append("no_purchase_account_skipped_purchase_cleanup")
+
+        # CANONICAL RESET AUTHORITY: create one waiting lifecycle row for the exact
+        # account that was reset. This is account-scoped; unrelated live accounts
+        # are never changed to waiting.
+        try:
+            waiting_account = _ensure_canonical_reset_waiting_account(
+                account, stage, waiting_state, now, reason
+            )
+            reset_steps.append("canonical_reset_waiting_account_created")
+        except Exception as e:
+            print("RESET CANONICAL WAITING CREATE ERROR:", {
+                "trader_id": trader_id,
+                "trader_account_id": account.get("id"),
+                "purchase_id": purchase_id,
+                "old_mt5_login": old_login,
+                "error": str(e),
+            })
+            return _np_fail("Reset archived the old MT5 but could not create the exact waiting-for-fresh-MT5 lifecycle. Admin review required.", 500)
 
         # 2. Lock old MT5 pool row; never put it back to available.
         try:
@@ -2732,19 +2634,13 @@ def admin_reset_trader_account():
             trader_id,
         )
 
-        # STABILITY 2026-08-24 — Layer 4: invalidate the read cache
-        # so the next admin refresh sees the reset immediately.
-        try:
-            np_invalidate_admin_bootstrap("traders")
-        except Exception:
-            pass
-
         return _np_ok({
             "success": True,
             "message": "Account reset complete. Old MT5 archived. Trader is now waiting for fresh MT5 assignment.",
             "data": updated,
             "archived_account": archived,
-            "current_account": None,
+            "waiting_account": _trader_safe_account_row(waiting_account),
+            "current_account": _trader_safe_account_row(replacement_account) if replacement_account else None,
             "reset_stage": stage,
             "waiting_state": waiting_state,
             "operations_succeeded": reset_steps,
@@ -3226,19 +3122,8 @@ def phase_assignment_queue():
 # ================================
 
 def _admin_rest_rows(table, order_col="created_at", desc=True, limit=500):
-    """Stable NairaPips Admin table reader.
-
-    Restored from the last proven Admin data-loading path. This uses the same
-    Supabase key/REST visibility that the working production Admin used before
-    the recent bootstrap experiments.
-
-    STABILITY 2026-08-24:
-    PostgREST can return 5xx (notably PGRST002 schema-cache errors) when the
-    project is paused, the connection pool is exhausted, or the schema is
-    being refreshed. The previous version surfaced those as empty rows,
-    which then triggered the 503 safeguard and emptied the Admin dashboard.
-    We now retry transient 5xx with short exponential backoff (0.5s, 1.5s)
-    so a single PostgREST hiccup does not break the bootstrap.
+    """Fetch a Supabase table directly with a hard timeout.
+    This prevents /admin_bootstrap from hanging forever when one table is slow.
     """
     try:
         base = (SUPABASE_URL or "").rstrip("/")
@@ -3251,20 +3136,7 @@ def _admin_rest_rows(table, order_col="created_at", desc=True, limit=500):
         if order_col:
             params["order"] = f"{order_col}.{'desc' if desc else 'asc'}"
         url = f"{base}/rest/v1/{table}"
-        # Retry only on transient 5xx. 4xx (auth, RLS, bad request) is not retried.
-        delays = [0.0, 0.5, 1.5]
-        last_status = None
-        last_text = ""
-        for delay in delays:
-            if delay:
-                time.sleep(delay)
-            r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
-            last_status = r.status_code
-            last_text = r.text[:180]
-            if r.status_code < 500:
-                break
-        if last_status is not None and last_status >= 500:
-            print(f"ADMIN BOOTSTRAP REST TRANSIENT {table}: final {last_status} {last_text}")
+        r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
         if r.status_code >= 400 and order_col:
             params.pop("order", None)
             r = requests.get(url, headers=headers, params=params, timeout=(3, 7))
@@ -3273,8 +3145,8 @@ def _admin_rest_rows(table, order_col="created_at", desc=True, limit=500):
             return []
         data = r.json()
         return data if isinstance(data, list) else []
-    except Exception as exc:
-        print(f"ADMIN BOOTSTRAP REST TIMEOUT/ERROR {table}:", exc)
+    except Exception as e:
+        print(f"ADMIN BOOTSTRAP REST TIMEOUT/ERROR {table}:", e)
         return []
 
 
@@ -3296,232 +3168,41 @@ def _quick_available_mt5(rows):
 def admin_bootstrap():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
-
     admin, auth_response = _require_admin()
     if auth_response:
         return auth_response
-
-    force = str(
-        request.args.get("force") or request.args.get("fresh") or ""
-    ).lower() in {"1", "true", "yes", "manual"}
-
-    # STABILITY 2026-08-24 — Layer 4: 30s in-memory cache for the full
-    # bootstrap payload. This is the dominant read path: the admin
-    # dashboard hits /admin_bootstrap on every page load and every
-    # "Refresh" click. With the NANO compute at 97% CPU, the cache
-    # drops the per-admin-refresh cost from "6 REST round-trips" to
-    # "1 dict lookup" for 30s after the first hit. The force/fresh
-    # query param bypasses the cache, which keeps the manual "Refresh"
-    # button on the dashboard working as before.
-    if not force:
-        def _fetch_bootstrap():
-            return _build_admin_bootstrap_payload(admin)
-        try:
-            payload = np_cached_read("admin_bootstrap", 30, _fetch_bootstrap)
-            payload["cached"] = True
-            return _np_ok(payload)
-        except Exception as _cache_exc:
-            print("ADMIN BOOTSTRAP cache-miss fetch failed, falling through to live:", _cache_exc)
-    return _np_ok(_build_admin_bootstrap_payload(admin))
-
-
-def _build_admin_bootstrap_payload(admin):
-
+    force = str(request.args.get("force") or request.args.get("fresh") or "").lower() in {"1", "true", "yes", "manual"}
+    cached_payload = _ADMIN_BOOTSTRAP_CACHE.get("payload") if isinstance(_ADMIN_BOOTSTRAP_CACHE, dict) else None
+    cached_ts = float(_ADMIN_BOOTSTRAP_CACHE.get("ts") or 0) if isinstance(_ADMIN_BOOTSTRAP_CACHE, dict) else 0
+    if cached_payload and not force and (time.time() - cached_ts) <= ADMIN_BOOTSTRAP_TTL_SECONDS:
+        cached_payload["cached"] = True
+        return _np_ok(cached_payload)
     started = time.time()
 
-    # RECOVERY MODE:
-    # Restore the exact core table authority and practical row coverage used by
-    # the previously working Admin. Do NOT parallelize these queries. Recent
-    # concurrent bootstrap experiments could return a fast but empty dashboard.
-    # STABILITY RECOVERY 2026-08-24:
-    # The previous pass raised every limit to 500-2500 rows. With the 7s
-    # Supabase REST read timeout, those payloads could not complete in
-    # time, every query returned [], the core_rows_loaded==0 guard fired
-    # 503, and the Admin dashboard rendered all zeros. These limits
-    # match the previously working first-screen scope (about 2-4x the
-    # original, but well inside the 7s timeout for the data sizes that
-    # this Admin's Overview actually uses).
-    traders_rows = _admin_rest_rows("traders", "created_at", True, 400)
+    # First screen only: keep this genuinely light. Full module data is lazy-loaded
+    # through existing paginated/module endpoints when the admin opens that module.
+    traders_rows = _admin_rest_rows("traders", "created_at", True, 50)
     plan_rows = _admin_rest_rows("challenge_plans", "created_at", True, 100)
-    purchase_rows = _admin_rest_rows("challenge_purchases", "created_at", True, 400)
-    account_rows = _admin_rest_rows("trader_accounts", "updated_at", True, 600)
-    payout_rows = _admin_rest_rows("payouts", "created_at", True, 200)
-    mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 400)
-
-    # Nonessential/heavy modules must not block Overview.
+    purchase_rows = _admin_rest_rows("challenge_purchases", "created_at", True, 50)
+    account_rows = _admin_rest_rows("trader_accounts", "updated_at", True, 100)
+    payout_rows = _admin_rest_rows("payouts", "created_at", True, 25)
+    mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 100)
     ticket_rows = []
     announcement_rows = _admin_rest_rows("announcements", "created_at", True, 25)
     snapshot_rows = []
     event_rows = _admin_rest_rows("monitoring_events", "created_at", True, 50)
+
+    # Phase assignment is operational module data, not first-screen data.
+    # Loading it here previously allowed a slow queue scan to block Admin startup.
+    # The existing /np_assignment_center endpoint now loads it only when the
+    # Phase Assignment module is opened.
     phase_queue_rows = []
 
     available_mt5_rows = _quick_available_mt5(mt5_rows)
 
-    core_rows_loaded = (
-        len(traders_rows)
-        + len(purchase_rows)
-        + len(account_rows)
-        + len(payout_rows)
-        + len(mt5_rows)
-    )
-
-    # Render-log diagnostic: one line per table, so empty / partial
-    # bootstrap is visible in production logs without having to
-    # reproduce the issue.
-    try:
-        print(
-            "ADMIN BOOTSTRAP rows: "
-            f"traders={len(traders_rows)} plans={len(plan_rows)} "
-            f"purchases={len(purchase_rows)} accounts={len(account_rows)} "
-            f"payouts={len(payout_rows)} mt5={len(mt5_rows)} "
-            f"announcements={len(announcement_rows)} events={len(event_rows)} "
-            f"core_rows_loaded={core_rows_loaded}"
-        )
-    except Exception:
-        pass
-
-    # Never represent a failed data connection as a genuine all-zero business.
-    # STABILITY 2026-08-24: when the live bootstrap is unable to reach
-    # Supabase but a recent good cache exists (under 5 minutes old), serve
-    # that cache with degraded=True so the dashboard stays usable. This is
-    # strictly better than a hard 503 + empty dashboard when the underlying
-    # issue is on Supabase's side, not ours. The cache is only used when it
-    # is recent AND it was a real success (cached_rows > 0), so we never
-    # serve an empty "good" cache as a false "degraded" success.
-    #
-    # STABILITY 2026-08-24 (pass 3): if the live Supabase is responsive but
-    # all six tables coincidentally come back empty, we no longer 503. We
-    # still return 200 with empty arrays, because 503 was previously the
-    # root cause of the v9 Obsidian admin_clean.html page rendering all
-    # zeros. The dashboard at least gets a valid response it can render.
-    if core_rows_loaded == 0:
-        stale_payload = None
-        try:
-            if (
-                isinstance(_ADMIN_BOOTSTRAP_CACHE, dict)
-                and _ADMIN_BOOTSTRAP_CACHE.get("payload")
-                and (time.time() - float(_ADMIN_BOOTSTRAP_CACHE.get("ts") or 0)) <= 300
-                and int((_ADMIN_BOOTSTRAP_CACHE.get("payload") or {}).get("counts", {}).get("traders", 0)
-                        or 0) > 0
-            ):
-                stale_payload = dict(_ADMIN_BOOTSTRAP_CACHE["payload"])
-        except Exception:
-            stale_payload = None
-        if stale_payload:
-            stale_payload["cached"] = True
-            stale_payload["degraded"] = True
-            stale_payload["source"] = "admin_bootstrap_stale_cache_during_supabase_outage"
-            stale_payload["degraded_reason"] = "live_supabase_unreachable_using_recent_cache"
-            try:
-                print(
-                    "ADMIN BOOTSTRAP DEGRADED: live Supabase unreachable, "
-                    "serving recent cache (age_s="
-                    f"{int(time.time() - float(_ADMIN_BOOTSTRAP_CACHE.get('ts') or 0))})."
-                )
-            except Exception:
-                pass
-            return stale_payload
-        # PASS 3 CHANGE: do not 503 on "live Supabase reachable but all
-        # tables empty". That condition used to mean "failed connection",
-        # but with the retry-with-backoff in _admin_rest_rows it can also
-        # mean "we connected successfully, the project is healthy, the
-        # tables just happen to be empty right now". A 503 was the wrong
-        # answer in that case — it caused the v9 admin_clean.html to
-        # render as all zeros because its fallback path also failed.
-        # Returning 200 with empty arrays is the safer default.
-        try:
-            print(
-                "ADMIN BOOTSTRAP EMPTY: live Supabase returned 0 rows on "
-                "all six core tables. Returning 200 with empty arrays. "
-                "If this is unexpected, check Supabase project status and "
-                "Row Level Security policies on the traders / challenge_"
-                "purchases / trader_accounts / payouts / mt5_pool tables."
-            )
-        except Exception:
-            pass
-        # Fall through to payload build below. Do not 503.
-
-    # PASS 3: parallel supabase-client fallback. If the direct REST path
-    # in _admin_rest_rows returned empty for any of the six core tables,
-    # try the supabase client (supabase-py) as a second path. The two
-    # paths use different connection pools; if REST 5xx's because the
-    # PostgREST layer is exhausted, the client can sometimes still serve
-    # the read. We never overwrite non-empty REST data with empty client
-    # data; we only fill in tables where REST came back empty AND the
-    # client returned something.
-    if core_rows_loaded == 0:
-        try:
-            if not traders_rows:
-                try:
-                    _r = supabase.table("traders").select("*").order("created_at", desc=True).limit(400).execute().data or []
-                    if _r:
-                        traders_rows = _r
-                        print("ADMIN BOOTSTRAP PASS3 client-fill traders:", len(_r))
-                except Exception as _exc:
-                    print("ADMIN BOOTSTRAP PASS3 client-fill traders FAILED:", _exc)
-            if not purchase_rows:
-                try:
-                    _r = supabase.table("challenge_purchases").select("*").order("created_at", desc=True).limit(400).execute().data or []
-                    if _r:
-                        purchase_rows = _r
-                        print("ADMIN BOOTSTRAP PASS3 client-fill purchases:", len(_r))
-                except Exception as _exc:
-                    print("ADMIN BOOTSTRAP PASS3 client-fill purchases FAILED:", _exc)
-            if not account_rows:
-                try:
-                    _r = supabase.table("trader_accounts").select("*").order("updated_at", desc=True).limit(600).execute().data or []
-                    if _r:
-                        account_rows = _r
-                        print("ADMIN BOOTSTRAP PASS3 client-fill accounts:", len(_r))
-                except Exception as _exc:
-                    print("ADMIN BOOTSTRAP PASS3 client-fill accounts FAILED:", _exc)
-            if not payout_rows:
-                try:
-                    _r = supabase.table("payouts").select("*").order("created_at", desc=True).limit(200).execute().data or []
-                    if _r:
-                        payout_rows = _r
-                        print("ADMIN BOOTSTRAP PASS3 client-fill payouts:", len(_r))
-                except Exception as _exc:
-                    print("ADMIN BOOTSTRAP PASS3 client-fill payouts FAILED:", _exc)
-            if not mt5_rows:
-                try:
-                    _r = supabase.table("mt5_pool").select("*").order("created_at", desc=True).limit(400).execute().data or []
-                    if _r:
-                        mt5_rows = _r
-                        available_mt5_rows = _quick_available_mt5(mt5_rows)
-                        print("ADMIN BOOTSTRAP PASS3 client-fill mt5:", len(_r))
-                except Exception as _exc:
-                    print("ADMIN BOOTSTRAP PASS3 client-fill mt5 FAILED:", _exc)
-            if not plan_rows:
-                try:
-                    _r = supabase.table("challenge_plans").select("*").order("created_at", desc=True).limit(100).execute().data or []
-                    if _r:
-                        plan_rows = _r
-                        print("ADMIN BOOTSTRAP PASS3 client-fill plans:", len(_r))
-                except Exception as _exc:
-                    print("ADMIN BOOTSTRAP PASS3 client-fill plans FAILED:", _exc)
-            core_rows_loaded = (
-                len(traders_rows)
-                + len(purchase_rows)
-                + len(account_rows)
-                + len(payout_rows)
-                + len(mt5_rows)
-            )
-            try:
-                print(
-                    "ADMIN BOOTSTRAP PASS3 after client-fill: "
-                    f"traders={len(traders_rows)} purchases={len(purchase_rows)} "
-                    f"accounts={len(account_rows)} payouts={len(payout_rows)} "
-                    f"mt5={len(mt5_rows)} core_rows_loaded={core_rows_loaded}"
-                )
-            except Exception:
-                pass
-        except Exception as _outer_exc:
-            print("ADMIN BOOTSTRAP PASS3 client-fill wrapper error:", _outer_exc)
-
     payload = {
         "success": True,
-        "source": "admin_bootstrap_recovered_stable_authority",
+        "source": "admin_bootstrap_fast",
         "generated_at": now_iso(),
         "duration_ms": int((time.time() - started) * 1000),
 
@@ -3542,29 +3223,8 @@ def _build_admin_bootstrap_payload(admin):
         "phase_assignment_queue": phase_queue_rows,
         "assignment_queue": phase_queue_rows,
 
-        # PASS 3: v9-friendly alias keys. The v9 Obsidian admin_clean.html
-        # frontend (and any future version) might read these common name
-        # variants. We publish the same data under every name so the
-        # dashboard cannot fail to render simply because of a key rename.
-        "users": traders_rows,
-        "users_list": traders_rows,
-        "all_traders": traders_rows,
-        "all_accounts": account_rows,
-        "all_purchases": purchase_rows,
-        "all_payouts": payout_rows,
-        "all_mt5": mt5_rows,
-        "all_plans": plan_rows,
-        "mt5_available": available_mt5_rows,
-        "trader_accounts_list": account_rows,
-        "purchases_list": purchase_rows,
-        "payouts_list": payout_rows,
-        "traders_list": traders_rows,
-        "plans_list": plan_rows,
-        "announcements_list": announcement_rows,
-        "events_list": event_rows,
-        "open_tickets": ticket_rows,
-        "tickets_list": ticket_rows,
-
+        # First-screen bootstrap is intentionally small. Monitoring history is lazy-loaded
+        # by monitoring-specific views/endpoints instead of blocking Admin startup.
         "trader_trades": [],
         "trades": [],
         "monitoring_snapshots": snapshot_rows,
@@ -3588,18 +3248,33 @@ def _build_admin_bootstrap_payload(admin):
             "payouts": len(payout_rows),
             "mt5_pool": len(mt5_rows),
             "available_mt5": len(available_mt5_rows),
-            "phase_assignment_queue": 0,
+            "phase_assignment_queue": len(phase_queue_rows),
         },
-        "bootstrap_scope": "recovered_stable_core_only_v9_compat",
+        "bootstrap_scope": "first_screen_lightweight",
+        "rows_loaded": {
+            "traders": len(traders_rows),
+            "challenge_plans": len(plan_rows),
+            "challenge_purchases": len(purchase_rows),
+            "trader_accounts": len(account_rows),
+            "payouts": len(payout_rows),
+            "mt5_pool": len(mt5_rows),
+            "support_tickets": len(ticket_rows),
+            "announcements": len(announcement_rows),
+            "monitoring_snapshots": len(snapshot_rows),
+            "monitoring_events": len(event_rows),
+        },
+        "module_data_deferred": [
+            "support", "monitoring", "payouts", "mt5_pool", "users_database",
+            "announcements", "full_traders", "full_purchases", "landing_leads",
+            "affiliates"
+        ],
     }
-
     try:
         _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
         _ADMIN_BOOTSTRAP_CACHE["payload"] = payload
     except Exception:
         pass
-
-    return payload
+    return _np_ok(payload)
 
 @app.route("/trader_current_account/<path:lookup>", methods=["GET"])
 def trader_current_account(lookup):
@@ -3659,8 +3334,7 @@ def trader_dashboard_payload(lookup):
         if not trader:
             return bad("Trader not found", 404)
         token = _request_trader_auth_token()
-        # SPEED 2026-08-24: cached verify.
-        if not _np_verify_auth_token_cached(token, trader.get("id")):
+        if not _verify_trader_auth_token(token, trader.get("id")):
             return bad("Login password is required to load trader dashboard", 401)
         return ok(_dashboard_payload_for_trader(trader), "Trader dashboard loaded")
     except Exception as e:
@@ -4423,14 +4097,10 @@ def _check_trader_password(trader, password):
         return False
     password_hash = str(trader.get("password_hash") or "").strip()
     if password_hash:
-        # SPEED 2026-08-24: 15s in-memory cache. The previous
-        # werkzeug.pbkdf2 600k-iteration verify took ~150ms. With
-        # this cache, repeat logins for the same trader within 15s
-        # skip the verify entirely. The plaintext password is
-        # hashed (sha256) before being used as part of the cache
-        # key — the plaintext never enters the cache.
-        lookup = str(trader.get("email") or trader.get("phone") or trader.get("id") or "").strip().lower()
-        return _np_password_verify_cached(lookup, raw, password_hash)
+        try:
+            return check_password_hash(password_hash, raw)
+        except Exception:
+            return False
     legacy_password = str(trader.get("password") or "").strip()
     return bool(legacy_password and legacy_password == raw)
 
@@ -4905,9 +4575,6 @@ def register_trader():
             "equity": 0,
             "phase": "no_account",
             "status": d.get("status", "new_signup"),
-            # Preserve explicit signup marketing consent when the frontend supplies it.
-            # Never infer consent from registration alone.
-            "marketing_consent": True if (d.get("marketing_consent") is True or str(d.get("marketing_consent") or "").lower() in {"true","1","yes"}) else False,
             "engine_group": d.get("engine_group", "engine_1"),
             "profit": 0,
             "drawdown": 0,
@@ -5143,7 +4810,7 @@ def delete_trader():
 _TRADER_BOOTSTRAP_CACHE = {}
 _ADMIN_BOOTSTRAP_CACHE = {"ts": 0, "payload": None}
 TRADER_BOOTSTRAP_TTL_SECONDS = 5
-ADMIN_BOOTSTRAP_TTL_SECONDS = 45
+ADMIN_BOOTSTRAP_TTL_SECONDS = 25
 _NP_SYNC_LOCK = __import__("threading").Lock()
 _NP_SYNC_STATE = {"running": False, "started_at": None, "finished_at": None, "last_result": None, "last_error": None}
 NP_SYNC_LOCK_TABLE = os.getenv("NP_SYNC_LOCK_TABLE", "np_system_locks")
@@ -5188,50 +4855,6 @@ def _cache_set(store, key, payload):
     return payload
 
 
-
-def _critical_rest_rows(table, filters=None, order_col="created_at", desc=True, limit=100):
-    """Bounded REST reader for login/bootstrap critical paths only.
-    Uses server-side service role when available and hard network timeouts so
-    Supabase latency can never monopolize a Gunicorn worker indefinitely.
-    """
-    try:
-        base = (SUPABASE_URL or "").rstrip("/")
-        key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
-        headers = {
-            "apikey": key,
-            "Authorization": f"Bearer {key}",
-            "Accept": "application/json",
-        }
-        params = {"select": "*", "limit": str(max(1, min(int(limit or 100), 500)))}
-        for col, val in (filters or []):
-            if val not in (None, ""):
-                params[str(col)] = f"eq.{val}"
-        if order_col:
-            params["order"] = f"{order_col}.{'desc' if desc else 'asc'}"
-        r = requests.get(
-            f"{base}/rest/v1/{table}",
-            headers=headers,
-            params=params,
-            timeout=(2, 4),
-        )
-        if r.status_code >= 400 and order_col:
-            params.pop("order", None)
-            r = requests.get(
-                f"{base}/rest/v1/{table}",
-                headers=headers,
-                params=params,
-                timeout=(2, 4),
-            )
-        if r.status_code >= 400:
-            print(f"CRITICAL REST ERROR {table}:", r.status_code, r.text[:180])
-            return []
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"CRITICAL REST TIMEOUT/ERROR {table}:", e)
-        return []
-
-
 def _safe_latest_rows(table, filters=None, order_col="created_at", limit=100):
     try:
         q = supabase.table(table).select("*")
@@ -5268,167 +4891,142 @@ def _latest_purchase_for_trader(trader):
 
 @app.route("/trader_bootstrap", methods=["GET", "OPTIONS"])
 def trader_bootstrap():
-    """Fast trader shell/account feed.
-
-    Critical-path rule: this endpoint must never scan monitoring history, trades,
-    League data, or perform account enrichment queries. Those modules load after
-    the dashboard becomes usable.
+    """One lightweight trader dashboard feed.
+    This replaces frontend fetching of /traders and direct monitoring API calls.
     """
     if request.method == "OPTIONS":
         return ok({"success": True})
     started = time.time()
     try:
-        lookup = str(
-            request.args.get("lookup")
-            or request.args.get("email")
-            or request.args.get("phone")
-            or request.args.get("id")
-            or ""
-        ).strip().lower()
-        requested_trader_id = str(request.args.get("trader_id") or "").strip()
-
-        # Resolve the trader with one bounded request.
-        trader = None
-        if requested_trader_id:
-            rows = _critical_rest_rows(
-                "traders", [("id", requested_trader_id)], "created_at", True, 1
-            )
+        lookup = str(request.args.get("lookup") or request.args.get("email") or request.args.get("phone") or request.args.get("id") or "").strip().lower()
+        trader_id = str(request.args.get("trader_id") or "").strip()
+        if trader_id:
+            rows = _safe_latest_rows("traders", [("id", trader_id)], "created_at", 1)
             trader = rows[0] if rows else None
-        elif lookup:
-            # Compatibility for login generations that only provide lookup.
-            probes = [("email", lookup), ("phone", lookup), ("account_reference", lookup)]
-            for col, value in probes:
-                rows = _critical_rest_rows("traders", [(col, value)], "created_at", True, 1)
-                if rows:
-                    trader = rows[0]
-                    break
-
+        else:
+            trader = _latest_trader_for_lookup(lookup) if lookup else None
         if not trader:
             return bad("Trader not found", 404)
-
         token = _request_trader_auth_token()
-        # SPEED 2026-08-24: cached verify. Same token re-verified within
-        # 30s skips the base64+hmac work. One page load fires many
-        # bootstrap-class requests, so this compounds quickly.
-        if not _np_verify_auth_token_cached(token, trader.get("id")):
+        if not _verify_trader_auth_token(token, trader.get("id")):
             return _np_fail("Trader authentication is required", 401)
 
-        key = _cache_key("trader_bootstrap_fast", trader.get("id"), lookup)
+        key = _cache_key("trader_bootstrap", trader.get("id"), lookup)
         cached = _cache_get(_TRADER_BOOTSTRAP_CACHE, key, TRADER_BOOTSTRAP_TTL_SECONDS)
         if cached:
             cached["cached"] = True
             return ok(cached, "Trader bootstrap cached")
 
-        # Accounts and purchases are independent. Load only these two datasets.
-        account_rows = []
-        purchase_rows = []
+        account = _get_active_account(trader.get("id"), trader)
+        purchase = _latest_purchase_for_trader(trader)
+        purchases = _dedupe_by_id(_safe_fetch("challenge_purchases", "trader_id", trader.get("id"), 100))
+        active_accounts = _get_active_accounts(trader.get("id"), trader, purchases)
+        active_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), active_accounts)
+        all_accounts = list(active_accounts or [])
         try:
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="np-trader-bootstrap") as pool:
-                account_future = pool.submit(
-                    _critical_rest_rows,
-                    "trader_accounts",
-                    [("trader_id", trader.get("id"))],
-                    "updated_at",
-                    True,
-                    150,
-                )
-                purchase_future = pool.submit(
-                    _critical_rest_rows,
-                    "challenge_purchases",
-                    [("trader_id", trader.get("id"))],
-                    "created_at",
-                    True,
-                    100,
-                )
-                account_rows = account_future.result() or []
-                purchase_rows = purchase_future.result() or []
-        except Exception as e:
-            print("TRADER BOOTSTRAP CORE PARALLEL ERROR:", e)
+            raw_all_accounts = (
+                supabase.table("trader_accounts")
+                .select("*")
+                .eq("trader_id", trader.get("id"))
+                .order("updated_at", desc=True)
+                .order("started_at", desc=True)
+                .order("created_at", desc=True)
+                .limit(200)
+                .execute()
+                .data
+                or []
+            )
+            all_accounts = _enrich_accounts_with_latest_monitoring(
+                trader.get("id"),
+                [_decorate_account_for_api(row) for row in raw_all_accounts]
+            )
+        except Exception as all_account_error:
+            print("TRADER BOOTSTRAP ALL ACCOUNTS ERROR:", all_account_error)
 
-        purchases = _dedupe_by_id(purchase_rows)
-        purchase_by_id = {
-            str(p.get("id") or "").strip(): p
-            for p in purchases
-            if str(p.get("id") or "").strip()
+        if account:
+            account_id = str(account.get("id") or "").strip()
+            account_login = str(account.get("mt5_login") or "").strip()
+            enriched_current = None
+            for candidate in active_accounts or []:
+                if account_id and str(candidate.get("id") or "").strip() == account_id:
+                    enriched_current = candidate
+                    break
+                if account_login and str(candidate.get("mt5_login") or "").strip() == account_login:
+                    enriched_current = candidate
+                    break
+            if enriched_current:
+                account = enriched_current
+
+        pending_replacements = _canonical_reset_waiting_accounts_for_trader(trader.get("id"))
+        canonical_purchase_ids = {
+            str(row.get("purchase_id") or "").strip()
+            for row in pending_replacements
+            if str(row.get("purchase_id") or "").strip()
         }
-
-        all_accounts = []
-        for row in account_rows:
-            try:
-                purchase = purchase_by_id.get(
-                    str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip()
-                )
-                decorated = _decorate_account_for_api(
-                    _decorate_lifecycle_authority(row, purchase, None, trader)
-                )
-            except Exception:
-                decorated = _decorate_account_for_api(row)
-            all_accounts.append(decorated)
-
-        # Preserve account history. Frontend decides which records are selectable.
-        active_accounts = list(all_accounts)
-
-        # Current trading pointer: explicit trader pointer wins, then genuine live/funded,
-        # then latest account. This is display authority only.
-        current_account_id = str(trader.get("current_account_id") or "").strip()
-        account = None
-        if current_account_id:
-            account = next(
-                (r for r in all_accounts if str(r.get("id") or "").strip() == current_account_id),
-                None,
-            )
-        if not account:
-            live_statuses = {
-                "assigned_active", "active", "current_active", "funded",
-                "funded_active", "live", "profit_protected", "payout_pending",
-                "approved_payout_pending", "payment_processing"
-            }
-            account = next(
-                (
-                    r for r in all_accounts
-                    if str(r.get("account_status") or r.get("status") or "").strip().lower()
-                    in live_statuses
-                ),
-                None,
-            )
-        if not account and all_accounts:
-            account = all_accounts[0]
-
-        purchase = purchases[0] if purchases else None
-
+        # Legacy compatibility only: old resets created before canonical waiting rows
+        # may still exist in challenge_purchases. Never duplicate a canonical row.
+        for row in _purchase_accounts_for_trader(trader):
+            pid = str(row.get("purchase_id") or "").strip()
+            if pid and pid in canonical_purchase_ids:
+                continue
+            if str(row.get("account_status") or "").strip().lower() == "waiting_mt5":
+                pending_replacements.append(row)
         payload = {
             "success": True,
-            "source": "trader_bootstrap_critical_fast",
+            "source": "trader_bootstrap_portfolio_v2",
             "generated_at": now_iso(),
             "duration_ms": int((time.time() - started) * 1000),
             "trader": _public_trader_payload(trader),
             "current_account": _trader_safe_account_row(account) if account else None,
-            "active_accounts": [_trader_safe_account_row(r) for r in active_accounts],
-            "accounts": [_trader_safe_account_row(r) for r in active_accounts],
-            "all_accounts": [_trader_safe_account_row(r) for r in all_accounts],
+            "active_accounts": [_trader_safe_account_row(row) for row in (active_accounts or [])],
+            "accounts": [_trader_safe_account_row(row) for row in (active_accounts or [])],
+            "all_accounts": [_trader_safe_account_row(row) for row in (all_accounts or [])],
             "active_purchase": _trader_safe_purchase_row(purchase) if purchase else None,
-            "pending_replacements": [],
+            "pending_replacements": [_trader_safe_account_row(row) for row in pending_replacements],
             "latest_trades": [],
             "latest_monitoring": None,
             "payout_eligibility": {
+                # Traders League V1: League competition accounts are never paid-payout eligible,
+                # even if their stage happens to read "funded" or "live".
                 "eligible": bool(
                     account
                     and str(account.get("programme_type") or "").strip().lower() != "traders_league"
-                    and str(account.get("stage") or account.get("phase") or "").lower()
-                    in {"funded", "live", "funded_live"}
+                    and str(account.get("stage") or account.get("phase") or "").lower() in {"funded", "live", "funded_live"}
                 ),
                 "reason": (
                     "League competition accounts are not eligible for paid payouts. Use the League reward system."
-                    if (
-                        account
-                        and str(account.get("programme_type") or "").strip().lower()
-                        == "traders_league"
-                    )
+                    if (account and str(account.get("programme_type") or "").strip().lower() == "traders_league")
                     else ("Funded/live account required" if not account else "Check payout rules from admin")
                 ),
-            },
+                "blocked_reason": (
+                    "league_competition_account"
+                    if (account and str(account.get("programme_type") or "").strip().lower() == "traders_league")
+                    else None
+                ),
+            }
         }
-
+        if account:
+            account_id = str(account.get("id") or "").strip()
+            login = str(account.get("mt5_login") or "").strip()
+            try:
+                q = supabase.table("monitoring_snapshots").select("id,trader_id,trader_account_id,mt5_login,balance,equity,profit,dd_used_percent,max_drawdown_used,risk_zone,created_at,updated_at").order("created_at", desc=True).limit(1)
+                if account_id:
+                    q = q.eq("trader_account_id", account_id)
+                elif login:
+                    q = q.eq("mt5_login", login).eq("trader_id", trader.get("id"))
+                snap_rows = q.execute().data or []
+                payload["latest_monitoring"] = _trader_safe_monitoring_row(snap_rows[0]) if snap_rows else None
+            except Exception as e:
+                print("TRADER BOOTSTRAP LATEST MONITORING ERROR:", e)
+            try:
+                tq = supabase.table("trader_trades").select("*").order("opened_at", desc=True).limit(5)
+                if account_id:
+                    tq = tq.eq("trader_account_id", account_id)
+                elif login:
+                    tq = tq.eq("mt5_login", login).eq("trader_id", trader.get("id"))
+                payload["latest_trades"] = [_trader_safe_trade_row(r) for r in (tq.execute().data or [])]
+            except Exception as e:
+                print("TRADER BOOTSTRAP LATEST TRADES ERROR:", e)
         if account:
             payload["trader"].update({
                 "current_account_id": account.get("id"),
@@ -5441,11 +5039,7 @@ def trader_bootstrap():
                 "drawdown_percent": account.get("absolute_drawdown_percent") or account.get("drawdown_percent") or 0,
                 "max_drawdown_used": account.get("dd_used_percent") or account.get("max_drawdown_used") or 0,
             })
-
-        return ok(
-            _cache_set(_TRADER_BOOTSTRAP_CACHE, key, payload),
-            "Trader bootstrap loaded",
-        )
+        return ok(_cache_set(_TRADER_BOOTSTRAP_CACHE, key, payload), "Trader bootstrap loaded")
     except Exception as e:
         return bad(e)
 
@@ -5466,71 +5060,43 @@ def _trader_login_candidates(lookup):
     # Search only identity columns that can actually match the supplied value.
     # This preserves duplicate-identity reconciliation while removing unrelated
     # database round trips from the customer-facing authentication path.
-    #
-    # SPEED 2026-08-24: collapse the 2-3 sequential .eq() queries into a
-    # single .or_() query. PostgREST translates "col1.eq.x,col2.eq.x" into
-    # one round-trip with WHERE (col1 = x OR col2 = x OR ...). Saves one
-    # to two Supabase round-trips per login (100-200ms over the Lagos wire).
     if "@" in lookup:
-        # Email lookup: canonical_email OR email
-        or_filter = f"canonical_email.eq.{lookup},email.eq.{lookup}"
+        queries = [
+            ("canonical_email", lookup),
+            ("email", lookup),
+        ]
         check_mt5_owner = False
     elif lookup.isdigit() or lookup.startswith("+"):
-        # Phone lookup: canonical_phone OR phone OR account_reference
-        or_filter = (
-            f"canonical_phone.eq.{normalized_phone},"
-            f"phone.eq.{lookup},"
-            f"account_reference.eq.{lookup}"
-        )
+        queries = [
+            ("canonical_phone", normalized_phone),
+            ("phone", lookup),
+            ("account_reference", lookup),
+        ]
         check_mt5_owner = True
     else:
-        # Reference or ID lookup
-        or_filter = f"account_reference.eq.{lookup},id.eq.{lookup}"
+        queries = [
+            ("account_reference", lookup),
+            ("id", lookup),
+        ]
         check_mt5_owner = True
 
     matches = []
-    try:
-        rows = (
-            supabase.table("traders")
-            .select("*")
-            .or_(or_filter)
-            .limit(25)
-            .execute()
-            .data
-            or []
-        )
-        matches.extend(rows)
-    except Exception as e:
-        # Fall back to sequential queries if the .or_() syntax is not
-        # supported by the current PostgREST version. This is defensive —
-        # PostgREST 4+ supports .or_(), but some older deployments do not.
-        print(f"LOGIN CANDIDATE .or_() LOOKUP FALLBACK ({e}), trying sequential...")
-        if "@" in lookup:
-            queries = [("canonical_email", lookup), ("email", lookup)]
-        elif lookup.isdigit() or lookup.startswith("+"):
-            queries = [
-                ("canonical_phone", normalized_phone),
-                ("phone", lookup),
-                ("account_reference", lookup),
-            ]
-        else:
-            queries = [("account_reference", lookup), ("id", lookup)]
-        for column, value in queries:
-            if not value:
-                continue
-            try:
-                rows = (
-                    supabase.table("traders")
-                    .select("*")
-                    .eq(column, value)
-                    .limit(25)
-                    .execute()
-                    .data
-                    or []
-                )
-                matches.extend(rows)
-            except Exception as inner_e:
-                print(f"LOGIN CANDIDATE LOOKUP SKIPPED {column}:", inner_e)
+    for column, value in queries:
+        if not value:
+            continue
+        try:
+            rows = (
+                supabase.table("traders")
+                .select("*")
+                .eq(column, value)
+                .limit(25)
+                .execute()
+                .data
+                or []
+            )
+            matches.extend(rows)
+        except Exception as e:
+            print(f"LOGIN CANDIDATE LOOKUP SKIPPED {column}:", e)
 
     if check_mt5_owner:
         try:
@@ -5645,20 +5211,10 @@ def login_trader():
             )
             if not has_any_credential:
                 print(f"PERF trader_login total_ms={int((time.time()-started)*1000)} lookup_ms={t_lookup_ms} pwd_ms={t_pwd_ms} result=no_credential_set")
-                canonical_email = str(canonical.get("email") or "").strip().lower()
-                lookup_is_email = bool("@" in lookup and canonical_email and lookup == canonical_email)
-                return jsonify({
-                    "success": False,
-                    "error": "Your NairaPips account is active but needs a login password. Verify your email once to create it.",
-                    "code": "PASSWORD_SETUP_REQUIRED",
-                    "password_setup_required": True,
-                    "golden_ticket_account": bool(
-                        canonical.get("golden_ticket")
-                        or str(canonical.get("source") or "").lower().startswith("golden_ticket")
-                        or str(canonical.get("challenge_state") or "").lower().startswith("golden_ticket")
-                    ),
-                    "setup_email": canonical_email if lookup_is_email else "",
-                }), 403
+                return bad(
+                    "Password not set. Please verify your email and create a password.",
+                    403,
+                )
             print(f"PERF trader_login total_ms={int((time.time()-started)*1000)} lookup_ms={t_lookup_ms} pwd_ms={t_pwd_ms} result=bad_password")
             return bad("Invalid email/phone or password", 401)
 
@@ -5708,32 +5264,6 @@ def login_trader():
             f"/trader_bootstrap?trader_id={canonical.get('id')}"
         )
         t_token_ms = int((time.time() - t_token_start) * 1000)
-
-        # SPEED 2026-08-24: pre-warm the trader_bootstrap cache in a
-        # background daemon thread. The frontend will call bootstrap_url
-        # within ~100-200ms of receiving the login response. If our
-        # background pre-warm completes in that window, the bootstrap
-        # call is a cache hit (sub-50ms instead of 250-500ms).
-        # Net effect: the trader's "time to interactive dashboard"
-        # drops by 200-450ms per cold login.
-        try:
-            def _prewarm_trader_bootstrap(tid, atok):
-                try:
-                    with app.test_request_context(
-                        f"/trader_bootstrap?trader_id={tid}",
-                        headers={"Authorization": f"Bearer {atok}"},
-                    ):
-                        trader_bootstrap()
-                except Exception as pw_exc:
-                    print("LOGIN PREWARM failed (non-fatal):", pw_exc)
-            threading.Thread(
-                target=_prewarm_trader_bootstrap,
-                args=(canonical.get("id"), public["auth_token"]),
-                daemon=True,
-                name="np-login-prewarm",
-            ).start()
-        except Exception as pw_outer:
-            print("LOGIN PREWARM start skipped:", pw_outer)
 
         total_ms = int((time.time() - started) * 1000)
         print(f"PERF trader_login total_ms={total_ms} lookup_ms={t_lookup_ms} pwd_ms={t_pwd_ms} token_ms={t_token_ms} candidates={len(candidates)} result=ok")
@@ -5932,79 +5462,6 @@ Note: {upd["kyc_note"]}"""
     except Exception as e:
         return bad(e)
 
-# ============================================================
-# NAIRAPIPS SECOND LIFE — 2 LIVES / 1 PHASE
-# New purchases only. Legacy purchases remain unchanged unless their
-# purchase snapshot explicitly carries second_life_enabled=True.
-# ============================================================
-def _second_life_bool(value):
-    return value is True or str(value or "").strip().lower() in {"1", "true", "yes", "y", "enabled", "active"}
-
-
-def _second_life_plan_snapshot(plan):
-    plan = plan or {}
-    enabled = _second_life_bool(plan.get("second_life_enabled"))
-    total = 2 if enabled else 1
-    try:
-        configured = int(plan.get("lives_total") or total)
-        total = max(1, min(configured, 2 if enabled else 1))
-    except Exception:
-        pass
-    return {
-        "second_life_enabled": enabled,
-        "lives_total": total,
-        "life_number": 1,
-        "second_life_used": False,
-        "second_life_status": "available_on_eligible_breach" if enabled else "not_included",
-    }
-
-
-def _second_life_purchase_for_trader(purchase_id, trader_id):
-    if not purchase_id or not trader_id:
-        return None
-    rows = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
-    if not rows:
-        return None
-    p = rows[0]
-    if str(p.get("trader_id") or "") != str(trader_id):
-        return None
-    return p
-
-
-def _second_life_status_payload(purchase, trader_id=None):
-    p = purchase or {}
-    enabled = _second_life_bool(p.get("second_life_enabled"))
-    used = _second_life_bool(p.get("second_life_used"))
-    status = str(p.get("second_life_status") or ("available_on_eligible_breach" if enabled else "not_included")).strip().lower()
-    eligible = False
-    breached_account = None
-    if enabled and not used:
-        try:
-            q = supabase.table("trader_accounts").select("*").eq("purchase_id", p.get("id")).eq("trader_id", trader_id or p.get("trader_id")).order("created_at", desc=True).limit(50)
-            rows = q.execute().data or []
-            for a in rows:
-                ast = str(a.get("account_status") or a.get("status") or "").lower()
-                stage = _normalize_lifecycle_stage(a.get("stage") or a.get("phase"))
-                if stage == "phase1" and "breach" in ast:
-                    eligible = True
-                    breached_account = a
-                    break
-        except Exception as e:
-            print("SECOND LIFE STATUS ACCOUNT LOOKUP ERROR:", e)
-    if status in {"waiting_mt5", "activated", "life2_waiting_mt5"}:
-        eligible = False
-    return {
-        "purchase_id": p.get("id"),
-        "enabled": enabled,
-        "lives_total": int(p.get("lives_total") or (2 if enabled else 1)),
-        "life_number": int(p.get("life_number") or 1),
-        "used": used,
-        "status": status,
-        "eligible_now": bool(eligible),
-        "breached_account_id": (breached_account or {}).get("id"),
-        "activated_at": p.get("second_life_activated_at"),
-    }
-
 @app.route("/challenge_plans", methods=["GET"])
 def challenge_plans():
     try:
@@ -6012,8 +5469,6 @@ def challenge_plans():
         for row in rows:
             if "payout_split" in row:
                 row["payout_split"] = _effective_payout_split(row.get("payout_split"))
-            row["second_life_enabled"] = _second_life_bool(row.get("second_life_enabled"))
-            row["lives_total"] = int(row.get("lives_total") or (2 if row["second_life_enabled"] else 1))
         return jsonify(rows)
     except Exception as e: return bad(e)
 
@@ -6037,8 +5492,6 @@ def create_plan():
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
              "challenge_journey": challenge_journey, "journey_source": "plan_create",
              "payout_split":_effective_payout_split(d.get("payout_split")),"description":d.get("description",""),
-             "second_life_enabled":_second_life_bool(d.get("second_life_enabled")),
-             "lives_total":2 if _second_life_bool(d.get("second_life_enabled")) else 1,
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
              "status":d.get("status","active"),"created_at":now_iso(),"updated_at":now_iso()}
         return ok(supabase.table("challenge_plans").insert(row).execute().data, "Challenge plan created")
@@ -6054,9 +5507,6 @@ def update_plan():
             if k in d: upd[k]=d[k]
         if "payout_split" in d:
             upd["payout_split"] = _effective_payout_split(d.get("payout_split"))
-        if "second_life_enabled" in d:
-            upd["second_life_enabled"] = _second_life_bool(d.get("second_life_enabled"))
-            upd["lives_total"] = 2 if upd["second_life_enabled"] else 1
         upd["daily_drawdown"] = "None"
         if "mt5_server" in d and "default_server" not in d:
             upd["default_server"] = d.get("mt5_server")
@@ -6145,7 +5595,6 @@ def create_purchase():
 
         plan_row = _safe_plan_for_purchase({"plan_id": d.get("plan_id"), "plan_name": plan})
         challenge_journey = _journey_source_value(_journey_for_lifecycle({}, {}, plan_row, None))
-        second_life_snapshot = _second_life_plan_snapshot(plan_row)
         row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
              "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":quote.get("final_fee", original_fee),
              "original_fee":quote.get("original_fee", original_fee),"discount_percent":quote.get("discount_percent",0),"discount_amount":quote.get("discount_amount",0),
@@ -6153,7 +5602,6 @@ def create_purchase():
              "payment_proof_url":proof,"payment_status":"pending","status":"pending_review","admin_note":"",
              "challenge_journey": challenge_journey, "journey_source": "purchase_plan_snapshot",
              "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
-        row.update(second_life_snapshot)
         row.update(_affiliate_purchase_fields(d, original_fee))
         created = supabase.table("challenge_purchases").insert(row).execute().data or []
         if not created:
@@ -6220,93 +5668,6 @@ Proof URL: {proof}"""
         return ok(created, "Challenge purchase submitted")
     except Exception as e: return bad(e)
 
-@app.route("/second_life/status", methods=["GET", "OPTIONS"])
-def second_life_status():
-    if request.method == "OPTIONS":
-        return _np_ok({"success": True})
-    requested_id = str(request.args.get("trader_id") or "").strip()
-    authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
-    if auth_error:
-        return _np_fail(auth_error, 401)
-    try:
-        rows = supabase.table("challenge_purchases").select("*").eq("trader_id", authed_id).order("created_at", desc=True).limit(100).execute().data or []
-        items = [_second_life_status_payload(p, authed_id) for p in rows if _second_life_bool(p.get("second_life_enabled"))]
-        return _np_ok({"success": True, "items": items, "data": items})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-
-@app.route("/second_life/activate", methods=["POST", "OPTIONS"])
-def second_life_activate():
-    if request.method == "OPTIONS":
-        return _np_ok({"success": True})
-    data = request.get_json(silent=True) or {}
-    requested_id = str(data.get("trader_id") or "").strip()
-    authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
-    if auth_error:
-        return _np_fail(auth_error, 401)
-    purchase_id = str(data.get("purchase_id") or "").strip()
-    if not purchase_id:
-        return _np_fail("purchase_id is required", 400)
-    try:
-        p = _second_life_purchase_for_trader(purchase_id, authed_id)
-        if not p:
-            return _np_fail("Second Life purchase was not found for this trader", 404)
-        status = _second_life_status_payload(p, authed_id)
-        if not status.get("enabled"):
-            return _np_fail("Second Life is not included with this purchase", 409)
-        if status.get("used"):
-            return _np_fail("Second Life has already been used", 409)
-        if not status.get("eligible_now") or not status.get("breached_account_id"):
-            return _np_fail("Second Life activates only after an eligible Life 1 Phase 1 breach", 409)
-        # One-phase purchases only. Legacy two-phase journeys are intentionally excluded.
-        journey = _journey_from_text(p.get("challenge_journey"), p.get("journey_stages"), p.get("route"))
-        if journey != ONE_PHASE_CHALLENGE_JOURNEY:
-            return _np_fail("Second Life is only available on eligible 1-Phase purchases", 409)
-        now = now_iso()
-        purchase_update = {
-            "second_life_used": True,
-            "life_number": 2,
-            "second_life_status": "life2_waiting_mt5",
-            "second_life_activated_at": now,
-            "lifecycle_state": "phase1_waiting_mt5",
-            "updated_at": now,
-        }
-        supabase.table("challenge_purchases").update(purchase_update).eq("id", purchase_id).execute()
-        trader_update = {
-            "status": "phase1_waiting_mt5",
-            "phase": "phase1",
-            "challenge_state": "phase1_waiting_mt5",
-            "mt5_login": None,
-            "mt5_server": None,
-            "mt5_master_password": None,
-            "mt5_investor_password": None,
-            "updated_at": now,
-            "admin_note": "Second Life activated. Waiting for a fresh Life 2 Phase 1 MT5 account.",
-        }
-        supabase.table("traders").update(trader_update).eq("id", authed_id).execute()
-        _audit_safe("second_life", "activated", f"Purchase {purchase_id}; Life 2 awaiting fresh MT5", {"name":"trader","username":str(authed_id)[:12],"role":"trader"}, purchase_id)
-        trader = get_trader_by_id(authed_id) or {}
-        send_email_safe(
-            trader.get("email"),
-            "NairaPips Second Life activated",
-            f"""Hello {trader.get('name') or 'Trader'},
-
-Your NairaPips Second Life is now activated.
-
-Life: 2 of 2
-Stage: Phase 1
-Status: Waiting for fresh MT5 assignment
-
-Your breached Life 1 account remains locked as historical evidence. Life 2 starts fresh with the same eligible challenge terms.
-
-NairaPips Team"""
-        )
-        return _np_ok({"success": True, "purchase_id": purchase_id, "life_number": 2, "status": "life2_waiting_mt5", "breached_account_id": status.get("breached_account_id")})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-
 @app.route("/approve_challenge_purchase", methods=["POST"])
 def approve_purchase():
     try:
@@ -6366,11 +5727,6 @@ NairaPips Team"""
 
         _audit_safe("challenge_purchases", "challenge_purchase_approved", f"Purchase {pid} approved", staff)
         _audit_safe("mt5", "phase1_mt5_assignment", f"Purchase {pid} assigned MT5 {m.get('mt5_login','')} to trader account {account.get('id')}", staff)
-        try:
-            np_invalidate_admin_bootstrap("purchases")
-            np_invalidate_admin_bootstrap("mt5")
-        except Exception:
-            pass
         return ok(approved_rows, "Challenge purchase approved and MT5 assigned")
     except Exception as e: return bad(e)
 
@@ -6729,13 +6085,13 @@ def assign_phase_mt5():
             return bad("Missing trader_id")
         if not mt5_id:
             return bad("Choose an MT5 account from the pool")
-        if phase not in ["phase1", "phase2", "funded", "live"]:
-            return bad("Phase must be phase1, phase2, funded or live")
+        if phase not in ["phase2", "funded", "live"]:
+            return bad("Phase must be phase2, funded or live")
 
         trader = get_trader_by_id(trader_id)
         if not trader:
             return bad("Trader not found", 404)
-        target_stage = "funded" if phase in ["funded", "live"] else ("phase1" if phase == "phase1" else "phase2")
+        target_stage = "funded" if phase in ["funded", "live"] else "phase2"
         completed_account = None
         completed_account_id = str(d.get("completed_account_id") or d.get("trader_account_id") or d.get("passed_account_id") or "").strip()
         if completed_account_id and not completed_account_id.startswith("waiting:"):
@@ -6744,33 +6100,19 @@ def assign_phase_mt5():
             if not completed_account:
                 return bad("Completed trader account was not found for this trader", 404)
             completed_stage = _normalize_lifecycle_stage(completed_account.get("stage") or completed_account.get("phase"))
-            linked_purchase = _safe_purchase_for_account(completed_account)
-            second_life_reentry = bool(
-                target_stage == "phase1"
-                and linked_purchase
-                and _second_life_bool(linked_purchase.get("second_life_enabled"))
-                and _second_life_bool(linked_purchase.get("second_life_used"))
-                and str(linked_purchase.get("second_life_status") or "").lower() in {"life2_waiting_mt5", "waiting_mt5"}
-                and completed_stage == "phase1"
-                and "breach" in str(completed_account.get("account_status") or completed_account.get("status") or "").lower()
+            expected_stage = _next_stage_for_lifecycle(
+                completed_stage,
+                completed_account,
+                _safe_purchase_for_account(completed_account),
+                None,
+                trader
             )
-            if not second_life_reentry:
-                expected_stage = _next_stage_for_lifecycle(
-                    completed_stage,
-                    completed_account,
-                    linked_purchase,
-                    None,
-                    trader
-                )
-                if expected_stage and target_stage != expected_stage:
-                    return bad(f"Lifecycle authority requires {expected_stage} assignment for this completed account, not {target_stage}", 409)
-                if expected_stage:
-                    target_stage = expected_stage
+            if expected_stage and target_stage != expected_stage:
+                return bad(f"Lifecycle authority requires {expected_stage} assignment for this completed account, not {target_stage}", 409)
+            if expected_stage:
+                target_stage = expected_stage
         mt5_acc = _get_mt5_account(mt5_id=mt5_id)
         purchase = _safe_purchase_for_account(completed_account) if completed_account else None
-        if target_stage == "phase1":
-            if not purchase or not _second_life_bool(purchase.get("second_life_used")) or str(purchase.get("second_life_status") or "").lower() not in {"life2_waiting_mt5", "waiting_mt5"}:
-                return bad("Fresh Phase 1 assignment is reserved for an activated Second Life purchase", 409)
         account, updated = _assign_mt5_to_trader(
             trader,
             mt5_acc,
@@ -6779,22 +6121,9 @@ def assign_phase_mt5():
             _admin_from_payload(d),
             d.get("admin_note") or f"{target_stage.title()} MT5 assigned"
         )
-        if target_stage == "phase1" and purchase and _second_life_bool(purchase.get("second_life_used")):
-            try:
-                supabase.table("challenge_purchases").update({
-                    "second_life_status": "life2_active",
-                    "lifecycle_state": "phase1_active",
-                    "trader_account_id": account.get("id"),
-                    "assigned_mt5_id": mt5_acc.get("id"),
-                    "mt5_login": account.get("mt5_login"),
-                    "mt5_server": account.get("mt5_server"),
-                    "updated_at": now_iso(),
-                }).eq("id", purchase.get("id")).execute()
-            except Exception as e:
-                print("SECOND LIFE PURCHASE ACTIVE UPDATE ERROR:", e)
         send_email_safe(
             updated.get("email"),
-            f"NairaPips {'LIFE 2 PHASE 1' if target_stage == 'phase1' and purchase and _second_life_bool(purchase.get('second_life_used')) else target_stage.upper()} MT5 account assigned",
+            f"NairaPips {target_stage.upper()} MT5 account assigned",
             f"""Hello {updated.get("name") or "Trader"},
 
 Your fresh {target_stage.upper()} MT5 account has been assigned.
@@ -6968,99 +6297,6 @@ def payouts():
     except Exception as e:
         return bad(e)
 
-
-@app.route("/trader_payout_history", methods=["GET", "OPTIONS"])
-def trader_payout_history():
-    """Fast permanent payout-request history for the authenticated trader.
-
-    A request belongs in history immediately when submitted. Approval/payment
-    only changes the status of the same payout row.
-    """
-    if request.method == "OPTIONS":
-        return _np_ok({"success": True})
-
-    try:
-        requested_id = str(request.args.get("trader_id") or "").strip()
-        authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
-        if auth_error:
-            return _np_fail(auth_error, 401)
-
-        trader = _get_trader_by_id(authed_id) or {}
-        verified_email = str(trader.get("email") or "").strip().lower()
-        limit = max(1, min(int(request.args.get("limit") or 200), 300))
-
-        collected = []
-
-        # Fast canonical lookup: current authenticated trader id.
-        try:
-            collected.extend(
-                supabase.table("payouts").select("*")
-                .eq("trader_id", authed_id)
-                .order("created_at", desc=True).limit(limit)
-                .execute().data or []
-            )
-        except Exception as e:
-            print("TRADER PAYOUT HISTORY ID ERROR:", e)
-
-        # Historical compatibility: old payout rows may retain the trader email
-        # while their trader_id is absent/stale. This is a verified DB email,
-        # never an email trusted from the browser request.
-        if verified_email:
-            try:
-                collected.extend(
-                    supabase.table("payouts").select("*")
-                    .eq("email", verified_email)
-                    .order("created_at", desc=True).limit(limit)
-                    .execute().data or []
-                )
-            except Exception as e:
-                print("TRADER PAYOUT HISTORY EMAIL ERROR:", e)
-
-        # Only if canonical identity returned nothing, use a small owned-account
-        # fallback. Do not scan monitoring or every MT5 on normal page opening.
-        if not collected:
-            try:
-                owned = (
-                    supabase.table("trader_accounts")
-                    .select("id")
-                    .eq("trader_id", authed_id)
-                    .order("updated_at", desc=True).limit(100)
-                    .execute().data or []
-                )
-                account_ids=[str(r.get("id") or "").strip() for r in owned if str(r.get("id") or "").strip()]
-                if account_ids:
-                    collected.extend(
-                        supabase.table("payouts").select("*")
-                        .in_("trader_account_id", account_ids)
-                        .order("created_at", desc=True).limit(limit)
-                        .execute().data or []
-                    )
-            except Exception as e:
-                print("TRADER PAYOUT HISTORY ACCOUNT FALLBACK ERROR:", e)
-
-        merged={}
-        for row in collected:
-            row=row or {}
-            key=str(row.get("id") or "|".join([
-                str(row.get("trader_id") or ""),
-                str(row.get("email") or "").lower(),
-                str(row.get("mt5_login") or ""),
-                str(row.get("amount") or ""),
-                str(row.get("requested_at") or row.get("created_at") or ""),
-            ]))
-            merged[key]={**(merged.get(key) or {}), **row}
-
-        rows=list(merged.values())
-        rows.sort(key=lambda r: str(r.get("requested_at") or r.get("created_at") or r.get("updated_at") or ""), reverse=True)
-        safe_rows=[_trader_safe_payout_row(r) for r in rows[:limit]]
-        return _np_ok({
-            "payouts": safe_rows,
-            "data": safe_rows,
-            "count": len(safe_rows),
-            "includes_pending_requests": True,
-        })
-    except Exception as e:
-        return _np_fail(e, 500)
 
 def _set_funded_payout_trade_lock(trader_row, account, payout_id=None, reason="Payout request pending"):
     """Lock exact funded account while payout is open; separate from reset."""
@@ -7536,27 +6772,17 @@ def mark_paid():
         except Exception as e:
             print("PAID PAYOUT LOCK STATE UPDATE:", e)
 
-        # Certificate availability follows the existing production authority:
-        # only an APPROVED payout that has now been successfully marked PAID earns it.
-        # The certificate itself is rendered from the paid payout record in the trader dashboard;
-        # no lifecycle, MT5, drawdown, reset, profit-share or funded-cycle state is changed here.
         send_email_safe(
             payout.get("email"),
-            "NairaPips payout received - your certificate is ready",
+            "NairaPips payout marked paid",
             f"""Hello {payout.get("trader_name") or "Trader"},
 
-Your NairaPips payout has been completed successfully.
+Your payout has been marked as paid.
 
-Amount Received: {email_money(payout.get("amount"))}
-Status: PAID
+Amount: {email_money(payout.get("amount"))}
 Admin Note: {note or "Payment completed."}
 
-Your official NairaPips Payout Certificate is now available in your Trader Dashboard under Payouts. You can view, download and share it from there.
-
-TRADED. PROFITED. REWARDED.
-
-NairaPips Team
-Rewarding Nigerian Traders. Changing Trading Stories."""
+NairaPips Team"""
         )
 
         _audit_safe("payouts", "payout_paid", f"Payout {pid} marked paid", _admin_from_payload(d))
@@ -10166,9 +9392,6 @@ def staff_members():
     except Exception as e:
         return jsonify([])
 
-
-_NP_STAFF_LOGIN_CACHE = {}
-
 @app.post('/staff_login')
 def staff_login():
     try:
@@ -10179,29 +9402,25 @@ def staff_login():
         if not login or not password:
             return jsonify({'success': False, 'error': 'Enter username/email and password'}), 400
 
-        # ADMIN LOGIN DIRECT FAST PATH:
-        # The built-in NairaPips super-admin is verified locally FIRST. It must never
-        # wait for Supabase just to prove credentials already held by the server.
-        bootstrap_username = os.getenv('NAIRAPIPS_BOOTSTRAP_ADMIN_USERNAME', 'admin')
-        bootstrap_password = os.getenv('NAIRAPIPS_BOOTSTRAP_ADMIN_PASSWORD', 'nairapips123')
-        staff = None
+        # Staff may sign in with either their username or registered email.
+        # Password verification and active status remain authoritative.
+        db = _staff_db()
+        rows = (
+            db.table('admin_staff_members')
+            .select('*')
+            .eq('username', login)
+            .eq('password', password)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
 
-        if hmac.compare_digest(login, bootstrap_username) and hmac.compare_digest(password, bootstrap_password):
-            staff = {
-                'id': 'bootstrap-super-admin',
-                'username': bootstrap_username,
-                'name': 'Super Admin',
-                'role': 'super_admin',
-                'permissions': 'all',
-                'status': 'active',
-            }
-        else:
-            # Database lookup is only for additional staff accounts.
-            db = _staff_db()
+        if not rows and '@' in login:
             rows = (
                 db.table('admin_staff_members')
                 .select('*')
-                .eq('username', login)
+                .eq('email', login.lower())
                 .eq('password', password)
                 .limit(1)
                 .execute()
@@ -10209,19 +9428,21 @@ def staff_login():
                 or []
             )
 
-            if not rows and '@' in login:
-                rows = (
-                    db.table('admin_staff_members')
-                    .select('*')
-                    .eq('email', login.lower())
-                    .eq('password', password)
-                    .limit(1)
-                    .execute()
-                    .data
-                    or []
-                )
+        staff = rows[0] if rows else None
 
-            staff = rows[0] if rows else None
+        # Compatibility path for the existing NairaPips bootstrap super-admin.
+        if not staff:
+            bootstrap_username = os.getenv('NAIRAPIPS_BOOTSTRAP_ADMIN_USERNAME', 'admin')
+            bootstrap_password = os.getenv('NAIRAPIPS_BOOTSTRAP_ADMIN_PASSWORD', 'nairapips123')
+            if hmac.compare_digest(login, bootstrap_username) and hmac.compare_digest(password, bootstrap_password):
+                staff = {
+                    'id': 'bootstrap-super-admin',
+                    'username': bootstrap_username,
+                    'name': 'Super Admin',
+                    'role': 'super_admin',
+                    'permissions': 'all',
+                    'status': 'active',
+                }
 
         if not staff:
             return jsonify({'success': False, 'error': 'Invalid username/email or password'}), 401
@@ -12742,12 +11963,69 @@ def admin_trader_accounts_feed():
             query = query.in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
         rows = query.execute().data or []
 
-        # STABILITY RECOVERY 2026-08-23:
-        # Keep /trader_accounts a fast lifecycle/account-authority feed.
-        # Do NOT scan monitoring_snapshots here. Render logs proved that enrichment
-        # could hit PostgreSQL statement_timeout and hold a Gunicorn worker.
-        # Live monitoring remains available through dedicated monitoring/bootstrap
-        # paths and the MT5 engine; no trading rule or stored account data is changed.
+        # PRODUCTION SAFETY: Admin must not show stale 0 values when MT5 monitoring
+        # has already synced newer balance/equity/profit evidence. This is read-only
+        # enrichment for the admin/trader account feed; it does not change trading logic.
+        try:
+            logins = []
+            for r in rows:
+                lg = str((r or {}).get("mt5_login") or "").strip()
+                if lg and lg not in logins:
+                    logins.append(lg)
+            latest_by_account = {}
+            snapshots_by_login = {}
+            for i in range(0, len(logins), 100):
+                batch = logins[i:i+100]
+                if not batch:
+                    continue
+                snaps = supabase.table("monitoring_snapshots").select("*").in_("mt5_login", batch).order("created_at", desc=True).limit(1000).execute().data or []
+                for snap in snaps:
+                    aid = str((snap or {}).get("trader_account_id") or "").strip()
+                    lg = str((snap or {}).get("mt5_login") or "").strip()
+                    if aid and aid not in latest_by_account:
+                        latest_by_account[aid] = snap
+                    if lg:
+                        snapshots_by_login.setdefault(lg, []).append(snap)
+            enriched = []
+            for r in rows:
+                row = dict(r or {})
+                account_id = str(row.get("id") or "").strip()
+                trader_owner = str(row.get("trader_id") or "").strip()
+                lg = str(row.get("mt5_login") or "").strip()
+                snap = latest_by_account.get(account_id)
+                # Legacy fallback is allowed only when exactly one snapshot candidate belongs
+                # to the same trader. Login alone is never lifecycle authority.
+                if not snap and lg:
+                    candidates = [x for x in snapshots_by_login.get(lg, []) if str((x or {}).get("trader_id") or "").strip() == trader_owner]
+                    accountless = [x for x in candidates if not str((x or {}).get("trader_account_id") or "").strip()]
+                    if len(accountless) == 1:
+                        snap = accountless[0]
+                if snap:
+                    # Prefer monitoring truth for live metrics, especially newly-fixed
+                    # accounts like Fatoba where trader_accounts may still show defaults.
+                    bal = snap.get("balance") or snap.get("current_balance")
+                    eq = snap.get("equity") or snap.get("current_equity") or bal
+                    profit = snap.get("profit") or snap.get("current_profit")
+                    profit_pct = snap.get("profit_percent") or snap.get("current_profit_percent")
+                    if bal not in [None, ""]:
+                        row["current_balance"] = bal
+                        row["balance"] = bal
+                    if eq not in [None, ""]:
+                        row["current_equity"] = eq
+                        row["equity"] = eq
+                    if profit not in [None, ""]:
+                        row["profit"] = profit
+                    if profit_pct not in [None, ""]:
+                        row["profit_percent"] = profit_pct
+                    for k in ["dd_used_percent", "max_drawdown_used", "drawdown_percent", "risk_zone", "highest_equity", "lowest_equity", "phase_pass_status", "target_percent", "target_equity"]:
+                        if snap.get(k) not in [None, ""]:
+                            row[k] = snap.get(k)
+                    row["latest_monitoring_snapshot"] = snap
+                    row["last_sync_at"] = snap.get("created_at") or row.get("last_sync_at")
+                enriched.append(row)
+            rows = enriched
+        except Exception as enrich_err:
+            print("ADMIN ACCOUNT FEED MONITORING ENRICH ERROR:", enrich_err)
 
         rows = [_decorate_account_for_api(r) if "_decorate_account_for_api" in globals() else r for r in rows]
         if trader_id:
@@ -12805,26 +12083,16 @@ def np_assignment_center():
                 continue
             if pid:
                 seen.add(pid)
-            lifecycle_blob = " ".join([
-                str(p.get("lifecycle_state") or ""), str(p.get("active_stage") or ""),
-                str(p.get("assigned_phase") or ""), str(p.get("phase") or ""), str(p.get("status") or "")
-            ]).lower().replace(" ", "_")
-            if "funded_waiting" in lifecycle_blob or "waiting_for_funded" in lifecycle_blob:
-                assignment_stage = "funded"
-            elif "phase2_waiting" in lifecycle_blob or "waiting_for_phase_2" in lifecycle_blob:
-                assignment_stage = "phase2"
-            else:
-                assignment_stage = "phase1"
             purchase_rows.append({
                 "id": p.get("trader_id") or p.get("id"),
                 "trader_id": p.get("trader_id") or "",
                 "purchase_id": p.get("id"),
                 "source_type": "purchase",
                 "source": "challenge_purchases",
-                "target_phase": assignment_stage,
-                "target_stage": assignment_stage,
-                "stage_label": f"{assignment_stage.upper()} MT5 ASSIGNMENT",
-                "assignment_label": "Assign Funded MT5" if assignment_stage == "funded" else ("Assign Phase 2 MT5" if assignment_stage == "phase2" else "Assign Phase 1 MT5"),
+                "target_phase": "phase1",
+                "target_stage": "phase1",
+                "stage_label": "PHASE 1 MT5 ASSIGNMENT",
+                "assignment_label": "Assign Phase 1 MT5",
                 "name": p.get("trader_name") or p.get("name") or p.get("full_name") or "Trader",
                 "email": p.get("email") or "",
                 "phone": p.get("phone") or "",
@@ -13960,7 +13228,6 @@ def admin_mark_notification_read():
 """In-process scheduler for auto-pilot revenue engine."""
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -14096,195 +13363,6 @@ def _np_weekly_cleanup():
 
 
 
-
-
-# ============================================================
-# NAIRAPIPS HUMAN LEAD FOLLOW-UP ENGINE — 2026-08-25
-# Behaviour-aware Nigerian follow-up. Uses existing traders,
-# landing_leads, challenge_purchases and email_logs only.
-# No lifecycle/trading/payout logic is modified.
-# ============================================================
-NP_LEAD_FOLLOWUP_VERSION = "HUMAN_NG_V1_2026_08_25"
-
-def _np_parse_iso(value):
-    try:
-        return datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-def _np_days_since(value):
-    dt = _np_parse_iso(value)
-    if not dt:
-        return 99999
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return max(0, (datetime.now(timezone.utc) - dt).days)
-
-def _np_first_name(name):
-    name = str(name or "").strip()
-    return name.split()[0].title() if name else "Legend"
-
-def _np_has_purchase(email, trader_id=None):
-    try:
-        q = supabase.table("challenge_purchases").select("id,status,payment_status,created_at").limit(20)
-        if trader_id:
-            rows = q.eq("trader_id", trader_id).execute().data or []
-        elif email:
-            rows = q.eq("email", str(email).strip().lower()).execute().data or []
-        else:
-            rows = []
-        paid = any(str(r.get("payment_status") or r.get("status") or "").lower() in {"approved","paid","active","approved_active"} for r in rows)
-        started = bool(rows)
-        return started, paid
-    except Exception:
-        return False, False
-
-def _np_followup_class(row, source_type):
-    email = str(row.get("email") or "").strip().lower()
-    tid = str(row.get("id") or "") if source_type == "trader" else None
-    started, paid = _np_has_purchase(email, tid)
-    status = str(row.get("status") or row.get("lead_status") or "").lower()
-    phase = str(row.get("phase") or "").lower()
-    if paid or status in {"active","funded","live","passed","breached"} or phase in {"phase1","phase2","funded","live"}:
-        return "customer"
-    if started:
-        return "abandoned_purchase"
-    if source_type == "golden":
-        return "golden_vip" if bool(row.get("vip_status")) else "golden_ticket"
-    days = _np_days_since(row.get("created_at"))
-    return "dormant_signup" if days >= 30 else "new_signup"
-
-NP_FOLLOWUP_SEQUENCES = {
-    "new_signup": {
-        0: ("Legend, welcome to NairaPips 🇳🇬", "Legend {name}, welcome to NairaPips.\n\nYou don enter our house now 😄. Before anything else, know this: NairaPips was built for traders who want a simpler route to opportunity — 1 Phase and Static Balance Drawdown.\n\nNo pressure to buy today. Look around, understand the rules, and if anything confuse you, reply this email. Human beings dey here.\n\n— NairaPips"),
-        1: ("Quick question, Legend", "Legend {name}, make we ask you one honest question.\n\nIf enough trading capital landed in your hand today, is your trading ready for it?\n\nCapital no dey repair bad risk management. It only makes the mistake bigger. That is why we care about discipline before size.\n\nThink am. We go talk again.\n\n— NairaPips"),
-        3: ("Why NairaPips made it 1 Phase", "Legend {name}, forex hard already. Why funding company go still add another mountain?\n\nThat is why NairaPips uses 1 Phase. Meet the target, respect the rules, move forward. And the drawdown is static balance-based — it no dey chase your profit up and down.\n\nFight the market. Not your funding company.\n\n— NairaPips"),
-        5: ("Static drawdown — make we explain am", "Legend {name}, this one confuses plenty traders, so make we make am simple.\n\nIf your challenge starts at a balance, the NairaPips maximum drawdown floor is based on that starting balance. Profit no make the floor begin pursue you.\n\nRisk limit should be a limit, not a moving trap.\n\n— NairaPips"),
-        7: ("You registered. You never start.", "Legend {name}, you registered with NairaPips but you never pick a challenge. No wahala. Maybe you were checking us out. Maybe timing never right.\n\nBut if capital is the thing holding your trading back, check the current NairaPips offers in your dashboard before you decide.\n\n— NairaPips"),
-        10: ("Wetin really dey hold you?", "Legend {name}, no sales grammar today 😄. Wetin really dey hold you from starting — price, trust, rules, or you never ready?\n\nReply with just one word if you like. We want to understand, not disturb you.\n\n— NairaPips"),
-        14: ("Should we leave you small? 😄", "Legend {name}, we don check on you a few times since you registered. We no wan become that friend wey no dey know when to go home 😂.\n\nIf you still want NairaPips opportunity, we dey here. If now is not your season, no problem — we will reduce the follow-up and only send important updates.\n\n— NairaPips"),
-    },
-    "golden_ticket": {
-        0: ("Your NairaPips Golden Ticket is alive 🎫", "Legend {name}, your Golden Ticket don land. Keep it safe.\n\nThis is not just another registration number — it keeps you inside the NairaPips Capital Selection opportunity. Watch your email and NairaPips updates.\n\n— NairaPips"),
-        2: ("Golden Ticket: small reminder", "Legend {name}, your Golden Ticket never disappear o 😄. Stay active and keep an eye on NairaPips updates.\n\nAnd if you referred people, those referrals matter to your Golden Ticket journey too.\n\n— NairaPips"),
-        4: ("While you wait, sharpen this", "Legend {name}, while you wait for Golden Ticket opportunities, work on the thing capital cannot fix: risk management.\n\nA bigger account with the same bad habit is just a bigger problem. Skill plus control first. Capital second.\n\n— NairaPips"),
-        7: ("You don't have to only wait", "Legend {name}, Golden Ticket gives you an opportunity to be selected. But make we tell you something: you don't have to put your whole trading journey on pause while waiting.\n\nNairaPips also has paid challenge opportunities for traders ready to move now. Check the current offer when you are ready. No pressure.\n\n— NairaPips"),
-        10: ("1 Phase. Static Drawdown.", "Legend {name}, if you decide to take the paid route while your Golden Ticket stays active, remember what makes NairaPips different: 1 Phase and Static Balance Drawdown.\n\nWe made the journey simpler because forex itself is already enough battle.\n\n— NairaPips"),
-        14: ("Something worth checking", "Legend {name}, before you continue waiting only for selection, check the latest NairaPips challenge offer. Sometimes opportunity no dey knock twice with the same price.\n\nOnly move if the challenge fits your trading and your pocket.\n\n— NairaPips"),
-        21: ("Legend, you still dey with us?", "Legend {name}, you entered NairaPips through Golden Ticket some weeks ago. You still dey trade? 😄\n\nReply and tell us where you are now: WAITING, READY, or JUST WATCHING. We will know how to talk to you from there.\n\n— NairaPips"),
-    },
-    "golden_vip": {
-        0: ("VIP Legend, we see you 👑", "Legend {name}, your Golden Ticket activity has put you in our VIP group. We see the effort.\n\nVIP no mean noise — it means we pay closer attention when opportunities open. Keep your details current and watch your NairaPips updates.\n\n— NairaPips"),
-        7: ("VIP opportunity check-in", "Legend {name}, quick VIP check-in. If you are ready to trade now instead of only waiting for selection, check the current NairaPips challenge opportunity.\n\nIf you have a question before moving, reply us directly.\n\n— NairaPips"),
-        14: ("VIP: where are you now?", "Legend {name}, make we know where you stand: READY, WAITING, or NOT NOW?\n\nReply with one of those three. We no need long story. 😄\n\n— NairaPips"),
-    },
-    "abandoned_purchase": {
-        0: ("Legend, wetin happen? 😄", "Legend {name}, you came close to starting your NairaPips challenge but stopped along the way.\n\nNo pressure o. We just want to know if something confused you, payment gave you issue, or you changed your mind.\n\nIf na question hold you, reply us. We dey here.\n\n— NairaPips"),
-        2: ("Still need help completing it?", "Legend {name}, quick one about the challenge you started. If payment or any step gave you wahala, reply this email and tell us where it stopped.\n\nIf you simply changed your mind, that one dey okay too.\n\n— NairaPips"),
-        5: ("We won't chase you 😄", "Legend {name}, we no go pursue you around internet because of challenge 😂. This is our last close follow-up for now.\n\nIf you still want to complete it, NairaPips is ready. If not, we will leave the door open.\n\n— NairaPips"),
-    },
-    "dormant_signup": {
-        30: ("Legend, you don forget us? 😂", "Legend {name}, you registered with NairaPips some time ago but never started a challenge.\n\nA lot can change in one trading month. Before we assume trading don tire you 😄, come see what NairaPips is offering traders now.\n\n— NairaPips"),
-        45: ("Are you still trading?", "Legend {name}, serious question: are you still trading?\n\nIf yes, reply YES. If you took a break, reply BREAK. We would rather know than keep throwing offers at you like robot.\n\n— NairaPips"),
-        60: ("One last check-in", "Legend {name}, this is a quiet check-in, not pressure. If funding is still part of your trading plan, NairaPips is here. If not, we will keep things light and only send important opportunities.\n\n— NairaPips"),
-    },
-}
-
-def _np_followup_step_for(row, lead_class):
-    seq = NP_FOLLOWUP_SEQUENCES.get(lead_class) or {}
-    age = _np_days_since(row.get("created_at"))
-    if lead_class == "abandoned_purchase":
-        # Purchase age is better when available; registration age is safe fallback.
-        email = str(row.get("email") or "").strip().lower()
-        try:
-            p = supabase.table("challenge_purchases").select("created_at").eq("email", email).order("created_at", desc=True).limit(1).execute().data or []
-            if p: age = _np_days_since(p[0].get("created_at"))
-        except Exception:
-            pass
-    return age if age in seq else None
-
-def _np_followup_already_sent(email, lead_class, day):
-    marker = f"[NPFOLLOW:{NP_LEAD_FOLLOWUP_VERSION}:{lead_class}:D{day}]"
-    try:
-        rows = supabase.table("email_logs").select("id").eq("recipient_email", str(email).strip().lower()).eq("email_type", "lead_followup").ilike("message_preview", f"%{marker}%").limit(1).execute().data or []
-        return bool(rows)
-    except Exception:
-        return False
-
-def _np_send_lead_followups(dry_run=False, limit=250):
-    candidates = []
-    # Golden Ticket / Capital Selection: explicit marketing consent exists.
-    try:
-        for r in supabase.table(LEAD_TABLE).select("*").eq("consent_marketing", True).order("created_at", desc=True).limit(2000).execute().data or []:
-            rr = dict(r); rr["_source_type"] = "golden"; candidates.append(rr)
-    except Exception as e:
-        print("FOLLOWUP golden fetch skipped:", e)
-    # Normal trader signups: only auto-send where marketing_consent is explicitly true.
-    try:
-        rows = supabase.table("traders").select("id,name,email,phone,status,phase,created_at,lead_status,marketing_consent").eq("marketing_consent", True).order("created_at", desc=True).limit(3000).execute().data or []
-        for r in rows:
-            rr = dict(r); rr["_source_type"] = "trader"; candidates.append(rr)
-    except Exception as e:
-        print("FOLLOWUP trader fetch skipped:", e)
-    # Dedupe by email; trader identity wins over landing lead when both exist.
-    by_email = {}
-    for r in candidates:
-        email = str(r.get("email") or "").strip().lower()
-        if not email:
-            continue
-        old = by_email.get(email)
-        if not old or r.get("_source_type") == "trader":
-            by_email[email] = r
-    due = []
-    for email, r in by_email.items():
-        cls = _np_followup_class(r, r.get("_source_type"))
-        if cls == "customer":
-            continue
-        day = _np_followup_step_for(r, cls)
-        if day is None or _np_followup_already_sent(email, cls, day):
-            continue
-        subject, body = NP_FOLLOWUP_SEQUENCES[cls][day]
-        name = _np_first_name(r.get("name") or r.get("full_name"))
-        body = body.format(name=name)
-        due.append({"email": email, "name": name, "class": cls, "day": day, "subject": subject, "body": body, "source": r.get("_source_type")})
-    due.sort(key=lambda x: (x["day"], x["email"]))
-    sent = 0
-    failed = 0
-    for item in due[:max(1, int(limit or 250))]:
-        if dry_run:
-            continue
-        marker = f"[NPFOLLOW:{NP_LEAD_FOLLOWUP_VERSION}:{item['class']}:D{item['day']}]"
-        html_body = text_to_html_content(item["body"] + "\n\n" + marker)
-        ok_send = bool(send_email_brevo(item["email"], item["subject"], html_body))
-        # send_email_brevo logs as general; add a dedicated best-effort marker log for deterministic dedupe.
-        _log_email_bank(item["email"], item["subject"], email_type="lead_followup", status="sent" if ok_send else "failed", message=marker + " " + item["body"][:800])
-        sent += 1 if ok_send else 0
-        failed += 0 if ok_send else 1
-    return {"version": NP_LEAD_FOLLOWUP_VERSION, "eligible_contacts": len(by_email), "due": len(due), "sent": sent, "failed": failed, "preview": [{k:v for k,v in x.items() if k != "body"} for x in due[:25]]}
-
-@app.route("/admin/lead_followup_status", methods=["GET", "OPTIONS"])
-def admin_lead_followup_status():
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        return _np_ok({"success": True, **_np_send_lead_followups(dry_run=True)})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-@app.route("/admin/run_lead_followups", methods=["POST", "OPTIONS"])
-def admin_run_lead_followups():
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        body = request.get_json(silent=True) or {}
-        limit = min(250, max(1, int(body.get("limit", 100) or 100)))
-        result = _np_send_lead_followups(dry_run=False, limit=limit)
-        _audit_safe("leads", "run_human_followups", f"due={result.get('due')} sent={result.get('sent')} failed={result.get('failed')}")
-        return _np_ok({"success": True, **result})
-    except Exception as e:
-        return _np_fail(e, 500)
-
-
 def _np_scheduler_loop():
     """Background thread that runs scheduled tasks."""
     while True:
@@ -14302,11 +13380,6 @@ def _np_scheduler_loop():
                             for rule in rules:
                                 _np_run_single_rule(rule)
                             print(f"[CRON] Daily run processed {len(rules)} rules")
-                            try:
-                                lead_result = _np_send_lead_followups(dry_run=False, limit=250)
-                                print(f"[CRON] Human lead follow-up due={lead_result.get('due')} sent={lead_result.get('sent')} failed={lead_result.get('failed')}")
-                            except Exception as lead_exc:
-                                print("[CRON] Human lead follow-up failed:", lead_exc)
                     except Exception as e:
                         print("[CRON] Daily run error:", e)
             
@@ -15062,7 +14135,7 @@ def admin_test_notification_channels():
 
 LEAD_CAMPAIGN_DEFAULT = "capital_selection_founding_1000"
 LEAD_OFFER_DEFAULT = "10_monthly_1m_challenge_accounts"
-LEAD_FOUNDING_LIMIT = 50  # Global Golden Ticket monthly capacity. Do not allow stale Render env values to restore the retired 1,000-slot campaign.
+LEAD_FOUNDING_LIMIT = int(os.getenv("NAIRAPIPS_FOUNDING_LIMIT", "1000"))
 LEAD_COMMUNITY_URL = os.getenv("NAIRAPIPS_COMMUNITY_URL", "").strip()
 LEAD_PUBLIC_BASE_URL = os.getenv("NAIRAPIPS_PUBLIC_BASE_URL", "https://nairapips.com").rstrip("/")
 LEAD_TABLE = os.getenv("NAIRAPIPS_LEAD_TABLE", "landing_leads")
@@ -15356,7 +14429,6 @@ def golden_ticket_access():
         now = now_iso()
 
         trader_row = None
-        created_new_trader = False
         try:
             if email:
                 found = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
@@ -15388,13 +14460,6 @@ def golden_ticket_access():
         }
 
         if trader_row:
-            # Preserve any existing password credential. For older Golden Ticket
-            # traders with no credential, explicitly flag the account for setup.
-            if not (
-                str(trader_row.get("password_hash") or "").strip()
-                or str(trader_row.get("password") or "").strip()
-            ):
-                gift_payload["password_reset_required"] = True
             try:
                 updated = supabase.table("traders").update(gift_payload).eq("id", trader_row.get("id")).execute().data or []
                 trader_row = updated[0] if updated else {**trader_row, **gift_payload}
@@ -15404,43 +14469,14 @@ def golden_ticket_access():
         else:
             create_payload = dict(gift_payload)
             create_payload["created_at"] = now
-            create_payload["password_reset_required"] = True
             try:
                 created = supabase.table("traders").insert(create_payload).execute().data or []
                 trader_row = created[0] if created else create_payload
-                created_new_trader = True
             except Exception as create_error:
                 print("GOLDEN TICKET TRADER CREATE ERROR:", create_error)
                 # Return a safe dashboard row even if traders table needs columns added.
                 trader_row = create_payload
                 trader_row["id"] = "lead-" + str(lead.get("id") or ticket)
-
-        if created_new_trader and email:
-            try:
-                setup_url = (
-                    LEAD_PUBLIC_BASE_URL
-                    + "/dashboard/trader_clean.html?setup_password=1&email="
-                    + urllib.parse.quote(email)
-                )
-                send_email_safe(
-                    email,
-                    "Secure your NairaPips Golden Ticket account",
-                    f"""Hello {full_name or 'Trader'},
-
-Your NairaPips Golden Ticket access is active.
-
-To make sure you can always sign in normally, create your personal dashboard password here:
-
-{setup_url}
-
-You will verify this email with a one-time code before the password is saved.
-
-Your Golden Ticket remains active.
-
-NairaPips Team"""
-                )
-            except Exception as setup_email_error:
-                print("GOLDEN TICKET PASSWORD SETUP EMAIL SKIPPED:", setup_email_error)
 
         try:
             supabase.table(LEAD_TABLE).update({
@@ -15468,19 +14504,12 @@ NairaPips Team"""
         except Exception:
             pass
 
-        password_setup_required = not bool(
-            str(trader_row.get("password_hash") or "").strip()
-            or str(trader_row.get("password") or "").strip()
-        )
-
         return _np_ok({
             "success": True,
             "message": "Golden Ticket verified. Dashboard access opened.",
             "data": trader_row,
             "trader": trader_row,
             "golden_ticket": lead.get("golden_ticket") or ticket,
-            "password_setup_required": password_setup_required,
-            "setup_email": email if password_setup_required else "",
             "lead": {
                 "id": lead.get("id"),
                 "full_name": full_name,
@@ -16018,14 +15047,11 @@ def founding_social_action():
         note=f"{platform} button clicked"
     ))
 
-# Auto-start only when a scheduler implementation exists.
-# Production stability: do not raise/log a NameError on every Gunicorn worker boot.
+# Auto-start at module load
 try:
-    _np_scheduler = globals().get("start_scheduler")
-    if callable(_np_scheduler):
-        _np_scheduler()
+    start_scheduler()
 except Exception as e:
-    print("[BOOT] Scheduler start skipped:", e)
+    print("[BOOT] Scheduler start failed:", e)
 
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
@@ -16565,19 +15591,15 @@ def _runtime_flag(name, env_default):
         return _RUNTIME_FLAG_CACHE[name]
     return os.getenv(name, env_default) == "1"
 
-# PRODUCTION STABILITY 2026-08-24:
-# NEVER query Supabase while a Gunicorn worker is importing/booting.
-# Render logs proved app_runtime_flags could block worker startup until the
-# Gunicorn timeout killed the worker before it could serve /staff_login.
-#
-# League starts immediately from environment defaults. Database overrides are
-# read only by explicit League admin endpoints/actions, never by login/bootstrap
-# or worker startup.
-LEAGUE_ENABLED = os.getenv("LEAGUE_ENABLED", "0") == "1"
-LEAGUE_PUBLIC_ENABLED = os.getenv("LEAGUE_PUBLIC_ENABLED", "0") == "1"
-LEAGUE_REGISTRATION_ENABLED = os.getenv("LEAGUE_REGISTRATION_ENABLED", "0") == "1"
-LEAGUE_LEADERBOARD_ENABLED = os.getenv("LEAGUE_LEADERBOARD_ENABLED", "0") == "1"
-LEAGUE_ACTIVITY_ENABLED = os.getenv("LEAGUE_ACTIVITY_ENABLED", "0") == "1"
+# Load overrides once at import time. Admin endpoints can call _load_runtime_flags()
+# again to refresh after the user toggles a flag in the admin UI.
+_load_runtime_flags()
+
+LEAGUE_ENABLED = _runtime_flag("LEAGUE_ENABLED", "0")
+LEAGUE_PUBLIC_ENABLED = _runtime_flag("LEAGUE_PUBLIC_ENABLED", "0")
+LEAGUE_REGISTRATION_ENABLED = _runtime_flag("LEAGUE_REGISTRATION_ENABLED", "0")
+LEAGUE_LEADERBOARD_ENABLED = _runtime_flag("LEAGUE_LEADERBOARD_ENABLED", "0")
+LEAGUE_ACTIVITY_ENABLED = _runtime_flag("LEAGUE_ACTIVITY_ENABLED", "0")
 
 LEAGUE_PROGRAMME_TYPE = "traders_league"
 LEAGUE_ACCOUNT_STAGE = "phase1"  # re-uses existing stage machinery
@@ -16617,11 +15639,7 @@ _LEAGUE_PUBLIC_TTL = 30.0
 def _is_league_account(account):
     if not account:
         return False
-    # Production compatibility: current trader_accounts may not expose
-    # programme_type. League assignments are already tied to a season through
-    # competition_id, so that is sufficient authority for this compatibility path.
-    programme = str(account.get("programme_type") or "").strip().lower()
-    return programme == LEAGUE_PROGRAMME_TYPE or bool(str(account.get("competition_id") or "").strip())
+    return str(account.get("programme_type") or "").strip().lower() == LEAGUE_PROGRAMME_TYPE
 
 
 def _default_league_nickname(registration, mt5_login, trader_id):
@@ -16824,7 +15842,7 @@ def _season_registration_counts(season_id):
     except Exception as e:
         print("LEAGUE REGISTRATION COUNTS ERROR:", str(e))
     try:
-        active = supabase.table("trader_accounts").select("id", count="exact").eq("competition_id", season_id).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).execute().count or 0
+        active = supabase.table("trader_accounts").select("id", count="exact").eq("programme_type", LEAGUE_PROGRAMME_TYPE).eq("competition_id", season_id).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES)).execute().count or 0
     except Exception as e:
         print("LEAGUE ACTIVE COUNT ERROR:", str(e))
     return registered, selected, active
@@ -16838,6 +15856,7 @@ def _compute_leaderboard_metrics(season, limit=20):
     try:
         rows = (supabase.table("trader_accounts")
                 .select("*")
+                .eq("programme_type", LEAGUE_PROGRAMME_TYPE)
                 .eq("competition_id", season_id)
                 .in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
                 .limit(500)
@@ -17131,17 +16150,17 @@ def trader_league_accounts():
         return _np_ok({})
     if not LEAGUE_ENABLED:
         return _public_disabled()
-    trader_id, auth_error = _authenticated_trader_id_for_request()
-    if auth_error:
-        return _np_fail(auth_error, 401)
+    trader_id = _authenticated_trader_id_for_request()
+    if not trader_id:
+        return _np_fail("Trader authentication required", 401)
     try:
         rows = (supabase.table("trader_accounts")
                 .select("*")
+                .eq("programme_type", LEAGUE_PROGRAMME_TYPE)
                 .eq("trader_id", trader_id)
                 .order("updated_at", desc=True)
-                .limit(100)
+                .limit(50)
                 .execute().data or [])
-        rows = [r for r in rows if str((r or {}).get("competition_id") or "").strip()]
     except Exception as e:
         print("TRADER LEAGUE ACCOUNTS ERROR:", str(e))
         rows = []
@@ -17166,15 +16185,16 @@ def trader_league_profile(season_id):
         return _np_ok({})
     if not LEAGUE_ENABLED:
         return _public_disabled()
-    trader_id, auth_error = _authenticated_trader_id_for_request()
-    if auth_error:
-        return _np_fail(auth_error, 401)
+    trader_id = _authenticated_trader_id_for_request()
+    if not trader_id:
+        return _np_fail("Trader authentication required", 401)
     season = _get_season_by_id(season_id)
     if not season:
         return _np_fail("Season not found", 404)
     try:
         rows = (supabase.table("trader_accounts")
                 .select("*")
+                .eq("programme_type", LEAGUE_PROGRAMME_TYPE)
                 .eq("trader_id", trader_id)
                 .eq("competition_id", season_id)
                 .limit(1)
@@ -17210,9 +16230,9 @@ def trader_league_nickname(season_id):
         return _np_ok({})
     if not LEAGUE_ENABLED:
         return _public_disabled()
-    trader_id, auth_error = _authenticated_trader_id_for_request()
-    if auth_error:
-        return _np_fail(auth_error, 401)
+    trader_id = _authenticated_trader_id_for_request()
+    if not trader_id:
+        return _np_fail("Trader authentication required", 401)
     data = request.get_json(silent=True) or {}
     nickname = str(data.get("public_nickname") or "").strip()
     if not LEAGUE_NICKNAME_RE.match(nickname):
@@ -17231,6 +16251,7 @@ def trader_league_nickname(season_id):
     try:
         rows = (supabase.table("trader_accounts")
                 .select("id")
+                .eq("programme_type", LEAGUE_PROGRAMME_TYPE)
                 .eq("trader_id", trader_id)
                 .eq("competition_id", season_id)
                 .limit(1)
