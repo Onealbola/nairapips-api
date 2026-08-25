@@ -2367,39 +2367,7 @@ def admin_reset_trader_account():
 
         account_status_before = str(account.get("account_status") or account.get("status") or "").strip().lower()
         trader_waiting_state = str(trader.get("challenge_state") or trader.get("status") or "").strip().lower()
-
-        # RESTORED NAIRAPIPS POST-PAYOUT FLOW (2026-08-24):
-        # PAID -> Reset exact funded account -> funded_waiting_mt5 -> fresh funded MT5.
-        # Do not make payout-protected states globally active. Permit this reset only
-        # when the exact selected account has a PAID payout and no open payout remains.
-        payout_protected_states = {
-            "profit_protected", "payout_pending", "approved_payout_pending",
-            "payment_processing", "payout_processing", "pending_payout"
-        }
-        paid_payout_reset_ok = False
-        if account_status_before in payout_protected_states:
-            try:
-                exact_payouts = (
-                    supabase.table("payouts")
-                    .select("id,status,trader_account_id,paid_at,created_at")
-                    .eq("trader_id", trader_id)
-                    .eq("trader_account_id", requested_account_id)
-                    .order("created_at", desc=True)
-                    .limit(20)
-                    .execute().data or []
-                )
-                open_payout_states = {
-                    "pending", "requested", "submitted", "approved", "processing",
-                    "payment_processing", "pending_review", "awaiting_review", "under_review"
-                }
-                has_paid_payout = any(str(p.get("status") or "").strip().lower() == "paid" for p in exact_payouts)
-                has_open_payout = any(str(p.get("status") or "").strip().lower() in open_payout_states for p in exact_payouts)
-                paid_payout_reset_ok = bool(has_paid_payout and not has_open_payout)
-            except Exception as e:
-                print("POST-PAYOUT RESET ELIGIBILITY CHECK ERROR:", e)
-                paid_payout_reset_ok = False
-
-        if account_status_before not in ACTIVE_ACCOUNT_STATUSES and not paid_payout_reset_ok:
+        if account_status_before not in ACTIVE_ACCOUNT_STATUSES:
             if (
                 account_status_before.startswith("archived_")
                 and "waiting" in trader_waiting_state
@@ -2414,8 +2382,6 @@ def admin_reset_trader_account():
                     "purchase_id": requested_purchase_id or account.get("purchase_id"),
                     "idempotent": True,
                 })
-            if account_status_before in payout_protected_states:
-                return _np_fail("Reset is blocked until the payout for this exact account is PAID.", 409)
             return _np_fail("Selected trader_account_id is not an active MT5 account. Reset cancelled.", 409)
 
         account_purchase_id = str(account.get("purchase_id") or "").strip()
@@ -12802,26 +12768,16 @@ def np_assignment_center():
                 continue
             if pid:
                 seen.add(pid)
-            lifecycle_blob = " ".join([
-                str(p.get("lifecycle_state") or ""), str(p.get("active_stage") or ""),
-                str(p.get("assigned_phase") or ""), str(p.get("phase") or ""), str(p.get("status") or "")
-            ]).lower().replace(" ", "_")
-            if "funded_waiting" in lifecycle_blob or "waiting_for_funded" in lifecycle_blob:
-                assignment_stage = "funded"
-            elif "phase2_waiting" in lifecycle_blob or "waiting_for_phase_2" in lifecycle_blob:
-                assignment_stage = "phase2"
-            else:
-                assignment_stage = "phase1"
             purchase_rows.append({
                 "id": p.get("trader_id") or p.get("id"),
                 "trader_id": p.get("trader_id") or "",
                 "purchase_id": p.get("id"),
                 "source_type": "purchase",
                 "source": "challenge_purchases",
-                "target_phase": assignment_stage,
-                "target_stage": assignment_stage,
-                "stage_label": f"{assignment_stage.upper()} MT5 ASSIGNMENT",
-                "assignment_label": "Assign Funded MT5" if assignment_stage == "funded" else ("Assign Phase 2 MT5" if assignment_stage == "phase2" else "Assign Phase 1 MT5"),
+                "target_phase": "phase1",
+                "target_stage": "phase1",
+                "stage_label": "PHASE 1 MT5 ASSIGNMENT",
+                "assignment_label": "Assign Phase 1 MT5",
                 "name": p.get("trader_name") or p.get("name") or p.get("full_name") or "Trader",
                 "email": p.get("email") or "",
                 "phone": p.get("phone") or "",
