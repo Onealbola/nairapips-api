@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20"
+NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20_NO_PURCHASE_RESET_FIX_2026_08_25"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -2291,6 +2291,248 @@ def _dashboard_payload_for_trader(trader):
 
 
 
+
+def _no_purchase_reset_waiting_status(stage):
+    stage = _normalize_lifecycle_stage(stage)
+    return {
+        "phase1": "phase1_waiting_mt5",
+        "phase2": "phase2_waiting_mt5",
+        "funded": "funded_waiting_mt5",
+    }.get(stage, "phase1_waiting_mt5")
+
+
+def _create_no_purchase_reset_waiting_row(account, stage, now, reason):
+    """Create one account-scoped waiting row ONLY for a reset with no purchase_id.
+
+    Existing purchase-linked Phase/Funded reset logic is intentionally untouched:
+    challenge_purchases remains its waiting authority.
+
+    This closes the multi-account gap where a manual/free/legacy account was reset,
+    archived correctly, but disappeared because the trader mirror was repointed to
+    another still-live account and there was no challenge_purchase row to represent
+    the reset account's waiting state.
+    """
+    if not account:
+        raise ValueError("Reset account is required")
+
+    trader_id = str(account.get("trader_id") or "").strip()
+    source_account_id = str(account.get("id") or "").strip()
+    if not trader_id or not source_account_id:
+        raise ValueError("Reset account identity is incomplete")
+
+    if str(account.get("purchase_id") or "").strip():
+        # Hard safety: NEVER duplicate the already-working purchase reset flow.
+        return None
+
+    stage = _normalize_lifecycle_stage(stage)
+    waiting_status = _no_purchase_reset_waiting_status(stage)
+    lineage_marker = f"reset_source_account_id={source_account_id}"
+
+    # Idempotency: the exact source account can own only one open waiting row.
+    existing = (
+        supabase.table("trader_accounts")
+        .select("*")
+        .eq("trader_id", trader_id)
+        .in_("account_status", [
+            "waiting_mt5", "phase1_waiting_mt5",
+            "phase2_waiting_mt5", "funded_waiting_mt5"
+        ])
+        .limit(100)
+        .execute().data or []
+    )
+    for row in existing:
+        marker_blob = " ".join([
+            str(row.get("archive_reason") or ""),
+            str(row.get("admin_note") or ""),
+        ])
+        if lineage_marker in marker_blob:
+            return _decorate_account_for_api(row)
+
+    account_size = clean(
+        account.get("account_size")
+        or account.get("start_balance")
+        or account.get("current_balance")
+        or 0
+    )
+
+    # Use only columns already proven in the current trader_accounts schema.
+    waiting_row = {
+        "trader_id": trader_id,
+        "purchase_id": None,
+        "mt5_pool_id": None,
+        "stage": stage,
+        "challenge_journey": account.get("challenge_journey"),
+        "journey_source": account.get("journey_source") or "reset_no_purchase_same_stage",
+        "account_status": waiting_status,
+        "mt5_login": "",
+        "mt5_server": "",
+        "mt5_master_password": "",
+        "mt5_investor_password": "",
+        "account_size": account_size,
+        "start_balance": account_size,
+        "current_balance": account_size,
+        "current_equity": account_size,
+        "profit": 0,
+        "profit_percent": 0,
+        "absolute_drawdown_percent": 0,
+        "dd_limit_percent": clean(account.get("dd_limit_percent") or 20) or 20,
+        "dd_used_percent": 0,
+        "target_percent": _target_for_stage(stage),
+        "monitoring_enabled": False,
+        "started_at": now,
+        "created_at": now,
+        "updated_at": now,
+        "archive_reason": (
+            f"RESET WAITING — {lineage_marker} | "
+            f"old_mt5_login={account.get('mt5_login') or ''} | "
+            f"same_stage={stage} | {reason}"
+        ),
+    }
+
+    inserted = supabase.table("trader_accounts").insert(waiting_row).execute().data or []
+    if not inserted:
+        raise RuntimeError("Could not create no-purchase reset waiting row")
+    return _decorate_account_for_api(inserted[0])
+
+
+def _repair_recent_no_purchase_reset_waiting(trader_id, account_rows=None):
+    """Repair ONLY recent exact no-purchase resets that predate this patch.
+
+    This is deliberately narrow:
+    - archived_reset_* row
+    - purchase_id is empty
+    - exact admin_clean_account_reset monitoring event exists
+    - reset is recent (72 hours)
+    - no existing waiting row for that exact source account
+    - no same-stage/same-size replacement MT5 was assigned AFTER the reset
+
+    Old historical reset rows are never converted merely because they say RESET.
+    """
+    trader_id = str(trader_id or "").strip()
+    if not trader_id:
+        return []
+
+    rows = list(account_rows or [])
+    if not rows:
+        rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("trader_id", trader_id)
+            .order("updated_at", desc=True)
+            .limit(200)
+            .execute().data or []
+        )
+
+    waiting_rows = [
+        r for r in rows
+        if str(r.get("account_status") or "").strip().lower()
+        in {"waiting_mt5", "phase1_waiting_mt5", "phase2_waiting_mt5", "funded_waiting_mt5"}
+    ]
+
+    candidates = [
+        r for r in rows
+        if not str(r.get("purchase_id") or "").strip()
+        and str(r.get("account_status") or "").strip().lower().startswith("archived_reset")
+    ]
+    if not candidates:
+        return []
+
+    # Recent exact reset events are the authority for backfill.
+    events = (
+        supabase.table("monitoring_events")
+        .select("trader_account_id,event_type,created_at,mt5_login,message")
+        .eq("trader_id", trader_id)
+        .eq("event_type", "admin_clean_account_reset")
+        .order("created_at", desc=True)
+        .limit(50)
+        .execute().data or []
+    )
+    event_by_account = {
+        str(e.get("trader_account_id") or "").strip(): e
+        for e in events
+        if str(e.get("trader_account_id") or "").strip()
+    }
+
+    now_epoch = time.time()
+    repaired = []
+
+    for source in candidates:
+        source_id = str(source.get("id") or "").strip()
+        event = event_by_account.get(source_id)
+
+        # Preferred authority is the exact reset event. If event logging happened
+        # to fail after the reset itself succeeded, a very recent archived_reset
+        # row whose own archive_reason explicitly says ADMIN RESET is accepted as
+        # fallback evidence. This remains account-scoped and time-bounded.
+        event_epoch = _dt_score((event or {}).get("created_at"))
+        if not event_epoch:
+            archive_blob = " ".join([
+                str(source.get("archive_reason") or ""),
+                str(source.get("account_status") or ""),
+            ]).lower()
+            archived_epoch = _dt_score(
+                source.get("archived_at")
+                or source.get("updated_at")
+                or source.get("created_at")
+            )
+            if "admin reset" not in archive_blob or not archived_epoch:
+                continue
+            event_epoch = archived_epoch
+
+        if (now_epoch - event_epoch) > (72 * 3600):
+            continue
+
+        lineage_marker = f"reset_source_account_id={source_id}"
+        if any(
+            lineage_marker in " ".join([
+                str(w.get("archive_reason") or ""),
+                str(w.get("admin_note") or ""),
+            ])
+            for w in waiting_rows
+        ):
+            continue
+
+        stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+        source_size = clean(source.get("account_size") or source.get("start_balance") or 0)
+
+        # If a fresh same-stage/same-size active account was assigned AFTER this
+        # exact reset, the waiting lifecycle has already been consumed.
+        consumed = False
+        for live in rows:
+            live_status = str(live.get("account_status") or live.get("status") or "").strip().lower()
+            if live_status not in ACTIVE_ACCOUNT_STATUSES:
+                continue
+            if _normalize_lifecycle_stage(live.get("stage") or live.get("phase")) != stage:
+                continue
+            live_size = clean(live.get("account_size") or live.get("start_balance") or 0)
+            if source_size and live_size and source_size != live_size:
+                continue
+            live_epoch = _dt_score(
+                live.get("started_at")
+                or live.get("assigned_at")
+                or live.get("created_at")
+                or live.get("updated_at")
+            )
+            if live_epoch and live_epoch > event_epoch:
+                consumed = True
+                break
+
+        if consumed:
+            continue
+
+        waiting = _create_no_purchase_reset_waiting_row(
+            source,
+            stage,
+            now_iso(),
+            "Recovered from exact recent reset event."
+        )
+        if waiting:
+            repaired.append(waiting)
+            waiting_rows.append(waiting)
+
+    return repaired
+
+
 @app.route("/admin_reset_trader_account", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_account", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
@@ -2571,7 +2813,29 @@ def admin_reset_trader_account():
                 print("RESET PURCHASE MIRROR CLEANUP ERROR:", {"trader_id": trader_id, "trader_account_id": account.get("id"), "purchase_id": purchase_id, "old_mt5_login": old_login, "error": str(e)})
                 return _np_fail("Reset failed while clearing the linked purchase MT5 fields.", 500)
         else:
-            reset_steps.append("no_purchase_account_skipped_purchase_cleanup")
+            # Manual/free/legacy accounts have no challenge_purchase row, so the
+            # reset needs its own account-scoped waiting row. Purchase-linked
+            # Phase/Funded reset logic above remains completely unchanged.
+            try:
+                waiting_account = _create_no_purchase_reset_waiting_row(
+                    account, stage, now, reason
+                )
+                if waiting_account:
+                    reset_steps.append("no_purchase_exact_waiting_created")
+                else:
+                    reset_steps.append("no_purchase_waiting_already_exists")
+            except Exception as e:
+                print("RESET NO-PURCHASE WAITING ERROR:", {
+                    "trader_id": trader_id,
+                    "trader_account_id": account.get("id"),
+                    "old_mt5_login": old_login,
+                    "stage": stage,
+                    "error": str(e),
+                })
+                return _np_fail(
+                    "Selected account was archived but its exact waiting-for-MT5 row could not be created.",
+                    500
+                )
 
         # 2. Lock old MT5 pool row; never put it back to available.
         try:
@@ -2738,13 +3002,20 @@ def admin_reset_trader_account():
             np_invalidate_admin_bootstrap("traders")
         except Exception:
             pass
+        try:
+            # Reset must be visible immediately to the trader. Do not allow a
+            # five-second pre-reset bootstrap payload to overwrite the new state.
+            _TRADER_BOOTSTRAP_CACHE.clear()
+        except Exception:
+            pass
 
         return _np_ok({
             "success": True,
             "message": "Account reset complete. Old MT5 archived. Trader is now waiting for fresh MT5 assignment.",
             "data": updated,
             "archived_account": archived,
-            "current_account": None,
+            "waiting_account": _trader_safe_account_row(waiting_account) if "waiting_account" in locals() and waiting_account else None,
+            "current_account": _trader_safe_account_row(replacement_account) if replacement_account else None,
             "reset_stage": stage,
             "waiting_state": waiting_state,
             "operations_succeeded": reset_steps,
@@ -3613,7 +3884,26 @@ def trader_current_account(lookup):
             purchases += _safe_fetch("challenge_purchases", "email", trader.get("email"), 100)
         if trader.get("phone"):
             purchases += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
-        active_accounts = _get_active_accounts(trader.get("id"), trader, _dedupe_by_id(purchases))
+        purchases = _dedupe_by_id(purchases)
+        try:
+            raw_reset_rows = (
+                supabase.table("trader_accounts")
+                .select("*")
+                .eq("trader_id", trader.get("id"))
+                .order("updated_at", desc=True)
+                .limit(200)
+                .execute().data or []
+            )
+            if any(
+                (not str(r.get("purchase_id") or "").strip())
+                and str(r.get("account_status") or "").strip().lower().startswith("archived_reset")
+                for r in raw_reset_rows
+            ):
+                _repair_recent_no_purchase_reset_waiting(trader.get("id"), raw_reset_rows)
+        except Exception as repair_error:
+            print("NO-PURCHASE RESET CURRENT-ACCOUNT REPAIR WARNING:", repair_error)
+
+        active_accounts = _get_active_accounts(trader.get("id"), trader, purchases)
         active_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), active_accounts)
         if account:
             account_id = str(account.get("id") or "").strip()
@@ -5346,6 +5636,29 @@ def trader_bootstrap():
             print("TRADER BOOTSTRAP CORE PARALLEL ERROR:", e)
 
         purchases = _dedupe_by_id(purchase_rows)
+
+        # Surgical legacy/manual reset repair. Normal purchase-linked reset flows
+        # do not enter this path and therefore keep their existing behaviour.
+        if any(
+            (not str(r.get("purchase_id") or "").strip())
+            and str(r.get("account_status") or "").strip().lower().startswith("archived_reset")
+            for r in account_rows
+        ):
+            try:
+                repaired = _repair_recent_no_purchase_reset_waiting(
+                    trader.get("id"), account_rows
+                )
+                if repaired:
+                    account_rows = _critical_rest_rows(
+                        "trader_accounts",
+                        [("trader_id", trader.get("id"))],
+                        "updated_at",
+                        True,
+                        150,
+                    ) or account_rows
+            except Exception as repair_error:
+                print("NO-PURCHASE RESET BACKFILL WARNING:", repair_error)
+
         purchase_by_id = {
             str(p.get("id") or "").strip(): p
             for p in purchases
