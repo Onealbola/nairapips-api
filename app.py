@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20"
+NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20_RESET_AUTHORITY_2026_08_25"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1775,6 +1775,39 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
     account = (supabase.table("trader_accounts").insert(account_row).execute().data or [None])[0]
     if not account:
         raise RuntimeError("Could not create trader account")
+
+    # If this fresh MT5 replaces a reset account, consume only the matching
+    # canonical waiting row. Other waiting/live accounts remain untouched.
+    if purchase_id:
+        try:
+            waiting_rows = (
+                supabase.table("trader_accounts")
+                .select("*")
+                .eq("trader_id", trader.get("id"))
+                .eq("purchase_id", purchase_id)
+                .in_("account_status", [
+                    "waiting_mt5", "phase1_waiting_mt5",
+                    "phase2_waiting_mt5", "funded_waiting_mt5"
+                ])
+                .limit(20)
+                .execute().data or []
+            )
+            same_stage_waiting = [
+                row for row in waiting_rows
+                if _normalize_lifecycle_stage(row.get("stage") or row.get("phase")) == stage
+            ]
+            if same_stage_waiting:
+                wr = same_stage_waiting[0]
+                supabase.table("trader_accounts").update({
+                    "account_status": "archived",
+                    "monitoring_enabled": False,
+                    "archived_at": now,
+                    "archive_reason": f"Fresh {stage} MT5 assigned after reset",
+                    "updated_at": now,
+                }).eq("id", wr.get("id")).execute()
+        except Exception as e:
+            print("RESET WAITING CONSUME WARNING:", e)
+
     supabase.table("mt5_pool").update({
         "status": "assigned",
         "assigned_trader_id": trader.get("id"),
@@ -2291,6 +2324,105 @@ def _dashboard_payload_for_trader(trader):
 
 
 
+
+def _create_exact_reset_waiting_account(account, stage, waiting_state, now):
+    """Create ONE canonical waiting row for the exact trader_account being reset.
+
+    Multi-account rule:
+    - The selected account alone enters waiting-for-fresh-MT5.
+    - Other Phase/Funded accounts for the trader remain unchanged.
+    - trader_accounts remains the lifecycle source of truth.
+    """
+    if not account:
+        raise ValueError("Reset source account is required")
+
+    trader_id = str(account.get("trader_id") or "").strip()
+    purchase_id = str(account.get("purchase_id") or "").strip()
+    source_account_id = str(account.get("id") or "").strip()
+    stage = _normalize_lifecycle_stage(stage)
+    waiting_status = {
+        "phase1": "phase1_waiting_mt5",
+        "phase2": "phase2_waiting_mt5",
+        "funded": "funded_waiting_mt5",
+    }[stage]
+
+    # Idempotency for a purchase-linked reset: never create two waiting rows
+    # for the same account lifecycle.
+    if purchase_id:
+        existing = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("trader_id", trader_id)
+            .eq("purchase_id", purchase_id)
+            .in_("account_status", [
+                "waiting_mt5", "phase1_waiting_mt5",
+                "phase2_waiting_mt5", "funded_waiting_mt5"
+            ])
+            .limit(20)
+            .execute().data or []
+        )
+        same_stage = [
+            row for row in existing
+            if _normalize_lifecycle_stage(row.get("stage") or row.get("phase")) == stage
+        ]
+        if same_stage:
+            return _decorate_account_for_api(same_stage[0])
+
+    account_size = clean(account.get("account_size") or account.get("start_balance") or 0)
+    journey = _journey_source_value(
+        account.get("challenge_journey")
+        or account.get("journey_stages")
+        or _journey_for_lifecycle(account, _safe_purchase_for_account(account), None, None)
+    )
+
+    waiting_row = {
+        "trader_id": trader_id,
+        "purchase_id": purchase_id or None,
+        "stage": stage,
+        "challenge_journey": journey,
+        "journey_source": "reset_exact_account_waiting",
+        "account_status": waiting_status,
+        "mt5_login": "",
+        "mt5_server": "",
+        "mt5_master_password": "",
+        "mt5_investor_password": "",
+        "account_size": account_size,
+        "start_balance": account_size,
+        "current_balance": account_size,
+        "current_equity": account_size,
+        "profit": 0,
+        "profit_percent": 0,
+        "absolute_drawdown_percent": 0,
+        "dd_limit_percent": clean(account.get("dd_limit_percent") or 20) or 20,
+        "dd_used_percent": 0,
+        "target_percent": _target_for_stage(stage),
+        "monitoring_enabled": False,
+        "started_at": now,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    inserted = supabase.table("trader_accounts").insert(waiting_row).execute().data or []
+    if not inserted:
+        raise RuntimeError(
+            f"Could not create waiting lifecycle for reset account {source_account_id}"
+        )
+    return _decorate_account_for_api(inserted[0])
+
+
+def _pending_reset_waiting_accounts_from_rows(account_rows):
+    """Return only explicit canonical waiting rows from trader_accounts."""
+    statuses = {
+        "waiting_mt5", "phase1_waiting_mt5",
+        "phase2_waiting_mt5", "funded_waiting_mt5"
+    }
+    rows = []
+    for row in account_rows or []:
+        if str(row.get("account_status") or row.get("status") or "").strip().lower() in statuses:
+            rows.append(row)
+    return rows
+
+
 @app.route("/admin_reset_trader_account", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_account", methods=["POST", "OPTIONS"])
 @app.route("/reset_trader_mt5", methods=["POST", "OPTIONS"])
@@ -2539,6 +2671,29 @@ def admin_reset_trader_account():
         else:
             reset_steps.append("no_purchase_account_skipped_purchase_cleanup")
 
+        # 1B. Create ONE canonical waiting row for this exact reset account.
+        # This is deliberately account-scoped: unrelated active/funded accounts
+        # owned by the same trader are not modified.
+        try:
+            waiting_account = _create_exact_reset_waiting_account(
+                account, stage, waiting_state, now
+            )
+            reset_steps.append("exact_account_waiting_created")
+        except Exception as e:
+            print("RESET EXACT WAITING CREATE ERROR:", {
+                "trader_id": trader_id,
+                "trader_account_id": account.get("id"),
+                "purchase_id": purchase_id,
+                "old_mt5_login": old_login,
+                "stage": stage,
+                "error": str(e),
+            })
+            return _np_fail(
+                "Old MT5 was archived but the exact waiting-for-fresh-MT5 lifecycle "
+                "could not be created. Reset stopped for Admin review.",
+                500,
+            )
+
         # 2. Lock old MT5 pool row; never put it back to available.
         try:
             if account.get("mt5_pool_id"):
@@ -2707,10 +2862,11 @@ def admin_reset_trader_account():
 
         return _np_ok({
             "success": True,
-            "message": "Account reset complete. Old MT5 archived. Trader is now waiting for fresh MT5 assignment.",
+            "message": "Selected account reset complete. Old MT5 archived and this account is waiting for a fresh MT5.",
             "data": updated,
             "archived_account": archived,
-            "current_account": None,
+            "waiting_account": _trader_safe_account_row(waiting_account),
+            "current_account": _trader_safe_account_row(replacement_account) if replacement_account else None,
             "reset_stage": stage,
             "waiting_state": waiting_state,
             "operations_succeeded": reset_steps,
@@ -5370,7 +5526,10 @@ def trader_bootstrap():
             "accounts": [_trader_safe_account_row(r) for r in active_accounts],
             "all_accounts": [_trader_safe_account_row(r) for r in all_accounts],
             "active_purchase": _trader_safe_purchase_row(purchase) if purchase else None,
-            "pending_replacements": [],
+            "pending_replacements": [
+                _trader_safe_account_row(r)
+                for r in _pending_reset_waiting_accounts_from_rows(all_accounts)
+            ],
             "latest_trades": [],
             "latest_monitoring": None,
             "payout_eligibility": {
