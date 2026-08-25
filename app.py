@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20_RESET_LINEAGE_PERSISTENCE_2026_08_25"
+NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20_RESET_WAITING_SELECTOR_FINAL_2026_08_25"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1145,7 +1145,7 @@ def _reset_waiting_row_from_archive(source, trader=None):
         or now_iso()
     )
 
-    return _decorate_account_for_api({
+    waiting_row = _decorate_account_for_api({
         "id": _reset_waiting_virtual_id(old_id),
         "trader_id": source.get("trader_id") or (trader or {}).get("id"),
         "purchase_id": source.get("purchase_id"),
@@ -1181,6 +1181,15 @@ def _reset_waiting_row_from_archive(source, trader=None):
         "reset_reason": source.get("archive_reason") or source.get("admin_note") or "Admin reset",
         "_source": "archived_reset_waiting_lineage",
     })
+    # Critical distinction: the OLD MT5 may have been near-breach/breached,
+    # but the replacement placeholder itself is WAITING, not BREACHED.
+    waiting_row["risk_zone"] = "waiting"
+    waiting_row["display_risk_zone"] = "waiting"
+    waiting_row["absolute_drawdown_percent"] = 0
+    waiting_row["dd_used_percent"] = 0
+    waiting_row["monitoring_enabled"] = False
+    waiting_row["replacement_required"] = True
+    return waiting_row
 
 
 def _pending_reset_replacements_from_accounts(account_rows, trader=None):
@@ -1420,6 +1429,10 @@ def _get_active_accounts(trader_id, trader=None, purchases=None):
         rows = []
         for row in raw_rows:
             status = str(row.get("account_status") or "").strip().lower()
+            # Reset archives are historical MT5 evidence, never active accounts.
+            # They stay in all_accounts/history but must not contaminate active_accounts.
+            if status.startswith("archived_reset"):
+                continue
             if status in visible_statuses or str(row.get("mt5_login") or "").strip():
                 rows.append(row)
         decorated = []
