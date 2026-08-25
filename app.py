@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20_RESET_BACKFILL_2026_08_25"
+NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20_RESET_WAITING_PERSISTENCE_2026_08_25"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -2315,80 +2315,112 @@ def _dashboard_payload_for_trader(trader):
 
 
 def _create_exact_reset_waiting_account(account, stage, waiting_state, now):
-    """Create ONE canonical waiting row for the exact account being reset."""
+    """Create ONE persistent waiting row for the exact account being reset.
+
+    Uses only core trader_accounts columns already used by production so schema
+    drift cannot silently block the waiting lifecycle.
+    """
     if not account:
         raise ValueError("Reset source account is required")
+
     trader_id=str(account.get("trader_id") or "").strip()
     purchase_id=str(account.get("purchase_id") or "").strip()
     stage=_normalize_lifecycle_stage(stage)
-    waiting_status={"phase1":"phase1_waiting_mt5","phase2":"phase2_waiting_mt5","funded":"funded_waiting_mt5"}[stage]
+    waiting_status={
+        "phase1":"phase1_waiting_mt5",
+        "phase2":"phase2_waiting_mt5",
+        "funded":"funded_waiting_mt5",
+    }[stage]
 
-    if purchase_id:
-        existing=(supabase.table("trader_accounts").select("*")
-                  .eq("trader_id",trader_id).eq("purchase_id",purchase_id)
-                  .in_("account_status",["waiting_mt5","phase1_waiting_mt5","phase2_waiting_mt5","funded_waiting_mt5"])
-                  .limit(20).execute().data or [])
-        for row in existing:
-            if _normalize_lifecycle_stage(row.get("stage") or row.get("phase"))==stage:
-                return _decorate_account_for_api(row)
+    q=(supabase.table("trader_accounts").select("*")
+       .eq("trader_id",trader_id)
+       .in_("account_status",["waiting_mt5","phase1_waiting_mt5","phase2_waiting_mt5","funded_waiting_mt5"])
+       .limit(100))
+    existing=q.execute().data or []
+    for row in existing:
+        same_stage=_normalize_lifecycle_stage(row.get("stage") or row.get("phase"))==stage
+        same_purchase=bool(purchase_id) and str(row.get("purchase_id") or "").strip()==purchase_id
+        if same_stage and same_purchase:
+            return _decorate_account_for_api(row)
 
     account_size=clean(account.get("account_size") or account.get("start_balance") or 0)
-    purchase=_safe_purchase_for_account(account)
-    journey=_journey_source_value(
-        account.get("challenge_journey")
-        or account.get("journey_stages")
-        or _journey_for_lifecycle(account,purchase,None,None)
-    )
     waiting_row={
         "trader_id":trader_id,
         "purchase_id":purchase_id or None,
         "stage":stage,
-        "challenge_journey":journey,
-        "journey_source":"reset_exact_account_waiting",
         "account_status":waiting_status,
-        "mt5_login":"","mt5_server":"","mt5_master_password":"","mt5_investor_password":"",
-        "account_size":account_size,"start_balance":account_size,
-        "current_balance":account_size,"current_equity":account_size,
-        "profit":0,"profit_percent":0,"absolute_drawdown_percent":0,
+        "mt5_login":"",
+        "mt5_server":"",
+        "mt5_master_password":"",
+        "mt5_investor_password":"",
+        "account_size":account_size,
+        "start_balance":account_size,
+        "current_balance":account_size,
+        "current_equity":account_size,
+        "profit":0,
+        "profit_percent":0,
+        "absolute_drawdown_percent":0,
         "dd_limit_percent":clean(account.get("dd_limit_percent") or 20) or 20,
-        "dd_used_percent":0,"target_percent":_target_for_stage(stage),
-        "monitoring_enabled":False,"started_at":now,"created_at":now,"updated_at":now,
+        "dd_used_percent":0,
+        "target_percent":_target_for_stage(stage),
+        "monitoring_enabled":False,
+        "started_at":now,
+        "created_at":now,
+        "updated_at":now,
     }
     inserted=supabase.table("trader_accounts").insert(waiting_row).execute().data or []
     if not inserted:
-        raise RuntimeError("Could not create exact reset waiting account")
+        raise RuntimeError("Could not create persistent reset waiting row")
     return _decorate_account_for_api(inserted[0])
 
 
 def _repair_missing_reset_waiting_accounts(trader,purchases=None):
-    """Repair ONLY old resets whose own purchase is explicitly waiting for MT5."""
+    """Repair missing waiting rows from exact backend reset evidence.
+
+    Old historical reset rows are NOT blindly converted. A repair is allowed only
+    when:
+      A) its linked purchase explicitly says *_waiting_mt5 with no MT5, or
+      B) an exact admin_clean_account_reset event exists for that account in the
+         last 48 hours and no newer same-lineage MT5 assignment exists.
+    """
     if not trader:
         return []
     trader_id=str(trader.get("id") or "").strip()
     if not trader_id:
         return []
+
+    repaired=[]
+    waiting_statuses=["waiting_mt5","phase1_waiting_mt5","phase2_waiting_mt5","funded_waiting_mt5"]
+    reset_statuses=["archived_reset_phase1","archived_reset_phase2","archived_reset_funded","archived_reset"]
+
+    def already_waiting(stage,purchase_id=""):
+        rows=(supabase.table("trader_accounts").select("id,stage,purchase_id,account_status")
+              .eq("trader_id",trader_id)
+              .in_("account_status",waiting_statuses)
+              .limit(100).execute().data or [])
+        for r in rows:
+            if _normalize_lifecycle_stage(r.get("stage") or r.get("phase"))!=stage:
+                continue
+            rp=str(r.get("purchase_id") or "").strip()
+            if purchase_id and rp==purchase_id:
+                return True
+        return False
+
+    # A. Purchase-linked reset evidence.
     rows=list(purchases or [])
     if not rows:
         rows=_safe_fetch("challenge_purchases","trader_id",trader_id,100)
-
-    repaired=[]
     for p in rows:
-        state=str(p.get("lifecycle_state") or p.get("status") or p.get("phase") or "").strip().lower().replace(" ","_")
+        state=str(p.get("lifecycle_state") or p.get("status") or "").strip().lower().replace(" ","_")
         login=str(p.get("mt5_login") or p.get("current_mt5_login") or "").strip()
         if "waiting" not in state or "mt5" not in state or login:
             continue
         purchase_id=str(p.get("id") or "").strip()
-        if not purchase_id:
-            continue
         stage=_normalize_lifecycle_stage(
             p.get("waiting_for_stage") or p.get("active_stage") or p.get("assigned_phase")
             or p.get("phase") or p.get("lifecycle_state") or p.get("status")
         )
-        existing=(supabase.table("trader_accounts").select("*")
-                  .eq("trader_id",trader_id).eq("purchase_id",purchase_id)
-                  .in_("account_status",["waiting_mt5","phase1_waiting_mt5","phase2_waiting_mt5","funded_waiting_mt5"])
-                  .limit(20).execute().data or [])
-        if any(_normalize_lifecycle_stage(r.get("stage") or r.get("phase"))==stage for r in existing):
+        if already_waiting(stage,purchase_id):
             continue
 
         source=None
@@ -2398,21 +2430,78 @@ def _repair_missing_reset_waiting_accounts(trader,purchases=None):
             exact=(supabase.table("trader_accounts").select("*")
                    .eq("id",m.group(1)).eq("trader_id",trader_id).limit(1).execute().data or [])
             source=exact[0] if exact else None
-
         if not source:
             archived=(supabase.table("trader_accounts").select("*")
                       .eq("trader_id",trader_id).eq("purchase_id",purchase_id)
-                      .in_("account_status",["archived_reset_phase1","archived_reset_phase2","archived_reset_funded","archived_reset"])
+                      .in_("account_status",reset_statuses)
                       .order("updated_at",desc=True).limit(20).execute().data or [])
-            for row in archived:
-                if _normalize_lifecycle_stage(row.get("stage") or row.get("phase"))==stage:
-                    source=row
-                    break
+            source=next((r for r in archived if _normalize_lifecycle_stage(r.get("stage") or r.get("phase"))==stage),None)
+        if source:
+            repaired.append(_create_exact_reset_waiting_account(source,stage,f"{stage}_waiting_mt5",now_iso()))
 
-        if not source:
-            continue
+    # B. No-purchase / legacy exact reset evidence.
+    # This is what repairs a reset that already succeeded before the canonical
+    # waiting-row patch existed.
+    try:
+        events=(supabase.table("monitoring_events").select("*")
+                .eq("trader_id",trader_id)
+                .eq("event_type","admin_clean_account_reset")
+                .order("created_at",desc=True).limit(50).execute().data or [])
+        cutoff=time.time()-(48*3600)
+        for ev in events:
+            ev_time=_dt_score(ev.get("created_at"))
+            if not ev_time or ev_time<cutoff:
+                continue
+            source_id=str(ev.get("trader_account_id") or "").strip()
+            if not source_id:
+                continue
+            exact=(supabase.table("trader_accounts").select("*")
+                   .eq("id",source_id).eq("trader_id",trader_id).limit(1).execute().data or [])
+            if not exact:
+                continue
+            source=exact[0]
+            if str(source.get("account_status") or "").strip().lower() not in reset_statuses:
+                continue
+            stage=_normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+            purchase_id=str(source.get("purchase_id") or "").strip()
+            if already_waiting(stage,purchase_id):
+                continue
 
-        repaired.append(_create_exact_reset_waiting_account(source,stage,f"{stage}_waiting_mt5",now_iso()))
+            # If a new account on the same purchase exists after the reset, the
+            # waiting lifecycle was already consumed.
+            if purchase_id:
+                newer=(supabase.table("trader_accounts").select("id,stage,account_status,created_at,started_at,updated_at")
+                       .eq("trader_id",trader_id).eq("purchase_id",purchase_id)
+                       .in_("account_status",list(ACTIVE_ACCOUNT_STATUSES))
+                       .limit(50).execute().data or [])
+                if any(_dt_score(r.get("started_at") or r.get("created_at") or r.get("updated_at"))>ev_time for r in newer):
+                    continue
+            else:
+                # Legacy/no-purchase safety: only repair when no same-stage,
+                # same-size live account was assigned AFTER this exact reset.
+                source_size=clean(source.get("account_size") or source.get("start_balance") or 0)
+                newer=(supabase.table("trader_accounts").select("*")
+                       .eq("trader_id",trader_id)
+                       .in_("account_status",list(ACTIVE_ACCOUNT_STATUSES))
+                       .limit(100).execute().data or [])
+                consumed=False
+                for r in newer:
+                    if _normalize_lifecycle_stage(r.get("stage") or r.get("phase"))!=stage:
+                        continue
+                    r_size=clean(r.get("account_size") or r.get("start_balance") or 0)
+                    if source_size and r_size and r_size!=source_size:
+                        continue
+                    assigned=_dt_score(r.get("started_at") or r.get("assigned_at") or r.get("created_at") or r.get("updated_at"))
+                    if assigned>ev_time:
+                        consumed=True
+                        break
+                if consumed:
+                    continue
+
+            repaired.append(_create_exact_reset_waiting_account(source,stage,f"{stage}_waiting_mt5",now_iso()))
+    except Exception as e:
+        print("RESET RECENT EVENT BACKFILL WARNING:",e)
+
     return repaired
 
 
@@ -2843,6 +2932,15 @@ def admin_reset_trader_account():
         # so the next admin refresh sees the reset immediately.
         try:
             np_invalidate_admin_bootstrap("traders")
+        except Exception:
+            pass
+        try:
+            # The trader bootstrap has its own cache. If it is not cleared here,
+            # a stale pre-reset payload can overwrite the fresh waiting state a
+            # moment after the page first renders.
+            for _k in list(_TRADER_BOOTSTRAP_CACHE.keys()):
+                if str(trader_id).lower() in str(_k).lower():
+                    _TRADER_BOOTSTRAP_CACHE.pop(_k,None)
         except Exception:
             pass
 
@@ -3721,7 +3819,12 @@ def trader_current_account(lookup):
             purchases += _safe_fetch("challenge_purchases", "email", trader.get("email"), 100)
         if trader.get("phone"):
             purchases += _safe_fetch("challenge_purchases", "phone", trader.get("phone"), 100)
-        active_accounts = _get_active_accounts(trader.get("id"), trader, _dedupe_by_id(purchases))
+        purchases = _dedupe_by_id(purchases)
+        try:
+            _repair_missing_reset_waiting_accounts(trader,purchases)
+        except Exception as repair_error:
+            print("RESET WAITING CURRENT-ACCOUNT REPAIR WARNING:",repair_error)
+        active_accounts = _get_active_accounts(trader.get("id"), trader, purchases)
         active_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), active_accounts)
         if account:
             account_id = str(account.get("id") or "").strip()
@@ -3747,12 +3850,17 @@ def trader_current_account(lookup):
             print("TRADER ALL ACCOUNTS FETCH ERROR:", all_account_error)
             all_accounts = list(active_accounts or [])
         assignment_queue = _phase_assignment_rows_from_accounts(all_accounts, {str(trader.get("id")): trader})
+        pending_replacements=[
+            _trader_safe_account_row(r)
+            for r in _pending_reset_waiting_accounts_from_rows(all_accounts)
+        ]
         return ok({
             "trader": trader,
             "current_account": account,
             "active_accounts": active_accounts,
             "accounts": active_accounts,
             "all_accounts": all_accounts,
+            "pending_replacements": pending_replacements,
             "assignment_queue": assignment_queue,
             "challenge_state": trader.get("challenge_state") or "registered"
         })
@@ -5419,10 +5527,15 @@ def trader_bootstrap():
             return _np_fail("Trader authentication is required", 401)
 
         key = _cache_key("trader_bootstrap_fast", trader.get("id"), lookup)
+
+        # Reset lifecycle correctness outranks the 5-second speed cache.
+        # Do not allow a cached pre-reset payload to erase WAITING FOR FRESH MT5.
         cached = _cache_get(_TRADER_BOOTSTRAP_CACHE, key, TRADER_BOOTSTRAP_TTL_SECONDS)
         if cached:
-            cached["cached"] = True
-            return ok(cached, "Trader bootstrap cached")
+            pending_cached=cached.get("pending_replacements") or []
+            if pending_cached:
+                cached["cached"] = True
+                return ok(cached, "Trader bootstrap cached")
 
         # Accounts and purchases are independent. Load only these two datasets.
         account_rows = []
