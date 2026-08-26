@@ -14437,7 +14437,7 @@ def _np_weekly_cleanup():
 # landing_leads, challenge_purchases and email_logs only.
 # No lifecycle/trading/payout logic is modified.
 # ============================================================
-NP_LEAD_FOLLOWUP_VERSION = "HUMAN_NG_V1_2026_08_25"
+NP_LEAD_FOLLOWUP_VERSION = "HUMAN_NG_V2_2026_08_26"
 
 def _np_parse_iso(value):
     try:
@@ -14534,12 +14534,21 @@ def _np_followup_step_for(row, lead_class):
             if p: age = _np_days_since(p[0].get("created_at"))
         except Exception:
             pass
-    return age if age in seq else None
+    # Never depend on hitting the exact calendar day. Production restarts or a
+    # missed scheduler window must not permanently skip a lead. Return the oldest
+    # due unsent step, one step per run, preserving the conversation order.
+    email = str(row.get("email") or "").strip().lower()
+    for day in sorted(int(d) for d in seq.keys() if int(d) <= age):
+        if not _np_followup_already_sent(email, lead_class, day):
+            return day
+    return None
 
 def _np_followup_already_sent(email, lead_class, day):
-    marker = f"[NPFOLLOW:{NP_LEAD_FOLLOWUP_VERSION}:{lead_class}:D{day}]"
+    # Dedupe ACROSS engine versions. A V1 message must remain sent after a V2
+    # deployment; changing the release label must never restart a customer's sequence.
     try:
-        rows = supabase.table("email_logs").select("id").eq("recipient_email", str(email).strip().lower()).eq("email_type", "lead_followup").ilike("message_preview", f"%{marker}%").limit(1).execute().data or []
+        suffix = f":{lead_class}:D{day}]"
+        rows = supabase.table("email_logs").select("id").eq("recipient_email", str(email).strip().lower()).eq("email_type", "lead_followup").ilike("message_preview", f"%{suffix}%").limit(1).execute().data or []
         return bool(rows)
     except Exception:
         return False
@@ -14593,7 +14602,7 @@ def _np_send_lead_followups(dry_run=False, limit=250):
         _log_email_bank(item["email"], item["subject"], email_type="lead_followup", status="sent" if ok_send else "failed", message=marker + " " + item["body"][:800])
         sent += 1 if ok_send else 0
         failed += 0 if ok_send else 1
-    return {"version": NP_LEAD_FOLLOWUP_VERSION, "eligible_contacts": len(by_email), "due": len(due), "sent": sent, "failed": failed, "preview": [{k:v for k,v in x.items() if k != "body"} for x in due[:25]]}
+    return {"version": NP_LEAD_FOLLOWUP_VERSION, "eligible_contacts": len(by_email), "due": len(due), "sent": sent, "failed": failed, "preview": due[:50]}
 
 @app.route("/admin/lead_followup_status", methods=["GET", "OPTIONS"])
 def admin_lead_followup_status():
@@ -16350,6 +16359,35 @@ def founding_social_action():
         lead_id=d.get("lead_id"),
         note=f"{platform} button clicked"
     ))
+
+# Start the existing NairaPips scheduler exactly once per Render container.
+# fcntl file locking prevents multiple Gunicorn workers in the same container
+# from starting duplicate scheduler threads. Email-log dedupe remains a second layer.
+_scheduler_lock_file = None
+def start_scheduler():
+    global _scheduler_started, _scheduler_lock_file
+    with _scheduler_lock:
+        if _scheduler_started:
+            return False
+        try:
+            import fcntl
+            lock_file = open("/tmp/nairapips_scheduler.lock", "a+")
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock_file.close()
+                print("[BOOT] NairaPips scheduler already owned by another worker")
+                return False
+            _scheduler_lock_file = lock_file
+        except Exception as lock_exc:
+            # Linux/Render supports fcntl. If unavailable, preserve the process-local
+            # guard rather than breaking application boot.
+            print("[BOOT] Scheduler file-lock unavailable; using process guard:", lock_exc)
+        _scheduler_started = True
+        t = threading.Thread(target=_np_scheduler_loop, name="nairapips-scheduler", daemon=True)
+        t.start()
+        print("[BOOT] NairaPips scheduler started")
+        return True
 
 # Auto-start only when a scheduler implementation exists.
 # Production stability: do not raise/log a NameError on every Gunicorn worker boot.
