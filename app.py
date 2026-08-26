@@ -14456,7 +14456,7 @@ def _np_weekly_cleanup():
 # landing_leads, challenge_purchases and email_logs only.
 # No lifecycle/trading/payout logic is modified.
 # ============================================================
-NP_LEAD_FOLLOWUP_VERSION = "HUMAN_NG_V1_2026_08_25"
+NP_LEAD_FOLLOWUP_VERSION = "HUMAN_NG_V2_2026_08_26"
 
 def _np_parse_iso(value):
     try:
@@ -14476,25 +14476,24 @@ def _np_first_name(name):
     name = str(name or "").strip()
     return name.split()[0].title() if name else "Legend"
 
-def _np_has_purchase(email, trader_id=None):
-    try:
-        q = supabase.table("challenge_purchases").select("id,status,payment_status,created_at").limit(20)
-        if trader_id:
-            rows = q.eq("trader_id", trader_id).execute().data or []
-        elif email:
-            rows = q.eq("email", str(email).strip().lower()).execute().data or []
-        else:
-            rows = []
-        paid = any(str(r.get("payment_status") or r.get("status") or "").lower() in {"approved","paid","active","approved_active"} for r in rows)
-        started = bool(rows)
-        return started, paid
-    except Exception:
-        return False, False
+def _np_followup_purchase_state(row, source_type, purchase_by_email=None, purchase_by_trader=None):
+    """Resolve purchase state from preloaded indexes. No per-lead database query."""
+    purchase_by_email = purchase_by_email or {}
+    purchase_by_trader = purchase_by_trader or {}
+    email = str((row or {}).get("email") or "").strip().lower()
+    tid = str((row or {}).get("id") or "").strip() if source_type == "trader" else ""
+    rows = []
+    if tid:
+        rows.extend(purchase_by_trader.get(tid, []))
+    if email:
+        seen_ids = {str(x.get("id") or "") for x in rows}
+        rows.extend(x for x in purchase_by_email.get(email, []) if str(x.get("id") or "") not in seen_ids)
+    paid = any(str(r.get("payment_status") or r.get("status") or "").lower() in {"approved","paid","active","approved_active"} for r in rows)
+    return bool(rows), paid, rows
 
-def _np_followup_class(row, source_type):
-    email = str(row.get("email") or "").strip().lower()
-    tid = str(row.get("id") or "") if source_type == "trader" else None
-    started, paid = _np_has_purchase(email, tid)
+
+def _np_followup_class(row, source_type, purchase_by_email=None, purchase_by_trader=None):
+    started, paid, _rows = _np_followup_purchase_state(row, source_type, purchase_by_email, purchase_by_trader)
     status = str(row.get("status") or row.get("lead_status") or "").lower()
     phase = str(row.get("phase") or "").lower()
     if paid or status in {"active","funded","live","passed","breached"} or phase in {"phase1","phase2","funded","live"}:
@@ -14542,43 +14541,56 @@ NP_FOLLOWUP_SEQUENCES = {
     },
 }
 
-def _np_followup_step_for(row, lead_class):
+def _np_followup_log_keys(email_logs):
+    """Parse all historical NPFOLLOW markers so V2 never re-sends a V1 step."""
+    sent = set()
+    marker_re = re.compile(r"\[NPFOLLOW:[^:\]]+:([^:\]]+):D(\d+)\]", re.I)
+    for row in email_logs or []:
+        if str(row.get("status") or "sent").lower() not in {"sent", "delivered", "success", "ok"}:
+            continue
+        email = str(row.get("recipient_email") or row.get("email") or "").strip().lower()
+        blob = " ".join(str(row.get(k) or "") for k in ("message_preview", "message", "body", "subject"))
+        for cls, day in marker_re.findall(blob):
+            sent.add((email, str(cls).lower(), int(day)))
+    return sent
+
+
+def _np_followup_next_step(row, lead_class, sent_keys, purchase_rows=None):
+    """Return earliest unsent step already due. Recovers safely from missed scheduled days."""
     seq = NP_FOLLOWUP_SEQUENCES.get(lead_class) or {}
     age = _np_days_since(row.get("created_at"))
-    if lead_class == "abandoned_purchase":
-        # Purchase age is better when available; registration age is safe fallback.
-        email = str(row.get("email") or "").strip().lower()
-        try:
-            p = supabase.table("challenge_purchases").select("created_at").eq("email", email).order("created_at", desc=True).limit(1).execute().data or []
-            if p: age = _np_days_since(p[0].get("created_at"))
-        except Exception:
-            pass
-    return age if age in seq else None
+    if lead_class == "abandoned_purchase" and purchase_rows:
+        latest = max((r.get("created_at") for r in purchase_rows if r.get("created_at")), default=None)
+        if latest:
+            age = _np_days_since(latest)
+    email = str(row.get("email") or "").strip().lower()
+    for day in sorted(int(x) for x in seq.keys()):
+        if day <= age and (email, lead_class.lower(), day) not in sent_keys:
+            return day
+    return None
 
-def _np_followup_already_sent(email, lead_class, day):
-    marker = f"[NPFOLLOW:{NP_LEAD_FOLLOWUP_VERSION}:{lead_class}:D{day}]"
-    try:
-        rows = supabase.table("email_logs").select("id").eq("recipient_email", str(email).strip().lower()).eq("email_type", "lead_followup").ilike("message_preview", f"%{marker}%").limit(1).execute().data or []
-        return bool(rows)
-    except Exception:
-        return False
 
-def _np_send_lead_followups(dry_run=False, limit=250):
+def _np_followup_bulk_context():
+    """Load lead-follow-up context in a bounded number of Supabase requests."""
     candidates = []
-    # Golden Ticket / Capital Selection: explicit marketing consent exists.
+    warnings = []
+
     try:
-        for r in supabase.table(LEAD_TABLE).select("*").eq("consent_marketing", True).order("created_at", desc=True).limit(2000).execute().data or []:
+        rows = supabase.table(LEAD_TABLE).select("*").eq("consent_marketing", True).order("created_at", desc=True).limit(3000).execute().data or []
+        for r in rows:
             rr = dict(r); rr["_source_type"] = "golden"; candidates.append(rr)
     except Exception as e:
+        warnings.append("golden:" + str(e)[:180])
         print("FOLLOWUP golden fetch skipped:", e)
-    # Normal trader signups: only auto-send where marketing_consent is explicitly true.
+
     try:
-        rows = supabase.table("traders").select("id,name,email,phone,status,phase,created_at,lead_status,marketing_consent").eq("marketing_consent", True).order("created_at", desc=True).limit(3000).execute().data or []
+        rows = supabase.table("traders").select("id,name,email,phone,status,phase,created_at,lead_status,marketing_consent,account_reference").eq("marketing_consent", True).order("created_at", desc=True).limit(5000).execute().data or []
         for r in rows:
             rr = dict(r); rr["_source_type"] = "trader"; candidates.append(rr)
     except Exception as e:
+        warnings.append("traders:" + str(e)[:180])
         print("FOLLOWUP trader fetch skipped:", e)
-    # Dedupe by email; trader identity wins over landing lead when both exist.
+
     by_email = {}
     for r in candidates:
         email = str(r.get("email") or "").strip().lower()
@@ -14587,51 +14599,129 @@ def _np_send_lead_followups(dry_run=False, limit=250):
         old = by_email.get(email)
         if not old or r.get("_source_type") == "trader":
             by_email[email] = r
+
+    purchases = []
+    try:
+        purchases = supabase.table("challenge_purchases").select("id,trader_id,email,status,payment_status,created_at").order("created_at", desc=True).limit(10000).execute().data or []
+    except Exception as e:
+        warnings.append("purchases:" + str(e)[:180])
+        print("FOLLOWUP purchases fetch skipped:", e)
+
+    purchase_by_email = {}
+    purchase_by_trader = {}
+    for p in purchases:
+        email = str(p.get("email") or "").strip().lower()
+        tid = str(p.get("trader_id") or "").strip()
+        if email:
+            purchase_by_email.setdefault(email, []).append(p)
+        if tid:
+            purchase_by_trader.setdefault(tid, []).append(p)
+
+    logs = []
+    try:
+        logs = supabase.table("email_logs").select("recipient_email,email_type,status,message_preview,subject,created_at").eq("email_type", "lead_followup").order("created_at", desc=True).limit(10000).execute().data or []
+    except Exception as e:
+        warnings.append("email_logs:" + str(e)[:180])
+        print("FOLLOWUP email log fetch skipped:", e)
+
+    return by_email, purchase_by_email, purchase_by_trader, _np_followup_log_keys(logs), warnings
+
+
+def _np_send_lead_followups(dry_run=False, limit=250):
+    started_at = time.time()
+    by_email, purchase_by_email, purchase_by_trader, sent_keys, warnings = _np_followup_bulk_context()
     due = []
+
     for email, r in by_email.items():
-        cls = _np_followup_class(r, r.get("_source_type"))
+        source_type = r.get("_source_type")
+        cls = _np_followup_class(r, source_type, purchase_by_email, purchase_by_trader)
         if cls == "customer":
             continue
-        day = _np_followup_step_for(r, cls)
-        if day is None or _np_followup_already_sent(email, cls, day):
+        _started, _paid, purchase_rows = _np_followup_purchase_state(r, source_type, purchase_by_email, purchase_by_trader)
+        day = _np_followup_next_step(r, cls, sent_keys, purchase_rows)
+        if day is None:
             continue
         subject, body = NP_FOLLOWUP_SEQUENCES[cls][day]
         name = _np_first_name(r.get("name") or r.get("full_name"))
         body = body.format(name=name)
-        due.append({"email": email, "name": name, "class": cls, "day": day, "subject": subject, "body": body, "source": r.get("_source_type")})
+        due.append({
+            "email": email,
+            "name": name,
+            "class": cls,
+            "day": day,
+            "subject": subject,
+            "body": body,
+            "source": source_type,
+            "registered_at": r.get("created_at"),
+            "reason": {
+                "new_signup": "Registered with NairaPips and has not purchased",
+                "golden_ticket": "Golden Ticket lead due for nurture",
+                "golden_vip": "Golden Ticket VIP due for nurture",
+                "abandoned_purchase": "Started a purchase but has not completed/been approved",
+                "dormant_signup": "Older registered lead due for reactivation",
+            }.get(cls, "Lead is due for follow-up"),
+        })
+
     due.sort(key=lambda x: (x["day"], x["email"]))
     sent = 0
     failed = 0
-    for item in due[:max(1, int(limit or 250))]:
+    processed = 0
+
+    for item in due[:max(1, min(250, int(limit or 250)))]:
         if dry_run:
             continue
+        processed += 1
         marker = f"[NPFOLLOW:{NP_LEAD_FOLLOWUP_VERSION}:{item['class']}:D{item['day']}]"
         html_body = text_to_html_content(item["body"] + "\n\n" + marker)
         ok_send = bool(send_email_brevo(item["email"], item["subject"], html_body))
-        # send_email_brevo logs as general; add a dedicated best-effort marker log for deterministic dedupe.
         _log_email_bank(item["email"], item["subject"], email_type="lead_followup", status="sent" if ok_send else "failed", message=marker + " " + item["body"][:800])
-        sent += 1 if ok_send else 0
-        failed += 0 if ok_send else 1
-    return {"version": NP_LEAD_FOLLOWUP_VERSION, "eligible_contacts": len(by_email), "due": len(due), "sent": sent, "failed": failed, "preview": [{k:v for k,v in x.items() if k != "body"} for x in due[:25]]}
+        if ok_send:
+            sent += 1
+            sent_keys.add((item["email"], item["class"].lower(), int(item["day"])))
+        else:
+            failed += 1
+
+    elapsed_ms = int((time.time() - started_at) * 1000)
+    preview = [{k: v for k, v in x.items()} for x in due[:50]]
+    return {
+        "version": NP_LEAD_FOLLOWUP_VERSION,
+        "engine_label": "Human NG V2",
+        "eligible_contacts": len(by_email),
+        "due": len(due),
+        "sent": sent,
+        "failed": failed,
+        "processed": processed,
+        "elapsed_ms": elapsed_ms,
+        "warnings": warnings,
+        "preview": preview,
+    }
+
 
 @app.route("/admin/lead_followup_status", methods=["GET", "OPTIONS"])
 def admin_lead_followup_status():
     if request.method == "OPTIONS":
         return _np_ok({})
+    admin_auth, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     try:
         return _np_ok({"success": True, **_np_send_lead_followups(dry_run=True)})
     except Exception as e:
         return _np_fail(e, 500)
 
+
 @app.route("/admin/run_lead_followups", methods=["POST", "OPTIONS"])
 def admin_run_lead_followups():
     if request.method == "OPTIONS":
         return _np_ok({})
+    admin_auth, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
     try:
         body = request.get_json(silent=True) or {}
         limit = min(250, max(1, int(body.get("limit", 100) or 100)))
         result = _np_send_lead_followups(dry_run=False, limit=limit)
-        _audit_safe("leads", "run_human_followups", f"due={result.get('due')} sent={result.get('sent')} failed={result.get('failed')}")
+        _audit_safe("leads", "run_human_followups", f"due={result.get('due')} sent={result.get('sent')} failed={result.get('failed')}", {"id": admin_auth.get("id"), "role": admin_auth.get("role")})
         return _np_ok({"success": True, **result})
     except Exception as e:
         return _np_fail(e, 500)
