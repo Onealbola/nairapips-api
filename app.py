@@ -13925,11 +13925,30 @@ def private_offers_for_trader():
         email = _np_offer_clean_str(request.args.get("email"), 250).lower()
         phone = _np_offer_clean_str(request.args.get("phone"), 80)
         account_reference = _np_offer_clean_str(request.args.get("account_reference"), 120)
-        authed_id, auth_error = _authenticated_trader_id_for_request(trader_id)
-        if auth_error:
-            return _np_fail(auth_error, 401)
-        trader = _get_trader_by_id(authed_id) or {}
-        trader_id = authed_id
+
+        # ADMIN PRIVATE-OFFER READ FIX 2026-08-26:
+        # This endpoint is used by both the trader dashboard and Admin's Private
+        # Offers module. Admin sends the signed admin bearer token, which must not
+        # be parsed as a trader token. If the request is a valid Admin session,
+        # allow lookup of the explicitly requested trader. Otherwise enforce normal
+        # trader self-ownership exactly as before.
+        admin_auth = _request_admin_auth()
+        if admin_auth:
+            trader = _get_trader_by_id(trader_id) if trader_id else None
+            if not trader and email:
+                try:
+                    rows = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
+                    trader = rows[0] if rows else None
+                except Exception:
+                    trader = None
+            trader = trader or {}
+            trader_id = str(trader.get("id") or trader_id or "").strip()
+        else:
+            authed_id, auth_error = _authenticated_trader_id_for_request(trader_id)
+            if auth_error:
+                return _np_fail(auth_error, 401)
+            trader = _get_trader_by_id(authed_id) or {}
+            trader_id = authed_id
         email = str(trader.get("email") or email or "").strip().lower()
         phone = str(trader.get("phone") or phone or "").strip()
         account_reference = str(trader.get("account_reference") or account_reference or "").strip()
@@ -14437,7 +14456,7 @@ def _np_weekly_cleanup():
 # landing_leads, challenge_purchases and email_logs only.
 # No lifecycle/trading/payout logic is modified.
 # ============================================================
-NP_LEAD_FOLLOWUP_VERSION = "HUMAN_NG_V2_2026_08_26"
+NP_LEAD_FOLLOWUP_VERSION = "HUMAN_NG_V1_2026_08_25"
 
 def _np_parse_iso(value):
     try:
@@ -14534,21 +14553,12 @@ def _np_followup_step_for(row, lead_class):
             if p: age = _np_days_since(p[0].get("created_at"))
         except Exception:
             pass
-    # Never depend on hitting the exact calendar day. Production restarts or a
-    # missed scheduler window must not permanently skip a lead. Return the oldest
-    # due unsent step, one step per run, preserving the conversation order.
-    email = str(row.get("email") or "").strip().lower()
-    for day in sorted(int(d) for d in seq.keys() if int(d) <= age):
-        if not _np_followup_already_sent(email, lead_class, day):
-            return day
-    return None
+    return age if age in seq else None
 
 def _np_followup_already_sent(email, lead_class, day):
-    # Dedupe ACROSS engine versions. A V1 message must remain sent after a V2
-    # deployment; changing the release label must never restart a customer's sequence.
+    marker = f"[NPFOLLOW:{NP_LEAD_FOLLOWUP_VERSION}:{lead_class}:D{day}]"
     try:
-        suffix = f":{lead_class}:D{day}]"
-        rows = supabase.table("email_logs").select("id").eq("recipient_email", str(email).strip().lower()).eq("email_type", "lead_followup").ilike("message_preview", f"%{suffix}%").limit(1).execute().data or []
+        rows = supabase.table("email_logs").select("id").eq("recipient_email", str(email).strip().lower()).eq("email_type", "lead_followup").ilike("message_preview", f"%{marker}%").limit(1).execute().data or []
         return bool(rows)
     except Exception:
         return False
@@ -14602,7 +14612,7 @@ def _np_send_lead_followups(dry_run=False, limit=250):
         _log_email_bank(item["email"], item["subject"], email_type="lead_followup", status="sent" if ok_send else "failed", message=marker + " " + item["body"][:800])
         sent += 1 if ok_send else 0
         failed += 0 if ok_send else 1
-    return {"version": NP_LEAD_FOLLOWUP_VERSION, "eligible_contacts": len(by_email), "due": len(due), "sent": sent, "failed": failed, "preview": due[:50]}
+    return {"version": NP_LEAD_FOLLOWUP_VERSION, "eligible_contacts": len(by_email), "due": len(due), "sent": sent, "failed": failed, "preview": [{k:v for k,v in x.items() if k != "body"} for x in due[:25]]}
 
 @app.route("/admin/lead_followup_status", methods=["GET", "OPTIONS"])
 def admin_lead_followup_status():
@@ -16359,35 +16369,6 @@ def founding_social_action():
         lead_id=d.get("lead_id"),
         note=f"{platform} button clicked"
     ))
-
-# Start the existing NairaPips scheduler exactly once per Render container.
-# fcntl file locking prevents multiple Gunicorn workers in the same container
-# from starting duplicate scheduler threads. Email-log dedupe remains a second layer.
-_scheduler_lock_file = None
-def start_scheduler():
-    global _scheduler_started, _scheduler_lock_file
-    with _scheduler_lock:
-        if _scheduler_started:
-            return False
-        try:
-            import fcntl
-            lock_file = open("/tmp/nairapips_scheduler.lock", "a+")
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                lock_file.close()
-                print("[BOOT] NairaPips scheduler already owned by another worker")
-                return False
-            _scheduler_lock_file = lock_file
-        except Exception as lock_exc:
-            # Linux/Render supports fcntl. If unavailable, preserve the process-local
-            # guard rather than breaking application boot.
-            print("[BOOT] Scheduler file-lock unavailable; using process guard:", lock_exc)
-        _scheduler_started = True
-        t = threading.Thread(target=_np_scheduler_loop, name="nairapips-scheduler", daemon=True)
-        t.start()
-        print("[BOOT] NairaPips scheduler started")
-        return True
 
 # Auto-start only when a scheduler implementation exists.
 # Production stability: do not raise/log a NameError on every Gunicorn worker boot.
