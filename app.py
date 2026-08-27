@@ -4303,24 +4303,98 @@ def _email_type_from_subject(subject):
 
 
 def _log_email_bank(to_email, subject, email_type=None, status="queued", trader_id=None, message="", provider="brevo", provider_response="", error=""):
-    """Best-effort log. If the SQL has not been run yet, email sending must not break."""
-    try:
-        row = {
+    """Schema-tolerant persistent email log.
+
+    Production rule:
+    - Try the rich historical schema first.
+    - If optional columns are unavailable, retry with the minimal schema already
+      used by NairaPips Admin Email Status.
+    - Return the inserted row (or False). Lead-followup sends use this return
+      value to FAIL CLOSED rather than sending an untrackable email.
+    """
+    recipient = str(to_email or "").strip().lower()
+    created = now_iso() if "now_iso" in globals() else datetime.now(timezone.utc).isoformat()
+    base = {
+        "trader_id": trader_id,
+        "recipient_email": recipient,
+        "subject": str(subject or "")[:250],
+        "email_type": email_type or _email_type_from_subject(subject),
+        "status": status,
+        "provider": provider,
+        "provider_response": str(provider_response or "")[:2000],
+        "error": str(error or "")[:2000],
+        "message_preview": str(message or "")[:1000],
+        "created_at": created,
+        "sent_at": (created if status == "sent" else None),
+    }
+
+    attempts = [
+        base,
+        # Known-safe columns: these are read by /admin_email_status in current production.
+        {
             "trader_id": trader_id,
-            "recipient_email": str(to_email or "").strip().lower(),
+            "recipient_email": recipient,
             "subject": str(subject or "")[:250],
             "email_type": email_type or _email_type_from_subject(subject),
             "status": status,
-            "provider": provider,
-            "provider_response": str(provider_response or "")[:2000],
-            "error": str(error or "")[:2000],
-            "message_preview": str(message or "")[:1000],
-            "created_at": now_iso() if "now_iso" in globals() else datetime.now(timezone.utc).isoformat(),
-            "sent_at": (now_iso() if status == "sent" and "now_iso" in globals() else None),
-        }
-        supabase.table("email_logs").insert(row).execute()
-    except Exception as e:
-        print("EMAIL LOG BANK SKIPPED:", str(e))
+            "error": str(error or message or "")[:2000],
+            "created_at": created,
+        },
+        {
+            "recipient_email": recipient,
+            "subject": str(subject or "")[:250],
+            "email_type": email_type or _email_type_from_subject(subject),
+            "status": status,
+            "error": str(error or message or "")[:2000],
+            "created_at": created,
+        },
+    ]
+
+    last_error = None
+    for row in attempts:
+        try:
+            inserted = supabase.table("email_logs").insert(row).execute().data or []
+            return inserted[0] if inserted else row
+        except Exception as e:
+            last_error = e
+
+    print("EMAIL LOG BANK FAILED ALL SCHEMAS:", str(last_error))
+    return False
+
+
+def _np_followup_ledger_marker(lead_class, day):
+    return f"[NPFOLLOW:{NP_LEAD_FOLLOWUP_VERSION}:{str(lead_class).lower()}:D{int(day)}]"
+
+
+def _np_followup_reserve(item):
+    """Persist the exact step BEFORE calling Brevo.
+
+    This is fail-closed: if NairaPips cannot persist the send intent, the email
+    is not sent. A reserved step is considered consumed for automatic dedupe.
+    This trades an occasional missed marketing email for zero accidental spam.
+    """
+    marker = _np_followup_ledger_marker(item.get("class"), item.get("day"))
+    row = _log_email_bank(
+        item.get("email"),
+        item.get("subject"),
+        email_type="lead_followup",
+        status="reserved",
+        message="",
+        error=marker,
+    )
+    return bool(row), marker
+
+
+def _np_followup_finalize(item, marker, ok_send, provider_response="", error_text=""):
+    return _log_email_bank(
+        item.get("email"),
+        item.get("subject"),
+        email_type="lead_followup",
+        status="sent" if ok_send else "failed",
+        message="",
+        provider_response=provider_response,
+        error=(marker if ok_send else (marker + " " + str(error_text or "send_failed"))),
+    )
 
 def text_to_html_content(message):
     return "<p>" + html.escape(str(message or "")).replace("\n", "<br>") + "</p>"
@@ -14549,14 +14623,23 @@ NP_FOLLOWUP_SEQUENCES = {
     },
 }
 def _np_followup_log_keys(email_logs):
-    """Parse all historical NPFOLLOW markers so V2 never re-sends a V1 step."""
+    """Parse persistent follow-up ledger markers.
+
+    RESERVED is intentionally treated as consumed. Once NairaPips has reserved
+    a step, automatic processing never repeats it. Failed sends can be handled
+    explicitly later rather than silently spamming the trader.
+    """
     sent = set()
     marker_re = re.compile(r"\[NPFOLLOW:[^:\]]+:([^:\]]+):D(\d+)\]", re.I)
+    consumed_statuses = {"reserved", "queued", "sending", "sent", "delivered", "success", "ok"}
     for row in email_logs or []:
-        if str(row.get("status") or "sent").lower() not in {"sent", "delivered", "success", "ok"}:
+        if str(row.get("status") or "").strip().lower() not in consumed_statuses:
             continue
         email = str(row.get("recipient_email") or row.get("email") or "").strip().lower()
-        blob = " ".join(str(row.get(k) or "") for k in ("message_preview", "message", "body", "subject"))
+        blob = " ".join(
+            str(row.get(k) or "")
+            for k in ("message_preview", "message", "body", "subject", "error", "provider_response")
+        )
         for cls, day in marker_re.findall(blob):
             sent.add((email, str(cls).lower(), int(day)))
     return sent
@@ -14579,6 +14662,26 @@ def _np_followup_success_subject_keys(email_logs):
     return sent
 
 
+# First production campaign migration watermark.
+# The initial live batch was fired on 2026-08-27 around 08:25 UTC before the
+# persistent fail-closed ledger existed. D0 for leads existing by 08:30 UTC is
+# treated as consumed so that no trader can receive that first message twice.
+NP_FOLLOWUP_FIRST_LIVE_D0_CUTOVER_UTC = datetime(2026, 8, 27, 8, 30, 0, tzinfo=timezone.utc)
+
+
+def _np_followup_created_before_first_live_cutover(row):
+    raw = (row or {}).get("created_at")
+    if not raw:
+        return False
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc) <= NP_FOLLOWUP_FIRST_LIVE_D0_CUTOVER_UTC
+    except Exception:
+        return False
+
+
 def _np_followup_next_step(row, lead_class, sent_keys, purchase_rows=None):
     """Return earliest unsent step already due. Recovers safely from missed scheduled days."""
     seq = NP_FOLLOWUP_SEQUENCES.get(lead_class) or {}
@@ -14589,6 +14692,10 @@ def _np_followup_next_step(row, lead_class, sent_keys, purchase_rows=None):
             age = _np_days_since(latest)
     email = str(row.get("email") or "").strip().lower()
     for day in sorted(int(x) for x in seq.keys()):
+        # Migration safety: never repeat D0 from the first live campaign.
+        if day == 0 and _np_followup_created_before_first_live_cutover(row):
+            sent_keys.add((email, lead_class.lower(), 0))
+            continue
         if day <= age and (email, lead_class.lower(), day) not in sent_keys:
             return day
     return None
@@ -14645,10 +14752,17 @@ def _np_followup_bulk_context():
     try:
         # Read both dedicated lead_followup logs and normal Brevo send logs.
         # The latter are a hard fallback proving an email really left NairaPips.
-        logs = supabase.table("email_logs").select("recipient_email,email_type,status,message_preview,subject,created_at").order("created_at", desc=True).limit(10000).execute().data or []
+        logs = supabase.table("email_logs").select("recipient_email,email_type,status,message_preview,subject,error,provider_response,created_at").order("created_at", desc=True).limit(10000).execute().data or []
     except Exception as e:
-        warnings.append("email_logs:" + str(e)[:180])
-        print("FOLLOWUP email log fetch skipped:", e)
+        try:
+            logs = supabase.table("email_logs").select(
+                "recipient_email,email_type,status,subject,error,created_at"
+            ).order("created_at", desc=True).limit(10000).execute().data or []
+            warnings.append("email_logs_rich_fallback:" + str(e)[:120])
+        except Exception as e2:
+            warnings.append("email_logs:" + str(e2)[:180])
+            print("FOLLOWUP email log fetch skipped:", e2)
+            logs = []
 
     return (
         by_email,
@@ -14736,20 +14850,25 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
         if dry_run:
             continue
         processed += 1
-        marker = f"[NPFOLLOW:{NP_LEAD_FOLLOWUP_VERSION}:{item['class']}:D{item['day']}]"
-        # Customer-visible email stays clean. Tracking/dedupe marker is internal only.
+
+        reserved, marker = _np_followup_reserve(item)
+        if not reserved:
+            # Fail closed: never send an email NairaPips cannot persistently track.
+            failed += 1
+            print("FOLLOWUP SEND BLOCKED: could not reserve persistent ledger", item.get("email"), item.get("class"), item.get("day"))
+            continue
+
         html_body = text_to_html_content(item["body"])
         ok_send = bool(send_email_brevo(item["email"], item["subject"], html_body))
-        _log_email_bank(
-            item["email"],
-            item["subject"],
-            email_type="lead_followup",
-            status="sent" if ok_send else "failed",
-            message=marker + " " + item["body"][:800]
-        )
+
+        # send_email_brevo has its own general log; this dedicated final ledger
+        # record remains the authoritative follow-up history.
+        _np_followup_finalize(item, marker, ok_send)
+
+        # Reservation itself permanently consumes the step to prevent duplicates.
+        sent_keys.add((item["email"], item["class"].lower(), int(item["day"])))
         if ok_send:
             sent += 1
-            sent_keys.add((item["email"], item["class"].lower(), int(item["day"])))
         else:
             failed += 1
 
@@ -14757,7 +14876,7 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
     preview = [{k: v for k, v in x.items()} for x in due[:250]]
     return {
         "version": NP_LEAD_FOLLOWUP_VERSION,
-        "engine_label": "Human NG V3.4 · Chunked Reliable · Hard Dedupe",
+        "engine_label": "Human NG V4 · Persistent Ledger · Fail Closed",
         "eligible_contacts": len(by_email),
         "due": len(due),
         "send_capacity": min(250, len(due)),
@@ -14769,6 +14888,8 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
             for x in due[:max(1, min(250, int(limit or 250)))]
         ] if not dry_run else [],
         "elapsed_ms": elapsed_ms,
+        "ledger_mode": "persistent_fail_closed",
+        "first_live_d0_cutover_utc": NP_FOLLOWUP_FIRST_LIVE_D0_CUTOVER_UTC.isoformat(),
         "warnings": warnings,
         "preview": preview,
     }
