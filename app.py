@@ -14650,6 +14650,7 @@ def _np_send_lead_followups(dry_run=False, limit=250):
             continue
         subject, body = NP_FOLLOWUP_SEQUENCES[cls][day]
         name = _np_first_name(r.get("name") or r.get("full_name"))
+        subject = subject.format(name=name)
         body = body.format(name=name)
         due.append({
             "email": email,
@@ -14666,6 +14667,7 @@ def _np_send_lead_followups(dry_run=False, limit=250):
                 "golden_vip": "Golden Ticket VIP due for nurture",
                 "abandoned_purchase": "Started a purchase but has not completed/been approved",
                 "dormant_signup": "Older registered lead due for reactivation",
+                "breached_returning": "Previous NairaPips account breached · Recovery education sequence",
             }.get(cls, "Lead is due for follow-up"),
         })
 
@@ -14689,12 +14691,13 @@ def _np_send_lead_followups(dry_run=False, limit=250):
             failed += 1
 
     elapsed_ms = int((time.time() - started_at) * 1000)
-    preview = [{k: v for k, v in x.items()} for x in due[:50]]
+    preview = [{k: v for k, v in x.items()} for x in due[:250]]
     return {
         "version": NP_LEAD_FOLLOWUP_VERSION,
-        "engine_label": "Human NG V2",
+        "engine_label": "Human NG V3 · Educate → Convert",
         "eligible_contacts": len(by_email),
         "due": len(due),
+        "send_capacity": min(250, len(due)),
         "sent": sent,
         "failed": failed,
         "processed": processed,
