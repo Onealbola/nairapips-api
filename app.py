@@ -14660,7 +14660,7 @@ def _np_followup_bulk_context():
     )
 
 
-def _np_send_lead_followups(dry_run=False, limit=250):
+def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
     started_at = time.time()
     by_email, purchase_by_email, purchase_by_trader, sent_keys, sent_subject_keys, warnings = _np_followup_bulk_context()
     due = []
@@ -14716,6 +14716,18 @@ def _np_send_lead_followups(dry_run=False, limit=250):
         })
 
     due.sort(key=lambda x: (x["day"], x["email"]))
+
+    # Optional exact queue targeting for reliable chunked Admin sends.
+    # Re-evaluate every target against current buyer/consent/dedupe state first,
+    # then send only the leads the operator actually reviewed in this run.
+    target_set = {
+        str(x or "").strip().lower()
+        for x in (target_emails or [])
+        if str(x or "").strip()
+    }
+    if target_set:
+        due = [x for x in due if str(x.get("email") or "").strip().lower() in target_set]
+
     sent = 0
     failed = 0
     processed = 0
@@ -14745,13 +14757,17 @@ def _np_send_lead_followups(dry_run=False, limit=250):
     preview = [{k: v for k, v in x.items()} for x in due[:250]]
     return {
         "version": NP_LEAD_FOLLOWUP_VERSION,
-        "engine_label": "Human NG V3.3 · Hard Dedupe · Educate → Convert",
+        "engine_label": "Human NG V3.4 · Chunked Reliable · Hard Dedupe",
         "eligible_contacts": len(by_email),
         "due": len(due),
         "send_capacity": min(250, len(due)),
         "sent": sent,
         "failed": failed,
         "processed": processed,
+        "processed_emails": [
+            str(x.get("email") or "").strip().lower()
+            for x in due[:max(1, min(250, int(limit or 250)))]
+        ] if not dry_run else [],
         "elapsed_ms": elapsed_ms,
         "warnings": warnings,
         "preview": preview,
@@ -14780,8 +14796,19 @@ def admin_run_lead_followups():
         return auth_response
     try:
         body = request.get_json(silent=True) or {}
-        limit = min(250, max(1, int(body.get("limit", 100) or 100)))
-        result = _np_send_lead_followups(dry_run=False, limit=limit)
+        target_emails = [
+            str(x or "").strip().lower()
+            for x in (body.get("target_emails") or [])
+            if str(x or "").strip()
+        ][:10]
+        # Admin HTTP sends are intentionally small. This avoids long Render/Gunicorn
+        # requests while the browser automatically advances through the reviewed queue.
+        limit = min(10, max(1, int(body.get("limit", len(target_emails) or 2) or 2)))
+        result = _np_send_lead_followups(
+            dry_run=False,
+            limit=limit,
+            target_emails=target_emails or None,
+        )
         _audit_safe("leads", "run_human_followups", f"due={result.get('due')} sent={result.get('sent')} failed={result.get('failed')}", {"id": admin_auth.get("id"), "role": admin_auth.get("role")})
         return _np_ok({"success": True, **result})
     except Exception as e:
