@@ -14681,9 +14681,16 @@ def _np_send_lead_followups(dry_run=False, limit=250):
             continue
         processed += 1
         marker = f"[NPFOLLOW:{NP_LEAD_FOLLOWUP_VERSION}:{item['class']}:D{item['day']}]"
-        html_body = text_to_html_content(item["body"] + "\n\n" + marker)
+        # Customer-visible email stays clean. Tracking/dedupe marker is internal only.
+        html_body = text_to_html_content(item["body"])
         ok_send = bool(send_email_brevo(item["email"], item["subject"], html_body))
-        _log_email_bank(item["email"], item["subject"], email_type="lead_followup", status="sent" if ok_send else "failed", message=marker + " " + item["body"][:800])
+        _log_email_bank(
+            item["email"],
+            item["subject"],
+            email_type="lead_followup",
+            status="sent" if ok_send else "failed",
+            message=marker + " " + item["body"][:800]
+        )
         if ok_send:
             sent += 1
             sent_keys.add((item["email"], item["class"].lower(), int(item["day"])))
@@ -14694,7 +14701,7 @@ def _np_send_lead_followups(dry_run=False, limit=250):
     preview = [{k: v for k, v in x.items()} for x in due[:250]]
     return {
         "version": NP_LEAD_FOLLOWUP_VERSION,
-        "engine_label": "Human NG V3 · Educate → Convert",
+        "engine_label": "Human NG V3.2 · Educate → Convert",
         "eligible_contacts": len(by_email),
         "due": len(due),
         "send_capacity": min(250, len(due)),
