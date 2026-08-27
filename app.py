@@ -14622,16 +14622,13 @@ NP_FOLLOWUP_SEQUENCES = {
         14: ("The next account should meet a different trader", "Legend {name}, if you take another NairaPips opportunity, let the account meet a different version of you.\n\nSame market. Maybe same strategy. But better risk. Better patience. Better control.\n\nThat is what makes a second opportunity valuable.\n\n— NairaPips"),
     },
 }
-def _np_followup_log_keys(email_logs):
-    """Parse persistent follow-up ledger markers.
-
-    RESERVED is intentionally treated as consumed. Once NairaPips has reserved
-    a step, automatic processing never repeats it. Failed sends can be handled
-    explicitly later rather than silently spamming the trader.
-    """
+def _np_followup_log_state(email_logs):
+    """Return consumed follow-up steps AND their persistent timestamps."""
     sent = set()
+    sent_times = {}
     marker_re = re.compile(r"\[NPFOLLOW:[^:\]]+:([^:\]]+):D(\d+)\]", re.I)
     consumed_statuses = {"reserved", "queued", "sending", "sent", "delivered", "success", "ok"}
+
     for row in email_logs or []:
         if str(row.get("status") or "").strip().lower() not in consumed_statuses:
             continue
@@ -14640,26 +14637,52 @@ def _np_followup_log_keys(email_logs):
             str(row.get(k) or "")
             for k in ("message_preview", "message", "body", "subject", "error", "provider_response")
         )
+        raw_time = row.get("sent_at") or row.get("created_at")
+        dt = _np_parse_iso(raw_time)
+        if dt and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
         for cls, day in marker_re.findall(blob):
-            sent.add((email, str(cls).lower(), int(day)))
-    return sent
+            key = (email, str(cls).lower(), int(day))
+            sent.add(key)
+            if dt:
+                old = sent_times.get(key)
+                # Reservation time is the sequence clock. Keep the earliest record.
+                if old is None or dt < old:
+                    sent_times[key] = dt
+
+    return sent, sent_times
 
 
-def _np_followup_success_subject_keys(email_logs):
-    """Fallback dedupe from actual successful Brevo logs.
+def _np_followup_log_keys(email_logs):
+    # Compatibility helper for any older internal caller.
+    return _np_followup_log_state(email_logs)[0]
 
-    This protects against duplicate sends if the dedicated lead_followup marker log
-    was unavailable after Brevo already accepted the customer email.
-    """
+def _np_followup_success_subject_state(email_logs):
+    """Fallback proof from actual successful Brevo logs, including send time."""
     sent = set()
+    sent_times = {}
     for row in email_logs or []:
         if str(row.get("status") or "").strip().lower() not in {"sent", "delivered", "success", "ok"}:
             continue
         email = str(row.get("recipient_email") or row.get("email") or "").strip().lower()
         subject = re.sub(r"\s+", " ", str(row.get("subject") or "").strip()).casefold()
-        if email and subject:
-            sent.add((email, subject))
-    return sent
+        if not (email and subject):
+            continue
+        key = (email, subject)
+        sent.add(key)
+        dt = _np_parse_iso(row.get("sent_at") or row.get("created_at"))
+        if dt and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if dt:
+            old = sent_times.get(key)
+            if old is None or dt < old:
+                sent_times[key] = dt
+    return sent, sent_times
+
+
+def _np_followup_success_subject_keys(email_logs):
+    return _np_followup_success_subject_state(email_logs)[0]
 
 
 # First production campaign migration watermark.
@@ -14682,22 +14705,76 @@ def _np_followup_created_before_first_live_cutover(row):
         return False
 
 
-def _np_followup_next_step(row, lead_class, sent_keys, purchase_rows=None):
-    """Return earliest unsent step already due. Recovers safely from missed scheduled days."""
+def _np_followup_next_step(row, lead_class, sent_keys, purchase_rows=None, sent_times=None):
+    """Return the next step only when its real interval has elapsed.
+
+    Scientific timing rule:
+    - The first sequence step is due from the source-event age (registration,
+      purchase attempt, etc.).
+    - After any step is consumed, the NEXT step waits the intended interval
+      between sequence day numbers from the ACTUAL previous send/reservation.
+    - No catch-up avalanche: an old registration can never receive D0 and D1
+      minutes apart simply because the registration itself is old.
+    """
     seq = NP_FOLLOWUP_SEQUENCES.get(lead_class) or {}
-    age = _np_days_since(row.get("created_at"))
+    days = sorted(int(x) for x in seq.keys())
+    if not days:
+        return None
+
+    sent_times = sent_times or {}
+    email = str(row.get("email") or "").strip().lower()
+    cls = str(lead_class or "").lower()
+    now = datetime.now(timezone.utc)
+
+    # Source-event age only determines when the FIRST message becomes eligible.
+    source_dt = _np_parse_iso(row.get("created_at"))
     if lead_class == "abandoned_purchase" and purchase_rows:
         latest = max((r.get("created_at") for r in purchase_rows if r.get("created_at")), default=None)
         if latest:
-            age = _np_days_since(latest)
-    email = str(row.get("email") or "").strip().lower()
-    for day in sorted(int(x) for x in seq.keys()):
-        # Migration safety: never repeat D0 from the first live campaign.
-        if day == 0 and _np_followup_created_before_first_live_cutover(row):
-            sent_keys.add((email, lead_class.lower(), 0))
+            source_dt = _np_parse_iso(latest)
+    if source_dt and source_dt.tzinfo is None:
+        source_dt = source_dt.replace(tzinfo=timezone.utc)
+
+    # Migration safety for the first live D0 batch.
+    if 0 in days and _np_followup_created_before_first_live_cutover(row):
+        key0 = (email, cls, 0)
+        sent_keys.add(key0)
+        sent_times.setdefault(key0, NP_FOLLOWUP_FIRST_LIVE_D0_CUTOVER_UTC)
+
+    prior_day = None
+    prior_time = None
+
+    for day in days:
+        key = (email, cls, day)
+
+        if key in sent_keys:
+            prior_day = day
+            prior_time = sent_times.get(key) or prior_time
             continue
-        if day <= age and (email, lead_class.lower(), day) not in sent_keys:
+
+        if prior_day is None:
+            # No earlier step has been consumed. Respect the original first-step
+            # delay (e.g. dormant D30), but D0 is immediate.
+            required_days = max(0, day)
+            if source_dt is None:
+                return None
+            if now >= source_dt + timedelta(days=required_days):
+                return day
+            return None
+
+        # A previous step was consumed. Anchor the next interval to that actual
+        # send/reservation time, never to ancient registration age.
+        if prior_time is None:
+            # Conservative safety: if historical timestamp is unavailable,
+            # start the clock now rather than risk an immediate duplicate/cascade.
+            prior_time = now
+            sent_times[(email, cls, prior_day)] = prior_time
+
+        interval_days = max(0, day - prior_day)
+        if now >= prior_time + timedelta(days=interval_days):
             return day
+        return None
+
     return None
 
 
@@ -14768,15 +14845,24 @@ def _np_followup_bulk_context():
         by_email,
         purchase_by_email,
         purchase_by_trader,
-        _np_followup_log_keys(logs),
-        _np_followup_success_subject_keys(logs),
+        *_np_followup_log_state(logs),
+        *_np_followup_success_subject_state(logs),
         warnings,
     )
 
 
 def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
     started_at = time.time()
-    by_email, purchase_by_email, purchase_by_trader, sent_keys, sent_subject_keys, warnings = _np_followup_bulk_context()
+    (
+        by_email,
+        purchase_by_email,
+        purchase_by_trader,
+        sent_keys,
+        sent_times,
+        sent_subject_keys,
+        sent_subject_times,
+        warnings,
+    ) = _np_followup_bulk_context()
     due = []
 
     for email, r in by_email.items():
@@ -14787,29 +14873,36 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
         _started, _paid, purchase_rows = _np_followup_purchase_state(r, source_type, purchase_by_email, purchase_by_trader)
         name = _np_first_name(r.get("name") or r.get("full_name"))
 
-        # Resolve the next unsent step. If a normal successful Brevo log already
-        # contains the exact personalized subject, treat that step as sent even
-        # when the dedicated NPFOLLOW marker log is missing. Continue forward so
-        # old successful sends cannot reappear as D0/D1 duplicates.
-        day = None
-        subject = body = None
-        for _ in range(max(1, len(NP_FOLLOWUP_SEQUENCES.get(cls) or {}))):
-            candidate_day = _np_followup_next_step(r, cls, sent_keys, purchase_rows)
-            if candidate_day is None:
-                break
-            candidate_subject, candidate_body = NP_FOLLOWUP_SEQUENCES[cls][candidate_day]
-            candidate_subject = candidate_subject.format(name=name)
-            subject_key = re.sub(r"\s+", " ", candidate_subject.strip()).casefold()
-            if (email, subject_key) in sent_subject_keys:
-                sent_keys.add((email, cls.lower(), int(candidate_day)))
-                continue
-            day = candidate_day
-            subject = candidate_subject
-            body = candidate_body.format(name=name)
-            break
+        # Reconcile any historical successful Brevo subject into the persistent
+        # sequence state BEFORE timing is calculated. This preserves both dedupe
+        # and the true send timestamp used by the sequence clock.
+        for hist_day, (hist_subject_tpl, _hist_body_tpl) in (NP_FOLLOWUP_SEQUENCES.get(cls) or {}).items():
+            hist_subject = hist_subject_tpl.format(name=name)
+            hist_subject_key = re.sub(r"\s+", " ", hist_subject.strip()).casefold()
+            subject_state_key = (email, hist_subject_key)
+            if subject_state_key in sent_subject_keys:
+                step_key = (email, cls.lower(), int(hist_day))
+                sent_keys.add(step_key)
+                hist_time = sent_subject_times.get(subject_state_key)
+                if hist_time:
+                    old_time = sent_times.get(step_key)
+                    if old_time is None or hist_time < old_time:
+                        sent_times[step_key] = hist_time
 
+        day = _np_followup_next_step(
+            r,
+            cls,
+            sent_keys,
+            purchase_rows,
+            sent_times=sent_times,
+        )
         if day is None:
             continue
+
+        subject_tpl, body_tpl = NP_FOLLOWUP_SEQUENCES[cls][day]
+        subject = subject_tpl.format(name=name)
+        body = body_tpl.format(name=name)
+
         due.append({
             "email": email,
             "name": name,
@@ -14858,6 +14951,9 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
             print("FOLLOWUP SEND BLOCKED: could not reserve persistent ledger", item.get("email"), item.get("class"), item.get("day"))
             continue
 
+        reserved_at = datetime.now(timezone.utc)
+        sent_times[(item["email"], item["class"].lower(), int(item["day"]))] = reserved_at
+
         html_body = text_to_html_content(item["body"])
         ok_send = bool(send_email_brevo(item["email"], item["subject"], html_body))
 
@@ -14876,7 +14972,7 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
     preview = [{k: v for k, v in x.items()} for x in due[:250]]
     return {
         "version": NP_LEAD_FOLLOWUP_VERSION,
-        "engine_label": "Human NG V4 · Persistent Ledger · Fail Closed",
+        "engine_label": "Human NG V4.1 · 24h Sequence Clock · Fail Closed",
         "eligible_contacts": len(by_email),
         "due": len(due),
         "send_capacity": min(250, len(due)),
@@ -14889,6 +14985,7 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
         ] if not dry_run else [],
         "elapsed_ms": elapsed_ms,
         "ledger_mode": "persistent_fail_closed",
+        "timing_mode": "actual_previous_send_interval",
         "first_live_d0_cutover_utc": NP_FOLLOWUP_FIRST_LIVE_D0_CUTOVER_UTC.isoformat(),
         "warnings": warnings,
         "preview": preview,
