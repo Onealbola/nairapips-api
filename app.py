@@ -4375,22 +4375,45 @@ def _np_followup_ledger_marker(lead_class, day):
 
 
 def _np_followup_reserve(item):
-    """Persist the exact step BEFORE calling Brevo.
+    """Persist the exact step BEFORE calling Brevo, with a hard duplicate preflight.
 
-    This is fail-closed: if NairaPips cannot persist the send intent, the email
-    is not sent. A queued ledger step is considered consumed for automatic dedupe.
-    This trades an occasional missed marketing email for zero accidental spam.
+    The service-role ledger is authoritative. If this exact recipient/class/day
+    is already queued/sent, return an already-consumed result and DO NOT send.
+    If the ledger cannot be checked or written, fail closed.
     """
     marker = _np_followup_ledger_marker(item.get("class"), item.get("day"))
+    email = str(item.get("email") or "").strip().lower()
+    if not (supabase_admin and email):
+        print("FOLLOWUP RESERVE BLOCKED: service-role ledger unavailable", email)
+        return False, marker, False
+
+    try:
+        existing = (
+            supabase_admin.table("email_logs")
+            .select("id,status,created_at")
+            .eq("recipient_email", email)
+            .eq("email_type", "lead_followup")
+            .in_("status", ["queued", "sending", "sent", "delivered", "success", "ok"])
+            .ilike("error", f"%{marker}%")
+            .limit(1)
+            .execute().data or []
+        )
+        if existing:
+            print("FOLLOWUP DEDUPE HIT:", email, item.get("class"), item.get("day"))
+            return True, marker, True
+    except Exception as e:
+        print("FOLLOWUP RESERVE PREFLIGHT FAILED:", email, str(e))
+        return False, marker, False
+
     row = _log_email_bank(
-        item.get("email"),
+        email,
         item.get("subject"),
         email_type="lead_followup",
         status="queued",
         message="",
         error=marker,
     )
-    return bool(row), marker
+    return bool(row), marker, False
 
 
 def _np_followup_finalize(item, marker, ok_send, provider_response="", error_text=""):
@@ -14840,11 +14863,13 @@ def _np_followup_bulk_context():
     try:
         # Read both dedicated lead_followup logs and normal Brevo send logs.
         # The latter are a hard fallback proving an email really left NairaPips.
-        logs = supabase.table("email_logs").select("recipient_email,email_type,status,message_preview,subject,error,provider_response,created_at").order("created_at", desc=True).limit(10000).execute().data or []
+        ledger_db = supabase_admin or supabase
+        logs = ledger_db.table("email_logs").select("recipient_email,email_type,status,message_preview,subject,error,provider_response,created_at,sent_at").order("created_at", desc=True).limit(10000).execute().data or []
     except Exception as e:
         try:
-            logs = supabase.table("email_logs").select(
-                "recipient_email,email_type,status,subject,error,created_at"
+            ledger_db = supabase_admin or supabase
+            logs = ledger_db.table("email_logs").select(
+                "recipient_email,email_type,status,subject,error,created_at,sent_at"
             ).order("created_at", desc=True).limit(10000).execute().data or []
             warnings.append("email_logs_rich_fallback:" + str(e)[:120])
         except Exception as e2:
@@ -14956,12 +14981,17 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
             continue
         processed += 1
 
-        reserved, marker = _np_followup_reserve(item)
+        reserved, marker, already_consumed = _np_followup_reserve(item)
         if not reserved:
             # Fail closed: never send an email NairaPips cannot persistently track.
             failed += 1
             failure_stage_counts["ledger_reserve"] += 1
             print("FOLLOWUP SEND BLOCKED: could not queue persistent ledger", item.get("email"), item.get("class"), item.get("day"))
+            continue
+        if already_consumed:
+            # Another request or an earlier run already owns/completed this exact step.
+            # Count it as safely processed but NEVER call Brevo again.
+            sent_keys.add((item["email"], item["class"].lower(), int(item["day"])))
             continue
 
         reserved_at = datetime.now(timezone.utc)
@@ -14986,7 +15016,7 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
     preview = [{k: v for k, v in x.items()} for x in due[:250]]
     return {
         "version": NP_LEAD_FOLLOWUP_VERSION,
-        "engine_label": "Human NG V4.3 · RLS-Safe Ledger · 24h Clock · Fail Closed",
+        "engine_label": "Human NG V4.4 · Targeted + Idempotent · 24h Clock",
         "eligible_contacts": len(by_email),
         "due": len(due),
         "send_capacity": min(250, len(due)),
@@ -15035,13 +15065,17 @@ def admin_run_lead_followups():
             for x in (body.get("target_emails") or [])
             if str(x or "").strip()
         ][:10]
+        # HARD SAFETY: Admin mutation must be explicitly targeted. Never fall back
+        # to the first N due leads if JSON/body parsing fails.
+        if not target_emails:
+            return _np_fail("Explicit target_emails are required for lead follow-up sending", 400)
         # Admin HTTP sends are intentionally small. This avoids long Render/Gunicorn
         # requests while the browser automatically advances through the reviewed queue.
-        limit = min(10, max(1, int(body.get("limit", len(target_emails) or 2) or 2)))
+        limit = min(10, max(1, int(body.get("limit", len(target_emails)) or len(target_emails))))
         result = _np_send_lead_followups(
             dry_run=False,
             limit=limit,
-            target_emails=target_emails or None,
+            target_emails=target_emails,
         )
         _audit_safe("leads", "run_human_followups", f"due={result.get('due')} sent={result.get('sent')} failed={result.get('failed')}", {"id": admin_auth.get("id"), "role": admin_auth.get("role")})
         return _np_ok({"success": True, **result})
@@ -15067,8 +15101,10 @@ def _np_scheduler_loop():
                                 _np_run_single_rule(rule)
                             print(f"[CRON] Daily run processed {len(rules)} rules")
                             try:
-                                lead_result = _np_send_lead_followups(dry_run=False, limit=250)
-                                print(f"[CRON] Human lead follow-up due={lead_result.get('due')} sent={lead_result.get('sent')} failed={lead_result.get('failed')}")
+                                # Safety gate: autonomous lead sending remains disabled while
+                                # the V4.4 targeted/idempotent sender is under production verification.
+                                lead_result = _np_send_lead_followups(dry_run=True, limit=250)
+                                print(f"[CRON] Human lead follow-up CHECK ONLY due={lead_result.get('due')} (automatic send disabled)")
                             except Exception as lead_exc:
                                 print("[CRON] Human lead follow-up failed:", lead_exc)
                     except Exception as e:
