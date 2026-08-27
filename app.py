@@ -14562,6 +14562,23 @@ def _np_followup_log_keys(email_logs):
     return sent
 
 
+def _np_followup_success_subject_keys(email_logs):
+    """Fallback dedupe from actual successful Brevo logs.
+
+    This protects against duplicate sends if the dedicated lead_followup marker log
+    was unavailable after Brevo already accepted the customer email.
+    """
+    sent = set()
+    for row in email_logs or []:
+        if str(row.get("status") or "").strip().lower() not in {"sent", "delivered", "success", "ok"}:
+            continue
+        email = str(row.get("recipient_email") or row.get("email") or "").strip().lower()
+        subject = re.sub(r"\s+", " ", str(row.get("subject") or "").strip()).casefold()
+        if email and subject:
+            sent.add((email, subject))
+    return sent
+
+
 def _np_followup_next_step(row, lead_class, sent_keys, purchase_rows=None):
     """Return earliest unsent step already due. Recovers safely from missed scheduled days."""
     seq = NP_FOLLOWUP_SEQUENCES.get(lead_class) or {}
@@ -14626,17 +14643,26 @@ def _np_followup_bulk_context():
 
     logs = []
     try:
-        logs = supabase.table("email_logs").select("recipient_email,email_type,status,message_preview,subject,created_at").eq("email_type", "lead_followup").order("created_at", desc=True).limit(10000).execute().data or []
+        # Read both dedicated lead_followup logs and normal Brevo send logs.
+        # The latter are a hard fallback proving an email really left NairaPips.
+        logs = supabase.table("email_logs").select("recipient_email,email_type,status,message_preview,subject,created_at").order("created_at", desc=True).limit(10000).execute().data or []
     except Exception as e:
         warnings.append("email_logs:" + str(e)[:180])
         print("FOLLOWUP email log fetch skipped:", e)
 
-    return by_email, purchase_by_email, purchase_by_trader, _np_followup_log_keys(logs), warnings
+    return (
+        by_email,
+        purchase_by_email,
+        purchase_by_trader,
+        _np_followup_log_keys(logs),
+        _np_followup_success_subject_keys(logs),
+        warnings,
+    )
 
 
 def _np_send_lead_followups(dry_run=False, limit=250):
     started_at = time.time()
-    by_email, purchase_by_email, purchase_by_trader, sent_keys, warnings = _np_followup_bulk_context()
+    by_email, purchase_by_email, purchase_by_trader, sent_keys, sent_subject_keys, warnings = _np_followup_bulk_context()
     due = []
 
     for email, r in by_email.items():
@@ -14645,13 +14671,31 @@ def _np_send_lead_followups(dry_run=False, limit=250):
         if cls == "customer":
             continue
         _started, _paid, purchase_rows = _np_followup_purchase_state(r, source_type, purchase_by_email, purchase_by_trader)
-        day = _np_followup_next_step(r, cls, sent_keys, purchase_rows)
+        name = _np_first_name(r.get("name") or r.get("full_name"))
+
+        # Resolve the next unsent step. If a normal successful Brevo log already
+        # contains the exact personalized subject, treat that step as sent even
+        # when the dedicated NPFOLLOW marker log is missing. Continue forward so
+        # old successful sends cannot reappear as D0/D1 duplicates.
+        day = None
+        subject = body = None
+        for _ in range(max(1, len(NP_FOLLOWUP_SEQUENCES.get(cls) or {}))):
+            candidate_day = _np_followup_next_step(r, cls, sent_keys, purchase_rows)
+            if candidate_day is None:
+                break
+            candidate_subject, candidate_body = NP_FOLLOWUP_SEQUENCES[cls][candidate_day]
+            candidate_subject = candidate_subject.format(name=name)
+            subject_key = re.sub(r"\s+", " ", candidate_subject.strip()).casefold()
+            if (email, subject_key) in sent_subject_keys:
+                sent_keys.add((email, cls.lower(), int(candidate_day)))
+                continue
+            day = candidate_day
+            subject = candidate_subject
+            body = candidate_body.format(name=name)
+            break
+
         if day is None:
             continue
-        subject, body = NP_FOLLOWUP_SEQUENCES[cls][day]
-        name = _np_first_name(r.get("name") or r.get("full_name"))
-        subject = subject.format(name=name)
-        body = body.format(name=name)
         due.append({
             "email": email,
             "name": name,
@@ -14701,7 +14745,7 @@ def _np_send_lead_followups(dry_run=False, limit=250):
     preview = [{k: v for k, v in x.items()} for x in due[:250]]
     return {
         "version": NP_LEAD_FOLLOWUP_VERSION,
-        "engine_label": "Human NG V3.2 · Educate → Convert",
+        "engine_label": "Human NG V3.3 · Hard Dedupe · Educate → Convert",
         "eligible_contacts": len(by_email),
         "due": len(due),
         "send_capacity": min(250, len(due)),
