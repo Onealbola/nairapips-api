@@ -4350,10 +4350,18 @@ def _log_email_bank(to_email, subject, email_type=None, status="queued", trader_
         },
     ]
 
+    # email_logs is a protected server-side ledger. Using the public/anon
+    # Supabase client here is rejected by RLS in production (Postgres 42501).
+    # Never weaken RLS to make marketing sends work: require the service-role
+    # client and fail closed when it is unavailable.
+    if not supabase_admin:
+        print("EMAIL LOG BANK BLOCKED: SUPABASE_SERVICE_ROLE_KEY is unavailable")
+        return False
+
     last_error = None
     for row in attempts:
         try:
-            inserted = supabase.table("email_logs").insert(row).execute().data or []
+            inserted = supabase_admin.table("email_logs").insert(row).execute().data or []
             return inserted[0] if inserted else row
         except Exception as e:
             last_error = e
@@ -4370,7 +4378,7 @@ def _np_followup_reserve(item):
     """Persist the exact step BEFORE calling Brevo.
 
     This is fail-closed: if NairaPips cannot persist the send intent, the email
-    is not sent. A reserved step is considered consumed for automatic dedupe.
+    is not sent. A queued ledger step is considered consumed for automatic dedupe.
     This trades an occasional missed marketing email for zero accidental spam.
     """
     marker = _np_followup_ledger_marker(item.get("class"), item.get("day"))
@@ -4378,7 +4386,7 @@ def _np_followup_reserve(item):
         item.get("email"),
         item.get("subject"),
         email_type="lead_followup",
-        status="reserved",
+        status="queued",
         message="",
         error=marker,
     )
@@ -10720,12 +10728,15 @@ def audit_log(staff, module, action, details='', record_affected='', created_at=
             'record_affected': record_affected,
             'created_at': created_at or now_iso()
         }
+        # admin_audit_logs is server-only. Write through the service-role
+        # client so RLS remains enabled for browser/public clients.
+        db = _staff_db()
         try:
-            supabase.table('admin_audit_logs').insert(row).execute()
+            db.table('admin_audit_logs').insert(row).execute()
         except Exception:
             row.pop('record_affected', None)
             row.pop('created_at', None)
-            supabase.table('admin_audit_logs').insert(row).execute()
+            db.table('admin_audit_logs').insert(row).execute()
     except Exception as e:
         print('AUDIT LOG ERROR:', str(e))
 
@@ -14647,7 +14658,7 @@ def _np_followup_log_state(email_logs):
             sent.add(key)
             if dt:
                 old = sent_times.get(key)
-                # Reservation time is the sequence clock. Keep the earliest record.
+                # Queued-ledger time is the sequence clock. Keep the earliest record.
                 if old is None or dt < old:
                     sent_times[key] = dt
 
@@ -14938,6 +14949,7 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
     sent = 0
     failed = 0
     processed = 0
+    failure_stage_counts = {"ledger_reserve": 0, "brevo_send": 0}
 
     for item in due[:max(1, min(250, int(limit or 250)))]:
         if dry_run:
@@ -14948,7 +14960,8 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
         if not reserved:
             # Fail closed: never send an email NairaPips cannot persistently track.
             failed += 1
-            print("FOLLOWUP SEND BLOCKED: could not reserve persistent ledger", item.get("email"), item.get("class"), item.get("day"))
+            failure_stage_counts["ledger_reserve"] += 1
+            print("FOLLOWUP SEND BLOCKED: could not queue persistent ledger", item.get("email"), item.get("class"), item.get("day"))
             continue
 
         reserved_at = datetime.now(timezone.utc)
@@ -14967,17 +14980,19 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
             sent += 1
         else:
             failed += 1
+            failure_stage_counts["brevo_send"] += 1
 
     elapsed_ms = int((time.time() - started_at) * 1000)
     preview = [{k: v for k, v in x.items()} for x in due[:250]]
     return {
         "version": NP_LEAD_FOLLOWUP_VERSION,
-        "engine_label": "Human NG V4.1 · 24h Sequence Clock · Fail Closed",
+        "engine_label": "Human NG V4.3 · RLS-Safe Ledger · 24h Clock · Fail Closed",
         "eligible_contacts": len(by_email),
         "due": len(due),
         "send_capacity": min(250, len(due)),
         "sent": sent,
         "failed": failed,
+        "failure_stage_counts": failure_stage_counts,
         "processed": processed,
         "processed_emails": [
             str(x.get("email") or "").strip().lower()
@@ -14985,6 +15000,7 @@ def _np_send_lead_followups(dry_run=False, limit=250, target_emails=None):
         ] if not dry_run else [],
         "elapsed_ms": elapsed_ms,
         "ledger_mode": "persistent_fail_closed",
+        "ledger_reservation_status": "queued",
         "timing_mode": "actual_previous_send_interval",
         "first_live_d0_cutover_utc": NP_FOLLOWUP_FIRST_LIVE_D0_CUTOVER_UTC.isoformat(),
         "warnings": warnings,
