@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "PAYOUT_EXACT_FUNDED_ACCOUNT_AUTHORITY_2026_08_28"
+NAIRAPIPS_RELEASE = "PAYOUT_CANCEL_UNLOCK_ONLY_2026_08_28"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -7844,7 +7844,61 @@ def cancel_payout():
             trader_row, account,
             reason=f"Payout {payout_id} cancelled by trader before approval.",
         )
-        return ok(updated, "Payout cancelled. Submit a new request using the latest verified profit.")
+
+        # CANCELLATION-ONLY RECOVERY:
+        # A cancelled payout must reopen the SAME exact funded account because
+        # the payout was never approved/paid and the funded cycle has not ended.
+        reopened = _get_exact_trader_account(account.get("id")) or {}
+        reopened_status = str(
+            reopened.get("account_status") or reopened.get("status") or ""
+        ).strip().lower()
+
+        if reopened_status != "assigned_active":
+            try:
+                _staff_db().table("trader_accounts").update({
+                    "account_status": "assigned_active",
+                    "status": "assigned_active",
+                    "monitoring_enabled": True,
+                    "mt5_access_disabled": False,
+                    "updated_at": now_iso(),
+                }).eq("id", account.get("id")).eq("trader_id", authed_trader_id).execute()
+            except Exception as reopen_error:
+                print("PAYOUT CANCEL EXACT ACCOUNT REOPEN ERROR:", reopen_error)
+                return bad("Payout was cancelled but the funded account could not be reopened automatically. Please contact Admin.", 500)
+
+        # Clear trader-level payout lock mirrors only when no OTHER open payout exists.
+        try:
+            other_open_rows = (
+                supabase.table("payouts")
+                .select("id,status")
+                .eq("trader_id", authed_trader_id)
+                .neq("id", payout_id)
+                .in_("status", [
+                    "pending", "requested", "submitted", "pending_review",
+                    "awaiting_review", "under_review", "approved",
+                    "processing", "payment_processing",
+                ])
+                .limit(1)
+                .execute().data or []
+            )
+
+            if not other_open_rows:
+                _staff_db().table("traders").update({
+                    "payout_blocked": False,
+                    "payout_eligible": True,
+                    "mt5_access_disabled": False,
+                    "monitoring_enabled": True,
+                    "updated_at": now_iso(),
+                }).eq("id", authed_trader_id).execute()
+        except Exception as mirror_error:
+            print("PAYOUT CANCEL MIRROR RECOVERY WARNING:", mirror_error)
+
+        refreshed_account = _get_exact_trader_account(account.get("id")) or account
+        return ok({
+            "payout": updated[0] if updated else {"id": payout_id, "status": "cancelled"},
+            "account": _trader_safe_account_row(refreshed_account),
+            "unlocked": True,
+        }, "Payout cancelled. The funded account is active again.")
     except Exception as e:
         return bad(e)
 
