@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "PRIVATE_OFFER_EXPIRY_AUTHORITY_2026_08_27"
+NAIRAPIPS_RELEASE = "PAYOUT_EXACT_FUNDED_ACCOUNT_AUTHORITY_2026_08_28"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1778,24 +1778,65 @@ def _resolve_trader_for_money_action(data):
     return None
 
 
-def _payout_eligibility(trader):
+def _payout_eligibility(trader, requested_account_id=None):
+    """Resolve payout eligibility from the exact funded trader_account when supplied.
+
+    Multi-account authority:
+    - A trader may have Phase 1/Phase 2/Funded accounts at the same time.
+    - traders.current_account_id/challenge_state are display/profile mirrors and must
+      not block a payout from another exact active funded account.
+    - The browser-supplied account id is never trusted blindly: ownership, stage,
+      account status and League exclusion are all verified from trader_accounts.
+    """
     if not trader:
         return False, "Trader not found", None
-    state = str(trader.get("challenge_state") or "").strip().lower()
-    account = _get_active_account(trader.get("id"), trader)
-    # Traders League V1: League competition accounts are never eligible for paid payouts.
-    if account and str(account.get("programme_type") or "").strip().lower() == "traders_league":
-        return False, "League competition accounts are not eligible for paid payouts. Use the League reward system.", account
-    if state != "funded_active":
-        return False, "Payouts require funded_active lifecycle state.", account
+
+    trader_id = str(trader.get("id") or "").strip()
+    requested_account_id = str(requested_account_id or "").strip()
+    account = None
+
+    if requested_account_id:
+        try:
+            rows = (
+                supabase.table("trader_accounts")
+                .select("*")
+                .eq("id", requested_account_id)
+                .eq("trader_id", trader_id)
+                .limit(1)
+                .execute().data or []
+            )
+            account = rows[0] if rows else None
+        except Exception as e:
+            print("PAYOUT EXACT ACCOUNT LOOKUP ERROR:", e)
+            account = None
+
+        if not account:
+            return False, "Selected payout account could not be verified for this trader.", None
+    else:
+        # Backward-compatible path for older callers only.
+        account = _get_active_account(trader_id, trader)
+
     if not account:
         return False, "Payouts require an active funded MT5 account.", account
-    if str(account.get("stage") or "").lower() != "funded":
-        return False, "Payouts require the current active account to be funded stage.", account
-    if str(account.get("account_status") or "").lower() != "assigned_active":
-        return False, "Payouts require an assigned active account.", account
+
+    # Traders League competition accounts are never eligible for paid payouts.
+    if str(account.get("programme_type") or "").strip().lower() == "traders_league":
+        return False, "League competition accounts are not eligible for paid payouts. Use the League reward system.", account
+
+    stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
+    status = str(account.get("account_status") or account.get("status") or "").strip().lower()
+
+    if stage != "funded":
+        return False, "The selected payout account is not a funded-stage account.", account
+    if status != "assigned_active":
+        return False, "Payouts require the selected funded account to be assigned and active.", account
+    if not str(account.get("mt5_login") or "").strip():
+        return False, "Payouts require an active funded MT5 login.", account
+
+    # Keep the existing business-wide payout block protection.
     if _is_truthy(trader.get("payout_blocked")):
         return False, "Payout blocked for this trader.", account
+
     return True, "Payout eligible", account
 
 
@@ -7566,7 +7607,13 @@ def create_payout():
             return bad("Invalid payout amount")
 
         trader_row = _resolve_trader_for_money_action(d)
-        eligible, reason, account = _payout_eligibility(trader_row)
+        requested_account_id = str(
+            d.get("trader_account_id") or d.get("account_id") or ""
+        ).strip()
+        eligible, reason, account = _payout_eligibility(
+            trader_row,
+            requested_account_id=requested_account_id,
+        )
         if not eligible:
             return bad(reason, 403)
 
