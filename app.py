@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "SECOND_LIFE_1PHASE_2026_08_20_RESET_WAITING_STALE_HISTORY_FILTER_2026_08_25"
+NAIRAPIPS_RELEASE = "PRIVATE_OFFER_EXPIRY_AUTHORITY_2026_08_27"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -9384,6 +9384,40 @@ def create_private_offer():
             target_trader_id = ""
             trader = None
 
+        # GLOBAL PRIVATE-OFFER POLICY:
+        # A newly sent SINGLE-trader offer supersedes any older still-active
+        # single offer for that same trader. Historical rows remain for Admin,
+        # but can no longer pop up, be claimed, or discount checkout.
+        if audience_segment == "single" and (target_trader_id or target_email):
+            try:
+                old_rows = (
+                    supabase.table("announcements")
+                    .select("*")
+                    .eq("type", "private_offer")
+                    .eq("status", "active")
+                    .order("created_at", desc=True)
+                    .limit(100)
+                    .execute().data or []
+                )
+                for old_raw in old_rows:
+                    old_offer = _np_offer_merge_meta(old_raw)
+                    if _np_private_offer_matches(
+                        old_offer,
+                        target_trader_id,
+                        target_email,
+                        str((trader or {}).get("phone") or ""),
+                        str((trader or {}).get("account_reference") or ""),
+                    ):
+                        try:
+                            supabase.table("announcements").update({
+                                "status": "superseded",
+                                "show_on_dashboard": False,
+                            }).eq("id", old_offer.get("id")).execute()
+                        except Exception as supersede_error:
+                            print("PRIVATE OFFER SUPERSEDE SKIPPED:", supersede_error)
+            except Exception as e:
+                print("PRIVATE OFFER SUPERSEDE LOOKUP SKIPPED:", e)
+
         delivery_dashboard = _np_offer_bool(d.get("delivery_dashboard"), True)
         delivery_email = _np_offer_bool(d.get("delivery_email"), False)
         delivery_whatsapp = _np_offer_bool(d.get("delivery_whatsapp"), False)
@@ -9392,6 +9426,10 @@ def create_private_offer():
         cta_url = _np_offer_clean_str(d.get("cta_url") or "https://nairapips.com/dashboard/", 500)
         offer_code = "" if message_only else (_np_offer_clean_str(d.get("offer_code") or "PHASEHELP", 120) or "PHASEHELP")
         cta_label = "" if message_only else _np_offer_clean_str(d.get("cta_label") or "Contact Support", 120)
+
+        expires_at = _np_offer_clean_str(d.get("expires_at"), 120) or None
+        if not message_only and not expires_at:
+            return bad("Private discount offers require an expiry date/time")
 
         row = {
             "title": title,
@@ -9409,7 +9447,7 @@ def create_private_offer():
             "target_account_reference": _np_offer_clean_str(d.get("target_account_reference") or (trader or {}).get("account_reference"), 120) or None,
             "subject": subject,
             "offer_code": offer_code,
-            "expires_at": _np_offer_clean_str(d.get("expires_at"), 120) or None,
+            "expires_at": expires_at,
             "cta_label": cta_label,
             "cta_url": cta_url,
             "priority": _np_offer_clean_str(d.get("priority") or "normal", 40),
@@ -11670,7 +11708,8 @@ def _np_offer_active_for_quote(d, code):
             rows = []
     for raw in rows:
         row = _np_offer_merge_meta(raw)
-        if _np_private_offer_expired(row):
+        if not _np_private_offer_usable(row):
+            _np_expire_private_offer_if_needed(row)
             continue
         if not _np_private_offer_matches(row, trader_id, email, phone, account_reference):
             continue
@@ -11737,7 +11776,8 @@ def claim_private_offer():
             row = _np_offer_merge_meta(raw)
             if offer_id and str(row.get("id") or "") != offer_id:
                 continue
-            if _np_private_offer_expired(row):
+            if not _np_private_offer_usable(row):
+                _np_expire_private_offer_if_needed(row)
                 continue
             if not _np_private_offer_matches(row, trader_id, email, phone, account_reference):
                 continue
@@ -13986,6 +14026,49 @@ def _np_private_offer_expired(row):
         return False
 
 
+
+def _np_private_offer_used(row):
+    """True when a private offer is already consumed/redeemed."""
+    row = row or {}
+    status = str(row.get("status") or "").strip().lower()
+    return bool(
+        row.get("used_at")
+        or row.get("redeemed_at")
+        or status in {"used", "redeemed", "consumed"}
+    )
+
+
+def _np_private_offer_usable(row):
+    """Single production authority for whether a private offer may be shown/claimed/quoted."""
+    row = _np_offer_merge_meta(row or {})
+    status = str(row.get("status") or "active").strip().lower()
+
+    if status not in {"active", "live"}:
+        return False
+    if _np_private_offer_used(row):
+        return False
+    if _np_private_offer_expired(row):
+        return False
+    return True
+
+
+def _np_expire_private_offer_if_needed(row):
+    """Best-effort persistence: expired rows should stop saying ACTIVE in Admin/DB."""
+    row = _np_offer_merge_meta(row or {})
+    if not row.get("id") or not _np_private_offer_expired(row):
+        return
+    status = str(row.get("status") or "active").strip().lower()
+    if status in {"expired", "used", "redeemed", "disabled", "cancelled", "inactive"}:
+        return
+    try:
+        supabase.table("announcements").update({
+            "status": "expired",
+            "show_on_dashboard": False,
+        }).eq("id", row.get("id")).execute()
+    except Exception as e:
+        print("PRIVATE OFFER AUTO-EXPIRE PERSISTENCE SKIPPED:", e)
+
+
 def _np_private_offer_matches(row, trader_id="", email="", phone="", account_reference=""):
     def c(v):
         return str(v or "").strip().lower()
@@ -14074,7 +14157,8 @@ def private_offers_for_trader():
             row = _np_offer_merge_meta(raw_row)
             if not _np_offer_bool(row.get("delivery_dashboard"), _np_offer_bool(row.get("show_on_dashboard"), False)):
                 continue
-            if _np_private_offer_expired(row):
+            if not _np_private_offer_usable(row):
+                _np_expire_private_offer_if_needed(row)
                 continue
             if not _np_private_offer_matches(row, trader_id, email, phone, account_reference):
                 continue
@@ -15737,7 +15821,8 @@ def trader_targeted_offers():
             ):
                 continue
 
-            if _np_private_offer_expired(row):
+            if not _np_private_offer_usable(row):
+                _np_expire_private_offer_if_needed(row)
                 continue
 
             segment = str(row.get("audience_segment") or "single").strip().lower()
