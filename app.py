@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "PAYOUT_CANCEL_UNLOCK_ONLY_2026_08_28"
+NAIRAPIPS_RELEASE = "PLAN_PUBLIC_BADGE_AUTHORITY_2026_08_28"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -6427,6 +6427,15 @@ def _second_life_status_payload(purchase, trader_id=None):
         "activated_at": p.get("second_life_activated_at"),
     }
 
+def _normalize_public_badge(value):
+    """Optional short public badge for challenge cards, controlled from Admin."""
+    badge = str(value or "").strip()
+    if not badge:
+        return None
+    badge = re.sub(r"\s+", " ", badge)
+    return badge[:40]
+
+
 @app.route("/challenge_plans", methods=["GET"])
 def challenge_plans():
     try:
@@ -6459,6 +6468,7 @@ def create_plan():
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
              "challenge_journey": challenge_journey, "journey_source": "plan_create",
              "payout_split":_effective_payout_split(d.get("payout_split")),"description":d.get("description",""),
+             "public_badge":_normalize_public_badge(d.get("public_badge")),
              "second_life_enabled":_second_life_bool(d.get("second_life_enabled")),
              "lives_total":2 if _second_life_bool(d.get("second_life_enabled")) else 1,
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
@@ -6474,6 +6484,8 @@ def update_plan():
         upd={"updated_at":now_iso()}
         for k in ["name","daily_drawdown","description","status","mt5_server","default_server"]:
             if k in d: upd[k]=d[k]
+        if "public_badge" in d:
+            upd["public_badge"] = _normalize_public_badge(d.get("public_badge"))
         if "payout_split" in d:
             upd["payout_split"] = _effective_payout_split(d.get("payout_split"))
         if "second_life_enabled" in d:
