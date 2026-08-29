@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "PLAN_PUBLIC_BADGE_AUTHORITY_2026_08_28"
+NAIRAPIPS_RELEASE = "PLAN_TARGET_GLOBAL_AUTHORITY_2026_08_28"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -676,11 +676,65 @@ def _decorate_lifecycle_authority(row, purchase=None, plan=None, trader=None):
     out["waiting_for_stage"] = out.get("waiting_for_stage") or (
         _normalize_lifecycle_stage(out.get("lifecycle_state") or out.get("status")) if "waiting" in str(out.get("lifecycle_state") or out.get("status") or "").lower() else None
     )
+    if purchase or plan:
+        out["target_percent"] = _effective_target_percent(stage, out, purchase, plan)
+    elif out.get("target_percent") in (None, "", 0, "0"):
+        out["target_percent"] = _effective_target_percent(stage, out, None, None)
     return out
 
 
 def _target_for_stage(stage):
     return {"phase1": 10, "phase2": 8, "funded": None}.get(_normalize_lifecycle_stage(stage))
+
+
+def _effective_target_percent(stage, account=None, purchase=None, plan=None):
+    """Resolve the live profit target for one lifecycle account.
+
+    Authority order for purchase-linked challenges:
+      1. linked challenge plan (current Admin plan setting)
+      2. purchase snapshot fields, when present
+      3. stored trader_accounts target_percent
+      4. legacy stage defaults (10 / 8 / 0)
+
+    This lets an Admin plan change (for example Phase 1 10% -> 15%) propagate
+    globally to existing purchase-linked active accounts instead of leaving
+    stale 10% values on trader dashboards.
+    """
+    stage = _normalize_lifecycle_stage(stage)
+    account = account or {}
+    purchase = purchase or {}
+    resolved_plan = plan or (_safe_plan_for_purchase(purchase) if purchase else None) or {}
+
+    if stage == "funded":
+        return 0.0
+
+    if stage == "phase2":
+        candidates = [
+            resolved_plan.get("phase2_target"),
+            purchase.get("phase2_target"),
+            account.get("target_percent"),
+            account.get("profit_target"),
+            8,
+        ]
+    else:
+        candidates = [
+            resolved_plan.get("phase1_target"),
+            resolved_plan.get("profit_target"),
+            purchase.get("phase1_target"),
+            purchase.get("profit_target"),
+            account.get("target_percent"),
+            account.get("profit_target"),
+            10,
+        ]
+
+    for value in candidates:
+        try:
+            n = float(value)
+            if n > 0:
+                return n
+        except Exception:
+            continue
+    return float(_target_for_stage(stage) or 0)
 
 
 def _active_state_for_stage(stage):
@@ -2064,7 +2118,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         "absolute_drawdown_percent": 0,
         "dd_limit_percent": 20,
         "dd_used_percent": 0,
-        "target_percent": _target_for_stage(stage),
+        "target_percent": _effective_target_percent(stage, {}, purchase, plan),
         "monitoring_enabled": True,
         "started_at": now,
         "created_at": now,
@@ -5766,6 +5820,27 @@ def trader_bootstrap():
             for p in purchases
             if str(p.get("id") or "").strip()
         }
+        plan_ids = sorted({
+            str(p.get("plan_id") or p.get("challenge_plan_id") or "").strip()
+            for p in purchases
+            if str(p.get("plan_id") or p.get("challenge_plan_id") or "").strip()
+        })
+        plan_by_id = {}
+        if plan_ids:
+            try:
+                plan_rows = (
+                    supabase.table("challenge_plans")
+                    .select("*")
+                    .in_("id", plan_ids)
+                    .execute().data or []
+                )
+                plan_by_id = {
+                    str(p.get("id") or "").strip(): p
+                    for p in plan_rows
+                    if str(p.get("id") or "").strip()
+                }
+            except Exception as e:
+                print("TRADER BOOTSTRAP PLAN TARGET LOOKUP ERROR:", e)
 
         all_accounts = []
         for row in account_rows:
@@ -5773,8 +5848,11 @@ def trader_bootstrap():
                 purchase = purchase_by_id.get(
                     str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip()
                 )
+                plan = plan_by_id.get(
+                    str((purchase or {}).get("plan_id") or (purchase or {}).get("challenge_plan_id") or "").strip()
+                )
                 decorated = _decorate_account_for_api(
-                    _decorate_lifecycle_authority(row, purchase, None, trader)
+                    _decorate_lifecycle_authority(row, purchase, plan, trader)
                 )
             except Exception:
                 decorated = _decorate_account_for_api(row)
@@ -6427,15 +6505,6 @@ def _second_life_status_payload(purchase, trader_id=None):
         "activated_at": p.get("second_life_activated_at"),
     }
 
-def _normalize_public_badge(value):
-    """Optional short public badge for challenge cards, controlled from Admin."""
-    badge = str(value or "").strip()
-    if not badge:
-        return None
-    badge = re.sub(r"\s+", " ", badge)
-    return badge[:40]
-
-
 @app.route("/challenge_plans", methods=["GET"])
 def challenge_plans():
     try:
@@ -6468,7 +6537,6 @@ def create_plan():
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
              "challenge_journey": challenge_journey, "journey_source": "plan_create",
              "payout_split":_effective_payout_split(d.get("payout_split")),"description":d.get("description",""),
-             "public_badge":_normalize_public_badge(d.get("public_badge")),
              "second_life_enabled":_second_life_bool(d.get("second_life_enabled")),
              "lives_total":2 if _second_life_bool(d.get("second_life_enabled")) else 1,
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
@@ -6484,8 +6552,6 @@ def update_plan():
         upd={"updated_at":now_iso()}
         for k in ["name","daily_drawdown","description","status","mt5_server","default_server"]:
             if k in d: upd[k]=d[k]
-        if "public_badge" in d:
-            upd["public_badge"] = _normalize_public_badge(d.get("public_badge"))
         if "payout_split" in d:
             upd["payout_split"] = _effective_payout_split(d.get("payout_split"))
         if "second_life_enabled" in d:
@@ -7472,27 +7538,45 @@ def trader_payout_history():
             except Exception as e:
                 print("TRADER PAYOUT HISTORY EMAIL ERROR:", e)
 
-        # Only if canonical identity returned nothing, use a small owned-account
-        # fallback. Do not scan monitoring or every MT5 on normal page opening.
-        if not collected:
-            try:
-                owned = (
-                    supabase.table("trader_accounts")
-                    .select("id")
-                    .eq("trader_id", authed_id)
-                    .order("updated_at", desc=True).limit(100)
+        # Permanent financial-ledger ownership recovery.
+        # Different production generations stored payout ownership differently:
+        # trader_id, email, trader_account_id, or MT5 login. Merge ALL verified
+        # ownership paths every time so old PAID/CANCELLED/PENDING rows never vanish
+        # after resets, fresh MT5 assignment, or current-account changes.
+        try:
+            owned = (
+                supabase.table("trader_accounts")
+                .select("id,mt5_login")
+                .eq("trader_id", authed_id)
+                .order("updated_at", desc=True).limit(200)
+                .execute().data or []
+            )
+            account_ids = sorted({
+                str(r.get("id") or "").strip()
+                for r in owned if str(r.get("id") or "").strip()
+            })
+            owned_logins = sorted({
+                str(r.get("mt5_login") or "").strip()
+                for r in owned if str(r.get("mt5_login") or "").strip()
+            })
+
+            if account_ids:
+                collected.extend(
+                    supabase.table("payouts").select("*")
+                    .in_("trader_account_id", account_ids)
+                    .order("created_at", desc=True).limit(limit)
                     .execute().data or []
                 )
-                account_ids=[str(r.get("id") or "").strip() for r in owned if str(r.get("id") or "").strip()]
-                if account_ids:
-                    collected.extend(
-                        supabase.table("payouts").select("*")
-                        .in_("trader_account_id", account_ids)
-                        .order("created_at", desc=True).limit(limit)
-                        .execute().data or []
-                    )
-            except Exception as e:
-                print("TRADER PAYOUT HISTORY ACCOUNT FALLBACK ERROR:", e)
+
+            if owned_logins:
+                collected.extend(
+                    supabase.table("payouts").select("*")
+                    .in_("mt5_login", owned_logins)
+                    .order("created_at", desc=True).limit(limit)
+                    .execute().data or []
+                )
+        except Exception as e:
+            print("TRADER PAYOUT HISTORY OWNERSHIP RECOVERY ERROR:", e)
 
         merged={}
         for row in collected:
@@ -9892,7 +9976,10 @@ def disable_mt5_access():
                 d.get("highest_profit_percent"),
                 _num(d.get("profit_percent"), (profit / start_balance * 100) if start_balance else 0),
             )
-            target_percent = _num(d.get("profit_target"), 8 if stage == "phase2" else 10)
+            target_percent = _num(
+                d.get("profit_target"),
+                _num((account or {}).get("target_percent"), 8 if stage == "phase2" else 10),
+            )
             target_equity = _num(d.get("target_equity"), start_balance * (1 + target_percent / 100) if start_balance else 0)
             pass_progress = 100 if target_percent and profit_percent >= target_percent else _num(d.get("pass_progress_percent"), 0)
             now = now_iso()
@@ -13303,12 +13390,69 @@ def admin_trader_accounts_feed():
 
         # STABILITY RECOVERY 2026-08-23:
         # Keep /trader_accounts a fast lifecycle/account-authority feed.
-        # Do NOT scan monitoring_snapshots here. Render logs proved that enrichment
-        # could hit PostgreSQL statement_timeout and hold a Gunicorn worker.
-        # Live monitoring remains available through dedicated monitoring/bootstrap
-        # paths and the MT5 engine; no trading rule or stored account data is changed.
+        # Do NOT scan monitoring_snapshots here.
+        #
+        # PLAN TARGET AUTHORITY:
+        # Batch-load only linked purchases/plans so current Admin target changes
+        # propagate without an N+1 query per account.
+        purchase_ids = sorted({
+            str(r.get("purchase_id") or r.get("challenge_purchase_id") or "").strip()
+            for r in rows
+            if str(r.get("purchase_id") or r.get("challenge_purchase_id") or "").strip()
+        })
+        purchase_by_id = {}
+        plan_by_id = {}
+        if purchase_ids:
+            try:
+                purchase_rows = (
+                    supabase.table("challenge_purchases")
+                    .select("*")
+                    .in_("id", purchase_ids)
+                    .execute().data or []
+                )
+                purchase_by_id = {
+                    str(p.get("id") or "").strip(): p
+                    for p in purchase_rows
+                    if str(p.get("id") or "").strip()
+                }
+                plan_ids = sorted({
+                    str(p.get("plan_id") or p.get("challenge_plan_id") or "").strip()
+                    for p in purchase_rows
+                    if str(p.get("plan_id") or p.get("challenge_plan_id") or "").strip()
+                })
+                if plan_ids:
+                    plan_rows = (
+                        supabase.table("challenge_plans")
+                        .select("*")
+                        .in_("id", plan_ids)
+                        .execute().data or []
+                    )
+                    plan_by_id = {
+                        str(p.get("id") or "").strip(): p
+                        for p in plan_rows
+                        if str(p.get("id") or "").strip()
+                    }
+            except Exception as e:
+                print("TRADER ACCOUNTS PLAN TARGET LOOKUP ERROR:", e)
 
-        rows = [_decorate_account_for_api(r) if "_decorate_account_for_api" in globals() else r for r in rows]
+        decorated_rows = []
+        for r in rows:
+            try:
+                purchase = purchase_by_id.get(
+                    str(r.get("purchase_id") or r.get("challenge_purchase_id") or "").strip()
+                )
+                plan = plan_by_id.get(
+                    str((purchase or {}).get("plan_id") or (purchase or {}).get("challenge_plan_id") or "").strip()
+                )
+                decorated_rows.append(
+                    _decorate_account_for_api(
+                        _decorate_lifecycle_authority(r, purchase, plan, None)
+                    )
+                )
+            except Exception:
+                decorated_rows.append(_decorate_account_for_api(r))
+        rows = decorated_rows
+
         if trader_id:
             rows = [_trader_safe_account_row(r) for r in rows]
         return _np_ok({"success": True, "data": rows, "accounts": rows, "trader_accounts": rows, "count": len(rows)})
