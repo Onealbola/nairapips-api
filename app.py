@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "PLAN_TARGET_GLOBAL_AUTHORITY_2026_08_28"
+NAIRAPIPS_RELEASE = "PUBLIC_PLAN_SNAPSHOT_FAST_LANDING_2026_08_29"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -6505,17 +6505,57 @@ def _second_life_status_payload(purchase, trader_id=None):
         "activated_at": p.get("second_life_activated_at"),
     }
 
-@app.route("/challenge_plans", methods=["GET"])
-def challenge_plans():
-    try:
-        rows = supabase.table("challenge_plans").select("*").order("account_size", desc=False).execute().data or []
-        for row in rows:
+def _np_public_plan_snapshot_rows():
+    """Published public commercial plan snapshot.
+
+    This is intentionally tiny and cacheable. Landing-page visitors should not
+    trigger repeated Supabase plan reads just to see price/rules.
+    Admin plan writes invalidate this cache immediately.
+    """
+    def _fetch():
+        rows = (
+            supabase.table("challenge_plans")
+            .select("*")
+            .order("account_size", desc=False)
+            .execute().data or []
+        )
+        out = []
+        for raw in rows:
+            row = dict(raw or {})
             if "payout_split" in row:
                 row["payout_split"] = _effective_payout_split(row.get("payout_split"))
             row["second_life_enabled"] = _second_life_bool(row.get("second_life_enabled"))
             row["lives_total"] = int(row.get("lives_total") or (2 if row["second_life_enabled"] else 1))
-        return jsonify(rows)
-    except Exception as e: return bad(e)
+            out.append(row)
+        return out
+    return np_cached_read("public_plans_snapshot", 300, _fetch)
+
+
+@app.route("/public_plan_snapshot", methods=["GET"])
+def public_plan_snapshot():
+    """Fast public snapshot for nairapips.com landing cards."""
+    try:
+        rows = _np_public_plan_snapshot_rows()
+        response = jsonify({
+            "success": True,
+            "plans": rows,
+            "count": len(rows),
+            "published_at": now_iso(),
+        })
+        # Browser/edge may serve a warm snapshot immediately while revalidating.
+        response.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=300"
+        response.headers["X-NairaPips-Plan-Snapshot"] = "1"
+        return response
+    except Exception as e:
+        return bad(e)
+
+
+@app.route("/challenge_plans", methods=["GET"])
+def challenge_plans():
+    try:
+        return jsonify(_np_public_plan_snapshot_rows())
+    except Exception as e:
+        return bad(e)
 
 @app.route("/plans", methods=["GET"])
 def plans_alias():
@@ -6541,7 +6581,9 @@ def create_plan():
              "lives_total":2 if _second_life_bool(d.get("second_life_enabled")) else 1,
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
              "status":d.get("status","active"),"created_at":now_iso(),"updated_at":now_iso()}
-        return ok(supabase.table("challenge_plans").insert(row).execute().data, "Challenge plan created")
+        result = supabase.table("challenge_plans").insert(row).execute().data
+        np_invalidate("public_plans_snapshot", "plans_list", "admin_bootstrap")
+        return ok(result, "Challenge plan created")
     except Exception as e: return bad(e)
 
 @app.route("/update_challenge_plan", methods=["POST"])
@@ -6574,7 +6616,9 @@ def update_plan():
                 d.get("progression_route"), route_hint
             )
             upd["journey_source"] = "plan_update"
-        return ok(supabase.table("challenge_plans").update(upd).eq("id",pid).execute().data, "Challenge plan updated")
+        result = supabase.table("challenge_plans").update(upd).eq("id",pid).execute().data
+        np_invalidate("public_plans_snapshot", "plans_list", "admin_bootstrap")
+        return ok(result, "Challenge plan updated")
     except Exception as e: return bad(e)
 
 @app.route("/delete_challenge_plan", methods=["POST"])
@@ -6582,7 +6626,9 @@ def delete_plan():
     try:
         pid=(request.json or {}).get("id")
         if not pid: return bad("Missing plan id")
-        return ok(supabase.table("challenge_plans").delete().eq("id",pid).execute().data, "Challenge plan deleted")
+        result = supabase.table("challenge_plans").delete().eq("id",pid).execute().data
+        np_invalidate("public_plans_snapshot", "plans_list", "admin_bootstrap")
+        return ok(result, "Challenge plan deleted")
     except Exception as e: return bad(e)
 
 @app.route("/challenge_purchases", methods=["GET"])
