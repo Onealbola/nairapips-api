@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "PUBLIC_PLAN_SNAPSHOT_FAST_LANDING_2026_08_29"
+NAIRAPIPS_RELEASE = "MT5_AUTO_ASSIGNMENT_SAFETY_2026_08_30"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -2066,6 +2066,51 @@ def _ensure_trader_for_purchase(purchase):
     return created[0] if created else None
 
 
+# === NAIRAPIPS 2026 MT5 AUTO-ASSIGNMENT SAFETY AUTHORITY ===
+NP_MT5_AUTO_MAX_AGE_DAYS = 7
+
+def _np_mt5_age_days(mt5):
+    try:
+        raw = (mt5 or {}).get("created_at")
+        if not raw: return None
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc)-dt.astimezone(timezone.utc)).total_seconds()/86400.0)
+    except Exception:
+        return None
+
+def _np_mt5_auto_eligible(mt5, account_size=None):
+    m=mt5 or {}; st=str(m.get("status") or "").strip().lower()
+    if st not in {"available","unused","new","ready","open",""}: return False, "MT5 is not available"
+    if m.get("assigned_trader_id") or m.get("trader_id") or m.get("trader_account_id"): return False, "MT5 already has assignment evidence"
+    if account_size is not None and clean(m.get("account_size")) != clean(account_size): return False, "MT5 account size does not match"
+    age=_np_mt5_age_days(m)
+    if age is None: return False, "MT5 upload date is missing or invalid"
+    if age > NP_MT5_AUTO_MAX_AGE_DAYS: return False, f"MT5 is stale ({age:.1f} days old)"
+    used, reason = _mt5_login_has_any_history(m.get("mt5_login"), m.get("id"))
+    if used: return False, reason or "MT5 has prior history"
+    return True, "AUTO READY"
+
+def _np_pick_fresh_mt5(account_size):
+    rows=supabase.table("mt5_pool").select("*").eq("account_size",clean(account_size)).order("created_at",desc=True).limit(250).execute().data or []
+    for m in rows:
+        ok,_=_np_mt5_auto_eligible(m,account_size)
+        if ok: return m
+    return None
+
+def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"):
+    if reason not in {"lifecycle_progression","second_life"}: return None
+    stage=_normalize_lifecycle_stage(stage)
+    size=clean((purchase or {}).get("account_size") or (source_account or {}).get("account_size") or (trader or {}).get("account_size"))
+    if not trader or stage not in ACCOUNT_STAGES or not size: return None
+    mt5=_np_pick_fresh_mt5(size)
+    if not mt5:
+        _audit_safe("mt5_pool","auto_assignment_waiting",f"{reason}: no fresh <=7-day MT5 for {stage} size {size}",{"name":"system","username":"system","role":"system"},str(trader.get("id") or ""))
+        return None
+    account,updated=_assign_mt5_to_trader(trader,mt5,stage,purchase,{"name":"system","username":"system","role":"system"},f"2026 auto assignment: {reason}; fresh MT5 <=7 days")
+    _audit_safe("mt5_pool","automatic_mt5_assignment",f"{reason}: {stage} MT5 {account.get('mt5_login')} assigned",{"name":"system","username":"system","role":"system"},str(account.get("id") or ""))
+    return {"account":account,"trader":updated,"mt5":mt5}
+
 def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="MT5 assigned"):
     stage = str(stage or "").lower()
     if stage not in ACCOUNT_STAGES:
@@ -2479,7 +2524,13 @@ def _pass_stage(trader_id, stage, staff=None, note="Stage passed"):
         "mt5_access_disabled": True,
         "admin_note": note,
     }
-    return _update_trader_lifecycle(trader_id, next_state, None, extra, staff, f"pass_{stage}")
+    updated = _update_trader_lifecycle(trader_id, next_state, None, extra, staff, f"pass_{stage}")
+    try:
+        auto_result = _np_auto_assign_waiting_stage(updated or trader, next_stage, purchase, account, "lifecycle_progression")
+        if auto_result: return auto_result.get("trader") or updated
+    except Exception as exc:
+        print("LIFECYCLE AUTO ASSIGN SKIPPED:", exc)
+    return updated
 
 
 def _breach_trader_account(trader_id, reason, staff=None):
@@ -6831,7 +6882,16 @@ def second_life_activate():
             "admin_note": "Second Life activated. Waiting for a fresh Life 2 Phase 1 MT5 account.",
         }
         supabase.table("traders").update(trader_update).eq("id", authed_id).execute()
-        _audit_safe("second_life", "activated", f"Purchase {purchase_id}; Life 2 awaiting fresh MT5", {"name":"trader","username":str(authed_id)[:12],"role":"trader"}, purchase_id)
+        auto_second_life = None
+        try:
+            waiting_trader = get_trader_by_id(authed_id) or dict(trader_update, id=authed_id)
+            refreshed_purchase = _second_life_purchase_for_trader(purchase_id, authed_id) or p
+            auto_second_life = _np_auto_assign_waiting_stage(waiting_trader, "phase1", refreshed_purchase, None, "second_life")
+            if auto_second_life:
+                supabase.table("challenge_purchases").update({"second_life_status":"life2_active","lifecycle_state":"phase1_active","updated_at":now_iso()}).eq("id",purchase_id).execute()
+        except Exception as exc:
+            print("SECOND LIFE AUTO ASSIGN SKIPPED:", exc)
+        _audit_safe("second_life", "activated", f"Purchase {purchase_id}; " + ("Life 2 auto-assigned" if auto_second_life else "Life 2 awaiting fresh MT5"), {"name":"trader","username":str(authed_id)[:12],"role":"trader"}, purchase_id)
         trader = get_trader_by_id(authed_id) or {}
         send_email_safe(
             trader.get("email"),
@@ -6863,12 +6923,17 @@ def approve_purchase():
         p=pres.data[0]
         if p.get("trader_account_id") or p.get("assigned_mt5_id") or str(p.get("mt5_login") or "").strip():
             return bad("This purchase is already approved/assigned. Refresh the purchases page.", 409)
+        auto_mode = str(d.get("assignment_mode") or "").lower() in {"auto","auto_after_payment_approval","automatic"}
         if mt5_id:
             mres=supabase.table("mt5_pool").select("*").eq("id",mt5_id).limit(1).execute()
+            if not mres.data: return bad("Selected MT5 account was not found")
+            m=mres.data[0]
         else:
-            mres=supabase.table("mt5_pool").select("*").eq("status","available").eq("account_size",p.get("account_size") or 0).limit(1).execute()
-        if not mres.data: return bad("No available MT5 account found for this plan/account size")
-        m=mres.data[0]
+            m=_np_pick_fresh_mt5(p.get("account_size") or 0)
+            if not m: return bad("No fresh MT5 (7 days or less) is AUTO READY for this account size",409)
+        if auto_mode:
+            auto_ok,auto_reason=_np_mt5_auto_eligible(m,p.get("account_size") or 0)
+            if not auto_ok: return bad("Automatic assignment blocked: "+auto_reason,409)
         if str(m.get("status") or "").strip().lower() != "available":
             return bad("Selected MT5 account is not available")
         if clean(m.get("account_size")) != clean(p.get("account_size")):
