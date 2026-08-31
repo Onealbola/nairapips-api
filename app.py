@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "SECOND_LIFE_ADMIN_CORRECTION_UI_BRIDGE_2026_08_31"
+NAIRAPIPS_RELEASE = "GLOBAL_SECOND_LIFE_ADMIN_AUTHORITY_2026_08_31"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -6890,6 +6890,142 @@ def second_life_status():
         rows = supabase.table("challenge_purchases").select("*").eq("trader_id", authed_id).order("created_at", desc=True).limit(100).execute().data or []
         items = [_second_life_status_payload(p, authed_id) for p in rows if _second_life_bool(p.get("second_life_enabled"))]
         return _np_ok({"success": True, "items": items, "data": items})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+
+@app.route("/admin_second_life/activate", methods=["POST", "OPTIONS"])
+def admin_second_life_activate():
+    """Admin authority for the same global Second Life lifecycle used by traders.
+
+    This is NOT Destiny-specific. It works for any eligible 1-Phase purchase with
+    second_life_enabled=true. Eligibility comes from either:
+      - a genuine Phase 1 breached trader_account; or
+      - the narrow available_on_admin_correction repair authority.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    data = request.get_json(silent=True) or {}
+    trader_id = str(data.get("trader_id") or "").strip()
+    purchase_id = str(data.get("purchase_id") or "").strip()
+    if not trader_id or not purchase_id:
+        return _np_fail("trader_id and purchase_id are required", 400)
+
+    try:
+        p = _second_life_purchase_for_trader(purchase_id, trader_id)
+        if not p:
+            return _np_fail("Second Life purchase was not found for this trader", 404)
+
+        status = _second_life_status_payload(p, trader_id)
+        if not status.get("enabled"):
+            return _np_fail("Second Life is not included with this purchase", 409)
+        if status.get("used"):
+            return _np_fail("Second Life has already been used", 409)
+        if not status.get("eligible_now") or not status.get("breached_account_id"):
+            return _np_fail("Second Life is not currently eligible for activation", 409)
+
+        journey = _journey_from_text(
+            p.get("challenge_journey"),
+            p.get("journey_stages"),
+            p.get("route")
+        )
+        if journey != ONE_PHASE_CHALLENGE_JOURNEY:
+            return _np_fail("Second Life is only available on eligible 1-Phase purchases", 409)
+
+        now = now_iso()
+        purchase_update = {
+            "second_life_used": True,
+            "life_number": 2,
+            "second_life_status": "life2_waiting_mt5",
+            "second_life_activated_at": now,
+            "lifecycle_state": "phase1_waiting_mt5",
+            "updated_at": now,
+        }
+        supabase.table("challenge_purchases").update(purchase_update).eq("id", purchase_id).execute()
+
+        # Trader mirror only. trader_accounts remains lifecycle authority.
+        trader_update = {
+            "status": "phase1_waiting_mt5",
+            "phase": "phase1",
+            "challenge_state": "phase1_waiting_mt5",
+            "mt5_login": None,
+            "mt5_server": None,
+            "mt5_master_password": None,
+            "mt5_investor_password": None,
+            "updated_at": now,
+        }
+        # Optional admin_note may not exist in every historical schema.
+        try:
+            supabase.table("traders").update(dict(
+                trader_update,
+                admin_note="Second Life activated by Admin. Waiting for fresh Life 2 Phase 1 MT5."
+            )).eq("id", trader_id).execute()
+        except Exception:
+            supabase.table("traders").update(trader_update).eq("id", trader_id).execute()
+
+        auto_second_life = None
+        try:
+            waiting_trader = get_trader_by_id(trader_id) or dict(trader_update, id=trader_id)
+            refreshed_purchase = _second_life_purchase_for_trader(purchase_id, trader_id) or p
+            auto_second_life = _np_auto_assign_waiting_stage(
+                waiting_trader, "phase1", refreshed_purchase, None, "second_life"
+            )
+            if auto_second_life:
+                supabase.table("challenge_purchases").update({
+                    "second_life_status": "life2_active",
+                    "lifecycle_state": "phase1_active",
+                    "updated_at": now_iso(),
+                }).eq("id", purchase_id).execute()
+        except Exception as exc:
+            print("ADMIN SECOND LIFE AUTO ASSIGN SKIPPED:", exc)
+
+        actor = {
+            "name": (admin or {}).get("name") or (admin or {}).get("username") or "admin",
+            "username": (admin or {}).get("username") or "admin",
+            "role": (admin or {}).get("role") or "admin",
+        }
+        _audit_safe(
+            "second_life",
+            "admin_activated",
+            f"Purchase {purchase_id}; " + (
+                "Life 2 auto-assigned" if auto_second_life else "Life 2 awaiting fresh MT5"
+            ),
+            actor,
+            purchase_id,
+        )
+
+        trader = get_trader_by_id(trader_id) or {}
+        send_email_safe(
+            trader.get("email"),
+            "NairaPips Second Life activated",
+            f"""Hello {trader.get('name') or 'Trader'},
+
+Your NairaPips Second Life is now activated.
+
+Life: 2 of 2
+Stage: Phase 1
+Status: {'Fresh MT5 assigned' if auto_second_life else 'Waiting for fresh MT5 assignment'}
+
+Your Life 1 account remains locked as historical evidence. Life 2 starts fresh with the same eligible challenge terms.
+
+NairaPips Team"""
+        )
+
+        return _np_ok({
+            "success": True,
+            "purchase_id": purchase_id,
+            "trader_id": trader_id,
+            "life_number": 2,
+            "status": "life2_active" if auto_second_life else "life2_waiting_mt5",
+            "source_account_id": status.get("breached_account_id"),
+            "auto_assigned": bool(auto_second_life),
+            "account": (auto_second_life or {}).get("account") if auto_second_life else None,
+        })
     except Exception as e:
         return _np_fail(e, 500)
 
