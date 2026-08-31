@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "DUAL_JOURNEY_BOOTSTRAP_AUTHORITY_2026_08_31"
+NAIRAPIPS_RELEASE = "BREACH_PRIORITY_DUAL_JOURNEY_AUTHORITY_2026_08_31"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -5914,11 +5914,31 @@ def _np_bootstrap_lifecycle_authority(trader, accounts, purchases, plan_by_id):
                     active_life2 = a
                     break
 
+        # PASS and BREACH are different exits from Life 1:
+        # - PASS -> challenge completed -> Funded progression.
+        # - BREACH -> Second Life available (if unused).
+        # Never send a clean passed account into Second Life.
+        passed_source = None
+        for a in phase1_rows:
+            account_status = str(a.get("account_status") or a.get("status") or "").strip().lower()
+            pass_status = str(a.get("phase_pass_status") or "").strip().lower()
+            risk_zone = str(a.get("risk_zone") or "").strip().lower()
+            if (
+                "archived_phase1" in account_status
+                or pass_status == "phase1_passed"
+                or risk_zone == "passed"
+            ) and not _np_account_has_breach_evidence(a):
+                passed_source = a
+                break
+
         state = "not_eligible"
         if used and active_life2:
             state = "life2_active"
         elif used and raw_sl_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
             state = "life2_waiting_mt5"
+        elif (not used) and passed_source is not None and not admin_correction:
+            state = "challenge_passed_waiting_funded"
+            source = passed_source
         elif (not used) and source and (
             breach_source is not None
             or admin_correction
@@ -5978,8 +5998,10 @@ def _np_bootstrap_lifecycle_authority(trader, accounts, purchases, plan_by_id):
             "target_percent": target,
             "plan_name": plan.get("name") or plan.get("plan_name") or purchase.get("plan_name"),
             "funded": False,
-            "waiting_for_mt5": state == "life2_waiting_mt5",
+            "waiting_for_mt5": state in {"life2_waiting_mt5", "challenge_passed_waiting_funded"},
             "second_life_available": state == "second_life_available",
+            "challenge_passed": state == "challenge_passed_waiting_funded",
+            "next_stage": "funded" if state == "challenge_passed_waiting_funded" else "phase1",
         }
 
     return {
@@ -6172,7 +6194,7 @@ def trader_bootstrap():
 
             # While Second Life is available/waiting, there is deliberately NO current
             # trading account. Do not let an archived Funded/Phase1 row become current.
-            if sl_state in {"second_life_available", "life2_waiting_mt5"}:
+            if sl_state in {"second_life_available", "life2_waiting_mt5", "challenge_passed_waiting_funded"}:
                 account = None
             elif sl_state == "life2_active":
                 sl_id = str(lifecycle_authority.get("current_account_id") or "")
@@ -6217,19 +6239,20 @@ def trader_bootstrap():
         }
 
         if lifecycle_authority.get("journey") == "second_life" and lifecycle_authority.get("state") in {
-            "second_life_available", "life2_waiting_mt5"
+            "second_life_available", "life2_waiting_mt5", "challenge_passed_waiting_funded"
         }:
+            waiting_state = lifecycle_authority.get("state")
             payload["trader"].update({
                 "current_account_id": None,
                 "trader_account_id": None,
-                "phase": "phase1",
+                "phase": "funded" if waiting_state == "challenge_passed_waiting_funded" else "phase1",
                 "mt5_login": None,
                 "mt5_server": None,
                 "account_size": lifecycle_authority.get("account_size"),
                 "profit_percent": 0,
                 "drawdown_percent": 0,
                 "max_drawdown_used": 0,
-                "challenge_state": lifecycle_authority.get("state"),
+                "challenge_state": "funded_waiting_mt5" if waiting_state == "challenge_passed_waiting_funded" else waiting_state,
             })
         elif account:
             payload["trader"].update({
@@ -9400,8 +9423,9 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
         else:
             # Prevent stale pass flags from locking or mislabeling an active account.
             passed_status = ""
-    elif not active_account:
+    elif not active_account and not breached:
         # Legacy/manual fallback only when no account-level source exists.
+        # Never let an incoming pass flag override a breach flag.
         passed_status = incoming_pass_status
 
     old_zone = ((active_account or {}).get("risk_zone") or trader.get("risk_zone") or "safe").lower()
@@ -9449,9 +9473,31 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
         "funded_profit_label": payload.get("funded_profit_label") or trader.get("funded_profit_label"),
     }
 
-    # Critical rule order: PASS FIRST, BREACH SECOND.
-    # If highest equity has already hit the target, never let later DD overwrite it as critical/breached.
-    if passed_status:
+    # TERMINAL AUTHORITY:
+    # A breach flag from the monitoring engine wins over any simultaneous/stale
+    # pass flag. Passed accounts are already locked/monitoring-disabled, so a
+    # legitimate completed pass is not expected to receive later live snapshots.
+    if breached:
+        zone = "breached"
+        priority = "closed"
+        update_data.update({
+            "status": "breached",
+            "phase": "breached",
+            "risk_zone": "breached",
+            "critical_mode": False,
+            "monitoring_priority": "closed",
+            "breach_time": trader.get("breach_time") or now,
+            "breach_equity": equity,
+            "breach_reason": payload.get("reason") or "Maximum drawdown violation recorded by NairaPips monitoring engine.",
+            "admin_note": payload.get("reason") or "Auto-breach: maximum drawdown violation recorded by monitoring engine.",
+            "mt5_access_disabled": True,
+            "mt5_account_active": False,
+            "payout_eligible": False,
+            "payout_blocked": True,
+            "breach_detected_at": trader.get("breach_detected_at") or now,
+        })
+
+    elif passed_status:
         zone = "passed"
         priority = "passed"
         pass_stage = "phase2" if passed_status == "phase2_passed" else "phase1"
@@ -9487,26 +9533,6 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
             update_data["phase2_passed_at"] = trader.get("phase2_passed_at") or now
             update_data["certificate_status"] = trader.get("certificate_status") or "passed"
             update_data["certificate_passed_at"] = trader.get("certificate_passed_at") or now
-
-    elif breached:
-        zone = "breached"
-        priority = "closed"
-        update_data.update({
-            "status": "breached",
-            "phase": "breached",
-            "risk_zone": "breached",
-            "critical_mode": False,
-            "monitoring_priority": "closed",
-            "breach_time": trader.get("breach_time") or now,
-            "breach_equity": equity,
-            "breach_reason": payload.get("reason") or "Maximum drawdown violation recorded by NairaPips monitoring engine.",
-            "admin_note": payload.get("reason") or "Auto-breach: maximum drawdown violation recorded by monitoring engine.",
-            "mt5_access_disabled": True,
-            "mt5_account_active": False,
-            "payout_eligible": False,
-            "payout_blocked": True,
-            "breach_detected_at": trader.get("breach_detected_at") or now,
-        })
 
     elif incoming_status == "profit_protected" or incoming_zone == "profit_protected":
         zone = "profit_protected"
