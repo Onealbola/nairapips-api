@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "SECOND_LIFE_ADMIN_CORRECTION_AUTHORITY_2026_08_31"
+NAIRAPIPS_RELEASE = "SECOND_LIFE_ADMIN_CORRECTION_UI_BRIDGE_2026_08_31"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -6598,13 +6598,20 @@ def _second_life_status_payload(purchase, trader_id=None):
             print("SECOND LIFE STATUS ACCOUNT LOOKUP ERROR:", e)
     if status in {"waiting_mt5", "activated", "life2_waiting_mt5"}:
         eligible = False
+    # UI compatibility:
+    # Existing trader/admin frontends already know "available_on_eligible_breach".
+    # Keep the database's narrow "available_on_admin_correction" authority internally,
+    # but expose the standard AVAILABLE status to the UI so the Second Life card appears.
+    ui_status = "available_on_eligible_breach" if status == "available_on_admin_correction" else status
     return {
         "purchase_id": p.get("id"),
         "enabled": enabled,
         "lives_total": int(p.get("lives_total") or (2 if enabled else 1)),
         "life_number": int(p.get("life_number") or 1),
         "used": used,
-        "status": status,
+        "status": ui_status,
+        "source_status": status,
+        "admin_correction": bool(status == "available_on_admin_correction"),
         "eligible_now": bool(eligible),
         "breached_account_id": (breached_account or {}).get("id"),
         "activated_at": p.get("second_life_activated_at"),
