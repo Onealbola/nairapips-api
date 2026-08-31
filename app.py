@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "BREACH_WINS_LIFECYCLE_AUTHORITY_2026_08_31"
+NAIRAPIPS_RELEASE = "SECOND_LIFE_ADMIN_CORRECTION_AUTHORITY_2026_08_31"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -6576,10 +6576,21 @@ def _second_life_status_payload(purchase, trader_id=None):
         try:
             q = supabase.table("trader_accounts").select("*").eq("purchase_id", p.get("id")).eq("trader_id", trader_id or p.get("trader_id")).order("created_at", desc=True).limit(50)
             rows = q.execute().data or []
+            admin_correction = status == "available_on_admin_correction"
             for a in rows:
                 ast = str(a.get("account_status") or a.get("status") or "").lower()
                 stage = _normalize_lifecycle_stage(a.get("stage") or a.get("phase"))
-                if stage == "phase1" and "breach" in ast:
+                if stage != "phase1":
+                    continue
+                if "breach" in ast:
+                    eligible = True
+                    breached_account = a
+                    break
+                # Narrow exception for a staff-corrected lifecycle error where the
+                # database safety trigger refuses a false BREACHED label because
+                # current equity is above the breach level. The purchase status,
+                # not the account P/L, is the explicit authority for this exception.
+                if admin_correction and ast in {"archived_phase1", "archived", "passed"}:
                     eligible = True
                     breached_account = a
                     break
@@ -7414,14 +7425,23 @@ def assign_phase_mt5():
                     )
                 target_stage = completed_stage
 
+            _sl_status = str(linked_purchase.get("second_life_status") or "").lower() if linked_purchase else ""
+            _completed_status = str(completed_account.get("account_status") or completed_account.get("status") or "").lower()
+            _admin_corrected_life2 = bool(
+                linked_purchase
+                and _second_life_bool(linked_purchase.get("second_life_enabled"))
+                and _second_life_bool(linked_purchase.get("second_life_used"))
+                and _sl_status in {"life2_waiting_mt5", "waiting_mt5"}
+                and "admin correction" in str(linked_purchase.get("admin_note") or "").lower()
+            )
             second_life_reentry = bool(
                 target_stage == "phase1"
                 and linked_purchase
                 and _second_life_bool(linked_purchase.get("second_life_enabled"))
                 and _second_life_bool(linked_purchase.get("second_life_used"))
-                and str(linked_purchase.get("second_life_status") or "").lower() in {"life2_waiting_mt5", "waiting_mt5"}
+                and _sl_status in {"life2_waiting_mt5", "waiting_mt5"}
                 and completed_stage == "phase1"
-                and "breach" in str(completed_account.get("account_status") or completed_account.get("status") or "").lower()
+                and ("breach" in _completed_status or _admin_corrected_life2)
             )
             if not second_life_reentry and not reset_replacement:
                 expected_stage = _next_stage_for_lifecycle(
@@ -7447,6 +7467,10 @@ def assign_phase_mt5():
             if not reset_replacement:
                 if not purchase or not _second_life_bool(purchase.get("second_life_used")) or str(purchase.get("second_life_status") or "").lower() not in {"life2_waiting_mt5", "waiting_mt5"}:
                     return bad("Fresh Phase 1 assignment is reserved for an activated Second Life purchase or an exact Phase 1 reset replacement", 409)
+                completed_status_for_life2 = str((completed_account or {}).get("account_status") or (completed_account or {}).get("status") or "").lower()
+                admin_corrected_life2 = "admin correction" in str(purchase.get("admin_note") or "").lower()
+                if "breach" not in completed_status_for_life2 and not admin_corrected_life2:
+                    return bad("Second Life Phase 1 assignment requires breach evidence or an explicit admin lifecycle correction", 409)
         account, updated = _assign_mt5_to_trader(
             trader,
             mt5_acc,
