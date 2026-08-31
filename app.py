@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "MT5_AUTO_ASSIGNMENT_SAFETY_PLUS_PLAN_DD_2026_08_30"
+NAIRAPIPS_RELEASE = "BREACH_WINS_LIFECYCLE_AUTHORITY_2026_08_31"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -2389,6 +2389,42 @@ def _archive_specific_account(account, reason, staff=None, breached=False, archi
     return archived
 
 
+
+def _np_account_has_breach_evidence(account):
+    """True when this exact trader_account has already hit/exceeded its static DD limit.
+
+    BREACH IS TERMINAL. A later recovery or profit target must never convert the
+    same lifecycle account into PASSED.
+    """
+    account = account or {}
+    status_blob = " ".join(str(account.get(k) or "") for k in (
+        "account_status", "status", "risk_zone", "archive_reason",
+        "breach_reason", "phase_pass_status"
+    )).lower()
+    if "breach" in status_blob:
+        return True
+
+    start = clean(account.get("start_balance") or account.get("account_size") or 0)
+    dd_limit = clean(account.get("dd_limit_percent") or 20) or 20
+
+    # Usage fields are percentages of the allowed DD (100 == fully consumed).
+    for key in ("dd_used_percent", "max_drawdown_used", "worst_dd_used_percent"):
+        if clean(account.get(key)) >= 100:
+            return True
+
+    # Absolute drawdown fields are percentages of starting balance.
+    for key in ("absolute_drawdown_percent", "drawdown_percent", "worst_static_drawdown_percent"):
+        if clean(account.get(key)) >= dd_limit:
+            return True
+
+    lowest = clean(account.get("lowest_equity") or 0)
+    if start > 0 and lowest > 0:
+        breach_level = start * (1 - dd_limit / 100)
+        if lowest <= breach_level:
+            return True
+    return False
+
+
 def _pass_specific_account(trader, account, pass_status, staff=None, note="Stage passed"):
     if not trader:
         raise ValueError("Trader not found")
@@ -2404,6 +2440,11 @@ def _pass_specific_account(trader, account, pass_status, staff=None, note="Stage
         raise ValueError("Only Phase 1 or Phase 2 accounts can be passed")
     purchase = _safe_purchase_for_account(account)
     plan = _safe_plan_for_purchase(purchase)
+    if _np_account_has_breach_evidence(account):
+        raise ValueError("Pass blocked: this exact account has maximum-drawdown breach evidence")
+    effective_target = _effective_target_percent(stage, account, purchase, plan)
+    if effective_target and clean(account.get("profit_percent")) < effective_target:
+        raise ValueError(f"{stage} target not reached")
     next_stage = _next_stage_for_lifecycle(stage, account, purchase, plan, trader)
     if not next_stage:
         raise ValueError("This account journey has no next stage to assign")
@@ -2493,14 +2534,14 @@ def _pass_stage(trader_id, stage, staff=None, note="Stage passed"):
     account = _get_active_account(trader_id, trader)
     if not account or account.get("stage") != stage:
         raise ValueError(f"Trader does not have an active {stage} account")
-    target = _target_for_stage(stage)
-    if target is not None and clean(account.get("profit_percent")) < target:
-        raise ValueError(f"{stage} target not reached")
-    if clean(account.get("dd_used_percent")) >= 100:
-        raise ValueError("Account has breached maximum drawdown")
-    _archive_active_account(trader, note, staff)
     purchase = _safe_purchase_for_account(account)
     plan = _safe_plan_for_purchase(purchase)
+    target = _effective_target_percent(stage, account, purchase, plan)
+    if _np_account_has_breach_evidence(account):
+        raise ValueError("Pass blocked: account has maximum-drawdown breach evidence")
+    if target is not None and clean(account.get("profit_percent")) < target:
+        raise ValueError(f"{stage} target not reached")
+    _archive_active_account(trader, note, staff)
     next_stage = _next_stage_for_lifecycle(stage, account, purchase, plan, trader)
     if not next_stage:
         raise ValueError("This account journey has no next stage to assign")
@@ -13047,12 +13088,23 @@ def _iam_process_account(account, force=False):
     worst_dd_used = (worst_dd / dd_limit) * 100 if dd_limit else 0
     breach_level = start_balance * (1 - dd_limit / 100)
     risk_zone = _risk_zone(dd_used)
-    target_percent = _iam_stage_target(stage)
+    purchase = _safe_purchase_for_account(account)
+    plan = _safe_plan_for_purchase(purchase)
+    target_percent = _effective_target_percent(stage, account, purchase, plan)
+    target_percent = float(target_percent) if target_percent not in (None, "") else None
     target_equity = start_balance * (1 + (target_percent / 100)) if target_percent is not None else 0
+
+    # Terminal-risk authority: current OR historical worst DD can breach the account.
+    breached = (
+        current_equity <= breach_level
+        or lowest_equity <= breach_level
+        or dd_used >= 100
+        or worst_dd_used >= 100
+        or _np_account_has_breach_evidence(account)
+    )
     pass_status = ""
-    if target_percent is not None and highest_equity >= target_equity and dd_used < 100:
+    if (not breached) and target_percent is not None and highest_equity >= target_equity and profit_percent >= target_percent:
         pass_status = "phase2_passed" if stage == "phase2" else "phase1_passed"
-    breached = current_equity <= breach_level or dd_used >= 100
 
     update = {
         "current_balance": start_balance,
@@ -13064,7 +13116,7 @@ def _iam_process_account(account, force=False):
         "absolute_drawdown_percent": current_dd,
         "drawdown_percent": current_dd,
         "dd_used_percent": dd_used,
-        "risk_zone": "passed" if pass_status else ("breached" if breached else risk_zone),
+        "risk_zone": "breached" if breached else ("passed" if pass_status else risk_zone),
         "updated_at": _now_iso(),
     }
     # Optional columns, safely retried away if missing.
@@ -13083,6 +13135,18 @@ def _iam_process_account(account, force=False):
     _iam_safe_account_update(account.get("id"), update)
 
     # Hard business actions happen after evidence is saved.
+    if breached:
+        if "breach" not in status:
+            reason = f"Static drawdown breach detected. MT5 {account.get('mt5_login')} equity {current_equity:,.2f} <= breach level {breach_level:,.2f}."
+            try:
+                _breach_specific_account(trader, account, reason, {"name": "intelligent_account_manager", "username": "iam"})
+            except Exception as e:
+                print("IAM AUTO BREACH FAILED:", e)
+            _iam_alert(trader, account, "breach_detected", "NairaPips breach detected", reason, "breached")
+            return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "breached", "equity": current_equity, "breach_level": breach_level}
+        return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "already_breached"}
+
+
     if pass_status:
         already = str(account.get("phase_pass_status") or "").strip().lower() == pass_status or "archived_phase" in status
         if not already:
@@ -13101,17 +13165,6 @@ def _iam_process_account(account, force=False):
                 print("IAM PASS EMAIL FAILED:", e)
             return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "passed", "pass_status": pass_status, "equity": current_equity, "target_equity": target_equity}
         return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "already_passed", "pass_status": pass_status}
-
-    if breached:
-        if "breach" not in status:
-            reason = f"Static drawdown breach detected. MT5 {account.get('mt5_login')} equity {current_equity:,.2f} <= breach level {breach_level:,.2f}."
-            try:
-                _breach_specific_account(trader, account, reason, {"name": "intelligent_account_manager", "username": "iam"})
-            except Exception as e:
-                print("IAM AUTO BREACH FAILED:", e)
-            _iam_alert(trader, account, "breach_detected", "NairaPips breach detected", reason, "breached")
-            return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "breached", "equity": current_equity, "breach_level": breach_level}
-        return {"account_id": account.get("id"), "mt5_login": account.get("mt5_login"), "action": "already_breached"}
 
     # Alert before damage gets out of hand, without locking.
     if risk_zone in {"warning", "danger", "critical"}:
