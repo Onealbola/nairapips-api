@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "GLOBAL_SECOND_LIFE_ADMIN_AUTHORITY_2026_08_31"
+NAIRAPIPS_RELEASE = "DUAL_JOURNEY_BOOTSTRAP_AUTHORITY_2026_08_31"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -5826,6 +5826,171 @@ def _latest_purchase_for_trader(trader):
     return rows[0] if rows else None
 
 
+
+def _np_bootstrap_lifecycle_authority(trader, accounts, purchases, plan_by_id):
+    """One explicit lifecycle decision for Trader/Admin consumers.
+
+    Journeys are intentionally separated:
+      - legacy: old challenge progression remains untouched.
+      - second_life: Life 1 -> Second Life -> Life 2 Phase 1 -> Funded.
+
+    This helper uses ONLY rows already loaded by trader_bootstrap, so it adds no
+    database round-trip to the login critical path.
+    """
+    trader = trader or {}
+    accounts = list(accounts or [])
+    purchases = list(purchases or [])
+    plan_by_id = plan_by_id or {}
+
+    def _ts(row):
+        return str((row or {}).get("updated_at") or (row or {}).get("created_at") or "")
+
+    purchases.sort(key=_ts, reverse=True)
+
+    for purchase in purchases:
+        plan_id = str(
+            purchase.get("plan_id") or purchase.get("challenge_plan_id") or ""
+        ).strip()
+        plan = plan_by_id.get(plan_id) or {}
+
+        second_life_enabled = bool(
+            _second_life_bool(purchase.get("second_life_enabled"))
+            or _second_life_bool(plan.get("second_life_enabled"))
+        )
+        if not second_life_enabled:
+            continue
+
+        purchase_id = str(purchase.get("id") or "").strip()
+        linked = [
+            a for a in accounts
+            if str(a.get("purchase_id") or a.get("challenge_purchase_id") or "").strip()
+            == purchase_id
+        ]
+        linked.sort(key=_ts, reverse=True)
+
+        phase1_rows = [
+            a for a in linked
+            if _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == "phase1"
+        ]
+
+        raw_sl_status = str(
+            purchase.get("second_life_status") or "available_on_eligible_breach"
+        ).strip().lower()
+        used = _second_life_bool(purchase.get("second_life_used"))
+        admin_correction = raw_sl_status == "available_on_admin_correction"
+
+        breach_source = None
+        for a in phase1_rows:
+            try:
+                if _np_account_has_breach_evidence(a):
+                    breach_source = a
+                    break
+            except Exception:
+                blob = " ".join(str(a.get(k) or "") for k in (
+                    "account_status", "status", "risk_zone",
+                    "archive_reason", "breach_reason"
+                )).lower()
+                if "breach" in blob:
+                    breach_source = a
+                    break
+
+        # Destiny-style correction: do not fabricate a breach. The purchase status
+        # itself is the narrow, audited authority.
+        correction_source = phase1_rows[0] if (admin_correction and phase1_rows) else None
+        source = breach_source or correction_source
+
+        active_life2 = None
+        if used:
+            for a in phase1_rows:
+                st = str(a.get("account_status") or a.get("status") or "").strip().lower()
+                if (
+                    st in {
+                        "assigned_active", "active", "current_active",
+                        "phase1_active", "approved_active"
+                    }
+                    and str(a.get("mt5_login") or "").strip()
+                    and not _np_account_has_breach_evidence(a)
+                ):
+                    active_life2 = a
+                    break
+
+        state = "not_eligible"
+        if used and active_life2:
+            state = "life2_active"
+        elif used and raw_sl_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+            state = "life2_waiting_mt5"
+        elif (not used) and source and (
+            breach_source is not None
+            or admin_correction
+            or raw_sl_status == "available_on_eligible_breach"
+        ):
+            state = "second_life_available"
+
+        if state == "not_eligible":
+            # This is still a 2-Lives purchase, but no special transition is active.
+            # Let normal active-account rendering continue.
+            continue
+
+        account_size = clean(
+            (active_life2 or {}).get("account_size")
+            or purchase.get("account_size")
+            or (source or {}).get("account_size")
+            or trader.get("account_size")
+            or 0
+        )
+
+        dd_limit = clean(
+            (active_life2 or {}).get("dd_limit_percent")
+            or (source or {}).get("dd_limit_percent")
+            or plan.get("max_drawdown")
+            or plan.get("total_dd")
+            or purchase.get("max_drawdown")
+            or purchase.get("total_dd")
+            or 10
+        ) or 10
+
+        target = clean(
+            (active_life2 or {}).get("target_percent")
+            or plan.get("phase1_target")
+            or plan.get("profit_target")
+            or purchase.get("phase1_target")
+            or purchase.get("profit_target")
+            or 10
+        ) or 10
+
+        return {
+            "journey": "second_life",
+            "state": state,
+            "stage": "phase1",
+            "life_number": 2 if used else 1,
+            "lives_total": 2,
+            "second_life_enabled": True,
+            "second_life_used": bool(used),
+            "second_life_status": raw_sl_status,
+            "admin_correction": bool(admin_correction),
+            "purchase_id": purchase_id,
+            "source_account_id": (source or {}).get("id"),
+            "source_mt5_login": (source or {}).get("mt5_login"),
+            "current_account_id": (active_life2 or {}).get("id"),
+            "current_mt5_login": (active_life2 or {}).get("mt5_login"),
+            "account_size": account_size,
+            "dd_limit_percent": dd_limit,
+            "target_percent": target,
+            "plan_name": plan.get("name") or plan.get("plan_name") or purchase.get("plan_name"),
+            "funded": False,
+            "waiting_for_mt5": state == "life2_waiting_mt5",
+            "second_life_available": state == "second_life_available",
+        }
+
+    return {
+        "journey": "legacy",
+        "state": "normal",
+        "stage": None,
+        "funded": False,
+        "second_life_enabled": False,
+    }
+
+
 @app.route("/trader_bootstrap", methods=["GET", "OPTIONS"])
 def trader_bootstrap():
     """Fast trader shell/account feed.
@@ -5990,6 +6155,33 @@ def trader_bootstrap():
             account_rows, trader
         )
 
+        # EXPLICIT DUAL-JOURNEY AUTHORITY:
+        # The frontend must not infer Second Life from archived/reset/funded history.
+        lifecycle_authority = _np_bootstrap_lifecycle_authority(
+            trader, all_accounts, purchases, plan_by_id
+        )
+
+        if lifecycle_authority.get("journey") == "second_life":
+            sl_state = lifecycle_authority.get("state")
+            sl_purchase_id = str(lifecycle_authority.get("purchase_id") or "")
+            # Second Life supersedes generic reset replacement for this same purchase.
+            pending_replacements = [
+                r for r in pending_replacements
+                if str(r.get("purchase_id") or r.get("challenge_purchase_id") or "") != sl_purchase_id
+            ]
+
+            # While Second Life is available/waiting, there is deliberately NO current
+            # trading account. Do not let an archived Funded/Phase1 row become current.
+            if sl_state in {"second_life_available", "life2_waiting_mt5"}:
+                account = None
+            elif sl_state == "life2_active":
+                sl_id = str(lifecycle_authority.get("current_account_id") or "")
+                if sl_id:
+                    account = next(
+                        (r for r in all_accounts if str(r.get("id") or "") == sl_id),
+                        account
+                    )
+
         payload = {
             "success": True,
             "source": "trader_bootstrap_critical_fast",
@@ -6001,6 +6193,7 @@ def trader_bootstrap():
             "accounts": [_trader_safe_account_row(r) for r in active_accounts],
             "all_accounts": [_trader_safe_account_row(r) for r in all_accounts],
             "active_purchase": _trader_safe_purchase_row(purchase) if purchase else None,
+            "lifecycle_authority": lifecycle_authority,
             "pending_replacements": [_trader_safe_account_row(r) for r in pending_replacements],
             "latest_trades": [],
             "latest_monitoring": None,
@@ -6023,7 +6216,22 @@ def trader_bootstrap():
             },
         }
 
-        if account:
+        if lifecycle_authority.get("journey") == "second_life" and lifecycle_authority.get("state") in {
+            "second_life_available", "life2_waiting_mt5"
+        }:
+            payload["trader"].update({
+                "current_account_id": None,
+                "trader_account_id": None,
+                "phase": "phase1",
+                "mt5_login": None,
+                "mt5_server": None,
+                "account_size": lifecycle_authority.get("account_size"),
+                "profit_percent": 0,
+                "drawdown_percent": 0,
+                "max_drawdown_used": 0,
+                "challenge_state": lifecycle_authority.get("state"),
+            })
+        elif account:
             payload["trader"].update({
                 "current_account_id": account.get("id"),
                 "trader_account_id": account.get("id"),
