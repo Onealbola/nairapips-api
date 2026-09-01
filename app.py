@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "BREACH_PRIORITY_DUAL_JOURNEY_AUTHORITY_2026_08_31"
+NAIRAPIPS_RELEASE = "EXACT_ACCOUNT_BREACH_EVIDENCE_AUTHORITY_2026_09_01"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -2292,7 +2292,7 @@ def _archive_active_account(trader, reason, staff=None, breached=False):
     }).execute()
     # STABILITY 2026-08-24 — Layer 2:
     # The CHECK constraint on trader_accounts requires breach_reason,
-    # breach_at, and breach_equity_level to be set when account_status
+    # breached_at, and breach_equity_level to be set when account_status
     # is 'breached_archived'. Without these three fields, the PATCH
     # raises P001 ("violates check constraint") and the breach
     # transition fails, which was the source of every failed breach
@@ -2305,11 +2305,18 @@ def _archive_active_account(trader, reason, staff=None, breached=False):
         "updated_at": now,
     }
     if breached:
-        update_payload["breach_reason"] = reason
-        update_payload["breach_at"] = now
-        update_payload["breach_equity_level"] = float(
-            account.get("current_equity") or account.get("equity") or 0
+        # Exact-account terminal evidence required by the production DB constraint.
+        # `breached_at` is the canonical column used by monitoring/account history.
+        # `breach_equity_level` is the STATIC threshold, never the current breached equity.
+        start_balance = _num(account.get("start_balance"), _num(account.get("account_size"), 0))
+        dd_limit = _num(account.get("dd_limit_percent"), MAX_DRAWDOWN_LIMIT) or MAX_DRAWDOWN_LIMIT
+        breach_level = _num(
+            account.get("breach_equity_level"),
+            start_balance * (1 - dd_limit / 100) if start_balance else 0,
         )
+        update_payload["breach_reason"] = reason
+        update_payload["breached_at"] = now
+        update_payload["breach_equity_level"] = float(breach_level)
     supabase.table("trader_accounts").update(update_payload).eq("id", account.get("id")).execute()
     if account.get("mt5_pool_id"):
         supabase.table("mt5_pool").update({
@@ -2368,11 +2375,18 @@ def _archive_specific_account(account, reason, staff=None, breached=False, archi
         "updated_at": now,
     }
     if breached:
-        update_payload["breach_reason"] = reason
-        update_payload["breach_at"] = now
-        update_payload["breach_equity_level"] = float(
-            account.get("current_equity") or account.get("equity") or 0
+        # Exact-account terminal evidence required by the production DB constraint.
+        # `breached_at` is the canonical column used by monitoring/account history.
+        # `breach_equity_level` is the STATIC threshold, never the current breached equity.
+        start_balance = _num(account.get("start_balance"), _num(account.get("account_size"), 0))
+        dd_limit = _num(account.get("dd_limit_percent"), MAX_DRAWDOWN_LIMIT) or MAX_DRAWDOWN_LIMIT
+        breach_level = _num(
+            account.get("breach_equity_level"),
+            start_balance * (1 - dd_limit / 100) if start_balance else 0,
         )
+        update_payload["breach_reason"] = reason
+        update_payload["breached_at"] = now
+        update_payload["breach_equity_level"] = float(breach_level)
     supabase.table("trader_accounts").update(update_payload).eq("id", account.get("id")).execute()
     if account.get("mt5_pool_id"):
         try:
