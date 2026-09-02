@@ -7940,6 +7940,20 @@ Investor Password: {account.get("mt5_investor_password") or ""}
 NairaPips Team"""
         )
         _audit_safe("mt5_pool", "phase_mt5_assigned", f"{target_stage} MT5 assigned to trader {trader_id}", _admin_from_payload(d))
+
+        # Assignment visibility safety: the trader bootstrap is cached for a few seconds
+        # and login prewarm can repopulate it immediately. After a successful MT5
+        # assignment, force the next dashboard bootstrap to read the newly linked
+        # trader_accounts row instead of serving a pre-assignment snapshot.
+        try:
+            _TRADER_BOOTSTRAP_CACHE.clear()
+        except Exception:
+            pass
+        try:
+            np_invalidate_admin_bootstrap("all")
+        except Exception:
+            pass
+
         return ok({"trader": updated, "account": account}, f"{target_stage.upper()} MT5 assigned successfully")
 
         trader_rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
