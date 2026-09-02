@@ -1,4 +1,3 @@
-# EXACT_BREACH_COMPLETION_AND_TRADE_SYNC_2026_09_01
 import urllib.parse
 
 from flask import Flask, request, jsonify
@@ -2307,7 +2306,7 @@ def _archive_active_account(trader, reason, staff=None, breached=False):
     }
     if breached:
         update_payload["breach_reason"] = reason
-        update_payload["breached_at"] = now
+        update_payload["breach_at"] = now
         update_payload["breach_equity_level"] = float(
             account.get("current_equity") or account.get("equity") or 0
         )
@@ -2499,17 +2498,7 @@ def _breach_specific_account(trader, account, reason, staff=None):
         raise ValueError("Trader not found")
     if not account:
         raise ValueError("Trader account not found")
-
-    # 2026-09-01 EXACT BREACH COMPLETION:
-    # Monitoring can send snapshot + lock very close together. If this exact
-    # lifecycle row is already terminal-breached, treat the second signal as
-    # an idempotent success instead of attempting to archive it twice.
-    existing_status = str(account.get("account_status") or account.get("status") or "").strip().lower()
-    existing_zone = str(account.get("risk_zone") or "").strip().lower()
-    if "breach" in existing_status or existing_zone == "breached":
-        archived = dict(account)
-    else:
-        archived = _archive_specific_account(account, reason, staff, breached=True)
+    archived = _archive_specific_account(account, reason, staff, breached=True)
     _log_lifecycle_event(trader.get("id"), account.get("id"), account.get("stage"), "breached", "breach_specific_account", reason, staff)
     if _account_is_current_for_trader(trader, account):
         updated = _update_trader_lifecycle(
@@ -7137,6 +7126,53 @@ def second_life_status():
 
 
 
+def _record_second_life_lineage(trader_id, purchase_id, source_account_id, life2_account, activated_at=None):
+    """Append an exact Life1 -> Life2 audit link without deleting historical evidence.
+
+    Uses monitoring_events so this works with the existing production schema and
+    remains traceable by trader_id, source account, MT5 logins, purchase and time.
+    """
+    try:
+        source = {}
+        if source_account_id:
+            source_rows = (
+                supabase.table("trader_accounts")
+                .select("*")
+                .eq("id", source_account_id)
+                .limit(1)
+                .execute().data or []
+            )
+            source = source_rows[0] if source_rows else {}
+        child = (life2_account or {})
+        child_id = child.get("id") or child.get("trader_account_id")
+        child_login = child.get("mt5_login") or ""
+        source_login = source.get("mt5_login") or ""
+        linked_at = now_iso()
+        message = (
+            f"SECOND LIFE LINEAGE | purchase={purchase_id} | "
+            f"life1_account_id={source_account_id or ''} | life1_mt5={source_login} | "
+            f"life1_breached_at={source.get('breached_at') or source.get('breach_time') or source.get('archived_at') or ''} | "
+            f"second_life_activated_at={activated_at or ''} | "
+            f"life2_account_id={child_id or ''} | life2_mt5={child_login} | "
+            f"life2_assigned_at={child.get('assigned_at') or child.get('created_at') or linked_at}"
+        )
+        supabase.table("monitoring_events").insert({
+            "trader_id": trader_id,
+            "trader_account_id": child_id or source_account_id,
+            "mt5_login": str(child_login or source_login),
+            "event_type": "second_life_account_linked",
+            "risk_zone": "active",
+            "message": message,
+            "balance": child.get("current_balance") or child.get("start_balance") or child.get("account_size") or 0,
+            "equity": child.get("current_equity") or child.get("start_balance") or child.get("account_size") or 0,
+            "created_at": linked_at,
+        }).execute()
+        return True
+    except Exception as exc:
+        print("SECOND LIFE LINEAGE AUDIT ERROR:", exc, flush=True)
+        return False
+
+
 @app.route("/admin_second_life/activate", methods=["POST", "OPTIONS"])
 def admin_second_life_activate():
     """Admin authority for the same global Second Life lifecycle used by traders.
@@ -7223,6 +7259,10 @@ def admin_second_life_activate():
                     "lifecycle_state": "phase1_active",
                     "updated_at": now_iso(),
                 }).eq("id", purchase_id).execute()
+                _record_second_life_lineage(
+                    trader_id, purchase_id, status.get("breached_account_id"),
+                    (auto_second_life or {}).get("account") or {}, now
+                )
         except Exception as exc:
             print("ADMIN SECOND LIFE AUTO ASSIGN SKIPPED:", exc)
 
@@ -7328,6 +7368,10 @@ def second_life_activate():
             auto_second_life = _np_auto_assign_waiting_stage(waiting_trader, "phase1", refreshed_purchase, None, "second_life")
             if auto_second_life:
                 supabase.table("challenge_purchases").update({"second_life_status":"life2_active","lifecycle_state":"phase1_active","updated_at":now_iso()}).eq("id",purchase_id).execute()
+                _record_second_life_lineage(
+                    authed_id, purchase_id, status.get("breached_account_id"),
+                    (auto_second_life or {}).get("account") or {}, now
+                )
         except Exception as exc:
             print("SECOND LIFE AUTO ASSIGN SKIPPED:", exc)
         _audit_safe("second_life", "activated", f"Purchase {purchase_id}; " + ("Life 2 auto-assigned" if auto_second_life else "Life 2 awaiting fresh MT5"), {"name":"trader","username":str(authed_id)[:12],"role":"trader"}, purchase_id)
@@ -7877,6 +7921,10 @@ def assign_phase_mt5():
                 }).eq("id", purchase.get("id")).execute()
             except Exception as e:
                 print("SECOND LIFE PURCHASE ACTIVE UPDATE ERROR:", e)
+            _record_second_life_lineage(
+                trader_id, purchase.get("id"), (completed_account or {}).get("id"), account,
+                purchase.get("second_life_activated_at")
+            )
         send_email_safe(
             updated.get("email"),
             f"NairaPips {'LIFE 2 PHASE 1' if target_stage == 'phase1' and purchase and _second_life_bool(purchase.get('second_life_used')) else target_stage.upper()} MT5 account assigned",
@@ -10448,7 +10496,13 @@ def sync_trades():
                     "status": t.get("status") or ("closed" if t.get("closed_at") else "open"),
                     "opened_at": t.get("opened_at") or t.get("open_time"),
                     "closed_at": t.get("closed_at") or t.get("close_time"),
-                    "synced_at": now_iso()
+                    "synced_at": now_iso(),
+                    "updated_at": now_iso(),
+                    "history_entry": {
+                        "source": "mt5_engine_sync",
+                        "phase_label": t.get("phase_label") or t.get("phase") or "",
+                        "sync_reason": t.get("sync_reason") or t.get("reason") or "normal"
+                    }
                 }
                 # Drop empty None fields to reduce schema/type conflicts.
                 row = {k: v for k, v in row.items() if v is not None}
