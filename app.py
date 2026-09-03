@@ -2322,6 +2322,81 @@ def _archive_active_account(trader, reason, staff=None, breached=False):
     return account
 
 
+
+def _np_finalize_second_life_cycle(account, outcome):
+    """Persist the final state of an exact 2-Lives purchase.
+
+    Life 1 breach may create Life 2. Once purchase.life_number == 2, the exact
+    Phase-1 account is Life 2. A pass completes the 2-Lives challenge journey
+    into Funded entitlement; a breach exhausts the purchase permanently.
+
+    This never creates another life and never reactivates a breached account.
+    """
+    account = account or {}
+    if _normalize_lifecycle_stage(account.get("stage") or account.get("phase")) != "phase1":
+        return None
+    purchase = _safe_purchase_for_account(account)
+    if not purchase:
+        return None
+    if not _second_life_bool(purchase.get("second_life_enabled")):
+        return None
+    if not _second_life_bool(purchase.get("second_life_used")):
+        return None
+    try:
+        life_number = int(purchase.get("life_number") or 1)
+    except Exception:
+        life_number = 1
+    if life_number < 2:
+        return None
+
+    outcome = str(outcome or "").strip().lower()
+    if outcome not in {"passed", "breached"}:
+        return None
+
+    now = now_iso()
+    if outcome == "breached":
+        sl_status = "completed_exhausted"
+        lifecycle_state = "two_lives_completed"
+        note = (
+            f"2-Lives cycle completed and exhausted. Life 2 account "
+            f"{account.get('mt5_login') or account.get('id')} breached. "
+            "No further life is permitted on this purchase; trader must buy a new challenge."
+        )
+    else:
+        sl_status = "completed_passed"
+        lifecycle_state = "funded_waiting_mt5"
+        note = (
+            f"2-Lives cycle completed successfully. Life 2 account "
+            f"{account.get('mt5_login') or account.get('id')} passed. "
+            "Funded entitlement is now due; no additional challenge life remains."
+        )
+
+    payload = {
+        "second_life_status": sl_status,
+        "lifecycle_state": lifecycle_state,
+        "updated_at": now,
+    }
+    try:
+        # Keep optional note separate for older schemas.
+        try:
+            supabase.table("challenge_purchases").update(
+                dict(payload, admin_note=note)
+            ).eq("id", purchase.get("id")).execute()
+        except Exception:
+            supabase.table("challenge_purchases").update(payload).eq("id", purchase.get("id")).execute()
+        _audit_safe(
+            "second_life",
+            "cycle_completed",
+            f"purchase={purchase.get('id')}; account={account.get('id')}; "
+            f"mt5={account.get('mt5_login')}; outcome={outcome}; status={sl_status}",
+            {"name": "system", "username": "system", "role": "system"},
+            purchase.get("id"),
+        )
+    except Exception as e:
+        print("SECOND LIFE CYCLE FINALIZE ERROR:", e)
+    return {"status": sl_status, "lifecycle_state": lifecycle_state, "note": note}
+
+
 def _account_is_current_for_trader(trader, account):
     if not trader or not account:
         return False
@@ -2452,6 +2527,7 @@ def _pass_specific_account(trader, account, pass_status, staff=None, note="Stage
     next_state = _waiting_state_for_stage(next_stage)
     next_phase = _phase_value_for_waiting_stage(next_stage)
     archived = _archive_specific_account(account, note, staff, breached=False, archive_status=_archive_status_for_stage(stage))
+    _np_finalize_second_life_cycle(account, "passed")
     _log_lifecycle_event(trader.get("id"), account.get("id"), stage, next_state, f"pass_specific_{stage}", note, staff)
     if _account_is_current_for_trader(trader, account):
         extra = {
@@ -2500,6 +2576,7 @@ def _breach_specific_account(trader, account, reason, staff=None):
     if not account:
         raise ValueError("Trader account not found")
     archived = _archive_specific_account(account, reason, staff, breached=True)
+    _np_finalize_second_life_cycle(account, "breached")
     _log_lifecycle_event(trader.get("id"), account.get("id"), account.get("stage"), "breached", "breach_specific_account", reason, staff)
     if _account_is_current_for_trader(trader, account):
         updated = _update_trader_lifecycle(
@@ -19886,3 +19963,440 @@ def admin_league_flags_set():
     _RUNTIME_FLAG_CACHE[flag] = enabled
     _log_league_audit(admin, "flag_toggle", f"flag={flag} enabled={enabled}")
     return _np_ok({"flag": flag, "enabled": enabled}, "flag updated")
+
+
+# =============================================================================
+# NAIRAPIPS OPERATIONS ACTION CENTRE — PRODUCTION RECONCILIATION AUTHORITY
+# =============================================================================
+# Purpose:
+#   Convert existing business records into truthful operational obligations.
+#   This endpoint does not mutate trading data. It reconciles purchases,
+#   trader_accounts and payouts so Admin can see what is outstanding, completed,
+#   contradictory or stale without guessing from frontend status text.
+# =============================================================================
+
+_NP_OPS_ACTIVE_ACCOUNT_STATUSES = {
+    "assigned_active", "active", "current_active", "phase1_active", "phase2_active",
+    "funded_active", "live_active", "live", "funded", "approved_active",
+}
+_NP_OPS_OPEN_PAYOUT_STATUSES = {
+    "pending", "submitted", "requested", "approved", "processing",
+    "payment_processing", "approved_payout_pending", "payout_pending",
+}
+
+
+def _np_ops_lower(v):
+    return str(v or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _np_ops_dt(v):
+    if not v:
+        return None
+    try:
+        d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _np_ops_is_breached(a):
+    a = a or {}
+    text = " ".join(str(a.get(k) or "") for k in (
+        "account_status", "status", "risk_zone", "breach_reason", "archive_reason"
+    )).lower()
+    return bool(a.get("breached_at") or a.get("breach_at") or "breach" in text or "max_drawdown" in text)
+
+
+def _np_ops_is_passed(a):
+    a = a or {}
+    text = " ".join(str(a.get(k) or "") for k in (
+        "account_status", "status", "phase_pass_status", "archive_reason", "admin_note"
+    )).lower()
+    return (not _np_ops_is_breached(a)) and (
+        bool(a.get("passed_at"))
+        or "passed" in text
+        or "archived_phase1" in text
+        or "archived_phase2" in text
+        or "target_hit" in text
+    )
+
+
+def _np_ops_stage(a):
+    return _normalize_lifecycle_stage((a or {}).get("stage") or (a or {}).get("phase"))
+
+
+def _np_ops_account_time(a):
+    a = a or {}
+    return (
+        a.get("breached_at") or a.get("breach_at") or a.get("passed_at")
+        or a.get("archived_at") or a.get("last_sync_at")
+        or a.get("updated_at") or a.get("created_at")
+    )
+
+
+def _np_ops_make_action(severity, category, code, title, trader=None, purchase=None,
+                        account=None, payout=None, happened="", required="", evidence=None,
+                        done=False, occurred_at=None):
+    trader = trader or {}
+    purchase = purchase or {}
+    account = account or {}
+    payout = payout or {}
+    return {
+        "severity": severity,
+        "category": category,
+        "code": code,
+        "title": title,
+        "done": bool(done),
+        "trader_id": trader.get("id") or account.get("trader_id") or purchase.get("trader_id") or payout.get("trader_id"),
+        "trader_name": trader.get("full_name") or trader.get("name") or purchase.get("trader_name") or payout.get("trader_name") or "Trader",
+        "email": trader.get("email") or purchase.get("email") or payout.get("email"),
+        "phone": trader.get("phone") or trader.get("whatsapp") or purchase.get("phone"),
+        "purchase_id": purchase.get("id") or account.get("purchase_id") or payout.get("purchase_id"),
+        "account_id": account.get("id") or payout.get("trader_account_id"),
+        "mt5_login": account.get("mt5_login") or payout.get("mt5_login"),
+        "account_size": account.get("account_size") or account.get("start_balance") or purchase.get("account_size"),
+        "what_happened": happened,
+        "required_action": required,
+        "evidence": evidence or {},
+        "occurred_at": occurred_at or _np_ops_account_time(account) or payout.get("created_at") or purchase.get("created_at"),
+    }
+
+
+def _np_ops_build():
+    traders = supabase.table("traders").select("*").limit(5000).execute().data or []
+    accounts = supabase.table("trader_accounts").select("*").order("created_at", desc=False).limit(10000).execute().data or []
+    purchases = supabase.table("challenge_purchases").select("*").order("created_at", desc=False).limit(10000).execute().data or []
+    payouts = supabase.table("payouts").select("*").order("created_at", desc=False).limit(10000).execute().data or []
+
+    trader_by_id = {str(t.get("id")): t for t in traders if t.get("id")}
+    accounts_by_purchase, accounts_by_trader = {}, {}
+    for a in accounts:
+        accounts_by_trader.setdefault(str(a.get("trader_id") or ""), []).append(a)
+        pid = str(a.get("purchase_id") or a.get("challenge_purchase_id") or "")
+        if pid:
+            accounts_by_purchase.setdefault(pid, []).append(a)
+    payouts_by_account = {}
+    for p in payouts:
+        aid = str(p.get("trader_account_id") or p.get("account_id") or "")
+        if aid:
+            payouts_by_account.setdefault(aid, []).append(p)
+
+    actions, completed = [], []
+    now = datetime.now(timezone.utc)
+
+    # PURCHASE / 2-LIVES / FUNDED-ENTITLEMENT RECONCILIATION
+    for p in purchases:
+        pid = str(p.get("id") or "")
+        tid = str(p.get("trader_id") or "")
+        trader = trader_by_id.get(tid, {})
+        rows = accounts_by_purchase.get(pid, [])
+        phase1 = [a for a in rows if _np_ops_stage(a) == "phase1"]
+        funded = [a for a in rows if _np_ops_stage(a) == "funded"]
+        phase2 = [a for a in rows if _np_ops_stage(a) == "phase2"]
+        phase1_breached = [a for a in phase1 if _np_ops_is_breached(a)]
+        passed_rows = [a for a in rows if _np_ops_is_passed(a)]
+        latest_phase1 = phase1[-1] if phase1 else None
+        latest_pass = passed_rows[-1] if passed_rows else None
+        second_enabled = _second_life_bool(p.get("second_life_enabled"))
+        second_used = _second_life_bool(p.get("second_life_used"))
+        try:
+            life_number = int(p.get("life_number") or 1)
+        except Exception:
+            life_number = 1
+        sl_status = _np_ops_lower(p.get("second_life_status"))
+
+        # Life 1 breach -> Life 2 entitlement.
+        if second_enabled and (not second_used) and phase1_breached:
+            source = phase1_breached[-1]
+            actions.append(_np_ops_make_action(
+                "action", "second_life", "SECOND_LIFE_AVAILABLE",
+                "Second Life available — Life 1 breached",
+                trader, p, source,
+                happened=f"Life 1 MT5 {source.get('mt5_login') or '—'} breached.",
+                required="Activate/assign Life 2 exactly once for this purchase.",
+                evidence={
+                    "lives_total": 2, "life_used": 1, "life_remaining": 1,
+                    "breached_account_id": source.get("id"), "breached_at": source.get("breached_at") or source.get("breach_at"),
+                }
+            ))
+
+        # Life 2 is used: make completion/exhaustion unmistakable.
+        if second_enabled and second_used and life_number >= 2 and latest_phase1:
+            if _np_ops_is_breached(latest_phase1):
+                completed.append(_np_ops_make_action(
+                    "terminal", "second_life", "TWO_LIVES_EXHAUSTED",
+                    "2-Lives cycle completed — no life remaining",
+                    trader, p, latest_phase1,
+                    happened=f"Life 2 MT5 {latest_phase1.get('mt5_login') or '—'} breached.",
+                    required="NO FURTHER LIFE PERMITTED. Trader must purchase a new challenge.",
+                    evidence={
+                        "lives_total": 2, "lives_used": 2, "life_remaining": 0,
+                        "second_life_status": sl_status or "completed_exhausted",
+                    },
+                    done=True
+                ))
+            elif _np_ops_is_passed(latest_phase1):
+                completed.append(_np_ops_make_action(
+                    "completed", "second_life", "TWO_LIVES_COMPLETED_PASSED",
+                    "2-Lives cycle used and completed — challenge passed",
+                    trader, p, latest_phase1,
+                    happened=f"Life 2 MT5 {latest_phase1.get('mt5_login') or '—'} passed.",
+                    required="Progress to Funded. No additional challenge life remains.",
+                    evidence={"lives_total": 2, "lives_used": 2, "life_remaining": 0},
+                    done=True
+                ))
+
+        # Third phase1 account on same 2-Life purchase = serious contradiction.
+        if second_enabled and len(phase1) > 2:
+            newest = phase1[-1]
+            actions.append(_np_ops_make_action(
+                "critical", "contradiction", "THIRD_LIFE_DETECTED",
+                "CRITICAL — more than 2 challenge lives exist",
+                trader, p, newest,
+                happened=f"This purchase has {len(phase1)} Phase-1 account rows although its entitlement is 2 lives.",
+                required="Stop and review lineage before issuing/accepting any further account.",
+                evidence={"phase1_accounts": [a.get("mt5_login") for a in phase1], "count": len(phase1)}
+            ))
+
+        # Passed purchase with no later funded account = funded account owed.
+        # Current NairaPips 1-Phase plans move directly to funded. Legacy Phase2
+        # passes also create funded entitlement when no funded row exists.
+        if latest_pass and _np_ops_stage(latest_pass) in {"phase1", "phase2"}:
+            purchase_journey = _journey_for_lifecycle(latest_pass, p, None, trader)
+            next_stage = _next_stage_for_lifecycle(_np_ops_stage(latest_pass), latest_pass, p, None, trader)
+            if next_stage == "funded" and not funded:
+                actions.append(_np_ops_make_action(
+                    "action", "progression", "FUNDED_ACCOUNT_OWED",
+                    "Funded account owed",
+                    trader, p, latest_pass,
+                    happened=f"MT5 {latest_pass.get('mt5_login') or '—'} passed {_np_ops_stage(latest_pass).upper()}.",
+                    required="Assign one Funded MT5 to this exact purchase/pass entitlement.",
+                    evidence={
+                        "pass_account_id": latest_pass.get("id"),
+                        "passed_at": latest_pass.get("passed_at") or latest_pass.get("archived_at"),
+                        "journey": list(purchase_journey),
+                        "funded_accounts_issued_for_purchase": len(funded),
+                    }
+                ))
+
+        # Purchase waiting but no account yet.
+        pst = _np_ops_lower(p.get("lifecycle_state") or p.get("status") or p.get("payment_status"))
+        if any(x in pst for x in ("waiting_mt5", "awaiting_mt5", "pending_assignment")) and not any(
+            _np_ops_lower(a.get("account_status")) in _NP_OPS_ACTIVE_ACCOUNT_STATUSES for a in rows
+        ):
+            actions.append(_np_ops_make_action(
+                "action", "assignment", "MT5_ASSIGNMENT_REQUIRED",
+                "MT5 assignment required",
+                trader, p, latest_phase1,
+                happened=f"Purchase is {pst.replace('_',' ')} with no active MT5 account.",
+                required="Assign the exact lifecycle MT5 account.",
+                evidence={"purchase_status": pst}
+            ))
+
+    # ACCOUNT-LEVEL INTEGRITY / LIVE OPERATIONS
+    for a in accounts:
+        tid = str(a.get("trader_id") or "")
+        trader = trader_by_id.get(tid, {})
+        status = _np_ops_lower(a.get("account_status") or a.get("status"))
+        active = status in _NP_OPS_ACTIVE_ACCOUNT_STATUSES
+
+        # A verified breach marker is terminal even if somebody changed visible status.
+        if active and (a.get("breached_at") or a.get("breach_at")):
+            actions.append(_np_ops_make_action(
+                "critical", "contradiction", "BREACHED_ACCOUNT_REACTIVATED",
+                "CRITICAL — breached account appears active",
+                trader, account=a,
+                happened=f"MT5 {a.get('mt5_login') or '—'} has breach evidence but status={status}.",
+                required="Do not honour recovered profit/pass. Restore terminal breach authority and investigate reactivation.",
+                evidence={
+                    "breached_at": a.get("breached_at") or a.get("breach_at"),
+                    "breach_reason": a.get("breach_reason"),
+                    "account_status": status,
+                }
+            ))
+
+        # Active monitoring must be fresh enough to trust operational figures.
+        if active and a.get("monitoring_enabled") is not False:
+            last = _np_ops_dt(a.get("last_sync_at") or a.get("updated_at"))
+            if last and (now - last).total_seconds() > 600:
+                actions.append(_np_ops_make_action(
+                    "data", "monitoring", "STALE_MT5_DATA",
+                    "MT5 data stale — do not trust displayed figures",
+                    trader, account=a,
+                    happened=f"MT5 {a.get('mt5_login') or '—'} has not produced a trusted sync for more than 10 minutes.",
+                    required="Check engine authentication/monitoring before making pass, breach or payout decisions.",
+                    evidence={"last_sync_at": a.get("last_sync_at"), "updated_at": a.get("updated_at")}
+                ))
+
+        # Funded 50% gross profit liability ceiling.
+        if _np_ops_stage(a) == "funded" and active:
+            start = clean(a.get("start_balance") or a.get("account_size") or 0)
+            eq = clean(a.get("current_equity") or a.get("current_balance") or start)
+            pct = ((eq - start) / start * 100.0) if start > 0 else 0.0
+            if pct >= 50:
+                actions.append(_np_ops_make_action(
+                    "critical", "money", "FUNDED_50_PERCENT_CAP_REACHED",
+                    "Funded 50% gross-profit ceiling reached",
+                    trader, account=a,
+                    happened=f"Funded MT5 {a.get('mt5_login') or '—'} is at {round(pct,2)}% gross profit.",
+                    required="Trading must stop at the funded-cycle cap; payout liability is capped at 50% gross profit and split remains 60/40.",
+                    evidence={"start_balance": start, "current_equity": eq, "gross_profit_percent": round(pct,2)}
+                ))
+            elif pct >= 45:
+                actions.append(_np_ops_make_action(
+                    "money", "money", "FUNDED_CAP_NEAR",
+                    "Funded account approaching 50% ceiling",
+                    trader, account=a,
+                    happened=f"Funded MT5 {a.get('mt5_login') or '—'} is at {round(pct,2)}% gross profit.",
+                    required="Watch closely; engine should stop the cycle at 50%.",
+                    evidence={"gross_profit_percent": round(pct,2)}
+                ))
+
+    # PAYOUT OPERATIONS
+    for p in payouts:
+        st = _np_ops_lower(p.get("status"))
+        if st in _NP_OPS_OPEN_PAYOUT_STATUSES:
+            trader = trader_by_id.get(str(p.get("trader_id") or ""), {})
+            actions.append(_np_ops_make_action(
+                "money", "payout", "PAYOUT_REVIEW_REQUIRED",
+                "Payout requires action",
+                trader, payout=p,
+                happened=f"Payout request {p.get('id')} is {st.replace('_',' ')}.",
+                required="Review/complete the payout against the exact funded account and verified profit.",
+                evidence={
+                    "amount": p.get("amount"), "available_payout": p.get("available_payout"),
+                    "verified_profit": p.get("verified_profit"), "payout_split": p.get("payout_split") or 60,
+                },
+                occurred_at=p.get("requested_at") or p.get("created_at")
+            ))
+
+    severity_rank = {"critical": 5, "action": 4, "money": 3, "data": 2, "terminal": 1, "completed": 0}
+    actions.sort(key=lambda x: (
+        severity_rank.get(x.get("severity"), 0),
+        str(x.get("occurred_at") or "")
+    ), reverse=True)
+    completed.sort(key=lambda x: str(x.get("occurred_at") or ""), reverse=True)
+
+    summary = {
+        "critical": sum(1 for x in actions if x["severity"] == "critical"),
+        "action_required": sum(1 for x in actions if x["severity"] == "action"),
+        "money": sum(1 for x in actions if x["severity"] == "money"),
+        "data_integrity": sum(1 for x in actions if x["severity"] == "data"),
+        "funded_accounts_owed": sum(1 for x in actions if x["code"] == "FUNDED_ACCOUNT_OWED"),
+        "second_life_available": sum(1 for x in actions if x["code"] == "SECOND_LIFE_AVAILABLE"),
+        "two_lives_exhausted": sum(1 for x in completed if x["code"] == "TWO_LIVES_EXHAUSTED"),
+        "open_items": len(actions),
+        "completed_items": len(completed),
+    }
+    return {
+        "summary": summary,
+        "actions": actions,
+        "completed": completed[:500],
+        "generated_at": now_iso(),
+    }
+
+
+@app.route("/admin_operations_center", methods=["GET", "OPTIONS"])
+def admin_operations_center():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    try:
+        return _np_ok(_np_ops_build())
+    except Exception as e:
+        print("OPERATIONS ACTION CENTRE ERROR:", e)
+        return _np_fail(str(e), 500)
+
+
+@app.route("/admin_trader_360", methods=["GET", "OPTIONS"])
+def admin_trader_360():
+    """Read-only authoritative customer view and chronological transaction/lifecycle timeline."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+    try:
+        trader_rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+        if not trader_rows:
+            return _np_fail("Trader not found", 404)
+        trader = trader_rows[0]
+        accounts = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).order("created_at", desc=False).limit(500).execute().data or []
+        purchases = supabase.table("challenge_purchases").select("*").eq("trader_id", trader_id).order("created_at", desc=False).limit(500).execute().data or []
+        payouts = supabase.table("payouts").select("*").eq("trader_id", trader_id).order("created_at", desc=False).limit(500).execute().data or []
+
+        timeline = []
+        for p in purchases:
+            timeline.append({
+                "type": "PURCHASE", "at": p.get("approved_at") or p.get("paid_at") or p.get("created_at"),
+                "purchase_id": p.get("id"), "amount": p.get("amount") or p.get("fee") or p.get("price"),
+                "account_size": p.get("account_size"), "status": p.get("payment_status") or p.get("status"),
+                "detail": f"Challenge purchase · {p.get('plan_name') or p.get('selected_plan') or ''}".strip()
+            })
+        for a in accounts:
+            if a.get("created_at") or a.get("started_at"):
+                timeline.append({
+                    "type": "MT5_ASSIGNED", "at": a.get("started_at") or a.get("created_at"),
+                    "account_id": a.get("id"), "purchase_id": a.get("purchase_id"), "mt5_login": a.get("mt5_login"),
+                    "status": a.get("account_status"), "detail": f"{_np_ops_stage(a).upper()} · {a.get('account_size') or a.get('start_balance') or ''}"
+                })
+            if _np_ops_is_breached(a):
+                timeline.append({
+                    "type": "BREACH", "at": a.get("breached_at") or a.get("breach_at") or a.get("archived_at"),
+                    "account_id": a.get("id"), "purchase_id": a.get("purchase_id"), "mt5_login": a.get("mt5_login"),
+                    "status": a.get("account_status"), "detail": a.get("breach_reason") or a.get("archive_reason") or "Maximum drawdown breach"
+                })
+            elif _np_ops_is_passed(a):
+                timeline.append({
+                    "type": "PASS", "at": a.get("passed_at") or a.get("archived_at"),
+                    "account_id": a.get("id"), "purchase_id": a.get("purchase_id"), "mt5_login": a.get("mt5_login"),
+                    "status": a.get("phase_pass_status") or a.get("account_status"),
+                    "detail": f"{_np_ops_stage(a).upper()} passed"
+                })
+            if a.get("archive_reason") and "reset" in str(a.get("archive_reason")).lower():
+                timeline.append({
+                    "type": "RESET", "at": a.get("archived_at") or a.get("updated_at"),
+                    "account_id": a.get("id"), "purchase_id": a.get("purchase_id"), "mt5_login": a.get("mt5_login"),
+                    "status": a.get("account_status"), "detail": a.get("archive_reason")
+                })
+        for p in payouts:
+            timeline.append({
+                "type": "PAYOUT", "at": p.get("paid_at") or p.get("approved_at") or p.get("requested_at") or p.get("created_at"),
+                "account_id": p.get("trader_account_id"), "mt5_login": p.get("mt5_login"),
+                "amount": p.get("amount"), "status": p.get("status"),
+                "detail": f"Payout {p.get('status') or ''} · share {p.get('payout_split') or 60}%"
+            })
+        timeline = [x for x in timeline if x.get("at")]
+        timeline.sort(key=lambda x: str(x.get("at") or ""), reverse=True)
+
+        ops = _np_ops_build()
+        trader_actions = [x for x in ops.get("actions", []) if str(x.get("trader_id") or "") == trader_id]
+        trader_completed = [x for x in ops.get("completed", []) if str(x.get("trader_id") or "") == trader_id]
+
+        return _np_ok({
+            "trader": trader,
+            "accounts": [_decorate_account_for_api(a) for a in accounts],
+            "purchases": purchases,
+            "payouts": payouts,
+            "timeline": timeline,
+            "actions": trader_actions,
+            "completed": trader_completed,
+            "summary": {
+                "purchases": len(purchases),
+                "accounts": len(accounts),
+                "passed": sum(1 for a in accounts if _np_ops_is_passed(a)),
+                "breached": sum(1 for a in accounts if _np_ops_is_breached(a)),
+                "funded_accounts": sum(1 for a in accounts if _np_ops_stage(a) == "funded"),
+                "open_actions": len(trader_actions),
+            }
+        })
+    except Exception as e:
+        print("TRADER 360 ERROR:", e)
+        return _np_fail(str(e), 500)
