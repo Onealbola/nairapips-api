@@ -91,6 +91,7 @@ def _staff_db():
 
 # NairaPips payout safety cap. Keep server-side because frontend/admin values can be stale.
 PAYOUT_PROFIT_SHARE_PERCENT = 60
+FUNDED_MAX_GROSS_PROFIT_PERCENT = 50.0  # absolute payout-liability ceiling; 60/40 split remains unchanged
 
 def _effective_payout_split(*values):
     """Enforce the global funded payout policy: 60% trader / 40% NairaPips.
@@ -7126,53 +7127,6 @@ def second_life_status():
 
 
 
-def _record_second_life_lineage(trader_id, purchase_id, source_account_id, life2_account, activated_at=None):
-    """Append an exact Life1 -> Life2 audit link without deleting historical evidence.
-
-    Uses monitoring_events so this works with the existing production schema and
-    remains traceable by trader_id, source account, MT5 logins, purchase and time.
-    """
-    try:
-        source = {}
-        if source_account_id:
-            source_rows = (
-                supabase.table("trader_accounts")
-                .select("*")
-                .eq("id", source_account_id)
-                .limit(1)
-                .execute().data or []
-            )
-            source = source_rows[0] if source_rows else {}
-        child = (life2_account or {})
-        child_id = child.get("id") or child.get("trader_account_id")
-        child_login = child.get("mt5_login") or ""
-        source_login = source.get("mt5_login") or ""
-        linked_at = now_iso()
-        message = (
-            f"SECOND LIFE LINEAGE | purchase={purchase_id} | "
-            f"life1_account_id={source_account_id or ''} | life1_mt5={source_login} | "
-            f"life1_breached_at={source.get('breached_at') or source.get('breach_time') or source.get('archived_at') or ''} | "
-            f"second_life_activated_at={activated_at or ''} | "
-            f"life2_account_id={child_id or ''} | life2_mt5={child_login} | "
-            f"life2_assigned_at={child.get('assigned_at') or child.get('created_at') or linked_at}"
-        )
-        supabase.table("monitoring_events").insert({
-            "trader_id": trader_id,
-            "trader_account_id": child_id or source_account_id,
-            "mt5_login": str(child_login or source_login),
-            "event_type": "second_life_account_linked",
-            "risk_zone": "active",
-            "message": message,
-            "balance": child.get("current_balance") or child.get("start_balance") or child.get("account_size") or 0,
-            "equity": child.get("current_equity") or child.get("start_balance") or child.get("account_size") or 0,
-            "created_at": linked_at,
-        }).execute()
-        return True
-    except Exception as exc:
-        print("SECOND LIFE LINEAGE AUDIT ERROR:", exc, flush=True)
-        return False
-
-
 @app.route("/admin_second_life/activate", methods=["POST", "OPTIONS"])
 def admin_second_life_activate():
     """Admin authority for the same global Second Life lifecycle used by traders.
@@ -7259,10 +7213,6 @@ def admin_second_life_activate():
                     "lifecycle_state": "phase1_active",
                     "updated_at": now_iso(),
                 }).eq("id", purchase_id).execute()
-                _record_second_life_lineage(
-                    trader_id, purchase_id, status.get("breached_account_id"),
-                    (auto_second_life or {}).get("account") or {}, now
-                )
         except Exception as exc:
             print("ADMIN SECOND LIFE AUTO ASSIGN SKIPPED:", exc)
 
@@ -7368,10 +7318,6 @@ def second_life_activate():
             auto_second_life = _np_auto_assign_waiting_stage(waiting_trader, "phase1", refreshed_purchase, None, "second_life")
             if auto_second_life:
                 supabase.table("challenge_purchases").update({"second_life_status":"life2_active","lifecycle_state":"phase1_active","updated_at":now_iso()}).eq("id",purchase_id).execute()
-                _record_second_life_lineage(
-                    authed_id, purchase_id, status.get("breached_account_id"),
-                    (auto_second_life or {}).get("account") or {}, now
-                )
         except Exception as exc:
             print("SECOND LIFE AUTO ASSIGN SKIPPED:", exc)
         _audit_safe("second_life", "activated", f"Purchase {purchase_id}; " + ("Life 2 auto-assigned" if auto_second_life else "Life 2 awaiting fresh MT5"), {"name":"trader","username":str(authed_id)[:12],"role":"trader"}, purchase_id)
@@ -7921,10 +7867,6 @@ def assign_phase_mt5():
                 }).eq("id", purchase.get("id")).execute()
             except Exception as e:
                 print("SECOND LIFE PURCHASE ACTIVE UPDATE ERROR:", e)
-            _record_second_life_lineage(
-                trader_id, purchase.get("id"), (completed_account or {}).get("id"), account,
-                purchase.get("second_life_activated_at")
-            )
         send_email_safe(
             updated.get("email"),
             f"NairaPips {'LIFE 2 PHASE 1' if target_stage == 'phase1' and purchase and _second_life_bool(purchase.get('second_life_used')) else target_stage.upper()} MT5 account assigned",
@@ -7940,20 +7882,6 @@ Investor Password: {account.get("mt5_investor_password") or ""}
 NairaPips Team"""
         )
         _audit_safe("mt5_pool", "phase_mt5_assigned", f"{target_stage} MT5 assigned to trader {trader_id}", _admin_from_payload(d))
-
-        # Assignment visibility safety: the trader bootstrap is cached for a few seconds
-        # and login prewarm can repopulate it immediately. After a successful MT5
-        # assignment, force the next dashboard bootstrap to read the newly linked
-        # trader_accounts row instead of serving a pre-assignment snapshot.
-        try:
-            _TRADER_BOOTSTRAP_CACHE.clear()
-        except Exception:
-            pass
-        try:
-            np_invalidate_admin_bootstrap("all")
-        except Exception:
-            pass
-
         return ok({"trader": updated, "account": account}, f"{target_stage.upper()} MT5 assigned successfully")
 
         trader_rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
@@ -8379,7 +8307,12 @@ def create_payout():
 
         start_balance = clean(account.get("start_balance") or account.get("account_size") or 0)
         current_equity = clean(account.get("current_equity") or account.get("equity") or account.get("current_balance") or account.get("balance") or start_balance)
-        verified_profit = max(0, current_equity - start_balance)
+        actual_verified_profit = max(0, current_equity - start_balance)
+        funded_profit_ceiling = max(0, round(start_balance * (FUNDED_MAX_GROSS_PROFIT_PERCENT / 100.0), 2))
+        # Business liability rule: payout calculations can never recognise more than
+        # 50% gross profit on the exact funded plan/start balance, even if MT5 overshoots
+        # between scans. This does NOT change the existing 60/40 split.
+        verified_profit = min(actual_verified_profit, funded_profit_ceiling)
         split_pct = _effective_payout_split(account.get("payout_split"), trader_row.get("payout_split"), d.get("payout_split"))
         max_payout = max(0, round((verified_profit * split_pct) / 100, 2))
         if max_payout <= 0:
@@ -8799,7 +8732,7 @@ Rewarding Nigerian Traders. Changing Trading Stories."""
 
 FUNDED_CYCLE_TRADER_SHARE_PERCENT = 60
 FUNDED_CYCLE_NAIRAPIPS_SHARE_PERCENT = 40
-FUNDED_CYCLE_PROFIT_CAP_PERCENT = 30
+FUNDED_CYCLE_PROFIT_CAP_PERCENT = 50
 FUNDED_CYCLE_MARKER_PREFIX = "FUNDED_CYCLE_RETURNED"
 
 
@@ -9481,7 +9414,10 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
     incoming_status = str(payload.get("status") or "").lower().strip()
     incoming_pass_status = _passed_status_from_snapshot(payload)
     passed_status = ""
-    breached = bool(payload.get("breached")) or incoming_status == "breached" or incoming_zone == "breached" or max_dd_used >= 100
+    terminal_breach_recorded = bool(active_account and (active_account.get("breached_at") or active_account.get("breach_detected_at")))
+    breached = terminal_breach_recorded or bool(payload.get("breached")) or incoming_status == "breached" or incoming_zone == "breached" or max_dd_used >= 100
+    if terminal_breach_recorded and not payload.get("reason"):
+        payload["reason"] = "TERMINAL BREACH AUTHORITY: this exact trader account previously recorded a verified breach and cannot be reactivated by balance recovery or lock removal."
 
     # GLOBAL PASS SAFETY RULE:
     # Live assigned accounts may only pass from current account metrics, never from stale
