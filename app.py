@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "EXACT_PURCHASE_PROGRESSION_AUTHORITY_2026_09_04"
+NAIRAPIPS_RELEASE = "EXACT_SOURCE_WAITING_NEXT_PROGRESSION_2026_09_04"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -3622,25 +3622,24 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
     active_statuses = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"}
     def has_target_active(source_account, target_stage):
         """
-        Exact-lineage progression authority.
+        Exact progression authority.
 
-        A trader may own several independent NairaPips accounts. An active Funded
-        account from purchase A must never suppress a Funded assignment owed by
-        passed account/purchase B.
+        One passed account creates one waiting-next obligation. Another active
+        account owned by the same trader must never consume it.
 
-        Therefore an existing active target stage counts as "already assigned"
-        only when it belongs to the SAME purchase lineage as source_account.
-        If the source has no purchase lineage, do not guess across the trader's
-        portfolio; the exact completed_account_id remains the authority.
+        Progression is considered consumed only when an active target-stage
+        account belongs to the SAME purchase lineage as the passed source.
         """
-        trader_id = str((source_account or {}).get("trader_id") or "").strip()
+        source_account = source_account or {}
+        trader_id = str(source_account.get("trader_id") or "").strip()
         source_purchase = str(
-            (source_account or {}).get("purchase_id")
-            or (source_account or {}).get("challenge_purchase_id")
+            source_account.get("purchase_id")
+            or source_account.get("challenge_purchase_id")
             or ""
         ).strip()
         if not trader_id:
             return False
+
         active_rows = active_accounts_by_trader.get(trader_id, [])
         for row in active_rows:
             status = str(row.get("account_status") or row.get("status") or "").strip().lower()
@@ -3650,16 +3649,18 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
                 continue
 
             row_purchase = str(
-                row.get("purchase_id") or row.get("challenge_purchase_id") or ""
+                row.get("purchase_id")
+                or row.get("challenge_purchase_id")
+                or ""
             ).strip()
 
-            # Never use another independent account as progression proof.
+            # Never use trader-wide or same-size inference as progression proof.
             if source_purchase:
                 if not row_purchase or row_purchase != source_purchase:
                     continue
             else:
-                # Legacy/manual rows without purchase lineage require an exact
-                # completed-account action; portfolio-wide guessing is unsafe.
+                # Legacy/manual rows without exact lineage cannot safely be
+                # auto-consumed by another account.
                 continue
 
             if target_stage == "phase2" and stage in {"phase2", "funded", "live"}:
@@ -3697,6 +3698,10 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
                 "trader_id": trader.get("id") or trader_id,
                 "trader_account_id": account_id,
                 "completed_account_id": account_id,
+                "source_account_id": account_id,
+                "waiting_id": f"waiting:{account_id}:{target_stage}",
+                "purchase_id": acc.get("purchase_id") or acc.get("challenge_purchase_id"),
+                "progression_key": f"{account_id}->{target_stage}",
                 "name": trader.get("name") or trader.get("full_name") or acc.get("name") or "Trader",
                 "email": trader.get("email") or acc.get("email") or "",
                 "phone": trader.get("phone") or acc.get("phone") or "",
@@ -3735,7 +3740,7 @@ def _fetch_phase_assignment_queue():
         except Exception as e:
             print("PHASE QUEUE TRADER FETCH ERROR:", e)
         try:
-            active_rows = supabase.table("trader_accounts").select("id,trader_id,purchase_id,challenge_purchase_id,stage,phase,account_status,status,mt5_login").in_("trader_id", trader_ids).in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"]).limit(3000).execute().data or []
+            active_rows = supabase.table("trader_accounts").select("id,trader_id,purchase_id,stage,phase,account_status,status,mt5_login").in_("trader_id", trader_ids).in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"]).limit(3000).execute().data or []
             for row in active_rows:
                 tid = str(row.get("trader_id") or "").strip()
                 if tid:
@@ -7888,8 +7893,30 @@ def assign_phase_mt5():
             return bad("Trader not found", 404)
         target_stage = "funded" if phase in ["funded", "live"] else ("phase1" if phase == "phase1" else "phase2")
         completed_account = None
-        completed_account_id = str(d.get("completed_account_id") or d.get("trader_account_id") or d.get("passed_account_id") or "").strip()
-        if completed_account_id and not completed_account_id.startswith("waiting:"):
+        completed_account_id = str(
+            d.get("completed_account_id")
+            or d.get("source_account_id")
+            or d.get("trader_account_id")
+            or d.get("passed_account_id")
+            or ""
+        ).strip()
+
+        # A virtual waiting id is only a wrapper around the exact passed source:
+        # waiting:<source_account_id>:<target_stage>
+        if completed_account_id.startswith("waiting:"):
+            parts = completed_account_id.split(":")
+            completed_account_id = str(parts[1] if len(parts) > 1 else "").strip()
+
+        # Phase 2/Funded progression is never trader-wide. It must be supplied
+        # by one exact completed/passed account, just like 2 Lives.
+        if target_stage in {"phase2", "funded"} and not completed_account_id:
+            return bad(
+                "Exact passed source account is required for next-stage assignment. "
+                "Open the trader's PASSED / WAITING NEXT row and assign from that progression.",
+                409
+            )
+
+        if completed_account_id:
             rows = supabase.table("trader_accounts").select("*").eq("id", completed_account_id).eq("trader_id", trader_id).limit(1).execute().data or []
             completed_account = rows[0] if rows else None
             if not completed_account:
@@ -7900,6 +7927,20 @@ def assign_phase_mt5():
                 completed_account.get("account_status") or completed_account.get("status") or ""
             ).strip().lower()
             reset_replacement = completed_status.startswith("archived_reset")
+
+            if target_stage in {"phase2", "funded"} and not reset_replacement:
+                passed_evidence = bool(
+                    completed_status in {"archived_phase1", "archived_phase2"}
+                    or str(completed_account.get("risk_zone") or "").strip().lower() == "passed"
+                    or str(completed_account.get("phase_pass_status") or "").strip().lower()
+                       in {"phase1_passed", "phase2_passed"}
+                )
+                if not passed_evidence:
+                    return bad(
+                        "Next-stage assignment blocked: the exact source account is not recorded as PASSED.",
+                        409
+                    )
+
             if reset_replacement:
                 # RESET means same stage, fresh MT5. Never turn a Phase 1 reset
                 # into Phase 2, or a Funded reset into a challenge account.
@@ -7965,6 +8006,26 @@ def assign_phase_mt5():
             _admin_from_payload(d),
             d.get("admin_note") or f"{target_stage.title()} MT5 assigned"
         )
+        # Exact progression audit: source PASSED -> waiting-next -> new active account.
+        if completed_account:
+            try:
+                _audit_safe(
+                    "trader_accounts",
+                    "exact_progression_assignment",
+                    (
+                        f"source_account_id={completed_account.get('id')} "
+                        f"source_mt5={completed_account.get('mt5_login')} "
+                        f"target_stage={target_stage} "
+                        f"new_account_id={account.get('id')} "
+                        f"new_mt5={account.get('mt5_login')} "
+                        f"purchase_id={(purchase or {}).get('id') or completed_account.get('purchase_id') or ''}"
+                    ),
+                    _admin_from_payload(d),
+                    str(account.get("id") or "")
+                )
+            except Exception as progression_audit_error:
+                print("EXACT PROGRESSION AUDIT ERROR:", progression_audit_error)
+
         if target_stage == "phase1" and purchase and _second_life_bool(purchase.get("second_life_used")):
             try:
                 supabase.table("challenge_purchases").update({
@@ -11341,7 +11402,7 @@ def referral_settings_default():
         'customerBonus': '0',
         'cookieDays': '30',
         'cookie_days': 30,
-        'minPayout': '10000',
+        'minPayout': '5000',
         'status': 'active',
         'publicMessage': 'Refer a trader to NairaPips and earn rebate when they buy a challenge.',
         'payoutRule': 'Rebate is approved only after a referred trader pays and passes payment verification.'
@@ -13265,7 +13326,6 @@ def affiliate_payout_quote():
             "approved_count": len(approved),
             "pending_count": len(pending),
             "paid_count": len(paid),
-            "minimum_payout": 10000,
             "open_payout_request": open_requests[0] if open_requests else None,
         }, "Affiliate payout quote ready")
     except Exception as e:
@@ -13308,13 +13368,8 @@ def request_affiliate_payout():
         approved = [r for r in rows if str(r.get("status") or "").strip().lower() == "approved"]
         available = round(sum(clean(r.get("commission_amount")) for r in approved), 2)
         requested = clean(d.get("amount") or available)
-        minimum_payout = 10000
         if available <= 0:
             return bad("No approved affiliate commission is available for payout", 403)
-        if available < minimum_payout:
-            return bad(f"Minimum affiliate withdrawal is {email_money(minimum_payout)}. Current approved commission is {email_money(available)}.", 403)
-        if requested < minimum_payout:
-            return bad(f"Minimum affiliate withdrawal is {email_money(minimum_payout)}.", 403)
         if requested <= 0 or requested > available:
             return bad(f"Requested amount must be between 1 and approved available commission {email_money(available)}", 403)
 
@@ -14192,10 +14247,9 @@ def np_assignment_center():
                 if pid and a_pid and pid == a_pid:
                     already_assigned = True
                     break
-                # MULTI-ACCOUNT SAFETY:
-                # Same trader + same account size is NOT proof of the same purchase.
-                # Traders may legitimately own multiple ₦2m/₦1m/etc accounts.
-                # Never suppress a queue row without exact purchase lineage.
+                if trader_id and a_trader_id and trader_id == a_trader_id and p_size and a_size and int(p_size) == int(a_size):
+                    already_assigned = True
+                    break
             if already_assigned:
                 continue
             if pid and pid in seen:
@@ -20441,3 +20495,4 @@ def admin_trader_360():
     except Exception as e:
         print("TRADER 360 ERROR:", e)
         return _np_fail(str(e), 500)
+
