@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "EXACT_PURCHASE_FUNDED_ASSIGNMENT_AUTHORITY_2026_09_04"
+NAIRAPIPS_RELEASE = "EXACT_PURCHASE_PROGRESSION_AUTHORITY_2026_09_04"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -3620,28 +3620,48 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
     active_accounts_by_trader = active_accounts_by_trader or {}
     seen = set()
     active_statuses = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"}
-    def has_target_active(trader_id, target_stage, source_account=None):
-        """Return True only when THIS completed lifecycle already progressed.
-
-        Multi-account safety: a funded account from another purchase must never
-        consume or block the funded entitlement of this passed account. When an
-        exact purchase lineage exists, compare only accounts from that purchase.
-        Legacy/manual rows with no purchase id keep the previous trader-level
-        fallback because there is no stronger lineage key available.
+    def has_target_active(source_account, target_stage):
         """
-        active_rows = active_accounts_by_trader.get(str(trader_id or "").strip(), [])
-        source_account = source_account or {}
-        source_purchase_id = str(source_account.get("purchase_id") or source_account.get("challenge_purchase_id") or "").strip()
+        Exact-lineage progression authority.
+
+        A trader may own several independent NairaPips accounts. An active Funded
+        account from purchase A must never suppress a Funded assignment owed by
+        passed account/purchase B.
+
+        Therefore an existing active target stage counts as "already assigned"
+        only when it belongs to the SAME purchase lineage as source_account.
+        If the source has no purchase lineage, do not guess across the trader's
+        portfolio; the exact completed_account_id remains the authority.
+        """
+        trader_id = str((source_account or {}).get("trader_id") or "").strip()
+        source_purchase = str(
+            (source_account or {}).get("purchase_id")
+            or (source_account or {}).get("challenge_purchase_id")
+            or ""
+        ).strip()
+        if not trader_id:
+            return False
+        active_rows = active_accounts_by_trader.get(trader_id, [])
         for row in active_rows:
             status = str(row.get("account_status") or row.get("status") or "").strip().lower()
             stage = str(row.get("stage") or row.get("phase") or "").strip().lower()
             login = str(row.get("mt5_login") or "").strip()
             if status not in active_statuses or not login:
                 continue
-            if source_purchase_id:
-                row_purchase_id = str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip()
-                if row_purchase_id != source_purchase_id:
+
+            row_purchase = str(
+                row.get("purchase_id") or row.get("challenge_purchase_id") or ""
+            ).strip()
+
+            # Never use another independent account as progression proof.
+            if source_purchase:
+                if not row_purchase or row_purchase != source_purchase:
                     continue
+            else:
+                # Legacy/manual rows without purchase lineage require an exact
+                # completed-account action; portfolio-wide guessing is unsafe.
+                continue
+
             if target_stage == "phase2" and stage in {"phase2", "funded", "live"}:
                 return True
             if target_stage == "funded" and stage in {"funded", "live"}:
@@ -3670,7 +3690,7 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
             target_stage = acc.get("next_stage") or _next_stage_for_lifecycle(passed_stage, acc, None, None, trader)
             if not target_stage:
                 continue
-            if has_target_active(trader_id, target_stage, acc):
+            if has_target_active(acc, target_stage):
                 continue
             rows.append({
                 "id": trader.get("id") or trader_id,
@@ -3700,24 +3720,6 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
             })
         except Exception as row_error:
             print("PHASE ASSIGNMENT ROW ERROR:", row_error)
-    # One purchase + one next stage = one actionable progression row.
-    # If historical duplicates exist for the same purchase, keep only the newest
-    # passed source in Phase Assignment; older rows remain untouched in history.
-    deduped = []
-    winner_by_lineage = {}
-    for row in rows:
-        source = next((a for a in (accounts or []) if str(a.get("id") or "") == str(row.get("trader_account_id") or "")), {})
-        pid = str(source.get("purchase_id") or source.get("challenge_purchase_id") or "").strip()
-        if not pid:
-            deduped.append(row)
-            continue
-        key = (pid, str(row.get("target_stage") or "").strip().lower())
-        score = _dt_score(row.get("passed_at") or row.get("archived_at") or source.get("updated_at") or source.get("created_at"))
-        prev = winner_by_lineage.get(key)
-        if prev is None or score > prev[0]:
-            winner_by_lineage[key] = (score, row)
-    deduped.extend(v[1] for v in winner_by_lineage.values())
-    rows = deduped
     rows.sort(key=lambda r: str(r.get("passed_at") or r.get("archived_at") or ""), reverse=True)
     return rows
 
@@ -14190,9 +14192,10 @@ def np_assignment_center():
                 if pid and a_pid and pid == a_pid:
                     already_assigned = True
                     break
-                # MULTI-ACCOUNT SAFETY: same trader + same account size is not
-                # proof that this purchase was assigned. Traders may legitimately
-                # own multiple ₦2m (or other same-size) purchases.
+                # MULTI-ACCOUNT SAFETY:
+                # Same trader + same account size is NOT proof of the same purchase.
+                # Traders may legitimately own multiple ₦2m/₦1m/etc accounts.
+                # Never suppress a queue row without exact purchase lineage.
             if already_assigned:
                 continue
             if pid and pid in seen:
