@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "EXACT_SOURCE_WAITING_NEXT_PROGRESSION_2026_09_04"
+NAIRAPIPS_RELEASE = "PROGRESSION_CONSUMES_WAITING_SOURCE_2026_09_04"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -8006,6 +8006,63 @@ def assign_phase_mt5():
             _admin_from_payload(d),
             d.get("admin_note") or f"{target_stage.title()} MT5 assigned"
         )
+
+        # PROGRESSION CONSUMPTION AUTHORITY:
+        # Once the exact PASSED source successfully supplies its next-stage MT5,
+        # that source must leave the trader's current/actionable selector.
+        # It remains preserved in MT5/history as generic archived evidence.
+        if completed_account and target_stage in {"phase2", "funded"}:
+            source_id = str(completed_account.get("id") or "").strip()
+            source_status = str(
+                completed_account.get("account_status")
+                or completed_account.get("status")
+                or ""
+            ).strip().lower()
+            if source_id and source_status in {"archived_phase1", "archived_phase2"}:
+                consumed_at = now_iso()
+                consume_reason = (
+                    f"progression_consumed:{target_stage} "
+                    f"| source_mt5={completed_account.get('mt5_login') or ''} "
+                    f"| next_account_id={account.get('id') or ''} "
+                    f"| next_mt5={account.get('mt5_login') or ''}"
+                )
+                consumed_ok, _removed, consumed_error = _np_adaptive_table_update(
+                    "trader_accounts",
+                    "id",
+                    source_id,
+                    {
+                        "account_status": "archived",
+                        "monitoring_enabled": False,
+                        "archive_reason": consume_reason,
+                        "archived_at": consumed_at,
+                        "updated_at": consumed_at,
+                    },
+                )
+                if not consumed_ok:
+                    return bad(
+                        f"{target_stage.upper()} MT5 was assigned, but source progression "
+                        f"could not be closed safely: {consumed_error}",
+                        500,
+                    )
+                try:
+                    safe_insert("lifecycle_events", {
+                        "trader_id": trader_id,
+                        "trader_account_id": source_id,
+                        "from_state": source_status,
+                        "to_state": "archived",
+                        "action": "progression_consumed",
+                        "details": consume_reason,
+                        "created_by": str(
+                            d.get("admin_username")
+                            or d.get("admin_name")
+                            or d.get("approved_by")
+                            or "admin"
+                        ),
+                        "created_at": consumed_at,
+                    })
+                except Exception as consume_audit_error:
+                    print("PROGRESSION CONSUMPTION AUDIT ERROR:", consume_audit_error)
+
         # Exact progression audit: source PASSED -> waiting-next -> new active account.
         if completed_account:
             try:
