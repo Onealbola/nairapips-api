@@ -11307,7 +11307,7 @@ def referral_settings_default():
         'customerBonus': '0',
         'cookieDays': '30',
         'cookie_days': 30,
-        'minPayout': '5000',
+        'minPayout': '10000',
         'status': 'active',
         'publicMessage': 'Refer a trader to NairaPips and earn rebate when they buy a challenge.',
         'payoutRule': 'Rebate is approved only after a referred trader pays and passes payment verification.'
@@ -13231,6 +13231,7 @@ def affiliate_payout_quote():
             "approved_count": len(approved),
             "pending_count": len(pending),
             "paid_count": len(paid),
+            "minimum_payout": 10000,
             "open_payout_request": open_requests[0] if open_requests else None,
         }, "Affiliate payout quote ready")
     except Exception as e:
@@ -13273,8 +13274,13 @@ def request_affiliate_payout():
         approved = [r for r in rows if str(r.get("status") or "").strip().lower() == "approved"]
         available = round(sum(clean(r.get("commission_amount")) for r in approved), 2)
         requested = clean(d.get("amount") or available)
+        minimum_payout = 10000
         if available <= 0:
             return bad("No approved affiliate commission is available for payout", 403)
+        if available < minimum_payout:
+            return bad(f"Minimum affiliate withdrawal is {email_money(minimum_payout)}. Current approved commission is {email_money(available)}.", 403)
+        if requested < minimum_payout:
+            return bad(f"Minimum affiliate withdrawal is {email_money(minimum_payout)}.", 403)
         if requested <= 0 or requested > available:
             return bad(f"Requested amount must be between 1 and approved available commission {email_money(available)}", 403)
 
