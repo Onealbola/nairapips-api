@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "PROGRESSION_CONSUMES_WAITING_SOURCE_2026_09_04"
+NAIRAPIPS_RELEASE = "GLOBAL_PROGRESSION_CONSUMPTION_DIRECT_UPDATE_2026_09_04"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -8026,24 +8026,57 @@ def assign_phase_mt5():
                     f"| next_account_id={account.get('id') or ''} "
                     f"| next_mt5={account.get('mt5_login') or ''}"
                 )
-                consumed_ok, _removed, consumed_error = _np_adaptive_table_update(
-                    "trader_accounts",
-                    "id",
-                    source_id,
-                    {
-                        "account_status": "archived",
-                        "monitoring_enabled": False,
-                        "archive_reason": consume_reason,
-                        "archived_at": consumed_at,
-                        "updated_at": consumed_at,
-                    },
-                )
-                if not consumed_ok:
+                # Use the live Supabase client directly. Do NOT call an optional
+                # helper here: this path must be guaranteed to run after assignment.
+                source_update = {
+                    "account_status": "archived",
+                    "monitoring_enabled": False,
+                    "archive_reason": consume_reason,
+                    "archived_at": consumed_at,
+                    "updated_at": consumed_at,
+                }
+                try:
+                    updated_source_rows = (
+                        supabase.table("trader_accounts")
+                        .update(source_update)
+                        .eq("id", source_id)
+                        .eq("trader_id", trader_id)
+                        .execute()
+                        .data
+                        or []
+                    )
+                except Exception as consume_update_error:
                     return bad(
                         f"{target_stage.upper()} MT5 was assigned, but source progression "
-                        f"could not be closed safely: {consumed_error}",
+                        f"could not be closed safely: {consume_update_error}",
                         500,
                     )
+
+                if not updated_source_rows:
+                    return bad(
+                        f"{target_stage.upper()} MT5 was assigned, but source progression "
+                        "closure returned no updated source row.",
+                        500,
+                    )
+
+                # Keep the old MT5 pool row historical as well. This is secondary
+                # evidence only; failure here must not resurrect the waiting obligation.
+                try:
+                    old_login = str(completed_account.get("mt5_login") or "").strip()
+                    if old_login:
+                        (
+                            supabase.table("mt5_pool")
+                            .update({
+                                "status": "archived",
+                                "updated_at": consumed_at,
+                                "admin_note": consume_reason,
+                            })
+                            .eq("mt5_login", old_login)
+                            .eq("assigned_trader_id", trader_id)
+                            .execute()
+                        )
+                except Exception as pool_consume_error:
+                    print("PROGRESSION SOURCE MT5 POOL ARCHIVE ERROR:", pool_consume_error)
                 try:
                     safe_insert("lifecycle_events", {
                         "trader_id": trader_id,
