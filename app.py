@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_ENTITLEMENT_AUTHORITY_V1_2026_09_05"
+NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_ENTITLEMENT_AUTHORITY_V2_2026_09_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1198,7 +1198,14 @@ def _np_reset_entitlement_for_source(source, trader=None):
         )
     ).strip().lower()
 
-    # 1) POST-PAYOUT FUNDED RENEWAL — strongest funded replacement authority.
+    # 1) POST-PAYOUT FUNDED RENEWAL.
+    # IMPORTANT: "this account once had a paid payout" is NOT entitlement.
+    # Future resets carry an explicit [NP_ENTITLEMENT:post_payout_renewal:<payout_id>]
+    # marker written at the exact reset transaction.
+    #
+    # Legacy compatibility is deliberately narrow: before this marker existed,
+    # only the NEWEST unresolved archived_reset_funded row for a trader who is
+    # currently funded_waiting_mt5 may use an exact paid payout as evidence.
     if stage == "funded" and source_id and trader_id:
         try:
             payout_rows = (
@@ -1223,15 +1230,65 @@ def _np_reset_entitlement_for_source(source, trader=None):
                 p for p in payout_rows
                 if str(p.get("status") or "").strip().lower() in open_states
             ]
-            if paid_rows and not open_rows:
-                p = paid_rows[0]
-                return {
-                    "eligible": True,
-                    "reason": "post_payout_renewal",
-                    "label": "PAYOUT PAID · RENEW FUNDED",
-                    "evidence_id": str(p.get("id") or ""),
-                    "target_stage": "funded",
-                }
+
+            marker_match = re.search(
+                r"\[NP_ENTITLEMENT:post_payout_renewal:([^\]]+)\]",
+                reason_blob,
+                re.I,
+            )
+            if marker_match and paid_rows and not open_rows:
+                marker_payout_id = str(marker_match.group(1) or "").strip()
+                matching = next(
+                    (p for p in paid_rows if str(p.get("id") or "").strip() == marker_payout_id),
+                    None,
+                )
+                if matching:
+                    return {
+                        "eligible": True,
+                        "reason": "post_payout_renewal",
+                        "label": "PAYOUT PAID · RENEW FUNDED",
+                        "evidence_id": marker_payout_id,
+                        "target_stage": "funded",
+                    }
+
+            # Legacy bridge: one trader can have several old funded histories.
+            # Only the newest archived_reset_funded row may inherit the old
+            # pre-marker payout workflow, and only while the trader is genuinely
+            # waiting for a fresh funded MT5 right now.
+            trader_state = str(
+                (trader or {}).get("challenge_state")
+                or (trader or {}).get("status")
+                or ""
+            ).strip().lower()
+
+            if paid_rows and not open_rows and trader_state == "funded_waiting_mt5":
+                reset_rows = (
+                    supabase.table("trader_accounts")
+                    .select("id,account_status,archived_at,reset_at,updated_at,created_at")
+                    .eq("trader_id", trader_id)
+                    .execute().data
+                    or []
+                )
+                funded_resets = [
+                    r for r in reset_rows
+                    if str(r.get("account_status") or "").strip().lower().startswith("archived_reset_funded")
+                ]
+                funded_resets.sort(
+                    key=lambda r: _dt_score(
+                        r.get("archived_at") or r.get("reset_at") or r.get("updated_at") or r.get("created_at")
+                    ),
+                    reverse=True,
+                )
+                newest_id = str((funded_resets[0] if funded_resets else {}).get("id") or "").strip()
+                if newest_id and newest_id == source_id:
+                    p = paid_rows[0]
+                    return {
+                        "eligible": True,
+                        "reason": "post_payout_renewal_legacy_latest_only",
+                        "label": "PAYOUT PAID · RENEW FUNDED",
+                        "evidence_id": str(p.get("id") or ""),
+                        "target_stage": "funded",
+                    }
         except Exception as e:
             print("RESET ENTITLEMENT PAYOUT CHECK ERROR:", source_id, str(e))
 
@@ -1261,7 +1318,10 @@ def _np_reset_entitlement_for_source(source, trader=None):
         "funded_reset_paid", "funded reset paid", "paid funded reset",
         "reset payment approved", "paid reset approved"
     )
-    if stage == "funded" and any(marker in reason_blob for marker in paid_reset_markers):
+    if stage == "funded" and (
+        "[np_entitlement:funded_reset_paid]" in reason_blob
+        or any(marker in reason_blob for marker in paid_reset_markers)
+    ):
         return {
             "eligible": True,
             "reason": "funded_reset_paid",
@@ -1278,7 +1338,7 @@ def _np_reset_entitlement_for_source(source, trader=None):
         "admin_decision", "admin decision",
         "approved recovery", "technical recovery"
     )
-    if any(marker in reason_blob for marker in recovery_markers):
+    if "[np_entitlement:admin_recovery]" in reason_blob or any(marker in reason_blob for marker in recovery_markers):
         return {
             "eligible": True,
             "reason": "admin_recovery",
@@ -3049,6 +3109,7 @@ def admin_reset_trader_account():
             "payment_processing", "payout_processing", "pending_payout"
         }
         paid_payout_reset_ok = False
+        paid_payout_reset_id = ""
         if account_status_before in payout_protected_states:
             try:
                 exact_payouts = (
@@ -3064,9 +3125,18 @@ def admin_reset_trader_account():
                     "pending", "requested", "submitted", "approved", "processing",
                     "payment_processing", "pending_review", "awaiting_review", "under_review"
                 }
-                has_paid_payout = any(str(p.get("status") or "").strip().lower() == "paid" for p in exact_payouts)
-                has_open_payout = any(str(p.get("status") or "").strip().lower() in open_payout_states for p in exact_payouts)
+                paid_matches = [
+                    p for p in exact_payouts
+                    if str(p.get("status") or "").strip().lower() == "paid"
+                ]
+                has_paid_payout = bool(paid_matches)
+                has_open_payout = any(
+                    str(p.get("status") or "").strip().lower() in open_payout_states
+                    for p in exact_payouts
+                )
                 paid_payout_reset_ok = bool(has_paid_payout and not has_open_payout)
+                if paid_payout_reset_ok:
+                    paid_payout_reset_id = str(paid_matches[0].get("id") or "").strip()
             except Exception as e:
                 print("POST-PAYOUT RESET ELIGIBILITY CHECK ERROR:", e)
                 paid_payout_reset_ok = False
@@ -3142,7 +3212,53 @@ def admin_reset_trader_account():
             stage = "phase1"
 
         now = now_iso()
+
+        reset_type_norm = str(reset_type or "").strip().lower().replace("-", "_").replace(" ", "_")
+        note_norm = str(admin_note or "").strip().lower()
+
+        paid_funded_reset = (
+            reset_type_norm in {
+                "funded_reset_paid", "paid_funded_reset", "paid_reset",
+                "funded_paid_reset", "reset_payment_approved"
+            }
+            or "funded reset paid" in note_norm
+            or "paid funded reset" in note_norm
+            or "reset payment approved" in note_norm
+        )
+        approved_recovery = (
+            reset_type_norm in {
+                "technical_issue", "technical_recovery", "operator_error",
+                "admin_recovery", "admin_decision", "approved_recovery"
+            }
+            or "technical recovery" in note_norm
+            or "operator error" in note_norm
+            or "approved recovery" in note_norm
+        )
+
+        entitlement_marker = ""
+        if stage == "funded":
+            if paid_payout_reset_ok and paid_payout_reset_id:
+                entitlement_marker = f"[NP_ENTITLEMENT:post_payout_renewal:{paid_payout_reset_id}]"
+            elif paid_funded_reset:
+                entitlement_marker = "[NP_ENTITLEMENT:funded_reset_paid]"
+            elif approved_recovery:
+                entitlement_marker = "[NP_ENTITLEMENT:admin_recovery]"
+            else:
+                # A Funded breach/archive alone is NOT a fresh-account entitlement.
+                # 2Lives free benefit belongs to the challenge/Phase-1 lifecycle,
+                # not to Funded breach replacement.
+                return _np_fail(
+                    "Funded reset blocked: this account has no verified replacement entitlement. "
+                    "Require a PAID funded reset, a completed payout renewal, or explicit approved recovery.",
+                    409
+                )
+        elif approved_recovery:
+            entitlement_marker = "[NP_ENTITLEMENT:admin_recovery]"
+
         reason = f"ADMIN RESET — {reset_type}: {admin_note}"
+        if entitlement_marker:
+            reason = f"{reason} | {entitlement_marker}"
+
         old_login = str(account.get("mt5_login") or trader.get("mt5_login") or "").strip()
         start_balance = clean(account.get("start_balance") or account.get("account_size") or trader.get("account_size") or 0)
 
