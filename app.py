@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_ENTITLEMENT_AUTHORITY_V2_2026_09_05"
+NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_ENTITLEMENT_AUTHORITY_V3_2026_09_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -8144,6 +8144,195 @@ def delete_mt5():
             return bad("Assigned MT5 accounts cannot be deleted",403)
         return ok(supabase.table("mt5_pool").delete().eq("id",mid).execute().data, "MT5 account deleted")
     except Exception as e: return bad(e)
+
+
+
+@app.route("/admin_mark_funded_reset_paid", methods=["POST", "OPTIONS"])
+def admin_mark_funded_reset_paid():
+    """Activate ONE exact breached Funded account as a paid-reset entitlement.
+
+    This endpoint does NOT assign MT5.
+    It only converts an exact breached Funded historical account from
+    RESET AVAILABLE / PAYMENT REQUIRED into a verified assignment entitlement.
+
+    Required authority:
+    - exact trader_account_id
+    - account belongs to trader
+    - stage is funded
+    - account has breach evidence
+    - account has not already been consumed by a later same-lineage Funded MT5
+    - admin explicitly confirms payment
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({})
+
+    admin_auth, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    d = request.get_json(silent=True) or {}
+    trader_id = str(d.get("trader_id") or "").strip()
+    account_id = str(d.get("trader_account_id") or d.get("account_id") or "").strip()
+    payment_confirmed = _is_truthy(d.get("payment_confirmed"))
+    admin_note = str(
+        d.get("admin_note")
+        or "Funded reset payment confirmed by admin."
+    ).strip()
+
+    if not trader_id or not account_id:
+        return _np_fail("Exact trader_id and trader_account_id are required.", 400)
+    if not payment_confirmed:
+        return _np_fail("Reset payment must be explicitly confirmed.", 400)
+
+    try:
+        rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("id", account_id)
+            .eq("trader_id", trader_id)
+            .limit(1)
+            .execute().data
+            or []
+        )
+        if not rows:
+            return _np_fail("Exact trader account was not found for this trader.", 404)
+
+        account = rows[0]
+        stage = _normalize_lifecycle_stage(account.get("stage") or account.get("phase"))
+        if stage != "funded":
+            return _np_fail("Paid Funded reset can only be activated for a Funded account.", 409)
+
+        # Require real breach evidence. A normal archived/payout account cannot be
+        # converted into a paid breach reset by mistake.
+        has_breach = False
+        try:
+            has_breach = bool(_np_account_has_breach_evidence(account))
+        except Exception:
+            blob = " ".join(
+                str(account.get(k) or "")
+                for k in ("account_status", "status", "risk_zone", "archive_reason", "breach_reason")
+            ).lower()
+            has_breach = "breach" in blob
+
+        if not has_breach:
+            return _np_fail(
+                "Paid Funded reset blocked: this exact account is not recorded as breached.",
+                409
+            )
+
+        # Prevent resurrecting an old breach that already received a later Funded MT5.
+        trader_accounts = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("trader_id", trader_id)
+            .execute().data
+            or []
+        )
+
+        source_purchase = str(
+            account.get("purchase_id") or account.get("challenge_purchase_id") or ""
+        ).strip()
+        source_size = clean(account.get("account_size") or account.get("start_balance") or 0)
+        source_time = _dt_score(
+            account.get("archived_at")
+            or account.get("reset_at")
+            or account.get("updated_at")
+            or account.get("created_at")
+        )
+
+        for candidate in trader_accounts:
+            if str(candidate.get("id") or "") == account_id:
+                continue
+            if _normalize_lifecycle_stage(candidate.get("stage") or candidate.get("phase")) != "funded":
+                continue
+            if not str(candidate.get("mt5_login") or "").strip():
+                continue
+
+            ctime = _dt_score(
+                candidate.get("assigned_at")
+                or candidate.get("started_at")
+                or candidate.get("created_at")
+                or candidate.get("updated_at")
+            )
+            if not source_time or not ctime or ctime <= source_time:
+                continue
+
+            cp = str(candidate.get("purchase_id") or candidate.get("challenge_purchase_id") or "").strip()
+            cs = clean(candidate.get("account_size") or candidate.get("start_balance") or 0)
+
+            same_lineage = (
+                (source_purchase and cp == source_purchase)
+                or (not source_purchase and source_size and cs and int(source_size) == int(cs))
+            )
+            if same_lineage:
+                return _np_fail(
+                    "Paid reset activation blocked: this older Funded breach already has a later "
+                    "Funded MT5 on the same lifecycle.",
+                    409
+                )
+
+        now = now_iso()
+        old_reason = str(account.get("archive_reason") or "").strip()
+        marker = "[NP_ENTITLEMENT:funded_reset_paid]"
+        new_reason = old_reason
+        if marker.lower() not in old_reason.lower():
+            new_reason = (
+                f"{old_reason} | {marker} {admin_note}".strip(" |")
+                if old_reason
+                else f"{marker} {admin_note}"
+            )
+
+        update_payload = {
+            "account_status": "archived_reset_funded",
+            "monitoring_enabled": False,
+            "archive_reason": new_reason,
+            "updated_at": now,
+        }
+        if not account.get("archived_at"):
+            update_payload["archived_at"] = now
+
+        updated = (
+            supabase.table("trader_accounts")
+            .update(update_payload)
+            .eq("id", account_id)
+            .eq("trader_id", trader_id)
+            .execute().data
+            or []
+        )
+        if not updated:
+            return _np_fail("Funded reset payment was not recorded.", 500)
+
+        # Trader-level state is display only; exact source account remains authority.
+        try:
+            supabase.table("traders").update({
+                "challenge_state": "funded_waiting_mt5",
+                "updated_at": now,
+            }).eq("id", trader_id).execute()
+        except Exception as e:
+            print("FUNDED RESET PAID TRADER STATE UPDATE ERROR:", str(e))
+
+        _audit_safe(
+            "trader_accounts",
+            "funded_reset_payment_confirmed",
+            f"account={account_id} mt5={account.get('mt5_login')} marker={marker}",
+            {
+                "id": admin_auth.get("id"),
+                "role": admin_auth.get("role"),
+            },
+        )
+
+        return _np_ok({
+            "success": True,
+            "trader_account_id": account_id,
+            "mt5_login": account.get("mt5_login"),
+            "account_size": account.get("account_size") or account.get("start_balance"),
+            "entitlement_reason": "funded_reset_paid",
+            "target_stage": "funded",
+            "message": "Paid Funded reset activated. Account is now waiting for a fresh Funded MT5.",
+        })
+
+    except Exception as e:
+        return _np_fail(e, 500)
 
 
 @app.route("/assign_phase_mt5", methods=["POST"])
