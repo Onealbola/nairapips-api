@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "GLOBAL_PAYOUT_RESET_TO_FIRE_ASSIGNMENT_LINEAGE_2026_09_05"
+NAIRAPIPS_RELEASE = "RESET_WAITING_ONLY_UNRESOLVED_LINEAGE_2026_09_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1253,9 +1253,11 @@ def _pending_reset_replacements_from_accounts(account_rows, trader=None):
     GLOBAL SAFETY RULES:
     - An archived_reset_* row is history.
     - It gets ONE virtual waiting row only while its replacement has not yet been assigned.
-    - Purchase-linked reset: a newer live MT5 on the same purchase consumes the wait.
-    - No-purchase/manual reset: a newer same-stage + same-size live MT5 consumes the wait.
-    - Older reset histories therefore stay history and do not reappear as waiting.
+    - Purchase-linked reset: ANY newer same-stage MT5 on the same purchase consumes the wait,
+      even if that replacement later passed, reset, breached, or was archived.
+    - No-purchase/manual reset: ANY newer same-stage/same-size MT5 consumes the wait.
+    - Only the latest genuinely unresolved reset can remain actionable.
+    - Older completed reset histories stay history and never reappear as waiting.
     """
     rows = list(account_rows or [])
     active_statuses = set(ACTIVE_ACCOUNT_STATUSES) | {
@@ -1307,9 +1309,13 @@ def _pending_reset_replacements_from_accounts(account_rows, trader=None):
         for candidate in rows:
             if str(candidate.get("id") or "").strip() == old_id:
                 continue
-            cstatus = str(candidate.get("account_status") or candidate.get("status") or "").strip().lower()
-            if cstatus not in active_statuses:
-                continue
+
+            # IMPORTANT:
+            # The replacement does NOT have to still be active today.
+            # Once a fresh MT5 was assigned after this reset, this old waiting
+            # obligation was fulfilled forever. If that replacement later became
+            # PASSED / ARCHIVED / RESET / BREACHED, it still proves the old reset
+            # already did its job.
             if not str(candidate.get("mt5_login") or "").strip():
                 continue
 
@@ -1320,9 +1326,7 @@ def _pending_reset_replacements_from_accounts(account_rows, trader=None):
                 or candidate.get("updated_at")
             )
 
-            # A reset can only be consumed by an account proven to have been
-            # assigned AFTER the reset. Unknown/zero timestamps are never allowed
-            # to erase a waiting lifecycle.
+            # Only a proven later MT5 can consume the reset.
             if not old_time or not ctime or ctime <= old_time:
                 continue
 
@@ -1331,20 +1335,15 @@ def _pending_reset_replacements_from_accounts(account_rows, trader=None):
             c_size = clean(candidate.get("account_size") or candidate.get("start_balance") or 0)
 
             if old_purchase:
-                if c_purchase and c_purchase == old_purchase:
+                # Paid/purchase lineage: exact purchase + exact reset stage.
+                if c_purchase == old_purchase and c_stage == old_stage:
                     consumed = True
                     break
             else:
-                # Manual/free/legacy reset lineage has no purchase id.
-                # A newer account of the SAME size at the SAME OR LATER lifecycle
-                # stage consumes an older reset. This prevents completed historical
-                # resets (for example Phase 2 -> later Funded) from reappearing as
-                # fresh waiting accounts, while a truly latest reset still remains
-                # pending until a newer continuation exists.
-                if old_size and c_size and int(old_size) != int(c_size):
+                # Manual/free/legacy lineage: same stage + same account size.
+                if c_stage != old_stage:
                     continue
-                stage_rank = {"phase1": 1, "phase2": 2, "funded": 3}
-                if stage_rank.get(c_stage, 0) < stage_rank.get(old_stage, 0):
+                if old_size and c_size and int(old_size) != int(c_size):
                     continue
                 consumed = True
                 break
