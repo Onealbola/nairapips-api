@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "GLOBAL_PROGRESSION_CONSUMPTION_DIRECT_UPDATE_2026_09_04"
+NAIRAPIPS_RELEASE = "GLOBAL_PAYOUT_RESET_TO_FIRE_ASSIGNMENT_LINEAGE_2026_09_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1387,6 +1387,12 @@ def _reset_assignment_rows_from_accounts(account_rows, traders_by_id=None):
             "trader_id": trader_id,
             "trader_account_id": old_id,
             "completed_account_id": old_id,
+            "source_account_id": old_id,
+            "replaces_trader_account_id": old_id,
+            "previous_trader_account_id": old_id,
+            "purchase_id": wait.get("purchase_id"),
+            "progression_key": f"reset:{old_id}->{stage}",
+            "replacement_required": True,
             "source_type": "reset_replacement",
             "source": "archived_reset_lineage",
             "target_phase": stage,
@@ -4208,8 +4214,24 @@ def trader_current_account(lookup):
         except Exception as all_account_error:
             print("TRADER ALL ACCOUNTS FETCH ERROR:", all_account_error)
             all_accounts = list(active_accounts or [])
-        assignment_queue = _phase_assignment_rows_from_accounts(all_accounts, {str(trader.get("id")): trader})
+        # ACTIONABLE PROGRESSION AUTHORITY:
+        # Normal pass progression and payout/admin-reset replacement use the SAME
+        # exact account-to-account handoff model.
+        #
+        # PASS: archived_phase1/2 -> waiting next -> fresh next-stage MT5
+        # RESET/PAYOUT: archived_reset_<same stage> -> waiting fresh MT5 -> fresh same-stage MT5
+        #
+        # The archived source account is the parent/lineage key. Never create a
+        # new challenge entitlement and never guess by trader name/account size.
+        phase_assignment_queue = _phase_assignment_rows_from_accounts(
+            all_accounts, {str(trader.get("id")): trader}
+        )
         pending_replacements = _pending_reset_replacements_from_accounts(all_accounts, trader)
+        reset_assignment_queue = _reset_assignment_rows_from_accounts(
+            all_accounts, {str(trader.get("id")): trader}
+        )
+        assignment_queue = reset_assignment_queue + phase_assignment_queue
+
         return ok({
             "trader": trader,
             "current_account": account,
@@ -4218,6 +4240,8 @@ def trader_current_account(lookup):
             "all_accounts": all_accounts,
             "pending_replacements": [_trader_safe_account_row(r) for r in pending_replacements],
             "assignment_queue": assignment_queue,
+            "phase_assignment_queue": phase_assignment_queue,
+            "reset_assignment_queue": reset_assignment_queue,
             "challenge_state": trader.get("challenge_state") or "registered"
         })
     except Exception as e:
@@ -7901,11 +7925,14 @@ def assign_phase_mt5():
             or ""
         ).strip()
 
-        # A virtual waiting id is only a wrapper around the exact passed source:
-        # waiting:<source_account_id>:<target_stage>
+        # Virtual waiting ids are wrappers around one exact source account.
+        # Pass progression: waiting:<source_account_id>:<target_stage>
+        # Reset/payout replacement: reset-waiting:<source_account_id>
         if completed_account_id.startswith("waiting:"):
             parts = completed_account_id.split(":")
             completed_account_id = str(parts[1] if len(parts) > 1 else "").strip()
+        elif completed_account_id.startswith("reset-waiting:"):
+            completed_account_id = completed_account_id.split(":", 1)[1].strip()
 
         # Phase 2/Funded progression is never trader-wide. It must be supplied
         # by one exact completed/passed account, just like 2 Lives.
@@ -20585,4 +20612,3 @@ def admin_trader_360():
     except Exception as e:
         print("TRADER 360 ERROR:", e)
         return _np_fail(str(e), 500)
-
