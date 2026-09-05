@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "RESET_WAITING_ONLY_UNRESOLVED_LINEAGE_2026_09_05"
+NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_ENTITLEMENT_AUTHORITY_V1_2026_09_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1166,6 +1166,135 @@ def _reset_waiting_virtual_id(source_account_id):
     return f"reset-waiting:{str(source_account_id or '').strip()}"
 
 
+
+def _np_reset_entitlement_for_source(source, trader=None):
+    """Return the exact authority that allows an archived reset account to receive a fresh MT5.
+
+    GLOBAL ASSIGNMENT LAW:
+    archived_reset_* is HISTORY, not entitlement.
+
+    A replacement is actionable only when one explicit authority exists:
+    - post_payout_renewal: exact funded source has a PAID payout and no open payout;
+    - second_life_free_reset: activated/used Phase-1 Second Life is waiting for MT5;
+    - funded_reset_paid: explicit audited paid-reset marker already recorded by production;
+    - admin_recovery: explicit technical/admin recovery marker.
+
+    Breach, archive status, trader-level waiting status, or owning a 2-Lives product
+    are never sufficient by themselves to create a fresh Funded MT5.
+    """
+    source = source or {}
+    status = str(source.get("account_status") or source.get("status") or "").strip().lower()
+    if not status.startswith("archived_reset"):
+        return {"eligible": False, "reason": "not_reset_source"}
+
+    source_id = str(source.get("id") or "").strip()
+    trader_id = str(source.get("trader_id") or (trader or {}).get("id") or "").strip()
+    stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+    reason_blob = " ".join(
+        str(source.get(k) or "")
+        for k in (
+            "archive_reason", "reset_reason", "admin_note", "message",
+            "lifecycle_state", "account_status"
+        )
+    ).strip().lower()
+
+    # 1) POST-PAYOUT FUNDED RENEWAL — strongest funded replacement authority.
+    if stage == "funded" and source_id and trader_id:
+        try:
+            payout_rows = (
+                supabase.table("payouts")
+                .select("id,status,trader_account_id,paid_at,created_at")
+                .eq("trader_id", trader_id)
+                .eq("trader_account_id", source_id)
+                .order("created_at", desc=True)
+                .limit(30)
+                .execute().data
+                or []
+            )
+            open_states = {
+                "pending", "requested", "submitted", "approved", "processing",
+                "payment_processing", "pending_review", "awaiting_review", "under_review"
+            }
+            paid_rows = [
+                p for p in payout_rows
+                if str(p.get("status") or "").strip().lower() == "paid"
+            ]
+            open_rows = [
+                p for p in payout_rows
+                if str(p.get("status") or "").strip().lower() in open_states
+            ]
+            if paid_rows and not open_rows:
+                p = paid_rows[0]
+                return {
+                    "eligible": True,
+                    "reason": "post_payout_renewal",
+                    "label": "PAYOUT PAID · RENEW FUNDED",
+                    "evidence_id": str(p.get("id") or ""),
+                    "target_stage": "funded",
+                }
+        except Exception as e:
+            print("RESET ENTITLEMENT PAYOUT CHECK ERROR:", source_id, str(e))
+
+    # 2) FREE SECOND LIFE — challenge/Phase 1 only.
+    # Existing Second-Life lifecycle remains authoritative and separate from Funded reset.
+    purchase = None
+    try:
+        purchase = _safe_purchase_for_account(source)
+    except Exception:
+        purchase = None
+    if stage == "phase1" and purchase:
+        sl_enabled = _second_life_bool(purchase.get("second_life_enabled"))
+        sl_used = _second_life_bool(purchase.get("second_life_used"))
+        sl_status = str(purchase.get("second_life_status") or "").strip().lower()
+        if sl_enabled and sl_used and sl_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+            return {
+                "eligible": True,
+                "reason": "second_life_free_reset",
+                "label": "SECOND LIFE · FREE PHASE RESET",
+                "evidence_id": str(purchase.get("id") or ""),
+                "target_stage": "phase1",
+            }
+
+    # 3) Explicit paid funded reset marker.
+    # This is intentionally narrow until a dedicated reset-payment table becomes source of truth.
+    paid_reset_markers = (
+        "funded_reset_paid", "funded reset paid", "paid funded reset",
+        "reset payment approved", "paid reset approved"
+    )
+    if stage == "funded" and any(marker in reason_blob for marker in paid_reset_markers):
+        return {
+            "eligible": True,
+            "reason": "funded_reset_paid",
+            "label": "FUNDED RESET PAID",
+            "evidence_id": source_id,
+            "target_stage": "funded",
+        }
+
+    # 4) Explicit staff recovery. This is an intentional administrative grant,
+    # not an automatic benefit caused by breach/archive status.
+    recovery_markers = (
+        "technical_issue", "technical issue",
+        "operator_error", "operator error",
+        "admin_decision", "admin decision",
+        "approved recovery", "technical recovery"
+    )
+    if any(marker in reason_blob for marker in recovery_markers):
+        return {
+            "eligible": True,
+            "reason": "admin_recovery",
+            "label": "ADMIN RECOVERY APPROVED",
+            "evidence_id": source_id,
+            "target_stage": stage,
+        }
+
+    return {
+        "eligible": False,
+        "reason": "no_verified_replacement_entitlement",
+        "label": "NO VERIFIED REPLACEMENT ENTITLEMENT",
+        "target_stage": stage,
+    }
+
+
 def _reset_waiting_row_from_archive(source, trader=None):
     """Build a DISPLAY/ASSIGNMENT waiting row from one exact archived reset account.
 
@@ -1294,6 +1423,11 @@ def _pending_reset_replacements_from_accounts(account_rows, trader=None):
 
     waiting = []
     for old in filtered_reset_rows:
+        entitlement = _np_reset_entitlement_for_source(old, trader)
+        if not entitlement.get("eligible"):
+            # Historical reset/breach rows do NOT create account liability by themselves.
+            continue
+
         old_id = str(old.get("id") or "").strip()
         old_stage = _normalize_lifecycle_stage(old.get("stage") or old.get("phase"))
         old_purchase = str(old.get("purchase_id") or old.get("challenge_purchase_id") or "").strip()
@@ -1353,6 +1487,11 @@ def _pending_reset_replacements_from_accounts(account_rows, trader=None):
 
         virtual = _reset_waiting_row_from_archive(old, trader)
         if virtual:
+            virtual["entitlement_verified"] = True
+            virtual["entitlement_reason"] = entitlement.get("reason")
+            virtual["entitlement_label"] = entitlement.get("label")
+            virtual["entitlement_evidence_id"] = entitlement.get("evidence_id")
+            virtual["assignment_reason"] = entitlement.get("reason")
             waiting.append(virtual)
 
     # One exact source-account lineage = one waiting row.
@@ -1393,7 +1532,11 @@ def _reset_assignment_rows_from_accounts(account_rows, traders_by_id=None):
             "progression_key": f"reset:{old_id}->{stage}",
             "replacement_required": True,
             "source_type": "reset_replacement",
-            "source": "archived_reset_lineage",
+            "source": "verified_reset_entitlement",
+            "entitlement_verified": True,
+            "entitlement_reason": wait.get("entitlement_reason"),
+            "entitlement_label": wait.get("entitlement_label"),
+            "entitlement_evidence_id": wait.get("entitlement_evidence_id"),
             "target_phase": stage,
             "target_stage": stage,
             "current_phase": stage,
@@ -7968,6 +8111,15 @@ def assign_phase_mt5():
                     )
 
             if reset_replacement:
+                entitlement = _np_reset_entitlement_for_source(completed_account, trader)
+                if not entitlement.get("eligible"):
+                    return bad(
+                        "Replacement assignment blocked: this archived/reset account has no "
+                        "verified unconsumed MT5 entitlement. Breach/archive status alone does "
+                        "not create a fresh account entitlement.",
+                        409
+                    )
+
                 # RESET means same stage, fresh MT5. Never turn a Phase 1 reset
                 # into Phase 2, or a Funded reset into a challenge account.
                 if target_stage != completed_stage:
@@ -20611,3 +20763,4 @@ def admin_trader_360():
     except Exception as e:
         print("TRADER 360 ERROR:", e)
         return _np_fail(str(e), 500)
+
