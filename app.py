@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_AUTHORITY_V4_PERSISTENT_CLASS_2026_09_06"
+NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_AUTHORITY_V5_PERMANENT_PASS_CONSUMPTION_2026_09_06"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -3893,52 +3893,40 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
     active_accounts_by_trader = active_accounts_by_trader or {}
     seen = set()
     active_statuses = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"}
-    def has_target_active(source_account, target_stage):
-        """
-        Exact progression authority.
-
-        One passed account creates one waiting-next obligation. Another active
-        account owned by the same trader must never consume it.
-
-        Progression is considered consumed only when an active target-stage
-        account belongs to the SAME purchase lineage as the passed source.
-        """
+    def has_target_consumed(source_account, target_stage):
+        """One passed source is permanently consumed by any later target-stage MT5 on the same purchase."""
         source_account = source_account or {}
+        source_id = str(source_account.get("id") or "").strip()
         trader_id = str(source_account.get("trader_id") or "").strip()
-        source_purchase = str(
-            source_account.get("purchase_id")
-            or source_account.get("challenge_purchase_id")
-            or ""
-        ).strip()
-        if not trader_id:
+        source_purchase = str(source_account.get("purchase_id") or source_account.get("challenge_purchase_id") or "").strip()
+        source_time = _dt_score(
+            source_account.get("passed_at") or source_account.get("archived_at")
+            or source_account.get("updated_at") or source_account.get("created_at")
+        )
+        if not trader_id or not source_purchase:
             return False
 
-        active_rows = active_accounts_by_trader.get(trader_id, [])
-        for row in active_rows:
-            status = str(row.get("account_status") or row.get("status") or "").strip().lower()
-            stage = str(row.get("stage") or row.get("phase") or "").strip().lower()
-            login = str(row.get("mt5_login") or "").strip()
-            if status not in active_statuses or not login:
+        for row in accounts or []:
+            if str(row.get("id") or "").strip() == source_id:
+                continue
+            if str(row.get("trader_id") or "").strip() != trader_id:
+                continue
+            if str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip() != source_purchase:
+                continue
+            if not str(row.get("mt5_login") or "").strip():
                 continue
 
-            row_purchase = str(
-                row.get("purchase_id")
-                or row.get("challenge_purchase_id")
-                or ""
-            ).strip()
-
-            # Never use trader-wide or same-size inference as progression proof.
-            if source_purchase:
-                if not row_purchase or row_purchase != source_purchase:
-                    continue
-            else:
-                # Legacy/manual rows without exact lineage cannot safely be
-                # auto-consumed by another account.
+            row_time = _dt_score(
+                row.get("assigned_at") or row.get("started_at")
+                or row.get("created_at") or row.get("updated_at")
+            )
+            if source_time and row_time and row_time <= source_time:
                 continue
 
-            if target_stage == "phase2" and stage in {"phase2", "funded", "live"}:
+            row_stage = _normalize_lifecycle_stage(row.get("stage") or row.get("phase"))
+            if target_stage == "phase2" and row_stage in {"phase2", "funded"}:
                 return True
-            if target_stage == "funded" and stage in {"funded", "live"}:
+            if target_stage == "funded" and row_stage == "funded":
                 return True
         return False
     for acc in accounts or []:
@@ -3964,7 +3952,7 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
             target_stage = acc.get("next_stage") or _next_stage_for_lifecycle(passed_stage, acc, None, None, trader)
             if not target_stage:
                 continue
-            if has_target_active(acc, target_stage):
+            if has_target_consumed(acc, target_stage):
                 continue
             rows.append({
                 "id": trader.get("id") or trader_id,
@@ -21088,3 +21076,4 @@ def admin_trader_360():
     except Exception as e:
         print("TRADER 360 ERROR:", e)
         return _np_fail(str(e), 500)
+
