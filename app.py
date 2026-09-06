@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_AUTHORITY_V5_PERMANENT_PASS_CONSUMPTION_2026_09_06"
+NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_AUTHORITY_V6_RECALL_TERMINAL_2026_09_06"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -3935,6 +3935,16 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
             pass_status = str(acc.get("phase_pass_status") or "").strip().lower()
             risk = str(acc.get("risk_zone") or acc.get("display_risk_zone") or "").strip().lower()
             stage = str(acc.get("stage") or "").strip().lower()
+            terminal_blob = " ".join(str(acc.get(k) or "") for k in (
+                "account_status", "status", "archive_reason", "admin_note",
+                "message", "phase_pass_status", "risk_zone"
+            )).lower()
+            if (
+                "wrong_assignment_recalled" in terminal_blob
+                or "recalled_wrong_assignment" in terminal_blob
+                or "np_terminal:recalled_wrong_assignment" in terminal_blob
+            ):
+                continue
             if status not in {"archived_phase1", "archived_phase2"}:
                 continue
             phase1_passed = status == "archived_phase1" and (pass_status == "phase1_passed" or risk == "passed" or stage == "phase1")
@@ -15147,7 +15157,17 @@ def _np_sync_recent(row, days=45):
     return False
 
 def _np_sync_terminal(row):
-    blob = " ".join(_np_sync_lower((row or {}).get(k)) for k in ["status", "account_status", "phase", "stage", "payment_status", "risk_zone", "phase_pass_status", "admin_note"])
+    blob = " ".join(_np_sync_lower((row or {}).get(k)) for k in [
+        "status", "account_status", "phase", "stage", "payment_status",
+        "risk_zone", "phase_pass_status", "admin_note", "archive_reason",
+        "breach_reason", "message"
+    ])
+    if (
+        "wrong_assignment_recalled" in blob
+        or "recalled_wrong_assignment" in blob
+        or "np_terminal_recalled_wrong_assignment" in blob
+    ):
+        return True
     return any(w in blob for w in NP_TERMINAL_ACCOUNT_WORDS)
 
 def _np_sync_active_signal(row):
@@ -20690,6 +20710,12 @@ def _np_ops_is_passed(a):
     text = " ".join(str(a.get(k) or "") for k in (
         "account_status", "status", "phase_pass_status", "archive_reason", "admin_note"
     )).lower()
+    if (
+        "wrong_assignment_recalled" in text
+        or "recalled_wrong_assignment" in text
+        or "np_terminal:recalled_wrong_assignment" in text
+    ):
+        return False
     return (not _np_ops_is_breached(a)) and (
         bool(a.get("passed_at"))
         or "passed" in text
