@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_ENTITLEMENT_AUTHORITY_V3_2026_09_05"
+NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_AUTHORITY_V4_PERSISTENT_CLASS_2026_09_06"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -3134,9 +3134,18 @@ def admin_reset_trader_account():
                     str(p.get("status") or "").strip().lower() in open_payout_states
                     for p in exact_payouts
                 )
-                paid_payout_reset_ok = bool(has_paid_payout and not has_open_payout)
-                if paid_payout_reset_ok:
-                    paid_payout_reset_id = str(paid_matches[0].get("id") or "").strip()
+                _reason_blob = str(account.get("archive_reason") or "")
+                _marker_match = re.search(r"\[NP_PAYOUT_PAID:([^\]]+)\]", _reason_blob, re.I)
+                if _marker_match:
+                    _marker_pid = str(_marker_match.group(1) or "").strip()
+                    _marker_paid = next((p for p in paid_matches if str(p.get("id") or "").strip() == _marker_pid), None)
+                    paid_payout_reset_ok = bool(_marker_paid and not has_open_payout)
+                    if paid_payout_reset_ok:
+                        paid_payout_reset_id = _marker_pid
+                else:
+                    paid_payout_reset_ok = bool(has_paid_payout and not has_open_payout)
+                    if paid_payout_reset_ok:
+                        paid_payout_reset_id = str(paid_matches[0].get("id") or "").strip()
             except Exception as e:
                 print("POST-PAYOUT RESET ELIGIBILITY CHECK ERROR:", e)
                 paid_payout_reset_ok = False
@@ -9430,14 +9439,25 @@ def mark_paid():
         if payout_status(payout) != "approved":
             return bad("Only approved payouts can be marked paid",409)
         note = d.get("admin_note","")
-        result = supabase.table("payouts").update({"status":"paid","paid_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+        _paid_now = now_iso()
+        result = supabase.table("payouts").update({
+            "status":"paid","paid_at":_paid_now,"admin_note":note
+        }).eq("id",pid).execute().data
         try:
-            if payout.get("trader_account_id"):
+            _paid_account_id = str(payout.get("trader_account_id") or "").strip()
+            if _paid_account_id:
+                _rows = supabase.table("trader_accounts").select("id,archive_reason").eq("id", _paid_account_id).limit(1).execute().data or []
+                _old_reason = str((_rows[0] if _rows else {}).get("archive_reason") or "").strip()
+                _marker = f"[NP_PAYOUT_PAID:{pid}]"
+                _new_reason = _old_reason if _marker.lower() in _old_reason.lower() else (f"{_old_reason} | {_marker}".strip(" |") if _old_reason else _marker)
                 supabase.table("trader_accounts").update({
-                    "status": "payment_processing", "monitoring_enabled": True, "updated_at": now_iso()
-                }).eq("id", payout.get("trader_account_id")).execute()
+                    "status":"payment_processing",
+                    "monitoring_enabled":True,
+                    "archive_reason":_new_reason,
+                    "updated_at":_paid_now
+                }).eq("id", _paid_account_id).execute()
         except Exception as e:
-            print("PAID PAYOUT LOCK STATE UPDATE:", e)
+            print("PAID PAYOUT AUTHORITY STAMP ERROR:", e)
 
         # Certificate availability follows the existing production authority:
         # only an APPROVED payout that has now been successfully marked PAID earns it.
@@ -21068,4 +21088,3 @@ def admin_trader_360():
     except Exception as e:
         print("TRADER 360 ERROR:", e)
         return _np_fail(str(e), 500)
-
