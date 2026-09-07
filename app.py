@@ -21152,3 +21152,275 @@ def admin_trader_360():
         print("TRADER 360 ERROR:", e)
         return _np_fail(str(e), 500)
 
+# ============================================================
+# NAIRAPIPS TRADER RESET RECOVERY AUTHORITY — 2026-09-07
+# Read-only classification + request intake. This layer NEVER assigns MT5,
+# NEVER creates an entitlement, and NEVER confirms payment.
+# ============================================================
+def _np_reset_recovery_public_opportunity(trader_id):
+    trader_id = str(trader_id or "").strip()
+    if not trader_id:
+        return None
+    trader = get_trader_by_id(trader_id) or {}
+    accounts = (
+        supabase.table("trader_accounts")
+        .select("*")
+        .eq("trader_id", trader_id)
+        .order("updated_at", desc=True)
+        .limit(200)
+        .execute().data
+        or []
+    )
+    purchases = (
+        supabase.table("challenge_purchases")
+        .select("*")
+        .eq("trader_id", trader_id)
+        .order("created_at", desc=True)
+        .limit(100)
+        .execute().data
+        or []
+    )
+    purchase_by_id = {str(p.get("id") or ""): p for p in purchases if p.get("id")}
+
+    # 1) Existing explicit replacement entitlements / waiting states outrank a breach offer.
+    reset_waiting = []
+    for a in accounts:
+        st = str(a.get("account_status") or a.get("status") or "").strip().lower()
+        if st.startswith("archived_reset"):
+            entitlement = _np_reset_entitlement_for_source(a, trader)
+            if entitlement.get("eligible"):
+                reset_waiting.append((a, entitlement))
+    if reset_waiting:
+        a, ent = reset_waiting[0]
+        stage = _normalize_lifecycle_stage(a.get("stage") or a.get("phase"))
+        return {
+            "kind": "waiting",
+            "title": "Reset Confirmed — Fresh MT5 Pending",
+            "subtitle": "Your reset entitlement is already verified. No second payment or duplicate reset request is needed.",
+            "stage": stage,
+            "account_size": clean(a.get("account_size") or a.get("start_balance") or 0),
+            "source_account_id": a.get("id"),
+            "source_mt5_login": a.get("mt5_login"),
+            "purchase_id": a.get("purchase_id") or a.get("challenge_purchase_id"),
+            "entitlement_reason": ent.get("reason"),
+            "action": "waiting_mt5",
+        }
+
+    # 2) Second Life is purchase-snapshot authority. Legacy accounts are untouched.
+    for p in purchases:
+        if not _second_life_bool(p.get("second_life_enabled")):
+            continue
+        status = _second_life_status_payload(p, trader_id)
+        if status.get("eligible_now") and not status.get("used"):
+            source_id = status.get("breached_account_id")
+            source = next((a for a in accounts if str(a.get("id") or "") == str(source_id or "")), {})
+            return {
+                "kind": "free_second_life",
+                "title": "Your Second Life Is Ready",
+                "subtitle": "Life 1 is closed, but this challenge includes one free Life 2. Activate it and continue without buying another challenge.",
+                "stage": "phase1",
+                "account_size": clean(p.get("account_size") or source.get("account_size") or source.get("start_balance") or 0),
+                "source_account_id": source_id,
+                "source_mt5_login": source.get("mt5_login"),
+                "purchase_id": p.get("id"),
+                "action": "activate_second_life",
+                "price_mode": "included_free",
+            }
+        sl_status = str(p.get("second_life_status") or "").strip().lower()
+        if _second_life_bool(p.get("second_life_used")) and sl_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+            return {
+                "kind": "waiting",
+                "title": "Second Life Activated",
+                "subtitle": "Your free Life 2 is active and a fresh Phase 1 MT5 is waiting for assignment.",
+                "stage": "phase1",
+                "account_size": clean(p.get("account_size") or 0),
+                "purchase_id": p.get("id"),
+                "action": "waiting_mt5",
+                "price_mode": "included_free",
+            }
+
+    # 3) Latest real breached account becomes the candidate recovery source.
+    breached = []
+    for a in accounts:
+        try:
+            is_breach = bool(_np_account_has_breach_evidence(a))
+        except Exception:
+            blob = " ".join(str(a.get(k) or "") for k in ("account_status","status","risk_zone","archive_reason","breach_reason")).lower()
+            is_breach = "breach" in blob
+        if is_breach:
+            breached.append(a)
+    if not breached:
+        return None
+    breached.sort(key=lambda a: _dt_score(a.get("breach_at") or a.get("breached_at") or a.get("updated_at") or a.get("created_at")), reverse=True)
+    a = breached[0]
+    stage = _normalize_lifecycle_stage(a.get("stage") or a.get("phase"))
+    pid = str(a.get("purchase_id") or a.get("challenge_purchase_id") or "").strip()
+    p = purchase_by_id.get(pid, {})
+
+    # 2-Lives Life 2 breach is terminal for that purchase. Do not manufacture Life 3.
+    if p and _second_life_bool(p.get("second_life_enabled")) and _second_life_bool(p.get("second_life_used")):
+        try:
+            life_number = int(p.get("life_number") or 1)
+        except Exception:
+            life_number = 1
+        if life_number >= 2:
+            return {
+                "kind": "terminal",
+                "title": "Both Challenge Lives Have Been Used",
+                "subtitle": "This 2-Lives cycle is complete. A third free life cannot be created from this purchase; start a fresh challenge when you are ready.",
+                "stage": "phase1",
+                "account_size": clean(a.get("account_size") or a.get("start_balance") or p.get("account_size") or 0),
+                "source_account_id": a.get("id"),
+                "source_mt5_login": a.get("mt5_login"),
+                "purchase_id": pid,
+                "action": "new_challenge",
+            }
+
+    kind = "paid_funded" if stage == "funded" else "paid_challenge"
+    return {
+        "kind": kind,
+        "title": "Protect Your Funded Journey" if stage == "funded" else "This Breach Does Not Have To Be The End",
+        "subtitle": (
+            "Request a Funded Reset review. Your exact breached account and payment must be verified before a fresh Funded MT5 can be assigned."
+            if stage == "funded" else
+            "Request an account reset review. Your exact breached account and applicable reset payment must be verified before a fresh same-stage MT5 can be assigned."
+        ),
+        "stage": stage,
+        "account_size": clean(a.get("account_size") or a.get("start_balance") or p.get("account_size") or 0),
+        "source_account_id": a.get("id"),
+        "source_mt5_login": a.get("mt5_login"),
+        "purchase_id": pid,
+        "action": "request_paid_reset",
+        "price_mode": "admin_confirmed",
+    }
+
+
+@app.route("/trader_reset_opportunities", methods=["GET", "OPTIONS"])
+def trader_reset_opportunities():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    requested = str(request.args.get("trader_id") or "").strip()
+    authed_id, auth_error = _authenticated_trader_id_for_request(requested or None)
+    if auth_error:
+        return _np_fail(auth_error, 401)
+    try:
+        opportunity = _np_reset_recovery_public_opportunity(authed_id)
+        return _np_ok({"success": True, "opportunity": opportunity})
+    except Exception as e:
+        print("TRADER RESET OPPORTUNITY ERROR:", e)
+        return _np_fail(e, 500)
+
+
+@app.route("/trader_reset_request", methods=["POST", "OPTIONS"])
+def trader_reset_request():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    d = request.get_json(silent=True) or {}
+    requested_trader_id = str(d.get("trader_id") or "").strip()
+    authed_id, auth_error = _authenticated_trader_id_for_request(requested_trader_id or None)
+    if auth_error:
+        return _np_fail(auth_error, 401)
+    account_id = str(d.get("trader_account_id") or d.get("account_id") or "").strip()
+    if not account_id:
+        return _np_fail("Exact breached trader_account_id is required.", 400)
+    try:
+        trader = get_trader_by_id(authed_id) or {}
+        rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("id", account_id)
+            .eq("trader_id", authed_id)
+            .limit(1)
+            .execute().data
+            or []
+        )
+        if not rows:
+            return _np_fail("This account was not found in your NairaPips account history.", 404)
+        account = rows[0]
+        try:
+            has_breach = bool(_np_account_has_breach_evidence(account))
+        except Exception:
+            has_breach = "breach" in " ".join(str(account.get(k) or "") for k in ("account_status","status","risk_zone","archive_reason","breach_reason")).lower()
+        if not has_breach:
+            return _np_fail("Reset request blocked: this exact account is not recorded as breached.", 409)
+
+        opportunity = _np_reset_recovery_public_opportunity(authed_id)
+        if not opportunity or str(opportunity.get("source_account_id") or "") != account_id:
+            return _np_fail("This account does not currently have an actionable reset opportunity.", 409)
+        kind = str(opportunity.get("kind") or "")
+        if kind == "free_second_life":
+            return _np_fail("This account includes a FREE Second Life. Use Activate Free Second Life instead of paying for a reset.", 409)
+        if kind == "terminal":
+            return _np_fail("Both free lives for this purchase have been used. Start a new challenge instead.", 409)
+        if kind == "waiting":
+            return _np_ok({"success": True, "message": "Your reset is already confirmed and waiting for fresh MT5 assignment.", "idempotent": True})
+        if kind not in {"paid_funded", "paid_challenge"}:
+            return _np_fail("No paid reset request is available for this account.", 409)
+
+        stage = _normalize_lifecycle_stage(account.get("stage") or account.get("phase"))
+        mt5 = str(account.get("mt5_login") or "").strip()
+        subject = f"RESET REQUEST · {stage.upper()} · MT5 {mt5 or 'N/A'} · {account_id}"
+
+        # Idempotent intake: an open request for this exact account remains the one request.
+        existing = (
+            supabase.table("support_tickets")
+            .select("*")
+            .eq("trader_id", authed_id)
+            .eq("status", "open")
+            .order("created_at", desc=True)
+            .limit(100)
+            .execute().data
+            or []
+        )
+        duplicate = next((x for x in existing if account_id in str(x.get("subject") or "")), None)
+        if duplicate:
+            return _np_ok({"success": True, "message": "Your reset request is already open. NairaPips will contact you with the payment/next-step confirmation.", "ticket": duplicate, "idempotent": True})
+
+        now = now_iso()
+        account_size = clean(account.get("account_size") or account.get("start_balance") or 0)
+        row = {
+            "trader_id": authed_id,
+            "trader_account_id": account_id,
+            "mt5_login": mt5,
+            "account_label": f"{stage.upper()} · {email_money(account_size)}",
+            "trader_name": trader.get("name") or "",
+            "email": trader.get("email") or "",
+            "phone": trader.get("phone") or "",
+            "subject": subject,
+            "message": (
+                f"Trader requested a {'Funded' if stage == 'funded' else stage.upper()} account reset from the Trader Dashboard.\n"
+                f"Exact account ID: {account_id}\nMT5: {mt5 or 'N/A'}\nAccount size: {email_money(account_size)}\n"
+                "Payment has NOT been confirmed by this request. Verify the reset class and applicable fee, then use the existing admin payment-confirmation/reset flow."
+            ),
+            "status": "open",
+            "priority": "high",
+            "admin_reply": "",
+            "created_at": now,
+            "last_updated_at": now,
+        }
+        try:
+            created = supabase.table("support_tickets").insert(row).execute().data or [row]
+        except Exception as insert_error:
+            safe_row = dict(row)
+            for optional_key in ("trader_account_id", "mt5_login", "account_label"):
+                safe_row.pop(optional_key, None)
+            created = supabase.table("support_tickets").insert(safe_row).execute().data or [safe_row]
+
+        send_admin_alert(
+            "NairaPips Reset Opportunity Request",
+            f"Trader: {trader.get('name') or 'Trader'}\nEmail: {trader.get('email') or ''}\nPhone: {trader.get('phone') or ''}\nStage: {stage.upper()}\nMT5: {mt5 or 'N/A'}\nAccount size: {email_money(account_size)}\nAccount ID: {account_id}\n\nPAYMENT IS NOT YET CONFIRMED. Verify fee/payment before activating any reset entitlement."
+        )
+        try:
+            send_email_brevo(
+                trader.get("email"),
+                "Your NairaPips Reset Opportunity Request",
+                f"Hello {trader.get('name') or 'Trader'},\n\nWe received your reset request for MT5 {mt5 or 'N/A'} ({stage.upper()}). Your request is now under reset review.\n\nYou do not need Telegram to continue this process. NairaPips will confirm the applicable payment/next step directly through your registered contact details.\n\nImportant: a reset request does not issue a new MT5 until the exact account and payment/entitlement have been verified.\n\nNairaPips\nRewarding Nigerian Traders. Changing Trading Stories."
+            )
+        except Exception as email_error:
+            print("RESET REQUEST TRADER EMAIL ERROR:", email_error)
+
+        _audit_safe("support_tickets", "trader_reset_requested", f"account={account_id} mt5={mt5} kind={kind}", {"trader_id": authed_id})
+        return _np_ok({"success": True, "message": "Reset request received. You no longer need Telegram for this step — NairaPips will confirm payment/next steps through your registered contact details.", "ticket": created[0] if created else row})
+    except Exception as e:
+        print("TRADER RESET REQUEST ERROR:", e)
+        return _np_fail(e, 500)
