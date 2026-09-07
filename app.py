@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_AUTHORITY_V6_RECALL_TERMINAL_2026_09_06"
+NAIRAPIPS_RELEASE = "MT5_ASSIGNMENT_AUTHORITY_V9_CONSUMED_PASS_USES_ACTIVE_ACCOUNTS_2026_09_07"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -3894,40 +3894,89 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
     seen = set()
     active_statuses = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"}
     def has_target_consumed(source_account, target_stage):
-        """One passed source is permanently consumed by any later target-stage MT5 on the same purchase."""
+        """
+        One passed source is permanently consumed once a genuine later-stage
+        live MT5 exists.
+
+        Exact purchase lineage is used when available. For legacy rows that lost
+        purchase linkage, same trader + same account size + later live stage is
+        the conservative fallback.
+        """
         source_account = source_account or {}
         source_id = str(source_account.get("id") or "").strip()
         trader_id = str(source_account.get("trader_id") or "").strip()
-        source_purchase = str(source_account.get("purchase_id") or source_account.get("challenge_purchase_id") or "").strip()
-        source_time = _dt_score(
-            source_account.get("passed_at") or source_account.get("archived_at")
-            or source_account.get("updated_at") or source_account.get("created_at")
+        source_purchase = str(
+            source_account.get("purchase_id")
+            or source_account.get("challenge_purchase_id")
+            or ""
+        ).strip()
+        source_size = _np_number(
+            source_account.get("account_size")
+            or source_account.get("start_balance"), 0
         )
-        if not trader_id or not source_purchase:
+
+        if not trader_id:
             return False
 
+        candidates = list(active_accounts_by_trader.get(trader_id, []) or [])
+
+        # Also include any matching rows already present in the supplied set.
         for row in accounts or []:
-            if str(row.get("id") or "").strip() == source_id:
+            if str(row.get("trader_id") or "").strip() == trader_id:
+                candidates.append(row)
+
+        seen_child = set()
+        for row in candidates:
+            row_id = str(row.get("id") or "").strip()
+            if row_id == source_id or (row_id and row_id in seen_child):
                 continue
-            if str(row.get("trader_id") or "").strip() != trader_id:
-                continue
-            if str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip() != source_purchase:
-                continue
+            if row_id:
+                seen_child.add(row_id)
+
             if not str(row.get("mt5_login") or "").strip():
                 continue
 
-            row_time = _dt_score(
-                row.get("assigned_at") or row.get("started_at")
-                or row.get("created_at") or row.get("updated_at")
-            )
-            if source_time and row_time and row_time <= source_time:
+            row_status = str(
+                row.get("account_status") or row.get("status") or ""
+            ).strip().lower()
+            blob = " ".join(str(row.get(k) or "") for k in (
+                "account_status","status","risk_zone",
+                "archive_reason","breach_reason"
+            )).lower()
+
+            if (
+                row_status == "archived"
+                or row_status.startswith("archived_")
+                or "breach" in blob
+                or "reset" in blob
+                or "recalled" in blob
+            ):
                 continue
 
-            row_stage = _normalize_lifecycle_stage(row.get("stage") or row.get("phase"))
+            row_purchase = str(
+                row.get("purchase_id")
+                or row.get("challenge_purchase_id")
+                or ""
+            ).strip()
+
+            if source_purchase and row_purchase and row_purchase != source_purchase:
+                continue
+
+            row_size = _np_number(
+                row.get("account_size") or row.get("start_balance"), 0
+            )
+            if source_size > 0 and row_size > 0 and abs(row_size - source_size) > 0.01:
+                continue
+
+            row_stage = _normalize_lifecycle_stage(
+                row.get("stage") or row.get("phase")
+            )
+
             if target_stage == "phase2" and row_stage in {"phase2", "funded"}:
                 return True
             if target_stage == "funded" and row_stage == "funded":
                 return True
+
         return False
     for acc in accounts or []:
         try:
@@ -4011,7 +4060,7 @@ def _fetch_phase_assignment_queue():
         except Exception as e:
             print("PHASE QUEUE TRADER FETCH ERROR:", e)
         try:
-            active_rows = supabase.table("trader_accounts").select("id,trader_id,purchase_id,stage,phase,account_status,status,mt5_login").in_("trader_id", trader_ids).in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"]).limit(3000).execute().data or []
+            active_rows = supabase.table("trader_accounts").select("id,trader_id,purchase_id,stage,phase,account_status,status,mt5_login,account_size,start_balance").in_("trader_id", trader_ids).in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"]).limit(3000).execute().data or []
             for row in active_rows:
                 tid = str(row.get("trader_id") or "").strip()
                 if tid:
