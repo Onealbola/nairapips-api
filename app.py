@@ -7324,16 +7324,24 @@ def _second_life_status_payload(purchase, trader_id=None):
             active_phase1_candidates = []
             for a in rows:
                 ast = str(a.get("account_status") or a.get("status") or "").lower()
-                stage = _normalize_lifecycle_stage(a.get("stage") or a.get("phase"))
+                stage = _normalize_lifecycle_stage(a.get("stage") or a.get("phase") or a.get("phase_label"))
                 if stage != "phase1":
                     continue
+                try:
+                    has_breach_evidence = bool(_np_account_has_breach_evidence(a))
+                except Exception:
+                    breach_blob = " ".join(str(a.get(k) or "") for k in (
+                        "account_status", "status", "risk_zone", "breach_reason",
+                        "archive_reason", "breach_at", "breached_at"
+                    )).lower()
+                    has_breach_evidence = "breach" in breach_blob
                 if (
                     ast in {"assigned_active", "active", "current_active", "phase1_active", "approved_active"}
                     and str(a.get("mt5_login") or "").strip()
-                    and "breach" not in ast
+                    and not has_breach_evidence
                 ):
                     active_phase1_candidates.append(a)
-                if "breach" in ast:
+                if has_breach_evidence:
                     eligible = True
                     breached_account = a
                     # Do not break: we still need to detect a later accidental active
