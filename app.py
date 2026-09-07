@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V9_TWO_MT5_POOLS_PHASE_FUNDED_2026_09_07"
+NAIRAPIPS_RELEASE = "V9_RESET_AUTHORITY_TWO_POOLS_PRODUCTION_2026_09_07"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -7300,18 +7300,45 @@ def _second_life_status_payload(purchase, trader_id=None):
     breached_account = None
     if enabled and not used:
         try:
-            q = supabase.table("trader_accounts").select("*").eq("purchase_id", p.get("id")).eq("trader_id", trader_id or p.get("trader_id")).order("created_at", desc=True).limit(50)
-            rows = q.execute().data or []
+            # SECOND LIFE LINEAGE AUTHORITY — both historical linkage columns are valid.
+            # Older/legacy rows may carry challenge_purchase_id while newer rows use purchase_id.
+            # Admin and Trader UI already understand both; activation must use the same law.
+            _pid = str(p.get("id") or "").strip()
+            _tid = str(trader_id or p.get("trader_id") or "").strip()
+            rows = []
+            seen_ids = set()
+            for _col in ("purchase_id", "challenge_purchase_id"):
+                try:
+                    _q = (supabase.table("trader_accounts").select("*")
+                          .eq(_col, _pid).eq("trader_id", _tid)
+                          .order("created_at", desc=True).limit(50))
+                    for _a in (_q.execute().data or []):
+                        _aid = str(_a.get("id") or "")
+                        if _aid and _aid not in seen_ids:
+                            seen_ids.add(_aid)
+                            rows.append(_a)
+                except Exception as _link_exc:
+                    print(f"SECOND LIFE STATUS LINK LOOKUP SKIP {_col}:", _link_exc)
+            rows.sort(key=lambda _a: str(_a.get("created_at") or _a.get("updated_at") or ""), reverse=True)
             admin_correction = status == "available_on_admin_correction"
+            active_phase1_candidates = []
             for a in rows:
                 ast = str(a.get("account_status") or a.get("status") or "").lower()
                 stage = _normalize_lifecycle_stage(a.get("stage") or a.get("phase"))
                 if stage != "phase1":
                     continue
+                if (
+                    ast in {"assigned_active", "active", "current_active", "phase1_active", "approved_active"}
+                    and str(a.get("mt5_login") or "").strip()
+                    and "breach" not in ast
+                ):
+                    active_phase1_candidates.append(a)
                 if "breach" in ast:
                     eligible = True
                     breached_account = a
-                    break
+                    # Do not break: we still need to detect a later accidental active
+                    # Phase-1 assignment on the same purchase so activation can adopt
+                    # it as Life 2 instead of issuing a third account.
                 # Narrow exception for a staff-corrected lifecycle error where the
                 # database safety trigger refuses a false BREACHED label because
                 # current equity is above the breach level. The purchase status,
@@ -7340,6 +7367,10 @@ def _second_life_status_payload(purchase, trader_id=None):
         "admin_correction": bool(status == "available_on_admin_correction"),
         "eligible_now": bool(eligible),
         "breached_account_id": (breached_account or {}).get("id"),
+        "breached_at": (breached_account or {}).get("breach_at") or (breached_account or {}).get("breached_at") or (breached_account or {}).get("archived_at"),
+        "existing_active_phase1_id": (active_phase1_candidates[0] if 'active_phase1_candidates' in locals() and active_phase1_candidates else {}).get("id"),
+        "existing_active_phase1_mt5": (active_phase1_candidates[0] if 'active_phase1_candidates' in locals() and active_phase1_candidates else {}).get("mt5_login"),
+        "active_phase1_candidate_count": len(active_phase1_candidates) if 'active_phase1_candidates' in locals() else 0,
         "activated_at": p.get("second_life_activated_at"),
     }
 
@@ -7621,6 +7652,89 @@ def second_life_status():
 
 
 
+def _np_adopt_existing_phase1_as_second_life(purchase, trader_id, status, actor=None):
+    """Adopt one already-assigned fresh Phase-1 account as Life 2.
+
+    This is a narrow recovery for an accidental ordinary Purchase Approval that
+    happened AFTER Life 1 breached but BEFORE Second Life was activated. It never
+    creates an MT5 and never resurrects history. More than one active candidate is
+    treated as a contradiction and must be reviewed manually.
+    """
+    p = purchase or {}
+    candidate_id = str((status or {}).get("existing_active_phase1_id") or "").strip()
+    source_id = str((status or {}).get("breached_account_id") or "").strip()
+    candidate_count = int((status or {}).get("active_phase1_candidate_count") or 0)
+    if not candidate_id:
+        return None
+    if candidate_count != 1:
+        raise ValueError("Second Life repair blocked: multiple active Phase 1 accounts exist for this purchase. Review lineage before activation.")
+    rows = (supabase.table("trader_accounts").select("*")
+            .eq("id", candidate_id).eq("trader_id", trader_id).limit(1).execute().data or [])
+    if not rows:
+        raise ValueError("Second Life repair candidate was not found")
+    candidate = rows[0]
+    cstage = _normalize_lifecycle_stage(candidate.get("stage") or candidate.get("phase"))
+    cstatus = str(candidate.get("account_status") or candidate.get("status") or "").strip().lower()
+    if cstage != "phase1" or cstatus not in {"assigned_active", "active", "current_active", "phase1_active", "approved_active"}:
+        raise ValueError("Second Life repair candidate is not a clean active Phase 1 account")
+    if not str(candidate.get("mt5_login") or "").strip():
+        raise ValueError("Second Life repair candidate has no MT5 login")
+    linked_pid = str(candidate.get("purchase_id") or candidate.get("challenge_purchase_id") or "").strip()
+    if linked_pid != str(p.get("id") or "").strip():
+        raise ValueError("Second Life repair candidate does not belong to this purchase")
+    source_rows = (supabase.table("trader_accounts").select("*")
+                   .eq("id", source_id).eq("trader_id", trader_id).limit(1).execute().data or [])
+    if not source_rows or not _np_account_has_breach_evidence(source_rows[0]):
+        raise ValueError("Second Life repair requires exact Life 1 breach evidence")
+    source = source_rows[0]
+    src_time = _dt_score(source.get("breach_at") or source.get("breached_at") or source.get("archived_at") or source.get("updated_at"))
+    cand_time = _dt_score(candidate.get("assigned_at") or candidate.get("started_at") or candidate.get("created_at") or candidate.get("updated_at"))
+    if src_time and cand_time and cand_time < src_time:
+        raise ValueError("Second Life repair candidate predates the Life 1 breach")
+
+    now = now_iso()
+    pupdate = {
+        "second_life_used": True,
+        "life_number": 2,
+        "second_life_status": "life2_active",
+        "second_life_activated_at": now,
+        "lifecycle_state": "phase1_active",
+        "trader_account_id": candidate.get("id"),
+        "assigned_mt5_id": candidate.get("mt5_pool_id"),
+        "mt5_login": candidate.get("mt5_login"),
+        "mt5_server": candidate.get("mt5_server"),
+        "updated_at": now,
+        "admin_note": f"Second Life adopted existing fresh Phase 1 assignment {candidate.get('mt5_login') or ''} after Life 1 breach {source.get('mt5_login') or ''}.",
+    }
+    # Preserve compatibility with schemas that may reject optional null columns.
+    try:
+        supabase.table("challenge_purchases").update(pupdate).eq("id", p.get("id")).execute()
+    except Exception:
+        for k in ("assigned_mt5_id", "admin_note"):
+            pupdate.pop(k, None)
+        supabase.table("challenge_purchases").update(pupdate).eq("id", p.get("id")).execute()
+
+    tupdate = {
+        "current_account_id": candidate.get("id"),
+        "status": "phase1_active",
+        "phase": "phase1",
+        "challenge_state": "phase1_active",
+        "mt5_login": candidate.get("mt5_login"),
+        "mt5_server": candidate.get("mt5_server"),
+        "mt5_master_password": candidate.get("mt5_master_password"),
+        "mt5_investor_password": candidate.get("mt5_investor_password"),
+        "updated_at": now,
+    }
+    supabase.table("traders").update(tupdate).eq("id", trader_id).execute()
+    _audit_safe(
+        "second_life", "adopt_existing_phase1_as_life2",
+        f"purchase={p.get('id')} source={source_id} source_mt5={source.get('mt5_login') or ''} candidate={candidate_id} candidate_mt5={candidate.get('mt5_login') or ''}",
+        actor or {"name":"system","username":"system","role":"system"},
+        p.get("id"),
+    )
+    return candidate
+
+
 @app.route("/admin_second_life/activate", methods=["POST", "OPTIONS"])
 def admin_second_life_activate():
     """Admin authority for the same global Second Life lifecycle used by traders.
@@ -7662,6 +7776,23 @@ def admin_second_life_activate():
         )
         if journey != ONE_PHASE_CHALLENGE_JOURNEY:
             return _np_fail("Second Life is only available on eligible 1-Phase purchases", 409)
+
+        actor = {
+            "name": (admin or {}).get("name") or (admin or {}).get("username") or "admin",
+            "username": (admin or {}).get("username") or "admin",
+            "role": (admin or {}).get("role") or "admin",
+        }
+        adopted = _np_adopt_existing_phase1_as_second_life(p, trader_id, status, actor)
+        if adopted:
+            trader = get_trader_by_id(trader_id) or {}
+            send_email_safe(trader.get("email"), "NairaPips Second Life activated",
+                f"Hello {trader.get('name') or 'Trader'},\n\nYour existing fresh Phase 1 MT5 {adopted.get('mt5_login') or ''} has been confirmed as Life 2 of 2.\n\nYour breached Life 1 account remains locked as history.\n\nNairaPips Team")
+            return _np_ok({
+                "success": True, "purchase_id": purchase_id, "trader_id": trader_id,
+                "life_number": 2, "status": "life2_active",
+                "source_account_id": status.get("breached_account_id"),
+                "auto_assigned": False, "adopted_existing": True, "account": adopted,
+            })
 
         now = now_iso()
         purchase_update = {
@@ -7783,6 +7914,18 @@ def second_life_activate():
         journey = _journey_from_text(p.get("challenge_journey"), p.get("journey_stages"), p.get("route"))
         if journey != ONE_PHASE_CHALLENGE_JOURNEY:
             return _np_fail("Second Life is only available on eligible 1-Phase purchases", 409)
+        adopted = _np_adopt_existing_phase1_as_second_life(
+            p, authed_id, status, {"name":"trader","username":str(authed_id)[:12],"role":"trader"}
+        )
+        if adopted:
+            trader = get_trader_by_id(authed_id) or {}
+            send_email_safe(trader.get("email"), "NairaPips Second Life activated",
+                f"Hello {trader.get('name') or 'Trader'},\n\nYour existing fresh Phase 1 MT5 {adopted.get('mt5_login') or ''} has been confirmed as Life 2 of 2.\n\nYour breached Life 1 account remains locked as history.\n\nNairaPips Team")
+            return _np_ok({
+                "success": True, "purchase_id": purchase_id, "life_number": 2,
+                "status": "life2_active", "breached_account_id": status.get("breached_account_id"),
+                "adopted_existing": True, "account": adopted,
+            })
         now = now_iso()
         purchase_update = {
             "second_life_used": True,
@@ -7846,6 +7989,30 @@ def approve_purchase():
         p=pres.data[0]
         if p.get("trader_account_id") or p.get("assigned_mt5_id") or str(p.get("mt5_login") or "").strip():
             return bad("This purchase is already approved/assigned. Refresh the purchases page.", 409)
+
+        # DUPLICATE-PURCHASE ASSIGNMENT GUARD — purchase mirror fields can be stale/empty.
+        # A purchase that already owns ANY trader_account history must never create a new
+        # Phase 1 account through ordinary Purchase Approval. Lifecycle actions (Second Life,
+        # pass progression, reset replacement) are the only legal way forward.
+        _linked_accounts = []
+        _seen_linked = set()
+        for _col in ("purchase_id", "challenge_purchase_id"):
+            try:
+                _rows = (supabase.table("trader_accounts").select("id,stage,phase,account_status,status,mt5_login")
+                         .eq(_col, pid).limit(100).execute().data or [])
+                for _a in _rows:
+                    _aid = str(_a.get("id") or "")
+                    if _aid and _aid not in _seen_linked:
+                        _seen_linked.add(_aid)
+                        _linked_accounts.append(_a)
+            except Exception as _link_exc:
+                print(f"PURCHASE HISTORY GUARD LOOKUP SKIP {_col}:", _link_exc)
+        if _linked_accounts:
+            _has_breach = any("breach" in str(a.get("account_status") or a.get("status") or "").lower() for a in _linked_accounts)
+            if _second_life_bool(p.get("second_life_enabled")) and not _second_life_bool(p.get("second_life_used")) and _has_breach:
+                return bad("Purchase already has Life 1 account history. Do not approve it again — use Activate Second Life.", 409)
+            return bad("Purchase already has MT5/account history. Ordinary Purchase Approval is blocked; use the correct lifecycle action.", 409)
+
         auto_mode = str(d.get("assignment_mode") or "").lower() in {"auto","auto_after_payment_approval","automatic"}
         if mt5_id:
             mres=supabase.table("mt5_pool").select("*").eq("id",mt5_id).limit(1).execute()
@@ -21200,4 +21367,511 @@ def admin_trader_360():
     except Exception as e:
         print("TRADER 360 ERROR:", e)
         return _np_fail(str(e), 500)
+
+
+
+# ============================================================================
+# NAIRAPIPS PRODUCTION RESET AUTHORITY — 2026-09-07
+# Additive authority layer. It does not reinterpret or resurrect dead history.
+# Payment law: every paid reset uses the normal payment-proof + Admin approval flow.
+# Entitlement law: one Challenge reset and one Funded reset per journey, with
+# 2-Lives Life 1 breach using its included free Second Life instead of paid reset.
+# Pool law: Phase 1 / Phase 2 / Second Life -> PHASE POOL; Funded -> FUNDED POOL.
+# ============================================================================
+
+_NP_RESET_TERMINAL_MARKERS = {"breached", "breached_archived", "archived_breached"}
+
+
+def _np_reset_bool(value):
+    return value is True or str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _np_reset_stage(account):
+    return _normalize_lifecycle_stage((account or {}).get("stage") or (account or {}).get("phase") or "phase1")
+
+
+def _np_reset_purchase_for_account(account):
+    if not account:
+        return None
+    pid = str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip()
+    if not pid:
+        return None
+    rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
+    return rows[0] if rows else None
+
+
+def _np_reset_current_plan_for(account, purchase=None):
+    """Resolve today's sell price for this account size without hard-coding reset fees."""
+    purchase = purchase or {}
+    size = clean((account or {}).get("account_size") or (account or {}).get("start_balance") or purchase.get("account_size") or 0)
+    plan_id = str(purchase.get("plan_id") or purchase.get("challenge_plan_id") or "").strip()
+    candidates = []
+    if plan_id:
+        try:
+            candidates += supabase.table("challenge_plans").select("*").eq("id", plan_id).limit(1).execute().data or []
+        except Exception:
+            pass
+    if size:
+        try:
+            rows = supabase.table("challenge_plans").select("*").eq("account_size", size).execute().data or []
+            candidates += rows
+        except Exception:
+            pass
+    seen = set(); clean_rows = []
+    for row in candidates:
+        rid = str(row.get("id") or "")
+        if rid and rid in seen:
+            continue
+        if rid: seen.add(rid)
+        clean_rows.append(row)
+    active = [r for r in clean_rows if str(r.get("status") or "active").strip().lower() not in {"inactive","disabled","archived","deleted"}]
+    rows = active or clean_rows
+    if not rows:
+        return None
+    # Prefer same plan id, otherwise current matching account size. Highest recency wins.
+    rows.sort(key=lambda r: (1 if plan_id and str(r.get("id")) == plan_id else 0, str(r.get("updated_at") or r.get("created_at") or "")), reverse=True)
+    return rows[0]
+
+
+def _np_reset_price(plan):
+    if not plan:
+        return 0.0
+    for key in ("fee", "price", "challenge_fee", "amount"):
+        value = clean(plan.get(key))
+        if value and value > 0:
+            return value
+    return 0.0
+
+
+def _np_reset_account_is_breached(account):
+    if not account:
+        return False
+    try:
+        if _np_account_has_breach_evidence(account):
+            return True
+    except Exception:
+        pass
+    blob = " ".join(str(account.get(k) or "") for k in (
+        "account_status", "status", "risk_zone", "archive_reason", "breach_reason", "admin_note"
+    )).lower()
+    return "breach" in blob
+
+
+def _np_reset_open_order(source_account_id):
+    if not source_account_id:
+        return None
+    try:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("purchase_type", "reset")
+            .eq("reset_source_account_id", source_account_id)
+            .order("created_at", desc=True).limit(20).execute().data or []
+        )
+    except Exception:
+        return None
+    for row in rows:
+        st = str(row.get("payment_status") or row.get("status") or "").strip().lower()
+        if st not in {"rejected", "cancelled", "canceled", "expired", "failed"}:
+            return row
+    return None
+
+
+def _np_reset_policy(account, trader=None):
+    """Single backend authority used by trader card, payment creation and Admin approval."""
+    account = account or {}
+    if not account or not _np_reset_account_is_breached(account):
+        return {"eligible": False, "kind": "none", "reason": "account_not_breached"}
+
+    source_id = str(account.get("id") or "").strip()
+    if account.get("reset_consumed_at") or account.get("reset_replacement_account_id"):
+        return {"eligible": False, "kind": "terminal", "reason": "reset_already_consumed", "title": "This Reset Has Already Been Used"}
+
+    stage = _np_reset_stage(account)
+    purchase = _np_reset_purchase_for_account(account) or {}
+    plan = _np_reset_current_plan_for(account, purchase) or {}
+    size = clean(account.get("account_size") or account.get("start_balance") or purchase.get("account_size") or 0)
+    price = _np_reset_price(plan)
+    second_enabled = _second_life_bool(purchase.get("second_life_enabled")) if purchase else False
+    second_used = _second_life_bool(purchase.get("second_life_used")) if purchase else False
+    life_number = int(purchase.get("life_number") or 1) if purchase else 1
+
+    # Existing approved/reset order means trader must not submit or pay again.
+    open_order = _np_reset_open_order(source_id)
+    if open_order:
+        st = str(open_order.get("payment_status") or open_order.get("status") or "").strip().lower()
+        if st in {"approved", "paid", "completed", "assigned"}:
+            return {
+                "eligible": True, "kind": "waiting", "reason": "reset_payment_approved",
+                "title": "Reset Payment Approved — Fresh MT5 Pending",
+                "subtitle": "Your reset payment is approved. Do not pay again. NairaPips will assign a fresh MT5 at the same stage.",
+                "stage": stage, "account_size": size, "source_account_id": source_id,
+                "source_mt5_login": account.get("mt5_login"), "purchase_id": purchase.get("id"),
+                "reset_order_id": open_order.get("id"), "price": clean(open_order.get("fee") or open_order.get("amount_due") or price),
+            }
+        return {
+            "eligible": True, "kind": "payment_pending", "reason": "reset_payment_under_review",
+            "title": "Reset Payment Under Review",
+            "subtitle": "Your payment proof has been submitted. Admin approval is required before a fresh MT5 can be assigned.",
+            "stage": stage, "account_size": size, "source_account_id": source_id,
+            "source_mt5_login": account.get("mt5_login"), "purchase_id": purchase.get("id"),
+            "reset_order_id": open_order.get("id"), "price": clean(open_order.get("fee") or open_order.get("amount_due") or price),
+        }
+
+    # Challenge-stage policy.
+    if stage in {"phase1", "phase2"}:
+        # 2-Lives: the included Second Life IS the one challenge reset. No paid challenge reset after it.
+        if second_enabled:
+            if stage == "phase1" and not second_used:
+                try:
+                    status = _second_life_status_payload(purchase, (trader or {}).get("id") if trader else None)
+                except Exception:
+                    status = {}
+                if status.get("eligible_now") or _np_reset_account_is_breached(account):
+                    return {
+                        "eligible": True, "kind": "free_second_life", "reason": "second_life_free_reset",
+                        "title": "Your Free Second Life Is Ready",
+                        "subtitle": "This is the one included Challenge reset on your 2-Lives journey. Activate it once and continue with a fresh Phase 1 MT5.",
+                        "stage": "phase1", "account_size": size, "source_account_id": source_id,
+                        "source_mt5_login": account.get("mt5_login"), "purchase_id": purchase.get("id"), "price": 0,
+                    }
+            # Life 2 breach or any later challenge breach on the same 2-Lives purchase = journey end.
+            return {
+                "eligible": False, "kind": "terminal", "reason": "challenge_reset_already_used",
+                "title": "Challenge Reset Already Used",
+                "subtitle": "Your free Challenge reset / Second Life has already been used. This challenge journey has ended. Start a new Challenge to continue.",
+                "stage": stage, "account_size": size, "source_account_id": source_id,
+                "source_mt5_login": account.get("mt5_login"), "purchase_id": purchase.get("id"), "price": 0,
+            }
+
+        if _np_reset_bool(purchase.get("challenge_reset_used")):
+            return {
+                "eligible": False, "kind": "terminal", "reason": "challenge_reset_already_used",
+                "title": "Challenge Reset Already Used",
+                "subtitle": "This journey has already used its one Challenge reset. Start a new Challenge to continue.",
+                "stage": stage, "account_size": size, "source_account_id": source_id,
+                "source_mt5_login": account.get("mt5_login"), "purchase_id": purchase.get("id"), "price": price,
+            }
+        if not purchase.get("id") or price <= 0:
+            return {"eligible": False, "kind": "review", "reason": "reset_price_or_purchase_missing", "stage": stage, "account_size": size, "source_account_id": source_id}
+        return {
+            "eligible": True, "kind": "paid_challenge", "reason": "challenge_reset_payment_required",
+            "title": "Continue This Challenge Journey",
+            "subtitle": "You have one paid reset available on this Challenge journey. Reset stays at the same stage and costs the current price of this account-size Challenge.",
+            "stage": stage, "account_size": size, "source_account_id": source_id,
+            "source_mt5_login": account.get("mt5_login"), "purchase_id": purchase.get("id"),
+            "plan_id": plan.get("id"), "plan_name": plan.get("name") or plan.get("plan_name") or purchase.get("plan_name"), "price": price,
+        }
+
+    # Funded policy is independent of Challenge reset usage: exactly one paid Funded reset per journey.
+    if stage == "funded":
+        if _np_reset_bool(purchase.get("funded_reset_used")):
+            return {
+                "eligible": False, "kind": "terminal", "reason": "funded_reset_already_used",
+                "title": "Funded Reset Already Used",
+                "subtitle": "This journey has already used its one Funded reset. Start a new Challenge to continue.",
+                "stage": stage, "account_size": size, "source_account_id": source_id,
+                "source_mt5_login": account.get("mt5_login"), "purchase_id": purchase.get("id"), "price": price,
+            }
+        if not purchase.get("id") or price <= 0:
+            return {"eligible": False, "kind": "review", "reason": "reset_price_or_purchase_missing", "stage": stage, "account_size": size, "source_account_id": source_id}
+        return {
+            "eligible": True, "kind": "paid_funded", "reason": "funded_reset_payment_required",
+            "title": "Your Funded Journey Can Continue",
+            "subtitle": "You have one Funded reset available on this journey. The reset costs the current price of this account-size Challenge and returns you to Funded after payment approval.",
+            "stage": "funded", "account_size": size, "source_account_id": source_id,
+            "source_mt5_login": account.get("mt5_login"), "purchase_id": purchase.get("id"),
+            "plan_id": plan.get("id"), "plan_name": plan.get("name") or plan.get("plan_name") or purchase.get("plan_name"), "price": price,
+        }
+
+    return {"eligible": False, "kind": "none", "reason": "unsupported_stage"}
+
+
+# Extend existing reset-assignment entitlement law without weakening historical safeguards.
+_np_reset_entitlement_for_source_core_20260907 = _np_reset_entitlement_for_source
+
+def _np_reset_entitlement_for_source(source, trader=None):
+    source = source or {}
+    if source.get("reset_consumed_at") or source.get("reset_replacement_account_id"):
+        return {"eligible": False, "reason": "reset_entitlement_consumed"}
+    blob = " ".join(str(source.get(k) or "") for k in ("archive_reason", "reset_reason", "admin_note", "message", "account_status")).lower()
+    stage = _np_reset_stage(source)
+    m = re.search(r"\[np_entitlement:challenge_reset_paid:([^\]]+)\]", blob, re.I)
+    if m and stage in {"phase1", "phase2"}:
+        return {"eligible": True, "reason": "challenge_reset_paid", "label": f"PAID {stage.upper()} RESET", "target_stage": stage, "evidence_id": m.group(1)}
+    m = re.search(r"\[np_entitlement:funded_reset_paid:([^\]]+)\]", blob, re.I)
+    if m and stage == "funded":
+        return {"eligible": True, "reason": "funded_reset_paid", "label": "PAID FUNDED RESET", "target_stage": "funded", "evidence_id": m.group(1)}
+    return _np_reset_entitlement_for_source_core_20260907(source, trader)
+
+
+@app.route("/trader_reset_opportunities", methods=["GET", "OPTIONS"])
+def trader_reset_opportunities():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True, "opportunity": None})
+    requested = str(request.args.get("trader_id") or "").strip()
+    authed_id, auth_error = _authenticated_trader_id_for_request(requested)
+    if auth_error:
+        return _np_fail(auth_error, 401)
+    try:
+        trader = get_trader_by_id(authed_id) or {}
+        rows = (supabase.table("trader_accounts").select("*").eq("trader_id", authed_id).order("updated_at", desc=True).limit(250).execute().data or [])
+        breached = [a for a in rows if _np_reset_account_is_breached(a)]
+        breached.sort(key=lambda a: str(a.get("breached_at") or a.get("breach_at") or a.get("updated_at") or a.get("created_at") or ""), reverse=True)
+        opportunity = _np_reset_policy(breached[0], trader) if breached else None
+        return _np_ok({"success": True, "opportunity": opportunity})
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+@app.route("/create_reset_purchase", methods=["POST", "OPTIONS"])
+def create_reset_purchase():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = request.get_json(silent=True) or {}
+        requested = str(d.get("trader_id") or "").strip()
+        authed_id, auth_error = _authenticated_trader_id_for_request(requested)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+        account_id = str(d.get("trader_account_id") or d.get("source_account_id") or "").strip()
+        proof = str(d.get("payment_proof_url") or d.get("file_url") or d.get("url") or "").strip()
+        if not account_id:
+            return _np_fail("Exact breached trader_account_id is required", 400)
+        if not proof:
+            return _np_fail("Payment proof is required", 400)
+        rows = supabase.table("trader_accounts").select("*").eq("id", account_id).eq("trader_id", authed_id).limit(1).execute().data or []
+        if not rows:
+            return _np_fail("Breached account was not found for this trader", 404)
+        account = rows[0]
+        trader = get_trader_by_id(authed_id) or {}
+        policy = _np_reset_policy(account, trader)
+        if policy.get("kind") not in {"paid_challenge", "paid_funded"} or not policy.get("eligible"):
+            return _np_fail(policy.get("subtitle") or policy.get("title") or "This account is not eligible for a paid reset", 409)
+        price = clean(policy.get("price") or 0)
+        if price <= 0:
+            return _np_fail("Current challenge price could not be resolved. Reset purchase was not created.", 409)
+        parent_purchase = _np_reset_purchase_for_account(account) or {}
+        if not parent_purchase.get("id"):
+            return _np_fail("Reset requires an exact challenge journey/purchase reference", 409)
+        if _np_reset_open_order(account_id):
+            return _np_fail("A reset payment already exists for this exact breached account. Do not pay twice.", 409)
+        plan = _np_reset_current_plan_for(account, parent_purchase) or {}
+        now = now_iso()
+        row = {
+            "trader_id": authed_id,
+            "trader_name": trader.get("name") or trader.get("full_name") or "",
+            "email": trader.get("email") or parent_purchase.get("email") or "",
+            "phone": trader.get("phone") or parent_purchase.get("phone") or "",
+            "plan_id": plan.get("id") or parent_purchase.get("plan_id"),
+            "plan_name": plan.get("name") or plan.get("plan_name") or parent_purchase.get("plan_name") or "Reset",
+            "account_size": clean(account.get("account_size") or account.get("start_balance") or parent_purchase.get("account_size") or 0),
+            "fee": price, "original_fee": price, "final_fee": price, "amount_due": price,
+            "payment_proof_url": proof,
+            "payment_status": "pending", "status": "pending_review",
+            "purchase_type": "reset", "reset_stage": _np_reset_stage(account),
+            "reset_source_account_id": account_id,
+            "reset_parent_purchase_id": parent_purchase.get("id"),
+            "reset_price_snapshot": price,
+            "challenge_journey": parent_purchase.get("challenge_journey"),
+            "journey_source": "reset_from_exact_purchase",
+            "created_at": now, "updated_at": now,
+            "purchase_month": month(), "purchase_year": year(),
+            "admin_note": f"RESET PAYMENT · {_np_reset_stage(account).upper()} · source MT5 {account.get('mt5_login') or '—'}",
+        }
+        created = supabase.table("challenge_purchases").insert(row).execute().data or []
+        if not created:
+            return _np_fail("Reset payment record could not be created", 500)
+        try:
+            send_admin_alert(
+                "NairaPips reset payment proof submitted",
+                f"Trader: {trader.get('name') or trader.get('email')}\nStage: {_np_reset_stage(account).upper()}\nOld MT5: {account.get('mt5_login')}\nAccount Size: {email_money(row['account_size'])}\nAmount: {email_money(price)}\nAdmin payment approval required."
+            )
+            send_email_safe(
+                trader.get("email"), "NairaPips reset payment received — awaiting approval",
+                f"Hello {trader.get('name') or 'Trader'},\n\nWe received your reset payment proof.\n\nStage: {_np_reset_stage(account).upper()}\nPrevious MT5: {account.get('mt5_login') or '—'}\nReset Amount: {email_money(price)}\nStatus: Awaiting Admin payment approval\n\nDo not make a second payment for this reset.\n\nNairaPips Team"
+            )
+        except Exception:
+            pass
+        return _np_ok({"success": True, "purchase": created[0], "opportunity": _np_reset_policy(account, trader)}, 200)
+    except Exception as e:
+        return _np_fail(e, 500)
+
+
+def _np_approve_reset_purchase_payment(p, admin_payload=None):
+    """Admin payment approval is the ONLY paid-reset unlock. It does not assign MT5."""
+    p = p or {}
+    reset_order_id = str(p.get("id") or "").strip()
+    trader_id = str(p.get("trader_id") or "").strip()
+    source_id = str(p.get("reset_source_account_id") or "").strip()
+    parent_id = str(p.get("reset_parent_purchase_id") or "").strip()
+    if not reset_order_id or not trader_id or not source_id or not parent_id:
+        return bad("Reset payment is missing exact journey/source references", 409)
+    source_rows = supabase.table("trader_accounts").select("*").eq("id", source_id).eq("trader_id", trader_id).limit(1).execute().data or []
+    parent_rows = supabase.table("challenge_purchases").select("*").eq("id", parent_id).eq("trader_id", trader_id).limit(1).execute().data or []
+    if not source_rows or not parent_rows:
+        return bad("Exact reset source account or parent journey was not found", 409)
+    source = source_rows[0]; parent = parent_rows[0]
+    policy = _np_reset_policy(source, get_trader_by_id(trader_id) or {})
+    # Pending order is expected; policy may surface it as payment_pending.
+    stage = _np_reset_stage(source)
+    second_enabled = _second_life_bool(parent.get("second_life_enabled"))
+    if stage in {"phase1", "phase2"}:
+        if second_enabled:
+            return bad("2-Lives Challenge reset is the included free Second Life; a paid Challenge reset cannot be approved for this journey", 409)
+        if _np_reset_bool(parent.get("challenge_reset_used")):
+            return bad("Challenge reset already used for this journey. A second Challenge reset is forbidden.", 409)
+        parent_field = "challenge_reset_used"
+        marker_kind = "challenge_reset_paid"
+    elif stage == "funded":
+        if _np_reset_bool(parent.get("funded_reset_used")):
+            return bad("Funded reset already used for this journey. A second Funded reset is forbidden.", 409)
+        parent_field = "funded_reset_used"
+        marker_kind = "funded_reset_paid"
+    else:
+        return bad("Reset payment stage is not supported", 409)
+    if source.get("reset_consumed_at") or source.get("reset_replacement_account_id"):
+        return bad("This exact reset was already consumed by a replacement MT5", 409)
+
+    now = now_iso()
+    marker = f"[NP_ENTITLEMENT:{marker_kind}:{reset_order_id}]"
+    old_reason = str(source.get("archive_reason") or source.get("breach_reason") or "").strip()
+    archive_reason = (old_reason + " | " + marker).strip(" |")
+    source_update = {
+        "account_status": f"archived_reset_{stage}",
+        "monitoring_enabled": False,
+        "archive_reason": archive_reason,
+        "reset_order_id": reset_order_id,
+        "reset_kind": marker_kind,
+        "updated_at": now,
+        "archived_at": source.get("archived_at") or now,
+    }
+    # Preserve access lock if the production schema contains it.
+    try:
+        source_update["mt5_access_disabled"] = True
+        updated_source = supabase.table("trader_accounts").update(source_update).eq("id", source_id).eq("trader_id", trader_id).execute().data or []
+    except Exception:
+        source_update.pop("mt5_access_disabled", None)
+        updated_source = supabase.table("trader_accounts").update(source_update).eq("id", source_id).eq("trader_id", trader_id).execute().data or []
+    if not updated_source:
+        return bad("Reset payment approval could not archive the exact source account safely", 500)
+
+    parent_update = {
+        parent_field: True,
+        ("challenge_reset_used_at" if parent_field == "challenge_reset_used" else "funded_reset_used_at"): now,
+        ("challenge_reset_source_account_id" if parent_field == "challenge_reset_used" else "funded_reset_source_account_id"): source_id,
+        "updated_at": now,
+    }
+    updated_parent = supabase.table("challenge_purchases").update(parent_update).eq("id", parent_id).execute().data or []
+    if not updated_parent:
+        return bad("Reset source was archived but journey reset counter could not be locked. STOP and review before assignment.", 500)
+
+    order_update = {
+        "payment_status": "approved", "status": "approved_reset_waiting_mt5",
+        "reset_payment_approved_at": now, "approved_at": now, "updated_at": now,
+        "admin_note": f"RESET PAYMENT APPROVED · {stage.upper()} · {marker}",
+    }
+    approved = supabase.table("challenge_purchases").update(order_update).eq("id", reset_order_id).execute().data or []
+
+    try:
+        _audit_safe("challenge_purchases", "reset_payment_approved", f"reset_order={reset_order_id} source={source_id} stage={stage}", _admin_from_payload(admin_payload or {}), reset_order_id)
+    except Exception:
+        pass
+    try:
+        trader = get_trader_by_id(trader_id) or {}
+        send_email_safe(
+            trader.get("email"), "NairaPips reset payment approved — fresh MT5 required",
+            f"Hello {trader.get('name') or 'Trader'},\n\nYour reset payment has been approved.\n\nStage: {stage.upper()}\nPrevious MT5: {source.get('mt5_login') or '—'}\nStatus: Fresh {stage.upper()} MT5 required\n\nYou do not need to pay again.\n\nNairaPips Team"
+        )
+    except Exception:
+        pass
+    try:
+        np_invalidate_admin_bootstrap("purchases"); np_invalidate_admin_bootstrap("traders")
+    except Exception:
+        pass
+    return ok({"purchase": approved[0] if approved else p, "source_account": updated_source[0], "target_stage": stage}, f"Reset payment approved. Fresh {stage.upper()} MT5 is now required.")
+
+
+# Route existing payment approval through reset authority only when purchase_type=reset.
+_np_normal_approve_purchase_view_20260907 = app.view_functions.get("approve_purchase")
+
+def _np_approve_purchase_router_20260907():
+    d = request.get_json(silent=True) or {}
+    pid = str(d.get("id") or "").strip()
+    if pid:
+        try:
+            rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
+            if rows and str(rows[0].get("purchase_type") or "challenge").strip().lower() == "reset":
+                return _np_approve_reset_purchase_payment(rows[0], d)
+        except Exception as e:
+            return bad(e)
+    return _np_normal_approve_purchase_view_20260907()
+
+if _np_normal_approve_purchase_view_20260907:
+    app.view_functions["approve_purchase"] = _np_approve_purchase_router_20260907
+
+
+# Mark an exact reset entitlement consumed only AFTER successful replacement assignment.
+_np_assign_phase_mt5_view_20260907 = app.view_functions.get("assign_phase_mt5")
+
+def _np_extract_assigned_account_from_response(resp):
+    try:
+        obj = resp.get_json(silent=True) if hasattr(resp, "get_json") else None
+        if not isinstance(obj, dict) or obj.get("success") is not True:
+            return None
+        data = obj.get("data")
+        if isinstance(data, dict) and isinstance(data.get("account"), dict):
+            return data.get("account")
+    except Exception:
+        pass
+    return None
+
+
+def _np_assign_phase_mt5_router_20260907():
+    d = request.get_json(silent=True) or {}
+    raw_source = str(d.get("completed_account_id") or d.get("source_account_id") or d.get("trader_account_id") or "").strip()
+    source_id = raw_source.split(":", 1)[1] if raw_source.startswith("reset-waiting:") else raw_source
+    source = None
+    if source_id:
+        try:
+            rows = supabase.table("trader_accounts").select("*").eq("id", source_id).limit(1).execute().data or []
+            source = rows[0] if rows else None
+        except Exception:
+            source = None
+    resp = _np_assign_phase_mt5_view_20260907()
+    try:
+        status_code = getattr(resp, "status_code", 200)
+        account = _np_extract_assigned_account_from_response(resp)
+        if status_code < 400 and account and source and str(source.get("account_status") or "").startswith("archived_reset"):
+            ent = _np_reset_entitlement_for_source(source, get_trader_by_id(source.get("trader_id")) or {})
+            if ent.get("eligible") and ent.get("reason") in {"challenge_reset_paid", "funded_reset_paid", "second_life_free_reset", "post_payout_renewal", "admin_recovery"}:
+                now = now_iso()
+                supabase.table("trader_accounts").update({
+                    "reset_consumed_at": now,
+                    "reset_replacement_account_id": account.get("id"),
+                    "account_status": "archived",
+                    "updated_at": now,
+                    "archive_reason": (str(source.get("archive_reason") or "") + f" | reset_consumed replacement_account_id={account.get('id')} replacement_mt5={account.get('mt5_login')}").strip(" |"),
+                }).eq("id", source.get("id")).execute()
+                order_id = str(source.get("reset_order_id") or ent.get("evidence_id") or "").strip()
+                if order_id:
+                    try:
+                        supabase.table("challenge_purchases").update({
+                            "status": "completed", "reset_entitlement_consumed_at": now,
+                            "reset_replacement_account_id": account.get("id"), "updated_at": now,
+                        }).eq("id", order_id).execute()
+                    except Exception:
+                        pass
+                parent_id = str(source.get("purchase_id") or "").strip()
+                if parent_id:
+                    field = "funded_reset_replacement_account_id" if _np_reset_stage(source) == "funded" else "challenge_reset_replacement_account_id"
+                    try:
+                        supabase.table("challenge_purchases").update({field: account.get("id"), "updated_at": now}).eq("id", parent_id).execute()
+                    except Exception:
+                        pass
+    except Exception as consume_error:
+        print("RESET ENTITLEMENT CONSUMPTION ERROR:", consume_error)
+    return resp
+
+if _np_assign_phase_mt5_view_20260907:
+    app.view_functions["assign_phase_mt5"] = _np_assign_phase_mt5_router_20260907
 
