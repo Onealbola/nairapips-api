@@ -21971,3 +21971,232 @@ def _np_assign_phase_mt5_router_20260907():
 if _np_assign_phase_mt5_view_20260907:
     app.view_functions["assign_phase_mt5"] = _np_assign_phase_mt5_router_20260907
 
+
+# ============================================================================
+# NAIRAPIPS EXACT POST-PAYOUT RESET SOURCE AUTHORITY — 2026-09-08
+# Payout renewal must be tied to payouts.trader_account_id. Never infer the
+# payout-reset source from another breached/archived Funded account.
+# ============================================================================
+
+def _np_account_time_20260908(row):
+    row = row or {}
+    return _dt_score(
+        row.get("assigned_at") or row.get("started_at") or row.get("archived_at")
+        or row.get("reset_at") or row.get("updated_at") or row.get("created_at")
+    )
+
+
+def _np_active_funded_row_20260908(row):
+    row = row or {}
+    if _np_reset_stage(row) != "funded":
+        return False
+    if not str(row.get("mt5_login") or "").strip():
+        return False
+    blob = " ".join(str(row.get(k) or "") for k in (
+        "account_status", "status", "risk_zone", "archive_reason", "breach_reason"
+    )).lower()
+    if any(x in blob for x in ("breach", "archive", "closed", "disabled", "locked", "reset", "recalled")):
+        return False
+    if row.get("mt5_access_disabled") is True:
+        return False
+    return True
+
+
+def _np_exact_post_payout_replacement_20260908(source, payout, account_rows, trader=None):
+    """Resolve only the fresh Funded MT5 that fulfilled this exact paid payout source."""
+    source = source or {}; payout = payout or {}; trader = trader or {}
+    source_id = str(source.get("id") or "").strip()
+    if not source_id or str(payout.get("trader_account_id") or "").strip() != source_id:
+        return None
+
+    # Strong explicit evidence always wins.
+    explicit_id = str(source.get("reset_replacement_account_id") or "").strip()
+    if explicit_id:
+        for row in account_rows or []:
+            if str(row.get("id") or "").strip() == explicit_id and _np_active_funded_row_20260908(row):
+                return row
+
+    source_pid = str(source.get("purchase_id") or source.get("challenge_purchase_id") or "").strip()
+    baseline = max(
+        _np_account_time_20260908(source),
+        _dt_score(payout.get("paid_at") or payout.get("approved_at") or payout.get("created_at")),
+    )
+
+    candidates = []
+    for row in account_rows or []:
+        if str(row.get("id") or "").strip() == source_id:
+            continue
+        if not _np_active_funded_row_20260908(row):
+            continue
+        ctime = _np_account_time_20260908(row)
+        if baseline and ctime and ctime <= baseline:
+            continue
+
+        # Exact lineage fields, when present, are authoritative.
+        parent_refs = {
+            str(row.get("replaces_trader_account_id") or "").strip(),
+            str(row.get("previous_trader_account_id") or "").strip(),
+            str(row.get("reset_source_account_id") or "").strip(),
+        }
+        if source_id in parent_refs:
+            return row
+
+        row_pid = str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip()
+        if source_pid:
+            if row_pid == source_pid:
+                candidates.append(row)
+            continue
+
+        # Legacy payout-reset rows may lack purchase lineage. In that case do not
+        # guess among several Funded accounts. Accept only the trader's exact current
+        # Funded account when it is the sole newer active candidate.
+        candidates.append(row)
+
+    if source_pid:
+        if len(candidates) == 1:
+            return candidates[0]
+        current_id = str(trader.get("current_account_id") or "").strip()
+        if current_id:
+            exact_current = [r for r in candidates if str(r.get("id") or "").strip() == current_id]
+            if len(exact_current) == 1:
+                return exact_current[0]
+        return None
+
+    if len(candidates) == 1:
+        current_id = str(trader.get("current_account_id") or "").strip()
+        if not current_id or str(candidates[0].get("id") or "").strip() == current_id:
+            return candidates[0]
+    return None
+
+
+def _np_stamp_exact_payout_consumed_20260908(source, replacement, trader_id):
+    if not source or not replacement:
+        return
+    if source.get("reset_consumed_at") and source.get("reset_replacement_account_id"):
+        return
+    try:
+        now = now_iso()
+        old_reason = str(source.get("archive_reason") or "").strip()
+        marker = (
+            f"post_payout_renewal_consumed replacement_account_id={replacement.get('id')} "
+            f"replacement_mt5={replacement.get('mt5_login')}"
+        )
+        supabase.table("trader_accounts").update({
+            "reset_consumed_at": now,
+            "reset_replacement_account_id": replacement.get("id"),
+            "archive_reason": (old_reason + " | " + marker).strip(" |"),
+            "updated_at": now,
+        }).eq("id", source.get("id")).eq("trader_id", trader_id).execute()
+    except Exception as exc:
+        print("POST PAYOUT EXACT CONSUMPTION STAMP SKIPPED:", exc)
+
+
+def _np_trader_reset_opportunities_exact_payout_20260908():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True, "opportunity": None})
+    requested = str(request.args.get("trader_id") or "").strip()
+    authed_id, auth_error = _authenticated_trader_id_for_request(requested)
+    if auth_error:
+        return _np_fail(auth_error, 401)
+    try:
+        trader = get_trader_by_id(authed_id) or {}
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", authed_id).order("updated_at", desc=True).limit(250).execute().data or []
+        )
+        by_id = {str(a.get("id") or "").strip(): a for a in rows if a.get("id")}
+
+        # FIRST AUTHORITY: exact PAID payout source. This is the only account that
+        # may represent a post-payout renewal on the Recovery card.
+        try:
+            paid_payouts = (
+                supabase.table("payouts").select("*")
+                .eq("trader_id", authed_id).eq("status", "paid")
+                .order("paid_at", desc=True).order("created_at", desc=True).limit(50).execute().data or []
+            )
+        except Exception:
+            paid_payouts = []
+
+        payout_source_ids = set()
+        for payout in paid_payouts:
+            source_id = str(payout.get("trader_account_id") or "").strip()
+            if not source_id:
+                continue
+            payout_source_ids.add(source_id)
+            source = by_id.get(source_id)
+            if not source:
+                continue
+
+            sblob = " ".join(str(source.get(k) or "") for k in (
+                "account_status", "status", "archive_reason", "reset_reason", "admin_note"
+            )).lower()
+            is_payout_renewal_source = (
+                "np_entitlement:post_payout_renewal" in sblob
+                or "post_payout_renewal" in sblob
+                or str(source.get("account_status") or "").lower().startswith("archived_reset_funded")
+            )
+            if not is_payout_renewal_source:
+                continue
+
+            replacement = _np_exact_post_payout_replacement_20260908(source, payout, rows, trader)
+            if replacement:
+                _np_stamp_exact_payout_consumed_20260908(source, replacement, authed_id)
+                # This payout renewal is fulfilled. It must not render any Recovery card.
+                continue
+
+            ent = _np_reset_entitlement_for_source(source, trader)
+            if ent.get("eligible") and str(ent.get("reason") or "").startswith("post_payout_renewal"):
+                size = clean(source.get("account_size") or source.get("start_balance") or 0)
+                return _np_ok({"success": True, "opportunity": {
+                    "eligible": True,
+                    "kind": "waiting",
+                    "reason": "post_payout_renewal_waiting",
+                    "title": "Payout Renewal Confirmed — Fresh Funded MT5 Pending",
+                    "subtitle": "Your paid payout has been completed and this exact Funded account is waiting for its fresh Funded MT5. No reset payment is required.",
+                    "stage": "funded",
+                    "account_size": size,
+                    "source_account_id": source_id,
+                    "source_mt5_login": source.get("mt5_login") or payout.get("mt5_login") or "",
+                    "payout_id": payout.get("id"),
+                    "payout_amount": clean(payout.get("amount") or 0),
+                    "reset_access": "PAYOUT RENEWAL",
+                }})
+
+        # SECOND AUTHORITY: ordinary breach/reset opportunities. A paid-payout source
+        # is never reinterpreted here as a generic Funded reset.
+        breached = [a for a in rows if _np_reset_account_is_breached(a)]
+        breached.sort(
+            key=lambda a: str(a.get("breached_at") or a.get("breach_at") or a.get("updated_at") or a.get("created_at") or ""),
+            reverse=True,
+        )
+        for source in breached:
+            if str(source.get("id") or "").strip() in payout_source_ids:
+                continue
+            replacement = _np_reset_source_already_replaced(source, rows)
+            if replacement:
+                if not source.get("reset_consumed_at") and not source.get("reset_replacement_account_id"):
+                    try:
+                        now = now_iso()
+                        old_reason = str(source.get("archive_reason") or "").strip()
+                        marker = f"reset_consumed replacement_account_id={replacement.get('id')} replacement_mt5={replacement.get('mt5_login')}"
+                        supabase.table("trader_accounts").update({
+                            "reset_consumed_at": now,
+                            "reset_replacement_account_id": replacement.get("id"),
+                            "archive_reason": (old_reason + " | " + marker).strip(" |"),
+                            "updated_at": now,
+                        }).eq("id", source.get("id")).eq("trader_id", authed_id).execute()
+                    except Exception as consume_exc:
+                        print("RESET OPPORTUNITY CONSUMPTION STAMP SKIPPED:", consume_exc)
+                continue
+            policy = _np_reset_policy(source, trader)
+            if policy.get("reason") == "reset_already_consumed":
+                continue
+            return _np_ok({"success": True, "opportunity": policy})
+
+        return _np_ok({"success": True, "opportunity": None})
+    except Exception as exc:
+        return _np_fail(exc, 500)
+
+
+# Replace only the recovery-opportunity view. Existing route URL remains unchanged.
+app.view_functions["trader_reset_opportunities"] = _np_trader_reset_opportunities_exact_payout_20260908
