@@ -22253,36 +22253,86 @@ def _np_active_funded_row_20260908(row):
 
 
 def _np_exact_post_payout_replacement_20260908(source, payout, account_rows, trader=None):
-    """Resolve only the fresh Funded MT5 that fulfilled this exact paid payout source."""
-    source = source or {}; payout = payout or {}; trader = trader or {}
+    """Resolve the Funded MT5 that fulfilled this exact paid-payout source.
+
+    IMPORTANT PRODUCTION LAW:
+    A payout renewal is fulfilled FOREVER once a genuine later Funded MT5 was
+    issued from the same journey. The replacement does NOT need to still be active.
+    It may later be breached, reset, archived, paid-out or closed. Those later
+    outcomes never resurrect the old payout-renewal entitlement.
+    Only an explicitly recalled/wrong assignment is ignored.
+    """
+    source = source or {}
+    payout = payout or {}
+    trader = trader or {}
+
     source_id = str(source.get("id") or "").strip()
     if not source_id or str(payout.get("trader_account_id") or "").strip() != source_id:
         return None
 
-    # Strong explicit evidence always wins.
-    explicit_id = str(source.get("reset_replacement_account_id") or "").strip()
+    def genuine_funded_successor(row):
+        row = row or {}
+        if str(row.get("id") or "").strip() == source_id:
+            return False
+        if not str(row.get("mt5_login") or "").strip():
+            return False
+
+        stage = _normalize_lifecycle_stage(row.get("stage") or row.get("phase"))
+        if stage != "funded":
+            return False
+
+        blob = " ".join(str(row.get(k) or "") for k in (
+            "account_status","status","archive_reason","admin_note","message"
+        )).lower()
+        if (
+            "wrong_assignment_recalled" in blob
+            or "recalled_wrong_assignment" in blob
+            or "np_terminal:recalled_wrong_assignment" in blob
+            or "np_excluded_from_progression" in blob
+        ):
+            return False
+        return True
+
+    # Strong explicit replacement evidence wins regardless of the replacement's
+    # later status (active/breached/archived/etc.).
+    explicit_id = str(
+        source.get("reset_replacement_account_id")
+        or source.get("payout_replacement_account_id")
+        or ""
+    ).strip()
     if explicit_id:
         for row in account_rows or []:
-            if str(row.get("id") or "").strip() == explicit_id and _np_active_funded_row_20260908(row):
+            if (
+                str(row.get("id") or "").strip() == explicit_id
+                and genuine_funded_successor(row)
+            ):
                 return row
 
-    source_pid = str(source.get("purchase_id") or source.get("challenge_purchase_id") or "").strip()
+    source_pid = str(
+        source.get("purchase_id")
+        or source.get("challenge_purchase_id")
+        or ""
+    ).strip()
+
     baseline = max(
         _np_account_time_20260908(source),
-        _dt_score(payout.get("paid_at") or payout.get("approved_at") or payout.get("created_at")),
+        _dt_score(
+            payout.get("paid_at")
+            or payout.get("approved_at")
+            or payout.get("created_at")
+        ),
     )
 
     candidates = []
     for row in account_rows or []:
-        if str(row.get("id") or "").strip() == source_id:
+        if not genuine_funded_successor(row):
             continue
-        if not _np_active_funded_row_20260908(row):
-            continue
+
         ctime = _np_account_time_20260908(row)
         if baseline and ctime and ctime <= baseline:
             continue
 
-        # Exact lineage fields, when present, are authoritative.
+        # Explicit lineage fields are authoritative.
         parent_refs = {
             str(row.get("replaces_trader_account_id") or "").strip(),
             str(row.get("previous_trader_account_id") or "").strip(),
@@ -22291,31 +22341,37 @@ def _np_exact_post_payout_replacement_20260908(source, payout, account_rows, tra
         if source_id in parent_refs:
             return row
 
-        row_pid = str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip()
+        row_pid = str(
+            row.get("purchase_id")
+            or row.get("challenge_purchase_id")
+            or ""
+        ).strip()
+
         if source_pid:
             if row_pid == source_pid:
                 candidates.append(row)
             continue
 
-        # Legacy payout-reset rows may lack purchase lineage. In that case do not
-        # guess among several Funded accounts. Accept only the trader's exact current
-        # Funded account when it is the sole newer active candidate.
+        # Legacy rows without purchase lineage: keep candidates, but only accept
+        # an unambiguous single later Funded account.
         candidates.append(row)
 
     if source_pid:
         if len(candidates) == 1:
             return candidates[0]
-        current_id = str(trader.get("current_account_id") or "").strip()
-        if current_id:
-            exact_current = [r for r in candidates if str(r.get("id") or "").strip() == current_id]
-            if len(exact_current) == 1:
-                return exact_current[0]
+
+        # If there are multiple later Funded rows in the same journey, choose the
+        # earliest one after the payout source. That is the MT5 that first fulfilled
+        # this payout-renewal entitlement; later Funded rows belong to subsequent
+        # payout/reset cycles.
+        if len(candidates) > 1:
+            candidates.sort(key=_np_account_time_20260908)
+            return candidates[0]
         return None
 
     if len(candidates) == 1:
-        current_id = str(trader.get("current_account_id") or "").strip()
-        if not current_id or str(candidates[0].get("id") or "").strip() == current_id:
-            return candidates[0]
+        return candidates[0]
+
     return None
 
 
