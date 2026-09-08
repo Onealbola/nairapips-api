@@ -2383,16 +2383,86 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
     return None
 
 def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"):
-    if reason not in {"lifecycle_progression","second_life"}: return None
-    stage=_normalize_lifecycle_stage(stage)
-    size=clean((purchase or {}).get("account_size") or (source_account or {}).get("account_size") or (trader or {}).get("account_size"))
-    if not trader or stage not in ACCOUNT_STAGES or not size: return None
-    mt5=_np_pick_fresh_mt5(size, stage)
-    if not mt5:
-        _audit_safe("mt5_pool","auto_assignment_waiting",f"{reason}: no fresh <=7-day MT5 for {stage} size {size}",{"name":"system","username":"system","role":"system"},str(trader.get("id") or ""))
+    """Production entitlement gate for SYSTEM automatic MT5 assignment.
+
+    LAW: no verified entitlement -> no MT5; one entitlement -> one MT5.
+    This deliberately protects only automatic assignment and does not redesign
+    the established Admin V14 manual assignment workflow.
+    """
+    if reason not in {"lifecycle_progression", "second_life"}:
         return None
-    account,updated=_assign_mt5_to_trader(trader,mt5,stage,purchase,{"name":"system","username":"system","role":"system"},f"2026 auto assignment: {reason}; fresh MT5 <=7 days")
-    _audit_safe("mt5_pool","automatic_mt5_assignment",f"{reason}: {stage} MT5 {account.get('mt5_login')} assigned",{"name":"system","username":"system","role":"system"},str(account.get("id") or ""))
+    stage = _normalize_lifecycle_stage(stage)
+    size = clean((purchase or {}).get("account_size") or (source_account or {}).get("account_size") or (trader or {}).get("account_size"))
+    if not trader or stage not in ACCOUNT_STAGES or not size:
+        return None
+
+    trader_id = str((trader or {}).get("id") or "").strip()
+    purchase_id = str((purchase or {}).get("id") or "").strip()
+
+    # IDEMPOTENCY: the same purchase cannot silently receive a second active MT5.
+    if purchase_id:
+        existing = (
+            supabase.table("trader_accounts")
+            .select("id,mt5_login,stage,account_status")
+            .eq("purchase_id", purchase_id)
+            .eq("account_status", "assigned_active")
+            .limit(1).execute().data or []
+        )
+        if existing:
+            _audit_safe("mt5_pool", "auto_assignment_blocked",
+                        f"{reason}: entitlement already consumed by active MT5 {existing[0].get('mt5_login')}",
+                        {"name":"system","username":"system","role":"system"}, trader_id)
+            return None
+
+    if reason == "second_life":
+        # Second Life is legitimate only after the exact paid purchase has enabled
+        # Life 2, consumed it once, and moved it to the waiting/activated state.
+        if not purchase_id:
+            _audit_safe("mt5_pool", "auto_assignment_blocked", "second_life: missing purchase authority",
+                        {"name":"system","username":"system","role":"system"}, trader_id)
+            return None
+        sl_enabled = _second_life_bool((purchase or {}).get("second_life_enabled"))
+        sl_used = _second_life_bool((purchase or {}).get("second_life_used"))
+        sl_status = str((purchase or {}).get("second_life_status") or "").strip().lower()
+        if not (stage == "phase1" and sl_enabled and sl_used and sl_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}):
+            _audit_safe("mt5_pool", "auto_assignment_blocked",
+                        f"second_life: invalid entitlement enabled={sl_enabled} used={sl_used} status={sl_status}",
+                        {"name":"system","username":"system","role":"system"}, trader_id)
+            return None
+
+    if reason == "lifecycle_progression":
+        # Progression must be tied to one exact completed source account.
+        if not source_account or not str((source_account or {}).get("id") or "").strip():
+            _audit_safe("mt5_pool", "auto_assignment_blocked", "lifecycle_progression: missing exact source account",
+                        {"name":"system","username":"system","role":"system"}, trader_id)
+            return None
+        source_stage = _normalize_lifecycle_stage((source_account or {}).get("stage") or (source_account or {}).get("phase"))
+        source_status = str((source_account or {}).get("account_status") or (source_account or {}).get("status") or "").strip().lower()
+        pass_status = str((source_account or {}).get("phase_pass_status") or "").strip().lower()
+        risk_zone = str((source_account or {}).get("risk_zone") or "").strip().lower()
+        passed = bool(source_status in {"archived_phase1", "archived_phase2", "passed", "archived_passed"}
+                      or pass_status in {"phase1_passed", "phase2_passed"}
+                      or risk_zone == "passed")
+        expected = _next_stage_for_lifecycle(source_stage, source_account, purchase, None, trader)
+        if not passed or not expected or _normalize_lifecycle_stage(expected) != stage:
+            _audit_safe("mt5_pool", "auto_assignment_blocked",
+                        f"lifecycle_progression: invalid source/pass authority source={source_stage}/{source_status} pass={pass_status} expected={expected} requested={stage}",
+                        {"name":"system","username":"system","role":"system"}, trader_id)
+            return None
+
+    mt5 = _np_pick_fresh_mt5(size)
+    if not mt5:
+        _audit_safe("mt5_pool", "auto_assignment_waiting", f"{reason}: no fresh <=7-day MT5 for {stage} size {size}",
+                    {"name":"system","username":"system","role":"system"}, trader_id)
+        return None
+    account, updated = _assign_mt5_to_trader(
+        trader, mt5, stage, purchase,
+        {"name":"system","username":"system","role":"system"},
+        f"2026 auto assignment: {reason}; VERIFIED_ENTITLEMENT; fresh MT5 <=7 days"
+    )
+    _audit_safe("mt5_pool", "automatic_mt5_assignment",
+                f"{reason}: VERIFIED_ENTITLEMENT -> {stage} MT5 {account.get('mt5_login')} assigned",
+                {"name":"system","username":"system","role":"system"}, str(account.get("id") or ""))
     return {"account":account,"trader":updated,"mt5":mt5}
 
 def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="MT5 assigned"):
