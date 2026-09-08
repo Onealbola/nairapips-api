@@ -8765,6 +8765,29 @@ def assign_phase_mt5():
             d.get("admin_note") or f"{target_stage.title()} MT5 assigned"
         )
 
+        # TWIN PROGRESSION LINK AUTHORITY — 2026-09-08
+        # Every fresh account created from an exact prior lifecycle source records
+        # that source explicitly. History remains history; this link is evidence only.
+        if completed_account and account and account.get("id"):
+            try:
+                link_update = {
+                    "previous_trader_account_id": completed_account.get("id"),
+                    "updated_at": now_iso(),
+                }
+                completed_status_for_link = str(
+                    completed_account.get("account_status")
+                    or completed_account.get("status")
+                    or ""
+                ).strip().lower()
+                if completed_status_for_link.startswith("archived_reset"):
+                    link_update["replaces_trader_account_id"] = completed_account.get("id")
+                supabase.table("trader_accounts").update(link_update).eq(
+                    "id", account.get("id")
+                ).eq("trader_id", trader_id).execute()
+                account.update(link_update)
+            except Exception as progression_link_error:
+                print("TWIN PROGRESSION LINK WARNING:", progression_link_error)
+
         # PROGRESSION CONSUMPTION AUTHORITY:
         # Once the exact PASSED source successfully supplies its next-stage MT5,
         # that source must leave the trader's current/actionable selector.
@@ -21939,31 +21962,75 @@ def _np_assign_phase_mt5_router_20260907():
         account = _np_extract_assigned_account_from_response(resp)
         if status_code < 400 and account and source and str(source.get("account_status") or "").startswith("archived_reset"):
             ent = _np_reset_entitlement_for_source(source, get_trader_by_id(source.get("trader_id")) or {})
-            if ent.get("eligible") and ent.get("reason") in {"challenge_reset_paid", "funded_reset_paid", "second_life_free_reset", "post_payout_renewal", "admin_recovery"}:
+            ent_reason = str(ent.get("reason") or "")
+            if ent.get("eligible") and ent_reason in {"challenge_reset_paid", "funded_reset_paid", "second_life_free_reset", "post_payout_renewal", "post_payout_renewal_legacy_latest_only", "admin_recovery"}:
                 now = now_iso()
-                supabase.table("trader_accounts").update({
-                    "reset_consumed_at": now,
-                    "reset_replacement_account_id": account.get("id"),
-                    "account_status": "archived",
-                    "updated_at": now,
-                    "archive_reason": (str(source.get("archive_reason") or "") + f" | reset_consumed replacement_account_id={account.get('id')} replacement_mt5={account.get('mt5_login')}").strip(" |"),
-                }).eq("id", source.get("id")).execute()
-                order_id = str(source.get("reset_order_id") or ent.get("evidence_id") or "").strip()
-                if order_id:
+
+                # PAYOUT RENEWAL IS NOT A BREACH RESET.
+                # It may repeat after every successful paid payout and must NEVER
+                # consume purchase.funded_reset_used or any funded breach-reset slot.
+                if ent_reason.startswith("post_payout_renewal"):
+                    payout_id = str(ent.get("evidence_id") or "").strip()
+                    payout_marker = (
+                        f"[NP_PAYOUT_RENEWAL_COMPLETED:{payout_id}] "
+                        f"replacement_account_id={account.get('id')} "
+                        f"replacement_mt5={account.get('mt5_login')}"
+                    )
+                    supabase.table("trader_accounts").update({
+                        "account_status": "archived",
+                        "monitoring_enabled": False,
+                        "updated_at": now,
+                        "archive_reason": (
+                            str(source.get("archive_reason") or "") + " | " + payout_marker
+                        ).strip(" |"),
+                    }).eq("id", source.get("id")).execute()
                     try:
-                        supabase.table("challenge_purchases").update({
-                            "status": "completed", "reset_entitlement_consumed_at": now,
-                            "reset_replacement_account_id": account.get("id"), "updated_at": now,
-                        }).eq("id", order_id).execute()
+                        _audit_safe(
+                            "payouts", "payout_renewal_completed",
+                            f"payout={payout_id} source_account={source.get('id')} replacement_account={account.get('id')}",
+                            _admin_from_payload(d), payout_id or source.get("id")
+                        )
                     except Exception:
                         pass
-                parent_id = str(source.get("purchase_id") or "").strip()
-                if parent_id:
-                    field = "funded_reset_replacement_account_id" if _np_reset_stage(source) == "funded" else "challenge_reset_replacement_account_id"
-                    try:
-                        supabase.table("challenge_purchases").update({field: account.get("id"), "updated_at": now}).eq("id", parent_id).execute()
-                    except Exception:
-                        pass
+
+                # Challenge / Funded BREACH reset remains one-time and is consumed.
+                else:
+                    supabase.table("trader_accounts").update({
+                        "reset_consumed_at": now,
+                        "reset_replacement_account_id": account.get("id"),
+                        "account_status": "archived",
+                        "updated_at": now,
+                        "archive_reason": (
+                            str(source.get("archive_reason") or "")
+                            + f" | reset_consumed replacement_account_id={account.get('id')} replacement_mt5={account.get('mt5_login')}"
+                        ).strip(" |"),
+                    }).eq("id", source.get("id")).execute()
+
+                    order_id = str(source.get("reset_order_id") or ent.get("evidence_id") or "").strip()
+                    if order_id and ent_reason in {"challenge_reset_paid", "funded_reset_paid"}:
+                        try:
+                            supabase.table("challenge_purchases").update({
+                                "status": "completed",
+                                "reset_entitlement_consumed_at": now,
+                                "reset_replacement_account_id": account.get("id"),
+                                "updated_at": now,
+                            }).eq("id", order_id).execute()
+                        except Exception:
+                            pass
+
+                    parent_id = str(source.get("purchase_id") or source.get("challenge_purchase_id") or "").strip()
+                    if parent_id and ent_reason in {"challenge_reset_paid", "funded_reset_paid"}:
+                        field = (
+                            "funded_reset_replacement_account_id"
+                            if ent_reason == "funded_reset_paid"
+                            else "challenge_reset_replacement_account_id"
+                        )
+                        try:
+                            supabase.table("challenge_purchases").update({
+                                field: account.get("id"), "updated_at": now
+                            }).eq("id", parent_id).execute()
+                        except Exception:
+                            pass
     except Exception as consume_error:
         print("RESET ENTITLEMENT CONSUMPTION ERROR:", consume_error)
     return resp
@@ -22070,25 +22137,32 @@ def _np_exact_post_payout_replacement_20260908(source, payout, account_rows, tra
 
 
 def _np_stamp_exact_payout_consumed_20260908(source, replacement, trader_id):
+    """Close ONE payout-renewal cycle without touching the Funded breach-reset counter."""
     if not source or not replacement:
         return
-    if source.get("reset_consumed_at") and source.get("reset_replacement_account_id"):
-        return
     try:
-        now = now_iso()
         old_reason = str(source.get("archive_reason") or "").strip()
+        # Idempotent: if this exact payout renewal was already linked, do nothing.
+        if (
+            "np_payout_renewal_completed" in old_reason.lower()
+            and str(replacement.get("id") or "") in old_reason
+        ):
+            return
+        now = now_iso()
         marker = (
-            f"post_payout_renewal_consumed replacement_account_id={replacement.get('id')} "
+            f"[NP_PAYOUT_RENEWAL_COMPLETED] replacement_account_id={replacement.get('id')} "
             f"replacement_mt5={replacement.get('mt5_login')}"
         )
+        # IMPORTANT: no reset_consumed_at / reset_replacement_account_id here.
+        # Those fields belong to one-time breach resets. Payout renewals are unlimited.
         supabase.table("trader_accounts").update({
-            "reset_consumed_at": now,
-            "reset_replacement_account_id": replacement.get("id"),
+            "account_status": "archived",
+            "monitoring_enabled": False,
             "archive_reason": (old_reason + " | " + marker).strip(" |"),
             "updated_at": now,
         }).eq("id", source.get("id")).eq("trader_id", trader_id).execute()
     except Exception as exc:
-        print("POST PAYOUT EXACT CONSUMPTION STAMP SKIPPED:", exc)
+        print("POST PAYOUT RENEWAL COMPLETION STAMP SKIPPED:", exc)
 
 
 def _np_trader_reset_opportunities_exact_payout_20260908():
@@ -22200,3 +22274,292 @@ def _np_trader_reset_opportunities_exact_payout_20260908():
 
 # Replace only the recovery-opportunity view. Existing route URL remains unchanged.
 app.view_functions["trader_reset_opportunities"] = _np_trader_reset_opportunities_exact_payout_20260908
+
+
+# =============================================================================
+# NAIRAPIPS TWIN PROGRESSION REPORT — 2026-09-08
+# Same lineage evidence is consumed by Admin and Trader views.
+# This report NEVER creates entitlement and NEVER reactivates history.
+# =============================================================================
+
+def _np_prog_time(row):
+    return _dt_score(
+        (row or {}).get("assigned_at") or (row or {}).get("started_at")
+        or (row or {}).get("passed_at") or (row or {}).get("breached_at")
+        or (row or {}).get("reset_at") or (row or {}).get("archived_at")
+        or (row or {}).get("updated_at") or (row or {}).get("created_at")
+    )
+
+def _np_prog_status(row):
+    row = row or {}
+    blob = " ".join(str(row.get(k) or "") for k in (
+        "account_status","status","risk_zone","archive_reason","breach_reason",
+        "phase_pass_status","lifecycle_state","challenge_state","admin_note"
+    )).lower()
+    if "wrong_assignment_recalled" in blob or "legacy_dead_account" in blob:
+        return "history"
+    if "np_payout_renewal_completed" in blob or "post_payout_renewal_consumed" in blob:
+        return "payout_renewed"
+    if "breach" in blob or row.get("breached_at"):
+        return "breached"
+    if "progression_consumed" in blob:
+        return "completed"
+    if "archived_phase" in blob or "passed" in blob or str(row.get("risk_zone") or "").lower() == "passed":
+        return "passed"
+    if "waiting" in blob or "pending_assignment" in blob or "awaiting_mt5" in blob:
+        return "waiting"
+    if "archived_reset" in blob:
+        if row.get("reset_consumed_at") or row.get("reset_replacement_account_id"):
+            return "completed"
+        return "reset_source"
+    if str(row.get("account_status") or row.get("status") or "").lower() in ACTIVE_ACCOUNT_STATUSES:
+        return "active"
+    return "history"
+
+def _np_progression_plan_model(purchase, rows):
+    purchase = purchase or {}
+    rows = rows or []
+    programme_blob = " ".join(
+        str(x or "") for x in [
+            purchase.get("programme_type"), purchase.get("program_type"),
+            purchase.get("source"), purchase.get("purchase_type"),
+            *[(r or {}).get("programme_type") for r in rows],
+        ]
+    ).lower()
+
+    if "league" in programme_blob or "competition" in programme_blob:
+        return {
+            "model": "traders_league",
+            "label": "TRADERS LEAGUE / COMPETITION",
+            "challenge_reset": "NOT_APPLICABLE",
+            "funded_breach_reset": "NOT_APPLICABLE",
+            "payout_renewal": "NOT_APPLICABLE",
+        }
+
+    second_enabled = _second_life_bool(purchase.get("second_life_enabled"))
+    second_used = _second_life_bool(purchase.get("second_life_used"))
+    journey_blob = " ".join(
+        str(x or "") for x in [
+            purchase.get("challenge_journey"), purchase.get("journey_stages"),
+            purchase.get("route"), purchase.get("progression_route"),
+        ]
+    ).lower()
+    phase2_target = clean(purchase.get("phase2_target") or 0)
+    has_phase2 = (
+        "two_phase" in journey_blob or "two-phase" in journey_blob
+        or "phase2" in journey_blob or "phase 2" in journey_blob
+        or phase2_target > 0
+        or any(_normalize_lifecycle_stage(r.get("stage") or r.get("phase")) == "phase2" for r in rows)
+    )
+
+    if second_enabled:
+        model = "one_phase_2_lives"
+        label = "1-PHASE · 2 LIVES"
+        challenge_reset = "USED" if second_used else "FREE_ONCE_AVAILABLE"
+    elif has_phase2:
+        model = "legacy_two_phase"
+        label = "LEGACY · PHASE 1 → PHASE 2 → FUNDED"
+        challenge_reset = "USED" if _np_reset_bool(purchase.get("challenge_reset_used")) else "PAID_ONCE_AVAILABLE"
+    else:
+        model = "one_phase"
+        label = "1-PHASE → FUNDED"
+        challenge_reset = "USED" if _np_reset_bool(purchase.get("challenge_reset_used")) else "PAID_ONCE_AVAILABLE"
+
+    funded_used = _np_reset_bool(purchase.get("funded_reset_used"))
+    return {
+        "model": model,
+        "label": label,
+        "challenge_reset": challenge_reset,
+        "funded_breach_reset": "USED" if funded_used else "PAID_ONCE_AVAILABLE",
+        # Successful payout renewals never consume funded_reset_used.
+        "payout_renewal": "UNLIMITED_WHILE_FUNDED",
+    }
+
+
+def _np_progression_report_for_trader(trader_id, purchase_id=None):
+    trader_id = str(trader_id or "").strip()
+    purchase_id = str(purchase_id or "").strip()
+    if not trader_id:
+        return {"state": "UNKNOWN", "journeys": []}
+
+    try:
+        accounts = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", trader_id)
+            .order("created_at")
+            .limit(500).execute().data or []
+        )
+    except Exception:
+        accounts = []
+
+    try:
+        payouts = (
+            supabase.table("payouts")
+            .select("id,status,trader_id,trader_account_id,mt5_login,amount,paid_at,created_at")
+            .eq("trader_id", trader_id)
+            .order("created_at")
+            .limit(200).execute().data or []
+        )
+    except Exception:
+        payouts = []
+
+    try:
+        purchases = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("trader_id", trader_id)
+            .order("created_at")
+            .limit(250).execute().data or []
+        )
+    except Exception:
+        purchases = []
+
+    purchases_by_id = {
+        str(p.get("id") or ""): p for p in purchases
+        if p.get("id") and str(p.get("purchase_type") or "challenge").lower() != "reset"
+    }
+    by_id = {str(a.get("id") or ""): a for a in accounts if a.get("id")}
+
+    children = {}
+    for a in accounts:
+        parent = str(
+            a.get("previous_trader_account_id")
+            or a.get("replaces_trader_account_id")
+            or ""
+        ).strip()
+        if parent:
+            children.setdefault(parent, []).append(a)
+
+    groups = {}
+    for a in accounts:
+        pid = str(a.get("purchase_id") or a.get("challenge_purchase_id") or "").strip()
+        key = pid or ("unlinked:" + str(a.get("id") or ""))
+        groups.setdefault(key, []).append(a)
+
+    journeys = []
+    for key, rows in groups.items():
+        pid = "" if key.startswith("unlinked:") else key
+        if purchase_id and pid != purchase_id:
+            continue
+
+        purchase = purchases_by_id.get(pid, {})
+        rows = sorted(rows, key=_np_prog_time)
+        model = _np_progression_plan_model(purchase, rows)
+
+        nodes = []
+        for a in rows:
+            aid = str(a.get("id") or "")
+            stage = _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) or "phase1"
+            status = _np_prog_status(a)
+            child_rows = sorted(children.get(aid, []), key=_np_prog_time)
+            child = child_rows[-1] if child_rows else None
+
+            reason_blob = " ".join(str(a.get(k) or "") for k in (
+                "archive_reason", "reset_reason", "admin_note", "message"
+            )).lower()
+            renewal_completed = (
+                "np_payout_renewal_completed" in reason_blob
+                or "post_payout_renewal_consumed" in reason_blob
+            )
+
+            nodes.append({
+                "account_id": aid,
+                "mt5_login": str(a.get("mt5_login") or ""),
+                "stage": stage,
+                "status": status,
+                "account_status": str(a.get("account_status") or a.get("status") or ""),
+                "previous_account_id": str(a.get("previous_trader_account_id") or ""),
+                "replaces_account_id": str(a.get("replaces_trader_account_id") or ""),
+                "next_account_id": str((child or {}).get("id") or ""),
+                "breach_reset_consumed": bool(
+                    a.get("reset_consumed_at") or a.get("reset_replacement_account_id")
+                ) and not renewal_completed,
+                "payout_renewal_completed": bool(renewal_completed),
+                "when": a.get("assigned_at") or a.get("started_at") or a.get("created_at"),
+            })
+
+        exact_payouts = []
+        row_ids = {str(r.get("id") or "") for r in rows}
+        for p in payouts:
+            aid = str(p.get("trader_account_id") or "").strip()
+            if aid and aid in row_ids:
+                replacement = None
+                src = by_id.get(aid)
+                if src and str(p.get("status") or "").lower() == "paid":
+                    replacement = _np_exact_post_payout_replacement_20260908(
+                        src, p, accounts, get_trader_by_id(trader_id) or {}
+                    )
+                exact_payouts.append({
+                    "payout_id": str(p.get("id") or ""),
+                    "account_id": aid,
+                    "mt5_login": str(
+                        p.get("mt5_login")
+                        or (by_id.get(aid) or {}).get("mt5_login")
+                        or ""
+                    ),
+                    "status": str(p.get("status") or "").lower(),
+                    "amount": p.get("amount"),
+                    "paid_at": p.get("paid_at"),
+                    "renewal_replacement_account_id": str((replacement or {}).get("id") or ""),
+                    "renewal_replacement_mt5": str((replacement or {}).get("mt5_login") or ""),
+                })
+
+        active = [n for n in nodes if n["status"] == "active"]
+        waiting = [n for n in nodes if n["status"] == "waiting"]
+        open_pass = []
+        for n in nodes:
+            if n["status"] != "passed":
+                continue
+            linked_child = next(
+                (x for x in nodes if x["previous_account_id"] == n["account_id"]),
+                None
+            )
+            if not linked_child:
+                open_pass.append(n)
+
+        if waiting:
+            state = "WAITING"
+        elif open_pass:
+            state = "PROGRESSION OPEN"
+        elif active:
+            state = "ACTIVE / LINKED"
+        elif nodes:
+            state = "COMPLETED / HISTORY"
+        else:
+            state = "UNKNOWN"
+
+        journeys.append({
+            "purchase_id": pid,
+            "state": state,
+            "model": model,
+            "nodes": nodes,
+            "payouts": exact_payouts,
+        })
+
+    journeys.sort(
+        key=lambda j: max(
+            [_np_prog_time(by_id.get(n.get("account_id")) or {}) for n in j.get("nodes", [])]
+            or [0]
+        ),
+        reverse=True,
+    )
+    return {
+        "state": journeys[0]["state"] if journeys else "UNKNOWN",
+        "journeys": journeys,
+    }
+
+
+@app.route("/progression_report", methods=["GET", "OPTIONS"])
+def progression_report():
+    if request.method == "OPTIONS": return _np_ok({})
+    requested_id=str(request.args.get("trader_id") or "").strip(); purchase_id=str(request.args.get("purchase_id") or "").strip()
+    admin=None
+    try:
+        admin, auth_response = _require_admin()
+        if auth_response: admin=None
+    except Exception:
+        admin=None
+    if not admin:
+        authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
+        if auth_error: return _np_fail(auth_error,401)
+        requested_id=authed_id
+    return _np_ok({"success":True,"trader_id":requested_id,"report":_np_progression_report_for_trader(requested_id,purchase_id)})
