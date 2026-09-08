@@ -21690,6 +21690,98 @@ def _np_reset_open_order(source_account_id):
     return None
 
 
+
+def _np_funded_reset_child_already_used(account):
+    """True when this Funded account is the replacement created by the journey's
+    one already-consumed Funded breach reset.
+
+    Evidence is exact and journey-scoped:
+      - same purchase_id
+      - historical source contains NP_FUNDED_BREACH_RESET_CONSUMED / funded_reset_paid
+      - and that source points to THIS account by replacement id/MT5 or explicit lineage.
+
+    Payout-renewal markers do NOT count as Funded breach-reset consumption.
+    Recalled/wrong assignments are ignored.
+    """
+    account = account or {}
+    current_id = str(account.get("id") or "").strip()
+    current_mt5 = str(account.get("mt5_login") or "").strip()
+    trader_id = str(account.get("trader_id") or "").strip()
+    purchase_id = str(account.get("purchase_id") or "").strip()
+
+    if not current_id or not trader_id or not purchase_id or not current_mt5:
+        return False
+
+    # Explicit child lineage on the current row is strongest evidence.
+    parent_refs = {
+        str(account.get("previous_trader_account_id") or "").strip(),
+        str(account.get("replaces_trader_account_id") or "").strip(),
+        str(account.get("reset_source_account_id") or "").strip(),
+    }
+
+    try:
+        rows = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .eq("trader_id", trader_id)
+            .eq("purchase_id", purchase_id)
+            .limit(250)
+            .execute().data or []
+        )
+    except Exception:
+        rows = []
+
+    for source in rows:
+        source_id = str(source.get("id") or "").strip()
+        if not source_id or source_id == current_id:
+            continue
+
+        blob = " ".join(str(source.get(k) or "") for k in (
+            "account_status","status","archive_reason","reset_reason",
+            "admin_note","message"
+        )).lower()
+
+        if (
+            "wrong_assignment_recalled" in blob
+            or "recalled_wrong_assignment" in blob
+            or "np_terminal:recalled_wrong_assignment" in blob
+            or "np_excluded_from_progression" in blob
+        ):
+            continue
+
+        # A payout renewal is NOT the one-time funded breach reset.
+        if (
+            "np_entitlement:post_payout_renewal" in blob
+            or "np_payout_renewal_completed" in blob
+            or "post_payout_renewal_consumed" in blob
+        ):
+            continue
+
+        funded_reset_evidence = (
+            "np_funded_breach_reset_consumed" in blob
+            or "np_entitlement:funded_reset_paid" in blob
+            or str(source.get("reset_kind") or "").strip().lower() == "funded_reset_paid"
+        )
+        if not funded_reset_evidence:
+            continue
+
+        # Exact stored replacement account id.
+        replacement_id = str(source.get("reset_replacement_account_id") or "").strip()
+        if replacement_id and replacement_id == current_id:
+            return True
+
+        # Exact explicit parent/child linkage.
+        if source_id in parent_refs:
+            return True
+
+        # Historical marker written by reconciliation/assignment.
+        m = re.search(r"replacement_mt5\s*=\s*([0-9]+)", blob, re.I)
+        if m and m.group(1) == current_mt5:
+            return True
+
+    return False
+
+
 def _np_reset_policy(account, trader=None):
     """Single backend authority used by trader card, payment creation and Admin approval."""
     account = account or {}
@@ -21778,6 +21870,25 @@ def _np_reset_policy(account, trader=None):
 
     # Funded policy is independent of Challenge reset usage: exactly one paid Funded reset per journey.
     if stage == "funded":
+        # GLOBAL TERMINAL AUTHORITY:
+        # If THIS breached Funded account is itself the replacement produced by
+        # the journey's one consumed Funded breach reset, a second Funded reset
+        # is forbidden even when old purchase mirror flags are stale/missing.
+        if _np_funded_reset_child_already_used(account):
+            return {
+                "eligible": False,
+                "kind": "terminal",
+                "reason": "funded_reset_replacement_breached_journey_complete",
+                "title": "Funded Journey Complete",
+                "subtitle": "This Funded account was issued from the one Funded reset already used on this journey. It has now breached, so this journey is complete. Start a new Challenge to continue.",
+                "stage": "funded",
+                "account_size": size,
+                "source_account_id": source_id,
+                "source_mt5_login": account.get("mt5_login"),
+                "purchase_id": purchase.get("id"),
+                "price": price,
+            }
+
         if _np_reset_bool(purchase.get("funded_reset_used")):
             return {
                 "eligible": False, "kind": "terminal", "reason": "funded_reset_already_used",
