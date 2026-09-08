@@ -21612,6 +21612,65 @@ def _np_reset_entitlement_for_source(source, trader=None):
     return _np_reset_entitlement_for_source_core_20260907(source, trader)
 
 
+def _np_reset_source_already_replaced(source, account_rows):
+    """Return the exact later active same-lineage replacement, if one exists.
+
+    Production invariant: an archived payout/reset source may create ONE fresh account.
+    Once a later active account exists on the same purchase/journey and stage, the old
+    source is consumed and must never surface as another recovery opportunity.
+    Unrelated accounts owned by the same trader do not count.
+    """
+    source = source or {}
+    source_id = str(source.get("id") or "").strip()
+    source_pid = str(source.get("purchase_id") or source.get("challenge_purchase_id") or "").strip()
+    source_stage = _np_reset_stage(source)
+    if not source_id or not source_pid or source_stage not in {"phase1", "phase2", "funded"}:
+        return None
+
+    status_blob = " ".join(str(source.get(k) or "") for k in (
+        "account_status", "status", "archive_reason", "reset_reason", "admin_note"
+    )).lower()
+    # Only resolve historical reset/renewal sources. A plain breached account must
+    # remain eligible according to normal reset policy.
+    if not (
+        "archived_reset" in status_blob
+        or "np_entitlement:post_payout_renewal" in status_blob
+        or "np_entitlement:funded_reset_paid" in status_blob
+        or "np_entitlement:challenge_reset_paid" in status_blob
+        or source.get("reset_order_id")
+        or source.get("reset_kind")
+    ):
+        return None
+
+    source_time = _dt_score(
+        source.get("reset_consumed_at") or source.get("archived_at") or source.get("reset_at")
+        or source.get("updated_at") or source.get("created_at")
+    )
+    terminal_words = ("breach", "archive", "closed", "disabled", "locked", "reset")
+    for candidate in account_rows or []:
+        if str(candidate.get("id") or "").strip() == source_id:
+            continue
+        candidate_pid = str(candidate.get("purchase_id") or candidate.get("challenge_purchase_id") or "").strip()
+        if candidate_pid != source_pid:
+            continue
+        if _np_reset_stage(candidate) != source_stage:
+            continue
+        if not str(candidate.get("mt5_login") or "").strip():
+            continue
+        ctime = _dt_score(candidate.get("assigned_at") or candidate.get("started_at") or candidate.get("created_at") or candidate.get("updated_at"))
+        if source_time and ctime and ctime <= source_time:
+            continue
+        cblob = " ".join(str(candidate.get(k) or "") for k in (
+            "account_status", "status", "risk_zone", "archive_reason", "breach_reason"
+        )).lower()
+        if any(w in cblob for w in terminal_words):
+            continue
+        if candidate.get("mt5_access_disabled") is True:
+            continue
+        return candidate
+    return None
+
+
 @app.route("/trader_reset_opportunities", methods=["GET", "OPTIONS"])
 def trader_reset_opportunities():
     if request.method == "OPTIONS":
@@ -21625,7 +21684,36 @@ def trader_reset_opportunities():
         rows = (supabase.table("trader_accounts").select("*").eq("trader_id", authed_id).order("updated_at", desc=True).limit(250).execute().data or [])
         breached = [a for a in rows if _np_reset_account_is_breached(a)]
         breached.sort(key=lambda a: str(a.get("breached_at") or a.get("breach_at") or a.get("updated_at") or a.get("created_at") or ""), reverse=True)
-        opportunity = _np_reset_policy(breached[0], trader) if breached else None
+
+        opportunity = None
+        for source in breached:
+            replacement = _np_reset_source_already_replaced(source, rows)
+            if replacement:
+                # Best-effort persistence so Admin, assignment queues and future
+                # dashboard calls all agree that this exact entitlement is consumed.
+                if not source.get("reset_consumed_at") and not source.get("reset_replacement_account_id"):
+                    try:
+                        now = now_iso()
+                        old_reason = str(source.get("archive_reason") or "").strip()
+                        marker = f"reset_consumed replacement_account_id={replacement.get('id')} replacement_mt5={replacement.get('mt5_login')}"
+                        payload = {
+                            "reset_consumed_at": now,
+                            "reset_replacement_account_id": replacement.get("id"),
+                            "archive_reason": (old_reason + " | " + marker).strip(" |"),
+                            "updated_at": now,
+                        }
+                        supabase.table("trader_accounts").update(payload).eq("id", source.get("id")).eq("trader_id", authed_id).execute()
+                    except Exception as consume_exc:
+                        print("RESET OPPORTUNITY CONSUMPTION STAMP SKIPPED:", consume_exc)
+                continue
+            policy = _np_reset_policy(source, trader)
+            # Historical reset sources already consumed by a replacement should not
+            # produce a terminal card either; they belong only in Account History.
+            if policy.get("reason") == "reset_already_consumed":
+                continue
+            opportunity = policy
+            break
+
         return _np_ok({"success": True, "opportunity": opportunity})
     except Exception as e:
         return _np_fail(e, 500)
