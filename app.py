@@ -1752,7 +1752,44 @@ def _get_active_accounts(trader_id, trader=None, purchases=None):
 
         for row in decorated:
             add_account(row)
+        # Purchase rows are mirrors only. They must never resurrect a stale
+        # WAITING FOR PHASE/FUNDED state after a real target-stage MT5 has already
+        # existed for that purchase (even if that MT5 later breached/archived).
+        def purchase_waiting_is_already_fulfilled(wait_row):
+            pid = str(wait_row.get("purchase_id") or "").strip()
+            target = _normalize_lifecycle_stage(
+                wait_row.get("waiting_for_stage")
+                or wait_row.get("stage")
+                or wait_row.get("phase")
+            )
+            if not pid or target not in {"phase1", "phase2", "funded"}:
+                return False
+            for real in decorated:
+                if str(real.get("purchase_id") or real.get("challenge_purchase_id") or "").strip() != pid:
+                    continue
+                if not str(real.get("mt5_login") or "").strip():
+                    continue
+                blob = " ".join(str(real.get(k) or "") for k in (
+                    "account_status","status","archive_reason","admin_note","message"
+                )).lower()
+                if "wrong_assignment_recalled" in blob or "recalled_wrong_assignment" in blob:
+                    continue
+                real_stage = _normalize_lifecycle_stage(real.get("stage") or real.get("phase"))
+                if target == "funded" and real_stage == "funded":
+                    return True
+                if target == "phase2" and real_stage in {"phase2", "funded"}:
+                    return True
+                if target == "phase1" and real_stage == "phase1":
+                    # For reset/Second Life, a later same-stage MT5 fulfils waiting.
+                    wait_time = _dt_score(wait_row.get("created_at") or wait_row.get("updated_at"))
+                    real_time = _dt_score(real.get("assigned_at") or real.get("started_at") or real.get("created_at"))
+                    if not wait_time or not real_time or real_time >= wait_time:
+                        return True
+            return False
+
         for row in purchase_accounts:
+            if purchase_waiting_is_already_fulfilled(row):
+                continue
             add_account(row)
         decorated = combined
         if not decorated:
@@ -3984,12 +4021,17 @@ def _phase_assignment_rows_from_accounts(accounts, traders_by_id=None, active_ac
                 "archive_reason","breach_reason"
             )).lower()
 
+            # GLOBAL PROGRESSION LAW 2026-09-08:
+            # Once a genuine child MT5 was ever issued from this passed source,
+            # the old progression is consumed FOREVER. The child may later be
+            # breached, reset, archived, paid-out or closed; none of those events
+            # resurrect the old pass. Only an explicitly recalled WRONG assignment
+            # is ignored as a successor.
             if (
-                row_status == "archived"
-                or row_status.startswith("archived_")
-                or "breach" in blob
-                or "reset" in blob
-                or "recalled" in blob
+                "wrong_assignment_recalled" in blob
+                or "recalled_wrong_assignment" in blob
+                or "np_terminal:recalled_wrong_assignment" in blob
+                or "admin_recall_wrong_assignment" in blob
             ):
                 continue
 
@@ -6426,12 +6468,29 @@ def _np_bootstrap_lifecycle_authority(trader, accounts, purchases, plan_by_id):
                 passed_source = a
                 break
 
+        # A passed Phase-1 source can open Funded only if that progression has
+        # NEVER already produced a Funded account. A later Funded breach is NOT a
+        # reason to resurrect the old Phase-1 pass.
+        passed_progression_consumed = False
+        if passed_source is not None:
+            try:
+                passed_progression_consumed, _existing_successor = (
+                    _np_progression_source_consumed_forever(passed_source, "funded")
+                )
+            except Exception:
+                passed_progression_consumed = False
+
         state = "not_eligible"
         if used and active_life2:
             state = "life2_active"
         elif used and raw_sl_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
             state = "life2_waiting_mt5"
-        elif (not used) and passed_source is not None and not admin_correction:
+        elif (
+            (not used)
+            and passed_source is not None
+            and not admin_correction
+            and not passed_progression_consumed
+        ):
             state = "challenge_passed_waiting_funded"
             source = passed_source
         elif (not used) and source and (
@@ -8610,6 +8669,115 @@ def admin_mark_funded_reset_paid():
         return _np_fail(e, 500)
 
 
+
+def _np_progression_source_consumed_forever(source_account, requested_target_stage=None):
+    """Return (consumed, successor) for a normal pass progression.
+
+    A pass source is consumed permanently after ANY genuine next-stage MT5 was
+    ever issued from the same journey. Successor status does not matter:
+    active, breached, reset, archived, paid-out, closed all still prove fulfilment.
+    Only an explicitly recalled wrong assignment is ignored.
+    """
+    source_account = source_account or {}
+    source_id = str(source_account.get("id") or "").strip()
+    trader_id = str(source_account.get("trader_id") or "").strip()
+    source_purchase = str(
+        source_account.get("purchase_id")
+        or source_account.get("challenge_purchase_id")
+        or ""
+    ).strip()
+    source_stage = _normalize_lifecycle_stage(
+        source_account.get("stage") or source_account.get("phase")
+    )
+    target_stage = _normalize_lifecycle_stage(
+        requested_target_stage
+        or source_account.get("next_stage")
+        or _next_stage_for_lifecycle(source_stage, source_account, None, None, None)
+    )
+    source_size = clean(
+        source_account.get("account_size")
+        or source_account.get("start_balance")
+        or 0
+    )
+    source_time = _dt_score(
+        source_account.get("passed_at")
+        or source_account.get("archived_at")
+        or source_account.get("updated_at")
+        or source_account.get("created_at")
+    )
+
+    if not source_id or not trader_id or target_stage not in {"phase2", "funded"}:
+        return False, None
+
+    try:
+        candidates = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", trader_id)
+            .limit(500).execute().data or []
+        )
+    except Exception:
+        candidates = []
+
+    for row in candidates:
+        if str(row.get("id") or "").strip() == source_id:
+            continue
+        login = str(row.get("mt5_login") or "").strip()
+        if not login:
+            continue
+
+        blob = " ".join(str(row.get(k) or "") for k in (
+            "account_status","status","archive_reason","admin_note","message"
+        )).lower()
+        if (
+            "wrong_assignment_recalled" in blob
+            or "recalled_wrong_assignment" in blob
+            or "np_terminal:recalled_wrong_assignment" in blob
+            or "admin_recall_wrong_assignment" in blob
+        ):
+            continue
+
+        # Explicit lineage link wins.
+        parent_id = str(
+            row.get("previous_trader_account_id")
+            or row.get("replaces_trader_account_id")
+            or ""
+        ).strip()
+        if parent_id and parent_id == source_id:
+            return True, row
+
+        row_stage = _normalize_lifecycle_stage(row.get("stage") or row.get("phase"))
+        if target_stage == "phase2" and row_stage not in {"phase2", "funded"}:
+            continue
+        if target_stage == "funded" and row_stage != "funded":
+            continue
+
+        row_purchase = str(
+            row.get("purchase_id")
+            or row.get("challenge_purchase_id")
+            or ""
+        ).strip()
+        if source_purchase:
+            if row_purchase != source_purchase:
+                continue
+        else:
+            row_size = clean(row.get("account_size") or row.get("start_balance") or 0)
+            if source_size and row_size and int(source_size) != int(row_size):
+                continue
+
+        child_time = _dt_score(
+            row.get("assigned_at")
+            or row.get("started_at")
+            or row.get("created_at")
+            or row.get("updated_at")
+        )
+        if source_time and child_time and child_time <= source_time:
+            continue
+
+        return True, row
+
+    return False, None
+
+
 @app.route("/assign_phase_mt5", methods=["POST"])
 def assign_phase_mt5():
     """
@@ -8729,6 +8897,21 @@ def assign_phase_mt5():
                 and ("breach" in _completed_status or _admin_corrected_life2)
             )
             if not second_life_reentry and not reset_replacement:
+                # HARD DUPLICATE-FUNDING GATE:
+                # old PASS can never issue another next-stage account after ANY
+                # genuine successor has ever existed, even if that successor is
+                # now breached/archived/reset.
+                _consumed, _successor = _np_progression_source_consumed_forever(
+                    completed_account, target_stage
+                )
+                if _consumed:
+                    return bad(
+                        "Progression already completed: this exact passed account "
+                        f"already produced MT5 {(_successor or {}).get('mt5_login') or 'a later account'}. "
+                        "A later breach/reset does not reopen the old progression.",
+                        409
+                    )
+
                 expected_stage = _next_stage_for_lifecycle(
                     completed_stage,
                     completed_account,
@@ -22294,12 +22477,21 @@ def _np_prog_status(row):
     row = row or {}
     blob = " ".join(str(row.get(k) or "") for k in (
         "account_status","status","risk_zone","archive_reason","breach_reason",
-        "phase_pass_status","lifecycle_state","challenge_state","admin_note"
+        "phase_pass_status","lifecycle_state","challenge_state","admin_note","message"
     )).lower()
     if "wrong_assignment_recalled" in blob or "legacy_dead_account" in blob:
         return "history"
-    if "np_payout_renewal_completed" in blob or "post_payout_renewal_consumed" in blob:
+
+    # SUCCESSFUL PAYOUT RENEWAL IS ITS OWN TERMINAL OUTCOME.
+    # It must outrank stale BREACHED/risk-zone mirrors left behind by older UI/data.
+    payout_renewal_marker = (
+        "np_payout_renewal_completed" in blob
+        or "post_payout_renewal_consumed" in blob
+        or "np_entitlement:post_payout_renewal" in blob
+    )
+    if payout_renewal_marker:
         return "payout_renewed"
+
     if "breach" in blob or row.get("breached_at"):
         return "breached"
     if "progression_consumed" in blob:
@@ -22315,6 +22507,49 @@ def _np_prog_status(row):
     if str(row.get("account_status") or row.get("status") or "").lower() in ACTIVE_ACCOUNT_STATUSES:
         return "active"
     return "history"
+
+
+def _np_exact_paid_payout_for_account(account_id, trader_id=None):
+    account_id = str(account_id or "").strip()
+    trader_id = str(trader_id or "").strip()
+    if not account_id:
+        return None
+    try:
+        q = supabase.table("payouts").select(
+            "id,status,trader_id,trader_account_id,mt5_login,amount,paid_at,created_at"
+        ).eq("trader_account_id", account_id)
+        if trader_id:
+            q = q.eq("trader_id", trader_id)
+        rows = q.order("created_at", desc=True).limit(50).execute().data or []
+        return next(
+            (p for p in rows if str(p.get("status") or "").strip().lower() == "paid"),
+            None
+        )
+    except Exception:
+        return None
+
+
+def _np_account_is_successful_payout_cycle(account, trader_id=None):
+    """True only when exact account evidence says this was a successful payout renewal source."""
+    account = account or {}
+    aid = str(account.get("id") or "").strip()
+    if not aid:
+        return False
+
+    blob = " ".join(str(account.get(k) or "") for k in (
+        "archive_reason","reset_reason","admin_note","message","lifecycle_state",
+        "account_status","status"
+    )).lower()
+
+    explicit = (
+        "np_payout_renewal_completed" in blob
+        or "post_payout_renewal_consumed" in blob
+        or "np_entitlement:post_payout_renewal" in blob
+        or "np_payout_paid:" in blob
+    )
+    payout = _np_exact_paid_payout_for_account(aid, trader_id or account.get("trader_id"))
+    return bool(explicit and payout)
+
 
 def _np_progression_plan_model(purchase, rows):
     purchase = purchase or {}
@@ -22454,11 +22689,11 @@ def _np_progression_report_for_trader(trader_id, purchase_id=None):
             child = child_rows[-1] if child_rows else None
 
             reason_blob = " ".join(str(a.get(k) or "") for k in (
-                "archive_reason", "reset_reason", "admin_note", "message"
+                "archive_reason", "reset_reason", "admin_note", "message",
+                "account_status", "status"
             )).lower()
-            renewal_completed = (
-                "np_payout_renewal_completed" in reason_blob
-                or "post_payout_renewal_consumed" in reason_blob
+            renewal_completed = _np_account_is_successful_payout_cycle(
+                a, trader_id
             )
 
             nodes.append({
