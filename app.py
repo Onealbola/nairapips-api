@@ -21672,114 +21672,33 @@ def _np_reset_account_is_breached(account):
 
 
 def _np_reset_open_order(source_account_id):
+    """
+    Schema-safe reset proof lookup.
+    Production challenge_purchases does not currently have purchase_type /
+    reset_source_account_id columns, so reset proof identity is stored in the
+    existing admin_note field as:
+      [NP_RESET_REQUEST:<source_account_id>:<parent_purchase_id>:<stage>]
+    """
+    source_account_id = str(source_account_id or "").strip()
     if not source_account_id:
         return None
+    marker = f"[NP_RESET_REQUEST:{source_account_id}:"
     try:
+        # Keep the query bounded; filter exact reset-source marker in Python.
         rows = (
             supabase.table("challenge_purchases").select("*")
-            .eq("purchase_type", "reset")
-            .eq("reset_source_account_id", source_account_id)
-            .order("created_at", desc=True).limit(20).execute().data or []
+            .order("created_at", desc=True).limit(500).execute().data or []
         )
     except Exception:
         return None
     for row in rows:
-        st = str(row.get("payment_status") or row.get("status") or "").strip().lower()
+        note = str((row or {}).get("admin_note") or "")
+        if marker not in note:
+            continue
+        st = str((row or {}).get("payment_status") or (row or {}).get("status") or "").strip().lower()
         if st not in {"rejected", "cancelled", "canceled", "expired", "failed"}:
             return row
     return None
-
-
-
-def _np_funded_reset_child_already_used(account):
-    """True when this Funded account is the replacement created by the journey's
-    one already-consumed Funded breach reset.
-
-    Evidence is exact and journey-scoped:
-      - same purchase_id
-      - historical source contains NP_FUNDED_BREACH_RESET_CONSUMED / funded_reset_paid
-      - and that source points to THIS account by replacement id/MT5 or explicit lineage.
-
-    Payout-renewal markers do NOT count as Funded breach-reset consumption.
-    Recalled/wrong assignments are ignored.
-    """
-    account = account or {}
-    current_id = str(account.get("id") or "").strip()
-    current_mt5 = str(account.get("mt5_login") or "").strip()
-    trader_id = str(account.get("trader_id") or "").strip()
-    purchase_id = str(account.get("purchase_id") or "").strip()
-
-    if not current_id or not trader_id or not purchase_id or not current_mt5:
-        return False
-
-    # Explicit child lineage on the current row is strongest evidence.
-    parent_refs = {
-        str(account.get("previous_trader_account_id") or "").strip(),
-        str(account.get("replaces_trader_account_id") or "").strip(),
-        str(account.get("reset_source_account_id") or "").strip(),
-    }
-
-    try:
-        rows = (
-            supabase.table("trader_accounts")
-            .select("*")
-            .eq("trader_id", trader_id)
-            .eq("purchase_id", purchase_id)
-            .limit(250)
-            .execute().data or []
-        )
-    except Exception:
-        rows = []
-
-    for source in rows:
-        source_id = str(source.get("id") or "").strip()
-        if not source_id or source_id == current_id:
-            continue
-
-        blob = " ".join(str(source.get(k) or "") for k in (
-            "account_status","status","archive_reason","reset_reason",
-            "admin_note","message"
-        )).lower()
-
-        if (
-            "wrong_assignment_recalled" in blob
-            or "recalled_wrong_assignment" in blob
-            or "np_terminal:recalled_wrong_assignment" in blob
-            or "np_excluded_from_progression" in blob
-        ):
-            continue
-
-        # A payout renewal is NOT the one-time funded breach reset.
-        if (
-            "np_entitlement:post_payout_renewal" in blob
-            or "np_payout_renewal_completed" in blob
-            or "post_payout_renewal_consumed" in blob
-        ):
-            continue
-
-        funded_reset_evidence = (
-            "np_funded_breach_reset_consumed" in blob
-            or "np_entitlement:funded_reset_paid" in blob
-            or str(source.get("reset_kind") or "").strip().lower() == "funded_reset_paid"
-        )
-        if not funded_reset_evidence:
-            continue
-
-        # Exact stored replacement account id.
-        replacement_id = str(source.get("reset_replacement_account_id") or "").strip()
-        if replacement_id and replacement_id == current_id:
-            return True
-
-        # Exact explicit parent/child linkage.
-        if source_id in parent_refs:
-            return True
-
-        # Historical marker written by reconciliation/assignment.
-        m = re.search(r"replacement_mt5\s*=\s*([0-9]+)", blob, re.I)
-        if m and m.group(1) == current_mt5:
-            return True
-
-    return False
 
 
 def _np_reset_policy(account, trader=None):
@@ -22092,6 +22011,16 @@ def trader_reset_opportunities():
 
 @app.route("/create_reset_purchase", methods=["POST", "OPTIONS"])
 def create_reset_purchase():
+    """
+    Upload/store reset payment proof only.
+
+    IMPORTANT:
+    - This route does NOT approve a challenge purchase.
+    - This route does NOT assign MT5.
+    - Funded reset approval remains Admin Trader Card -> Confirm Reset Paid.
+    - Exact reset identity is encoded in admin_note using existing production columns,
+      avoiding unsupported purchase_type/reset_* schema fields.
+    """
     if request.method == "OPTIONS":
         return _np_ok({})
     try:
@@ -22100,66 +22029,117 @@ def create_reset_purchase():
         authed_id, auth_error = _authenticated_trader_id_for_request(requested)
         if auth_error:
             return _np_fail(auth_error, 401)
+
         account_id = str(d.get("trader_account_id") or d.get("source_account_id") or "").strip()
         proof = str(d.get("payment_proof_url") or d.get("file_url") or d.get("url") or "").strip()
         if not account_id:
             return _np_fail("Exact breached trader_account_id is required", 400)
         if not proof:
             return _np_fail("Payment proof is required", 400)
-        rows = supabase.table("trader_accounts").select("*").eq("id", account_id).eq("trader_id", authed_id).limit(1).execute().data or []
+
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", account_id).eq("trader_id", authed_id)
+            .limit(1).execute().data or []
+        )
         if not rows:
             return _np_fail("Breached account was not found for this trader", 404)
+
         account = rows[0]
         trader = get_trader_by_id(authed_id) or {}
         policy = _np_reset_policy(account, trader)
         if policy.get("kind") not in {"paid_challenge", "paid_funded"} or not policy.get("eligible"):
-            return _np_fail(policy.get("subtitle") or policy.get("title") or "This account is not eligible for a paid reset", 409)
+            return _np_fail(
+                policy.get("subtitle") or policy.get("title") or
+                "This account is not eligible for a paid reset", 409
+            )
+
         price = clean(policy.get("price") or 0)
         if price <= 0:
-            return _np_fail("Current challenge price could not be resolved. Reset purchase was not created.", 409)
+            return _np_fail("Current challenge price could not be resolved. Reset payment was not created.", 409)
+
         parent_purchase = _np_reset_purchase_for_account(account) or {}
-        if not parent_purchase.get("id"):
+        parent_id = str(parent_purchase.get("id") or "").strip()
+        if not parent_id:
             return _np_fail("Reset requires an exact challenge journey/purchase reference", 409)
+
         if _np_reset_open_order(account_id):
-            return _np_fail("A reset payment already exists for this exact breached account. Do not pay twice.", 409)
+            return _np_fail(
+                "A reset payment proof already exists for this exact breached account. Do not submit twice.", 409
+            )
+
         plan = _np_reset_current_plan_for(account, parent_purchase) or {}
         now = now_iso()
+        stage = _np_reset_stage(account)
+        marker = f"[NP_RESET_REQUEST:{account_id}:{parent_id}:{stage}]"
+        mt5 = str(account.get("mt5_login") or "").strip() or "—"
+
+        # Use only fields already used by the established normal purchase schema.
+        # No purchase_type/reset_* columns are required.
         row = {
             "trader_id": authed_id,
             "trader_name": trader.get("name") or trader.get("full_name") or "",
             "email": trader.get("email") or parent_purchase.get("email") or "",
             "phone": trader.get("phone") or parent_purchase.get("phone") or "",
             "plan_id": plan.get("id") or parent_purchase.get("plan_id"),
-            "plan_name": plan.get("name") or plan.get("plan_name") or parent_purchase.get("plan_name") or "Reset",
-            "account_size": clean(account.get("account_size") or account.get("start_balance") or parent_purchase.get("account_size") or 0),
-            "fee": price, "original_fee": price, "final_fee": price, "amount_due": price,
+            "plan_name": f"{stage.upper()} RESET · " + (
+                plan.get("name") or plan.get("plan_name") or
+                parent_purchase.get("plan_name") or "RESET"
+            ),
+            "account_size": clean(
+                account.get("account_size") or account.get("start_balance") or
+                parent_purchase.get("account_size") or 0
+            ),
+            "fee": price,
+            "original_fee": price,
+            "final_fee": price,
+            "amount_due": price,
             "payment_proof_url": proof,
-            "payment_status": "pending", "status": "pending_review",
-            "purchase_type": "reset", "reset_stage": _np_reset_stage(account),
-            "reset_source_account_id": account_id,
-            "reset_parent_purchase_id": parent_purchase.get("id"),
-            "reset_price_snapshot": price,
+            "payment_status": "pending",
+            "status": "reset_payment_proof_submitted",
+            "admin_note": (
+                f"RESET PAYMENT PROOF · {stage.upper()} · source MT5 {mt5} · "
+                f"{marker} · Use Admin Trader Card → Confirm Reset Paid. "
+                f"DO NOT APPROVE AS NEW PURCHASE."
+            ),
             "challenge_journey": parent_purchase.get("challenge_journey"),
-            "journey_source": "reset_from_exact_purchase",
-            "created_at": now, "updated_at": now,
-            "purchase_month": month(), "purchase_year": year(),
-            "admin_note": f"RESET PAYMENT · {_np_reset_stage(account).upper()} · source MT5 {account.get('mt5_login') or '—'}",
+            "journey_source": "reset_payment_proof_exact_account",
+            "created_at": now,
+            "purchase_month": month(),
+            "purchase_year": year(),
         }
+
         created = supabase.table("challenge_purchases").insert(row).execute().data or []
         if not created:
-            return _np_fail("Reset payment record could not be created", 500)
+            return _np_fail("Reset payment proof record could not be created", 500)
+
         try:
             send_admin_alert(
                 "NairaPips reset payment proof submitted",
-                f"Trader: {trader.get('name') or trader.get('email')}\nStage: {_np_reset_stage(account).upper()}\nOld MT5: {account.get('mt5_login')}\nAccount Size: {email_money(row['account_size'])}\nAmount: {email_money(price)}\nAdmin payment approval required."
+                f"Trader: {trader.get('name') or trader.get('email')}\n"
+                f"Stage: {stage.upper()}\nOld MT5: {mt5}\n"
+                f"Account Size: {email_money(row['account_size'])}\n"
+                f"Amount: {email_money(price)}\n"
+                f"Action: Open Admin Trader Card and click Confirm Reset Paid on this exact account."
             )
             send_email_safe(
-                trader.get("email"), "NairaPips reset payment received — awaiting approval",
-                f"Hello {trader.get('name') or 'Trader'},\n\nWe received your reset payment proof.\n\nStage: {_np_reset_stage(account).upper()}\nPrevious MT5: {account.get('mt5_login') or '—'}\nReset Amount: {email_money(price)}\nStatus: Awaiting Admin payment approval\n\nDo not make a second payment for this reset.\n\nNairaPips Team"
+                trader.get("email"),
+                "NairaPips reset payment received — awaiting confirmation",
+                f"Hello {trader.get('name') or 'Trader'},\n\n"
+                f"We received your reset payment proof.\n\n"
+                f"Stage: {stage.upper()}\nPrevious MT5: {mt5}\n"
+                f"Reset Amount: {email_money(price)}\n"
+                f"Status: Awaiting NairaPips confirmation\n\n"
+                f"Do not make a second payment for this reset.\n\nNairaPips Team"
             )
         except Exception:
             pass
-        return _np_ok({"success": True, "purchase": created[0], "opportunity": _np_reset_policy(account, trader)}, 200)
+
+        return _np_ok({
+            "success": True,
+            "purchase": created[0],
+            "opportunity": _np_reset_policy(account, trader)
+        }, 200)
     except Exception as e:
         return _np_fail(e, 500)
 
@@ -22267,8 +22247,18 @@ def _np_approve_purchase_router_20260907():
     if pid:
         try:
             rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
-            if rows and str(rows[0].get("purchase_type") or "challenge").strip().lower() == "reset":
-                return _np_approve_reset_purchase_payment(rows[0], d)
+            if rows:
+                _row = rows[0] or {}
+                _note = str(_row.get("admin_note") or "")
+                _ptype = str(_row.get("purchase_type") or "challenge").strip().lower()
+                if "[NP_RESET_REQUEST:" in _note:
+                    return bad(
+                        "This is a RESET PAYMENT PROOF, not a new Challenge purchase. "
+                        "Open the trader's Admin card and use Confirm Reset Paid on the exact breached account.",
+                        409
+                    )
+                if _ptype == "reset":
+                    return _np_approve_reset_purchase_payment(_row, d)
         except Exception as e:
             return bad(e)
     return _np_normal_approve_purchase_view_20260907()
@@ -23019,3 +23009,5 @@ def progression_report():
         if auth_error: return _np_fail(auth_error,401)
         requested_id=authed_id
     return _np_ok({"success":True,"trader_id":requested_id,"report":_np_progression_report_for_trader(requested_id,purchase_id)})
+
+# NP_RELEASE: RESET_PAYMENT_PROOF_SCHEMA_SAFE_ADMIN_CARD_AUTHORITY_2026_09_08
