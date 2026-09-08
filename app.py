@@ -22062,14 +22062,11 @@ def _np_reset_source_already_replaced(source, account_rows):
             or candidate.get("challenge_purchase_id")
             or ""
         ).strip()
+        if candidate_pid != source_pid:
+            continue
 
         if _np_reset_stage(candidate) != source_stage:
             continue
-
-        # Strong same-purchase lineage remains preferred, but a genuine reset
-        # replacement can be issued under a new purchase/journey row. Do not
-        # discard it here solely because purchase_id changed.
-        same_purchase = bool(source_pid and candidate_pid == source_pid)
 
         cblob = " ".join(str(candidate.get(k) or "") for k in (
             "account_status","status","archive_reason","admin_note","message"
@@ -22099,42 +22096,20 @@ def _np_reset_source_already_replaced(source, account_rows):
         if source_time and ctime and ctime <= source_time:
             continue
 
-        # Keep same-purchase candidates first. Cross-purchase candidates are
-        # accepted only when they are unambiguous and match the exact stage/size.
-        candidate["_np_same_purchase_match"] = same_purchase
         candidates.append(candidate)
 
     if not candidates:
         return None
 
-    same_lineage = [c for c in candidates if c.get("_np_same_purchase_match")]
-    if same_lineage:
-        same_lineage.sort(
-            key=lambda r: _dt_score(
-                r.get("assigned_at")
-                or r.get("started_at")
-                or r.get("created_at")
-                or r.get("updated_at")
-            )
+    candidates.sort(
+        key=lambda r: _dt_score(
+            r.get("assigned_at")
+            or r.get("started_at")
+            or r.get("created_at")
+            or r.get("updated_at")
         )
-        return same_lineage[0]
-
-    # GLOBAL FULFILMENT FALLBACK:
-    # Reset assignments sometimes create a fresh journey/purchase row. In that
-    # case, recognise fulfilment only when there is exactly ONE later genuine
-    # same-stage MT5 with the same account size. Never guess between multiples.
-    source_size = clean(source.get("account_size") or source.get("start_balance") or 0)
-    cross = []
-    for c in candidates:
-        c_size = clean(c.get("account_size") or c.get("start_balance") or 0)
-        if source_size > 0 and c_size > 0 and abs(c_size - source_size) > 0.01:
-            continue
-        cross.append(c)
-
-    if len(cross) == 1:
-        return cross[0]
-
-    return None
+    )
+    return candidates[0]
 
 
 @app.route("/trader_reset_opportunities", methods=["GET", "OPTIONS"])
@@ -22690,34 +22665,24 @@ def _np_exact_post_payout_replacement_20260908(source, payout, account_rows, tra
 
         if source_pid:
             if row_pid == source_pid:
-                row["_np_same_purchase_match"] = True
-            else:
-                row["_np_same_purchase_match"] = False
-            candidates.append(row)
+                candidates.append(row)
             continue
 
         # Legacy rows without purchase lineage: keep candidates, but only accept
         # an unambiguous single later Funded account.
-        row["_np_same_purchase_match"] = False
         candidates.append(row)
 
     if source_pid:
-        same_lineage = [c for c in candidates if c.get("_np_same_purchase_match")]
-        if same_lineage:
-            same_lineage.sort(key=_np_account_time_20260908)
-            return same_lineage[0]
+        if len(candidates) == 1:
+            return candidates[0]
 
-        # Fresh payout-renewal Funded MT5 may be stored under a new purchase row.
-        # Accept only one unambiguous later Funded successor of the same size.
-        source_size = clean(source.get("account_size") or source.get("start_balance") or 0)
-        cross = []
-        for c in candidates:
-            c_size = clean(c.get("account_size") or c.get("start_balance") or 0)
-            if source_size > 0 and c_size > 0 and abs(c_size - source_size) > 0.01:
-                continue
-            cross.append(c)
-        if len(cross) == 1:
-            return cross[0]
+        # If there are multiple later Funded rows in the same journey, choose the
+        # earliest one after the payout source. That is the MT5 that first fulfilled
+        # this payout-renewal entitlement; later Funded rows belong to subsequent
+        # payout/reset cycles.
+        if len(candidates) > 1:
+            candidates.sort(key=_np_account_time_20260908)
+            return candidates[0]
         return None
 
     if len(candidates) == 1:
@@ -23209,5 +23174,3 @@ def progression_report():
 # NP_RELEASE: RESET_PAYMENT_PROOF_SCHEMA_SAFE_ADMIN_CARD_AUTHORITY_2026_09_08
 
 # NP_HOTFIX: RESTORED_FUNDED_RESET_CHILD_HELPER_2026_09_08
-
-# NP_HOTFIX: GLOBAL_FULFILLED_RESET_PAYOUT_REPLACEMENT_RECONCILIATION_2026_09_08
