@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V9_RECALL_RESTORES_EXACT_PREASSIGNMENT_AUTHORITY_2026_09_09"
+NAIRAPIPS_RELEASE = "V10_REFERRAL_ATTRIBUTION_COMMISSION_RECONCILE_2026_09_09"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -6059,6 +6059,21 @@ def register_trader():
         if existing:
             return ok(existing, "Trader already exists")
 
+        # Durable referral attribution: the landing page already sends ref/referral_code,
+        # but older registration code discarded it. Preserve it server-side inside the
+        # existing registration_source field so attribution survives logout/device changes
+        # without requiring a database migration.
+        _signup_referral_code = str(
+            d.get("referred_by_code") or d.get("referral_code") or d.get("affiliate_code")
+            or d.get("ref_code") or d.get("ref") or ""
+        ).strip().upper()
+        _signup_referral_code = re.sub(r"[^A-Z0-9_-]", "", _signup_referral_code)[:40]
+        _base_registration_source = str(d.get("source") or "public_register").strip() or "public_register"
+        _durable_registration_source = (
+            f"{_base_registration_source}|ref={_signup_referral_code}"
+            if _signup_referral_code else _base_registration_source
+        )
+
         row = {
             "name": name,
             "phone": phone,
@@ -6095,8 +6110,8 @@ def register_trader():
             "funded_at": None,
             "last_login_at": None,
             "trading_days_left": d.get("trading_days_left", 0),
-            "source": d.get("source", "public_register"),
-            "registration_source": d.get("source", "public_register"),
+            "source": _base_registration_source,
+            "registration_source": _durable_registration_source,
             "user_agent": user_agent[:250],
             "registration_user_agent": user_agent[:250],
             "ip_address": ip_address,
@@ -7689,6 +7704,23 @@ def create_purchase():
         if not proof: return bad("Payment proof is required")
         original_fee = clean(d.get("fee"))
         if original_fee <= 0: return bad("Challenge fee is required")
+
+        # Referral attribution must not depend on browser storage. If checkout did not
+        # submit a code, recover the code captured at registration from the trader row.
+        if not any(str(d.get(k) or "").strip() for k in ("affiliate_code","referral_code","ref_code","partner_code","promo_code","code")):
+            try:
+                _purchase_trader = get_trader_by_id(d.get("trader_id")) if d.get("trader_id") else None
+                _inherited_code = _np_referral_code_from_trader(_purchase_trader or {})
+                if _inherited_code:
+                    d = dict(d)
+                    d.update({
+                        "affiliate_code": _inherited_code,
+                        "referral_code": _inherited_code,
+                        "partner_code": _inherited_code,
+                        "promo_code": _inherited_code,
+                    })
+            except Exception as _ref_inherit_exc:
+                print("PURCHASE REFERRAL INHERIT SKIPPED:", _ref_inherit_exc)
 
         # Validate code before accepting proof. Invalid/expired codes must not create confused discounted purchases.
         quote = _affiliate_quote_details(d, original_fee)
@@ -13977,6 +14009,18 @@ def mark_private_offer_read():
     except Exception as e:
         return bad(e, 500)
 
+def _np_referral_code_from_trader(trader):
+    """Resolve the referrer code durably captured when this buyer registered."""
+    row = trader or {}
+    for key in ("referred_by_code", "referred_by", "signup_referral_code", "registration_referral_code"):
+        value = _aff_code(row.get(key))
+        if value:
+            return value
+    source = str(row.get("registration_source") or row.get("source") or "")
+    m = re.search(r"(?:^|[|;&\s])ref=([A-Za-z0-9_-]{1,40})(?:$|[|;&\s])", source, re.I)
+    return _aff_code(m.group(1)) if m else ""
+
+
 def _affiliate_quote_details(d, base_fee):
     """Return production-safe quote details for promo / affiliate / partner codes.
     Discount reduces customer price. Commission is calculated on the final paid fee.
@@ -14170,6 +14214,48 @@ def _affiliate_create_commission_from_purchase(purchase, admin_payload=None):
     except Exception as e:
         print("AFFILIATE COMMISSION CREATE ERROR:", str(e))
         return None
+
+def _affiliate_reconcile_commissions_for_code(code):
+    """Backfill missing commission rows from already-approved coded purchases.
+
+    This repairs historical cases where the referral code reached challenge_purchases
+    but the approval-time commission insert was skipped/failed. Idempotency is enforced
+    by purchase_id inside _affiliate_create_commission_from_purchase.
+    """
+    code = _aff_code(code)
+    if not code:
+        return {"checked": 0, "created": 0}
+    seen = set()
+    candidates = []
+    for column in ("affiliate_code", "referral_code", "partner_code", "promo_code"):
+        try:
+            rows = (supabase.table("challenge_purchases").select("*")
+                    .eq(column, code).order("created_at", desc=True).limit(500).execute().data or [])
+            for row in rows:
+                pid = str(row.get("id") or "")
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    candidates.append(row)
+        except Exception as exc:
+            print(f"AFFILIATE RECONCILE LOOKUP SKIP {column}:", exc)
+    created = 0
+    for row in candidates:
+        payment_status = str(row.get("payment_status") or "").strip().lower()
+        status = str(row.get("status") or "").strip().lower()
+        approved = payment_status in {"approved", "paid", "completed"} or status in {"approved", "active", "assigned", "completed"}
+        if not approved:
+            continue
+        try:
+            before = supabase.table("affiliate_commissions").select("id").eq("purchase_id", row.get("id")).limit(1).execute().data or []
+            if before:
+                continue
+            made = _affiliate_create_commission_from_purchase(row, {"admin_name": "system_reconcile"})
+            if made:
+                created += 1
+        except Exception as exc:
+            print("AFFILIATE RECONCILE CREATE SKIP:", exc)
+    return {"checked": len(candidates), "created": created}
+
 
 @app.route("/affiliate_signup", methods=["POST", "OPTIONS"])
 def affiliate_signup():
@@ -14515,6 +14601,9 @@ def affiliate_payout_quote():
         partner = _aff_get_partner_by_code(code) or _aff_get_code(code)
         if not partner:
             return bad("Affiliate code not found", 404)
+        # Self-heal any approved purchases whose referral code was saved but whose
+        # commission row was missed by the approval-time hook.
+        _affiliate_reconcile_commissions_for_code(code)
         rows = _affiliate_commission_rows_for_code(code)
         open_requests = _affiliate_open_payout_requests_for_code(code)
         approved = [r for r in rows if str(r.get("status") or "").strip().lower() == "approved"]
