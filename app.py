@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V9_ASSIGNMENT_CENTER_FAST_QUEUE_2026_09_08"
+NAIRAPIPS_RELEASE = "V9_RECALLED_ASSIGNMENT_REOPENS_SAME_ENTITLEMENT_2026_09_09"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -8893,6 +8893,8 @@ def assign_phase_mt5():
             completed_account_id = str(parts[1] if len(parts) > 1 else "").strip()
         elif completed_account_id.startswith("reset-waiting:"):
             completed_account_id = completed_account_id.split(":", 1)[1].strip()
+        elif completed_account_id.startswith("recall-waiting:"):
+            completed_account_id = completed_account_id.split(":", 1)[1].strip()
 
         # Phase 2/Funded progression is never trader-wide. It must be supplied
         # by one exact completed/passed account, just like 2 Lives.
@@ -8957,6 +8959,14 @@ def assign_phase_mt5():
                 and _sl_status in {"life2_waiting_mt5", "waiting_mt5"}
                 and "admin correction" in str(linked_purchase.get("admin_note") or "").lower()
             )
+            _recalled_same_life2 = bool(
+                linked_purchase
+                and _second_life_bool(linked_purchase.get("second_life_enabled"))
+                and _second_life_bool(linked_purchase.get("second_life_used"))
+                and _sl_status in {"life2_waiting_mt5", "waiting_mt5"}
+                and completed_stage == "phase1"
+                and _np_is_recalled_wrong_assignment(completed_account)
+            )
             second_life_reentry = bool(
                 target_stage == "phase1"
                 and linked_purchase
@@ -8964,7 +8974,7 @@ def assign_phase_mt5():
                 and _second_life_bool(linked_purchase.get("second_life_used"))
                 and _sl_status in {"life2_waiting_mt5", "waiting_mt5"}
                 and completed_stage == "phase1"
-                and ("breach" in _completed_status or _admin_corrected_life2)
+                and ("breach" in _completed_status or _admin_corrected_life2 or _recalled_same_life2)
             )
             if not second_life_reentry and not reset_replacement:
                 # HARD DUPLICATE-FUNDING GATE:
@@ -9007,8 +9017,9 @@ def assign_phase_mt5():
                     return bad("Fresh Phase 1 assignment is reserved for an activated Second Life purchase or an exact Phase 1 reset replacement", 409)
                 completed_status_for_life2 = str((completed_account or {}).get("account_status") or (completed_account or {}).get("status") or "").lower()
                 admin_corrected_life2 = "admin correction" in str(purchase.get("admin_note") or "").lower()
-                if "breach" not in completed_status_for_life2 and not admin_corrected_life2:
-                    return bad("Second Life Phase 1 assignment requires breach evidence or an explicit admin lifecycle correction", 409)
+                recalled_same_life2 = _np_is_recalled_wrong_assignment(completed_account or {})
+                if "breach" not in completed_status_for_life2 and not admin_corrected_life2 and not recalled_same_life2:
+                    return bad("Second Life Phase 1 assignment requires breach evidence, an explicit admin lifecycle correction, or an exact recalled wrong-assignment replacement", 409)
         account, updated = _assign_mt5_to_trader(
             trader,
             mt5_acc,
@@ -9032,7 +9043,7 @@ def assign_phase_mt5():
                     or completed_account.get("status")
                     or ""
                 ).strip().lower()
-                if completed_status_for_link.startswith("archived_reset"):
+                if completed_status_for_link.startswith("archived_reset") or _np_is_recalled_wrong_assignment(completed_account):
                     link_update["replaces_trader_account_id"] = completed_account.get("id")
                 supabase.table("trader_accounts").update(link_update).eq(
                     "id", account.get("id")
@@ -15348,6 +15359,169 @@ def admin_trader_accounts_feed():
         return _np_fail(e, 500)
 
 
+
+def _np_is_recalled_wrong_assignment(account):
+    """True only for an account explicitly recalled as a wrong/invalid assignment."""
+    blob = " ".join(
+        str(account.get(k) or "")
+        for k in ("account_status", "status", "risk_zone", "archive_reason", "reset_reason", "admin_note")
+    ).strip().lower()
+    return (
+        "wrong_assignment_recalled" in blob
+        or "recalled_wrong_assignment" in blob
+        or "np_terminal:recalled_wrong_assignment" in blob
+        or "admin_recall_wrong_assignment" in blob
+    )
+
+
+def _recalled_assignment_rows_from_accounts(account_rows, purchases_by_id=None, traders_by_id=None):
+    """Reopen the SAME assignment slot after an unused wrong MT5 is recalled.
+
+    This does not create a new purchase, reset, Second Life, or progression.
+    It only exposes a replacement queue row when the linked purchase itself
+    is already authoritative that the same entitlement is waiting for MT5.
+
+    Current supported entitlement:
+      Phase 1 / Life 2:
+        second_life_enabled = true
+        second_life_used = true
+        second_life_status in {life2_waiting_mt5, waiting_mt5}
+        life_number >= 2
+
+    A recalled account is never actionable if a newer/live MT5 already exists
+    on the exact same purchase + stage.
+    """
+    rows = list(account_rows or [])
+    purchases_by_id = purchases_by_id or {}
+    traders_by_id = traders_by_id or {}
+    out = []
+    seen = set()
+
+    active_statuses = {
+        "assigned_active", "active", "current_active",
+        "phase1_active", "phase2_active", "funded_active",
+        "live", "funded", "approved_active"
+    }
+
+    for recalled in rows:
+        if not _np_is_recalled_wrong_assignment(recalled):
+            continue
+
+        purchase_id = str(
+            recalled.get("purchase_id") or recalled.get("challenge_purchase_id") or ""
+        ).strip()
+        trader_id = str(recalled.get("trader_id") or "").strip()
+        if not purchase_id or not trader_id:
+            continue
+
+        purchase = purchases_by_id.get(purchase_id) or {}
+        if not purchase:
+            continue
+
+        stage = _normalize_lifecycle_stage(recalled.get("stage") or recalled.get("phase"))
+        sl_enabled = _second_life_bool(purchase.get("second_life_enabled"))
+        sl_used = _second_life_bool(purchase.get("second_life_used"))
+        sl_status = str(purchase.get("second_life_status") or "").strip().lower()
+        try:
+            life_number = int(purchase.get("life_number") or 0)
+        except Exception:
+            life_number = 0
+
+        # Never infer entitlement from recall history alone.
+        # Purchase lifecycle must explicitly say the SAME Life 2 is waiting.
+        if not (
+            stage == "phase1"
+            and sl_enabled
+            and sl_used
+            and sl_status in {"life2_waiting_mt5", "waiting_mt5"}
+            and life_number >= 2
+        ):
+            continue
+
+        recalled_time = _dt_score(
+            recalled.get("archived_at")
+            or recalled.get("updated_at")
+            or recalled.get("created_at")
+        )
+
+        # If a live/newer MT5 already exists for the exact purchase + stage,
+        # the replacement obligation is already fulfilled.
+        successor_exists = False
+        for candidate in rows:
+            if str(candidate.get("id") or "") == str(recalled.get("id") or ""):
+                continue
+            if str(candidate.get("purchase_id") or candidate.get("challenge_purchase_id") or "").strip() != purchase_id:
+                continue
+            if _normalize_lifecycle_stage(candidate.get("stage") or candidate.get("phase")) != stage:
+                continue
+            if not str(candidate.get("mt5_login") or "").strip():
+                continue
+
+            c_status = str(candidate.get("account_status") or candidate.get("status") or "").strip().lower()
+            c_time = _dt_score(
+                candidate.get("assigned_at")
+                or candidate.get("started_at")
+                or candidate.get("created_at")
+                or candidate.get("updated_at")
+            )
+            if c_status in active_statuses and (not recalled_time or not c_time or c_time > recalled_time):
+                successor_exists = True
+                break
+
+        if successor_exists:
+            continue
+
+        source_id = str(recalled.get("id") or "").strip()
+        if not source_id or source_id in seen:
+            continue
+        seen.add(source_id)
+
+        trader = traders_by_id.get(trader_id) or {}
+        size = (
+            recalled.get("account_size")
+            or recalled.get("start_balance")
+            or purchase.get("account_size")
+            or 0
+        )
+
+        out.append({
+            "id": f"recall-waiting:{source_id}",
+            "trader_id": trader_id,
+            "trader_account_id": source_id,
+            "completed_account_id": source_id,
+            "source_account_id": source_id,
+            "previous_trader_account_id": source_id,
+            "replaces_trader_account_id": source_id,
+            "purchase_id": purchase_id,
+            "source_type": "recalled_replacement",
+            "source": "recalled_wrong_assignment_same_entitlement",
+            "progression_key": f"recall:{source_id}->{stage}",
+            "replacement_required": True,
+            "entitlement_verified": True,
+            "entitlement_reason": "recalled_wrong_assignment_same_life2",
+            "entitlement_label": "WRONG MT5 RECALLED · REPLACE SAME LIFE 2",
+            "target_phase": stage,
+            "target_stage": stage,
+            "current_phase": stage,
+            "current_status": "waiting_mt5",
+            "account_status": "waiting_mt5",
+            "assignment_label": "Assign Replacement Phase 1 MT5",
+            "stage_label": "REPLACEMENT · WRONG MT5 RECALLED · LIFE 2",
+            "name": trader.get("name") or trader.get("full_name") or purchase.get("trader_name") or purchase.get("name") or "Trader",
+            "email": trader.get("email") or purchase.get("email") or "",
+            "phone": trader.get("phone") or purchase.get("phone") or "",
+            "account_reference": trader.get("account_reference") or purchase.get("account_reference") or purchase.get("reference") or "",
+            "old_mt5_login": recalled.get("mt5_login") or "",
+            "completed_mt5_login": recalled.get("mt5_login") or "",
+            "account_size": size,
+            "payment_status": purchase.get("payment_status") or "",
+            "created_at": recalled.get("archived_at") or recalled.get("updated_at") or recalled.get("created_at") or "",
+        })
+
+    out.sort(key=lambda r: _dt_score(r.get("created_at")), reverse=True)
+    return out
+
+
 @app.route("/np_assignment_center", methods=["GET", "OPTIONS"])
 def np_assignment_center():
     """Unified MT5 assignment desk feed for first assignment, Phase 2, and Funded."""
@@ -15442,7 +15616,10 @@ def np_assignment_center():
             reset_trader_ids = list({
                 str(r.get("trader_id") or "").strip()
                 for r in reset_source_accounts
-                if str(r.get("account_status") or r.get("status") or "").strip().lower().startswith("archived_reset")
+                if (
+                    str(r.get("account_status") or r.get("status") or "").strip().lower().startswith("archived_reset")
+                    or _np_is_recalled_wrong_assignment(r)
+                )
                 and str(r.get("trader_id") or "").strip()
             })
             if reset_trader_ids:
@@ -15461,10 +15638,35 @@ def np_assignment_center():
             reset_source_accounts, reset_traders_by_id
         )
 
+        # Purchase rows must be FIRST-ASSIGNMENT only.
+        # If an exact purchase already owns ANY trader_accounts history, it can
+        # never reappear as PURCHASE / Approve + Assign. Its lifecycle must be
+        # represented by reset / phase move / recalled-replacement authority.
+        account_history_purchase_ids = {
+            str(a.get("purchase_id") or a.get("challenge_purchase_id") or "").strip()
+            for a in reset_source_accounts
+            if str(a.get("purchase_id") or a.get("challenge_purchase_id") or "").strip()
+        }
+        purchase_rows = [
+            r for r in purchase_rows
+            if str(r.get("purchase_id") or "").strip() not in account_history_purchase_ids
+        ]
+
+        purchases_by_id = {
+            str(p.get("id") or "").strip(): p
+            for p in purchases
+            if str(p.get("id") or "").strip()
+        }
+        recalled_rows = _recalled_assignment_rows_from_accounts(
+            reset_source_accounts,
+            purchases_by_id,
+            reset_traders_by_id,
+        )
+
         golden_rows = _np_golden_ticket_candidates(1500)
         available_mt5 = _available_mt5_not_used(1500)
 
-        queue = golden_rows + reset_rows + purchase_rows + phase_rows
+        queue = golden_rows + recalled_rows + reset_rows + purchase_rows + phase_rows
         return _np_ok({
             "success": True,
             "rows": queue,
@@ -15472,12 +15674,14 @@ def np_assignment_center():
             "assignment_queue": queue,
             "phase_assignment_queue": phase_rows,
             "reset_assignment_queue": reset_rows,
+            "recalled_assignment_queue": recalled_rows,
             "purchase_assignment_queue": purchase_rows,
             "mt5_pool": available_mt5,
             "available_mt5": available_mt5,
             "summary": {
                 "total": len(queue),
                 "golden_ticket": len([r for r in queue if str(r.get("source_type") or "").lower() == "golden_ticket"]),
+                "recalled_replacement": len([r for r in queue if str(r.get("source_type") or "").lower() == "recalled_replacement"]),
                 "phase1": len([r for r in queue if str(r.get("target_phase") or "").lower() == "phase1"]),
                 "phase2": len([r for r in queue if str(r.get("target_phase") or "").lower() == "phase2"]),
                 "funded": len([r for r in queue if str(r.get("target_phase") or "").lower() == "funded"]),
@@ -23209,3 +23413,5 @@ def progression_report():
 # NP_RELEASE: RESET_PAYMENT_PROOF_SCHEMA_SAFE_ADMIN_CARD_AUTHORITY_2026_09_08
 
 # NP_HOTFIX: RESTORED_FUNDED_RESET_CHILD_HELPER_2026_09_08
+
+# NP_FIX: RECALLED_WRONG_ASSIGNMENT_QUEUE_AND_ASSIGNMENT_AUTHORITY_2026_09_09
