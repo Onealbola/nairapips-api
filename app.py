@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V9_RESET_AUTHORITY_TWO_POOLS_PRODUCTION_2026_09_07"
+NAIRAPIPS_RELEASE = "V9_ASSIGNMENT_CENTER_FAST_QUEUE_2026_09_08"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -18688,6 +18688,30 @@ def _np_golden_ticket_candidates(limit=1500):
     out = []
     seen = set()
 
+    # PERFORMANCE 2026-09-08: batch-load points once. The previous code called
+    # _np_points_total() inside add_candidate(), producing an N+1 Supabase query
+    # storm and pushing /np_assignment_center past Render's ~30s request window.
+    _np_assignment_points_lookup = {}
+    try:
+        point_rows = (
+            supabase.table("founding_trader_points")
+            .select("user_id,email,golden_ticket,points")
+            .limit(5000)
+            .execute().data or []
+        )
+        for pr in point_rows:
+            puid = str(pr.get("user_id") or "").strip()
+            pemail = str(pr.get("email") or "").strip().lower()
+            pticket = str(pr.get("golden_ticket") or "").strip().upper()
+            pts = int(pr.get("points") or 0)
+            # Candidate lookup uses the exact tuple when possible, with fallback
+            # combinations added so legacy rows missing one identity field still work.
+            for key in {(puid, pemail, pticket), (puid, "", ""), ("", pemail, ""), ("", "", pticket)}:
+                if any(key):
+                    _np_assignment_points_lookup[key] = max(pts, _np_assignment_points_lookup.get(key, 0))
+    except Exception as e:
+        print("GOLDEN TICKET POINTS BATCH FETCH ERROR:", e)
+
     active_trader_ids = set()
     active_logins = set()
     try:
@@ -18726,6 +18750,17 @@ def _np_golden_ticket_candidates(limit=1500):
             seen.add(key)
             account_size = _np_number(row.get("gift_account_size") or row.get("account_size") or 1000000) or 1000000
             name = row.get("name") or row.get("full_name") or row.get("trader_name") or "Trader"
+            # Assignment Center must stay a fast operational feed. Founding points
+            # are not required to decide MT5 eligibility; resolve them from the
+            # preloaded batch map below instead of one Supabase query per candidate.
+            points_key = (tid or "", email or "", ticket or "")
+            founding_points = (
+                _np_assignment_points_lookup.get(points_key)
+                or _np_assignment_points_lookup.get((tid or "", "", ""))
+                or _np_assignment_points_lookup.get(("", email or "", ""))
+                or _np_assignment_points_lookup.get(("", "", ticket or ""))
+                or 0
+            )
             out.append({
                 "id": tid or lead_id or ticket,
                 "trader_id": tid,
@@ -18749,7 +18784,7 @@ def _np_golden_ticket_candidates(limit=1500):
                 "payment_status": "gift",
                 "current_status": row.get("gift_status") or row.get("lead_status") or "awaiting_promise_assignment",
                 "created_at": row.get("created_at") or row.get("updated_at") or "",
-                "founding_points": _np_points_total(tid, email, ticket),
+                "founding_points": founding_points,
             })
         except Exception as e:
             print("GOLDEN TICKET CANDIDATE ROW SKIPPED:", e)
