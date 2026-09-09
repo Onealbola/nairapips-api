@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V10_SECOND_LIFE_WAITING_RETRY_AUTO_ASSIGN_2026_09_09"
+NAIRAPIPS_RELEASE = "V11_MULTI_FUNDED_PARALLEL_JOURNEYS_2026_09_09"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -6831,10 +6831,34 @@ def trader_bootstrap():
                 if str(r.get("purchase_id") or r.get("challenge_purchase_id") or "") != sl_purchase_id
             ]
 
-            # While Second Life is available/waiting, there is deliberately NO current
-            # trading account. Do not let an archived Funded/Phase1 row become current.
+            # MULTI-JOURNEY AUTHORITY 2026-09-09:
+            # A waiting Second-Life / passed-to-Funded journey is scoped to its own
+            # purchase. It must NOT blank a separate live Funded/Phase account owned
+            # by the same trader. Keep an unrelated live account as the dashboard
+            # default while the waiting journey remains separately selectable.
             if sl_state in {"second_life_available", "life2_waiting_mt5", "challenge_passed_waiting_funded"}:
-                account = None
+                live_statuses_for_parallel = {
+                    "assigned_active", "active", "current_active", "phase1_active",
+                    "phase2_active", "funded_active", "live", "funded", "approved_active",
+                    "profit_protected", "payout_pending", "approved_payout_pending",
+                    "payment_processing"
+                }
+                unrelated_live = next((
+                    r for r in all_accounts
+                    if str(r.get("purchase_id") or r.get("challenge_purchase_id") or "").strip() != sl_purchase_id
+                    and str(r.get("mt5_login") or "").strip()
+                    and str(r.get("account_status") or r.get("status") or "").strip().lower()
+                        in live_statuses_for_parallel
+                ), None)
+                current_is_unrelated_live = bool(
+                    account
+                    and str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip() != sl_purchase_id
+                    and str(account.get("mt5_login") or "").strip()
+                    and str(account.get("account_status") or account.get("status") or "").strip().lower()
+                        in live_statuses_for_parallel
+                )
+                if not current_is_unrelated_live:
+                    account = unrelated_live
             elif sl_state == "life2_active":
                 sl_id = str(lifecycle_authority.get("current_account_id") or "")
                 if sl_id:
@@ -23842,3 +23866,4 @@ def progression_report():
 # NP_FIX: GLOBAL_RECALL_RESTORES_EXACT_PREASSIGNMENT_AUTHORITY_2026_09_09
 
 # NP_FIX: SECOND_LIFE_WAITING_RETRY_AUTO_ASSIGN_2026_09_09
+# NP_FIX: MULTI_FUNDED_PARALLEL_JOURNEYS_2026_09_09
