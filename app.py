@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V11_MULTI_FUNDED_PARALLEL_JOURNEYS_2026_09_09"
+NAIRAPIPS_RELEASE = "V12_PARALLEL_JOURNEY_TIMELINE_2026_09_10"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -22269,49 +22269,139 @@ def admin_trader_360():
         purchases = supabase.table("challenge_purchases").select("*").eq("trader_id", trader_id).order("created_at", desc=False).limit(500).execute().data or []
         payouts = supabase.table("payouts").select("*").eq("trader_id", trader_id).order("created_at", desc=False).limit(500).execute().data or []
 
+        # PARALLEL JOURNEY LEDGER — one trader may own several independent journeys at once.
+        # Purchase/journey linkage is authoritative; trader.current_account_id is display-only.
+        def _tl_dt(v):
+            return _dt_score(v)
+
+        purchase_order = sorted(
+            purchases, key=lambda p: _tl_dt(p.get("created_at") or p.get("submitted_at"))
+        )
+        journey_number = {str(p.get("id") or ""): i + 1 for i, p in enumerate(purchase_order)}
+        account_by_id = {str(a.get("id") or ""): a for a in accounts if a.get("id")}
+
+        def _tl_pid(obj):
+            return str((obj or {}).get("purchase_id") or (obj or {}).get("challenge_purchase_id") or "").strip()
+
+        def _tl_parent_id(a):
+            return str(
+                (a or {}).get("previous_account_id") or (a or {}).get("previous_trader_account_id") or
+                (a or {}).get("replaces_trader_account_id") or (a or {}).get("source_account_id") or
+                (a or {}).get("reset_trader_account_id") or (a or {}).get("parent_account_id") or ""
+            ).strip()
+
+        def _tl_journey_for_account(a):
+            cur = a or {}
+            seen = set()
+            for _ in range(25):
+                pid = _tl_pid(cur)
+                if pid:
+                    return pid
+                cid = str(cur.get("id") or "").strip()
+                if not cid or cid in seen:
+                    break
+                seen.add(cid)
+                parent = _tl_parent_id(cur)
+                if not parent or parent not in account_by_id:
+                    break
+                cur = account_by_id[parent]
+            return ""
+
+        independent_keys = {}
+        independent_counter = len(purchase_order)
+
+        def _tl_journey_meta(obj=None, account_id=""):
+            nonlocal independent_counter
+            obj = obj or {}
+            pid = _tl_pid(obj)
+            account = account_by_id.get(str(account_id or obj.get("trader_account_id") or obj.get("account_id") or ""))
+            if not pid and account:
+                pid = _tl_journey_for_account(account)
+            if pid:
+                return pid, f"JOURNEY {journey_number.get(pid, '?')}"
+            root = str((account or obj).get("id") or account_id or "independent")
+            if root not in independent_keys:
+                independent_counter += 1
+                independent_keys[root] = independent_counter
+            return "", f"JOURNEY {independent_keys[root]}"
+
         timeline = []
+        if trader.get("created_at"):
+            timeline.append({"type":"PROFILE_CREATED","at":trader.get("created_at"),"journey_label":"PROFILE","detail":"Trader account created"})
+
         for p in purchases:
-            timeline.append({
-                "type": "PURCHASE", "at": p.get("approved_at") or p.get("paid_at") or p.get("created_at"),
-                "purchase_id": p.get("id"), "amount": p.get("amount") or p.get("fee") or p.get("price"),
-                "account_size": p.get("account_size"), "status": p.get("payment_status") or p.get("status"),
-                "detail": f"Challenge purchase · {p.get('plan_name') or p.get('selected_plan') or ''}".strip()
-            })
-        for a in accounts:
-            if a.get("created_at") or a.get("started_at"):
+            pid, jlabel = _tl_journey_meta(p)
+            created = p.get("created_at") or p.get("submitted_at")
+            if created:
                 timeline.append({
-                    "type": "MT5_ASSIGNED", "at": a.get("started_at") or a.get("created_at"),
+                    "type": "PURCHASE_STARTED", "at": created, "journey_id": pid, "journey_label": jlabel,
+                    "purchase_id": p.get("id"), "amount": p.get("amount") or p.get("fee") or p.get("price"),
+                    "account_size": p.get("account_size"), "status": p.get("payment_status") or p.get("status"),
+                    "detail": f"Challenge purchase · {p.get('plan_name') or p.get('selected_plan') or ''}".strip()
+                })
+            if p.get("approved_at"):
+                timeline.append({"type":"PURCHASE_APPROVED","at":p.get("approved_at"),"journey_id":pid,"journey_label":jlabel,"purchase_id":p.get("id"),"account_size":p.get("account_size"),"detail":"Purchase approved · ready for assignment"})
+            if p.get("rejected_at"):
+                timeline.append({"type":"PURCHASE_REJECTED","at":p.get("rejected_at"),"journey_id":pid,"journey_label":jlabel,"purchase_id":p.get("id"),"detail":"Purchase rejected"})
+            closed_at = p.get("cycle_ended_at") or p.get("completed_at") or p.get("closed_at")
+            pstate = str(p.get("lifecycle_state") or p.get("status") or "").strip().lower()
+            if closed_at or pstate in {"completed","closed","cycle_ended","exhausted","journey_complete"}:
+                timeline.append({"type":"CYCLE_ENDED","at":closed_at or p.get("updated_at"),"journey_id":pid,"journey_label":jlabel,"purchase_id":p.get("id"),"status":pstate,"detail":"Journey cycle ended"})
+
+        for a in accounts:
+            pid, jlabel = _tl_journey_meta(a, a.get("id"))
+            parent_id = _tl_parent_id(a)
+            parent = account_by_id.get(parent_id) if parent_id else None
+            previous_mt5 = str((parent or {}).get("mt5_login") or a.get("previous_mt5_login") or a.get("replaces_mt5_login") or a.get("source_mt5_login") or "").strip()
+            assigned_at = a.get("assigned_at") or a.get("started_at") or a.get("created_at")
+            if assigned_at and a.get("mt5_login"):
+                timeline.append({
+                    "type": "MT5_ASSIGNED", "at": assigned_at, "journey_id": pid, "journey_label": jlabel,
                     "account_id": a.get("id"), "purchase_id": a.get("purchase_id"), "mt5_login": a.get("mt5_login"),
-                    "status": a.get("account_status"), "detail": f"{_np_ops_stage(a).upper()} · {a.get('account_size') or a.get('start_balance') or ''}"
+                    "previous_mt5": previous_mt5, "stage": _np_ops_stage(a), "account_size": a.get("account_size") or a.get("start_balance"),
+                    "status": a.get("account_status"),
+                    "detail": f"{_np_ops_stage(a).upper()} account assigned" + (f" · from MT5 {previous_mt5}" if previous_mt5 else "")
                 })
             if _np_ops_is_breached(a):
                 timeline.append({
                     "type": "BREACH", "at": a.get("breached_at") or a.get("breach_at") or a.get("archived_at"),
-                    "account_id": a.get("id"), "purchase_id": a.get("purchase_id"), "mt5_login": a.get("mt5_login"),
-                    "status": a.get("account_status"), "detail": a.get("breach_reason") or a.get("archive_reason") or "Maximum drawdown breach"
+                    "journey_id": pid, "journey_label": jlabel, "account_id": a.get("id"), "purchase_id": a.get("purchase_id"),
+                    "mt5_login": a.get("mt5_login"), "stage": _np_ops_stage(a), "status": a.get("account_status"),
+                    "detail": a.get("breach_reason") or a.get("archive_reason") or "Maximum drawdown / rule breach"
                 })
             elif _np_ops_is_passed(a):
                 timeline.append({
                     "type": "PASS", "at": a.get("passed_at") or a.get("archived_at"),
-                    "account_id": a.get("id"), "purchase_id": a.get("purchase_id"), "mt5_login": a.get("mt5_login"),
-                    "status": a.get("phase_pass_status") or a.get("account_status"),
-                    "detail": f"{_np_ops_stage(a).upper()} passed"
+                    "journey_id": pid, "journey_label": jlabel, "account_id": a.get("id"), "purchase_id": a.get("purchase_id"),
+                    "mt5_login": a.get("mt5_login"), "stage": _np_ops_stage(a), "status": a.get("phase_pass_status") or a.get("account_status"),
+                    "detail": f"{_np_ops_stage(a).upper()} passed · progression earned"
                 })
+            blob = " ".join(str(a.get(k) or "") for k in ("archive_reason","reset_reason","admin_note","lifecycle_state","account_status")).lower()
             if a.get("archive_reason") and "reset" in str(a.get("archive_reason")).lower():
+                title = "PAYOUT_RENEWAL" if "payout" in blob else "RESET"
                 timeline.append({
-                    "type": "RESET", "at": a.get("archived_at") or a.get("updated_at"),
-                    "account_id": a.get("id"), "purchase_id": a.get("purchase_id"), "mt5_login": a.get("mt5_login"),
-                    "status": a.get("account_status"), "detail": a.get("archive_reason")
+                    "type": title, "at": a.get("reset_at") or a.get("archived_at") or a.get("updated_at"),
+                    "journey_id": pid, "journey_label": jlabel, "account_id": a.get("id"), "purchase_id": a.get("purchase_id"),
+                    "mt5_login": a.get("mt5_login"), "previous_mt5": previous_mt5, "stage": _np_ops_stage(a),
+                    "status": a.get("account_status"), "detail": a.get("reset_reason") or a.get("archive_reason") or "Account reset / replacement required"
                 })
+
         for p in payouts:
-            timeline.append({
-                "type": "PAYOUT", "at": p.get("paid_at") or p.get("approved_at") or p.get("requested_at") or p.get("created_at"),
-                "account_id": p.get("trader_account_id"), "mt5_login": p.get("mt5_login"),
-                "amount": p.get("amount"), "status": p.get("status"),
-                "detail": f"Payout {p.get('status') or ''} · share {p.get('payout_split') or 60}%"
-            })
+            pid, jlabel = _tl_journey_meta(p, p.get("trader_account_id"))
+            account = account_by_id.get(str(p.get("trader_account_id") or "")) or {}
+            mt5 = p.get("mt5_login") or account.get("mt5_login")
+            requested = p.get("requested_at") or p.get("created_at")
+            if requested:
+                timeline.append({"type":"PAYOUT_REQUESTED","at":requested,"journey_id":pid,"journey_label":jlabel,"account_id":p.get("trader_account_id"),"mt5_login":mt5,"amount":p.get("amount"),"status":p.get("status"),"detail":"Payout requested"})
+            if p.get("approved_at"):
+                timeline.append({"type":"PAYOUT_APPROVED","at":p.get("approved_at"),"journey_id":pid,"journey_label":jlabel,"account_id":p.get("trader_account_id"),"mt5_login":mt5,"amount":p.get("amount"),"status":p.get("status"),"detail":"Payout approved"})
+            if p.get("paid_at"):
+                timeline.append({"type":"PAYOUT_PAID","at":p.get("paid_at"),"journey_id":pid,"journey_label":jlabel,"account_id":p.get("trader_account_id"),"mt5_login":mt5,"amount":p.get("amount"),"status":p.get("status"),"detail":f"Payout paid · trader share {p.get('payout_split') or 60}%"})
+            if p.get("rejected_at"):
+                timeline.append({"type":"PAYOUT_REJECTED","at":p.get("rejected_at"),"journey_id":pid,"journey_label":jlabel,"account_id":p.get("trader_account_id"),"mt5_login":mt5,"amount":p.get("amount"),"status":p.get("status"),"detail":"Payout rejected"})
+
         timeline = [x for x in timeline if x.get("at")]
-        timeline.sort(key=lambda x: str(x.get("at") or ""), reverse=True)
+        timeline.sort(key=lambda x: _tl_dt(x.get("at")), reverse=True)
 
         ops = _np_ops_build()
         trader_actions = [x for x in ops.get("actions", []) if str(x.get("trader_id") or "") == trader_id]
