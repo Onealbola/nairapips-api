@@ -23265,12 +23265,15 @@ def _np_approve_reset_purchase_payment(p, admin_payload=None):
 
     # Production challenge_purchases does not expose the optional *_source_account_id
     # columns. Lock the entitlement using only columns already used by this schema.
-    parent_update = {
-        parent_field: True,
-        ("challenge_reset_used_at" if parent_field == "challenge_reset_used" else "funded_reset_used_at"): now,
-        "updated_at": now,
-    }
-    updated_parent = supabase.table("challenge_purchases").update(parent_update).eq("id", parent_id).execute().data or []
+    # Production schema does not contain the optional challenge_reset_used_at / funded_reset_used_at
+    # timestamp columns. The boolean entitlement lock is the authoritative control.
+    parent_update = {parent_field: True, "updated_at": now}
+    try:
+        updated_parent = supabase.table("challenge_purchases").update(parent_update).eq("id", parent_id).execute().data or []
+    except Exception as _parent_exc:
+        # Extra compatibility for older rows/schemas that may also lack updated_at.
+        parent_update.pop("updated_at", None)
+        updated_parent = supabase.table("challenge_purchases").update(parent_update).eq("id", parent_id).execute().data or []
     if not updated_parent:
         return bad("Reset source was archived but journey reset counter could not be locked. STOP and review before assignment.", 500)
 
