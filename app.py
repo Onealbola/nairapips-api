@@ -2487,6 +2487,53 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
         if ok: return m
     return None
 
+# === NAIRAPIPS AUTOMATION GENERATION FOUNDATION — 2026-09-09 CUTOFF ===
+_NP_AUTOMATION_GENERATION_CUTOFF = datetime(2026, 9, 9, 0, 0, 0, tzinfo=timezone.utc)
+
+def _np_parse_dt_safe(value):
+    try:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def _np_automation_generation_purchase(purchase):
+    """Only fresh purchase/journeys created from 2026-09-09 are trusted for new automation.
+    Registration date is irrelevant: an old trader's new purchase is a new automation journey.
+    """
+    if not purchase or not str(purchase.get("id") or "").strip() or not str(purchase.get("trader_id") or "").strip():
+        return False
+    created = _np_parse_dt_safe(purchase.get("created_at"))
+    return bool(created and created >= _NP_AUTOMATION_GENERATION_CUTOFF)
+
+def _np_green_automation_authority(trader, purchase, source_account=None, target_stage=None):
+    """Fail-closed GREEN gate. Returns (ok, reason). Never guesses missing lineage."""
+    tid = str((trader or {}).get("id") or "").strip()
+    pid = str((purchase or {}).get("id") or "").strip()
+    if not tid or not pid:
+        return False, "missing_trader_or_purchase"
+    if str((purchase or {}).get("trader_id") or "").strip() != tid:
+        return False, "purchase_owner_mismatch"
+    if not _np_automation_generation_purchase(purchase):
+        return False, "legacy_or_unstamped_journey"
+    if source_account:
+        if str(source_account.get("trader_id") or "").strip() != tid:
+            return False, "source_owner_mismatch"
+        if str(source_account.get("purchase_id") or "").strip() != pid:
+            return False, "source_purchase_mismatch"
+        src_size = clean(source_account.get("account_size") or source_account.get("start_balance") or 0)
+        pur_size = clean(purchase.get("account_size") or 0)
+        if src_size and pur_size and src_size != pur_size:
+            return False, "account_size_mismatch"
+    if target_stage and _normalize_lifecycle_stage(target_stage) not in ACCOUNT_STAGES:
+        return False, "invalid_target_stage"
+    return True, "green"
+
 def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"):
     """Production entitlement gate for SYSTEM automatic MT5 assignment.
 
@@ -2503,6 +2550,12 @@ def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=N
 
     trader_id = str((trader or {}).get("id") or "").strip()
     purchase_id = str((purchase or {}).get("id") or "").strip()
+
+    green, green_reason = _np_green_automation_authority(trader, purchase, source_account, stage)
+    if not green:
+        _audit_safe("automation", "review_required", f"AUTO BLOCKED: {green_reason}; purchase={purchase_id}; target={stage}",
+                    {"name":"system","username":"system","role":"system"}, trader_id)
+        return None
 
     # IDEMPOTENCY: the same purchase cannot silently receive a second active MT5.
     if purchase_id:
@@ -2637,7 +2690,7 @@ def _np_resume_waiting_zero_cost_automations(trigger="inventory_added"):
         # 2) New-plan INCLUDED Phase1 reset that is already activated and waiting.
         # Old plans remain excluded by launch-date + explicit Second-Life authority.
         try:
-            launch = datetime(2026, 8, 20, 0, 0, 0, tzinfo=timezone.utc)
+            launch = datetime(2026, 9, 9, 0, 0, 0, tzinfo=timezone.utc)
             purchases = supabase.table("challenge_purchases").select("*").order("created_at", desc=False).limit(1500).execute().data or []
             for purchase in purchases:
                 sl_status = str(purchase.get("second_life_status") or "").strip().lower()
@@ -2720,14 +2773,19 @@ def _np_auto_free_phase1_reset_after_breach(trader, breached_account):
               .eq('id',purchase_id).eq('trader_id',trader_id).limit(1).execute().data or [])
         if not rows: return None
         purchase=rows[0]
+        if not _np_automation_generation_purchase(purchase):
+            _audit_safe('automation','legacy_reset_auto_blocked',
+                        f'LEGACY_OR_PRE_CUTOFF_RESET_MANUAL: purchase={purchase_id} source_account={account_id}',
+                        {'name':'system','username':'system','role':'system'}, account_id)
+            return None
         if not _second_life_bool(purchase.get('second_life_enabled')): return None
         if _second_life_bool(purchase.get('second_life_used')): return None
 
         # BUSINESS LAW 2026-09-10 — LEGACY/OLD PLANS NEVER GET AN AUTOMATIC RESET.
-        # The 1-Phase · 2-Lives product was introduced on 2026-08-20. A historical
+        # AUTOMATION GENERATION begins 2026-09-09. Even if an earlier purchase carries 2-Lives-looking fields, A historical
         # purchase may carry old/migrated Second-Life-looking fields, so the boolean
         # flag alone is NOT enough authority to give away a free MT5. Only purchases
-        # created on/after the 2-Lives launch and explicitly snapshotted with the
+        # created on/after the Automation Generation cutoff and explicitly snapshotted with the
         # included benefit may self-fulfil. Anything older must go through the paid
         # reset -> Admin approval route. This check is deliberately fail-closed.
         created_raw = str(purchase.get('created_at') or '').strip()
@@ -2737,7 +2795,7 @@ def _np_auto_free_phase1_reset_after_breach(trader, breached_account):
                 created_dt = created_dt.replace(tzinfo=timezone.utc)
         except Exception:
             created_dt = None
-        two_lives_launch = datetime(2026, 8, 20, 0, 0, 0, tzinfo=timezone.utc)
+        two_lives_launch = datetime(2026, 9, 9, 0, 0, 0, tzinfo=timezone.utc)
         if created_dt is None or created_dt < two_lives_launch:
             _audit_safe('automation','legacy_reset_auto_blocked',
                         f'OLD_PLAN_PAID_RESET_REQUIRED: purchase={purchase_id} source_account={account_id}',
@@ -2799,6 +2857,15 @@ def _np_auto_post_payout_renewal(payout):
             return {'account':replacement,'already_fulfilled':True}
         size=clean(source.get('account_size') or source.get('start_balance') or payout.get('account_size') or 0)
         if not size: return None
+        trader=get_trader_by_id(trader_id)
+        if not trader: return None
+        purchase=_safe_purchase_for_account(source)
+        green, green_reason = _np_green_automation_authority(trader, purchase, source, 'funded')
+        if not green:
+            _audit_safe('automation','review_required',
+                        f'PAYOUT AUTO BLOCKED: {green_reason}; payout={payout_id}; source_account={source_id}',
+                        {'name':'system','username':'system','role':'system'},source_id)
+            return None
         # Close the paid source before assignment; preserve it as immutable history.
         old_reason=str(source.get('archive_reason') or '').strip()
         marker=f'[NP_ENTITLEMENT:post_payout_renewal:{payout_id}]'
@@ -2807,9 +2874,6 @@ def _np_auto_post_payout_renewal(payout):
             'account_status':'archived_reset_funded','monitoring_enabled':False,
             'archive_reason':new_reason,'updated_at':now_iso()
         }).eq('id',source_id).eq('trader_id',trader_id).execute()
-        trader=get_trader_by_id(trader_id)
-        if not trader: return None
-        purchase=_safe_purchase_for_account(source)
         mt5=_np_pick_fresh_mt5(size,'funded')
         if not mt5:
             _audit_safe('automation','payout_renewal_waiting_inventory',
