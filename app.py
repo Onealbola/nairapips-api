@@ -23192,8 +23192,9 @@ def _np_approve_reset_purchase_payment(p, admin_payload=None):
     stage = _np_reset_stage(source)
     second_enabled = _second_life_bool(parent.get("second_life_enabled"))
     if stage in {"phase1", "phase2"}:
-        if second_enabled:
-            return bad("2-Lives Challenge reset is the included free Second Life; a paid Challenge reset cannot be approved for this journey", 409)
+        # PRODUCTION RULE 2026-09-10: old-plan Challenge/Second-Life resets are NOT free.
+        # A reset entitlement only permits a PAID reset. Payment proof + Admin approval
+        # are required before a replacement Phase MT5 can enter the assignment queue.
         if _np_reset_bool(parent.get("challenge_reset_used")):
             return bad("Challenge reset already used for this journey. A second Challenge reset is forbidden.", 409)
         parent_field = "challenge_reset_used"
