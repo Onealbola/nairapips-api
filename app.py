@@ -1619,6 +1619,111 @@ def _reset_assignment_rows_from_accounts(account_rows, traders_by_id=None):
     return rows
 
 
+def _np_reset_rows_from_approved_orders(account_rows, traders_by_id=None):
+    """Schema-safe bridge: approved paid reset orders must always surface in Admin assignment.
+
+    Source of truth is the approved reset child order's NP_RESET_REQUEST marker.
+    This avoids dependence on optional reset_* columns in older production schemas.
+    """
+    traders_by_id = traders_by_id or {}
+    rows = list(account_rows or [])
+    by_id = {str(a.get("id") or "").strip(): a for a in rows if str(a.get("id") or "").strip()}
+    out = []
+    try:
+        orders = (supabase.table("challenge_purchases").select("*")
+                  .eq("payment_status", "approved")
+                  .order("approved_at", desc=True).limit(1500).execute().data or [])
+    except Exception:
+        try:
+            orders = (supabase.table("challenge_purchases").select("*")
+                      .order("created_at", desc=True).limit(1500).execute().data or [])
+        except Exception:
+            orders = []
+
+    seen_sources = set()
+    for order in orders:
+        note = str(order.get("admin_note") or "")
+        status = str(order.get("status") or "").strip().lower()
+        pay = str(order.get("payment_status") or "").strip().lower()
+        m = re.search(r"\[NP_RESET_REQUEST:([^:\]]+):([^:\]]+):(phase1|phase2|funded)\]", note, re.I)
+        if not m or pay != "approved":
+            continue
+        if status not in {"approved_reset_waiting_mt5", "approved", "paid", "completed"} and "reset payment approved" not in note.lower():
+            continue
+
+        source_id, parent_id, stage = str(m.group(1)).strip(), str(m.group(2)).strip(), str(m.group(3)).strip().lower()
+        if not source_id or source_id in seen_sources:
+            continue
+        source = by_id.get(source_id) or {}
+        trader_id = str(order.get("trader_id") or source.get("trader_id") or "").strip()
+        if not trader_id:
+            continue
+
+        approved_time = _dt_score(order.get("approved_at") or order.get("updated_at") or order.get("created_at"))
+        replacement = None
+        for candidate in rows:
+            if str(candidate.get("id") or "").strip() == source_id:
+                continue
+            if str(candidate.get("trader_id") or "").strip() != trader_id:
+                continue
+            if not str(candidate.get("mt5_login") or "").strip():
+                continue
+            if _normalize_lifecycle_stage(candidate.get("stage") or candidate.get("phase")) != stage:
+                continue
+            ctime = _dt_score(candidate.get("assigned_at") or candidate.get("started_at") or candidate.get("created_at") or candidate.get("updated_at"))
+            parent_refs = {
+                str(candidate.get("previous_trader_account_id") or "").strip(),
+                str(candidate.get("replaces_trader_account_id") or "").strip(),
+                str(candidate.get("reset_source_account_id") or "").strip(),
+            }
+            cpid = str(candidate.get("purchase_id") or candidate.get("challenge_purchase_id") or "").strip()
+            if source_id in parent_refs or (cpid == parent_id and approved_time and ctime and ctime > approved_time):
+                replacement = candidate
+                break
+        if replacement:
+            continue
+
+        trader = traders_by_id.get(trader_id) or {}
+        size = clean(order.get("account_size") or source.get("account_size") or source.get("start_balance") or 0)
+        old_login = str(source.get("mt5_login") or "").strip()
+        out.append({
+            "id": f"reset-order-waiting:{order.get('id')}",
+            "trader_id": trader_id,
+            "trader_account_id": source_id,
+            "completed_account_id": source_id,
+            "source_account_id": source_id,
+            "replaces_trader_account_id": source_id,
+            "previous_trader_account_id": source_id,
+            "purchase_id": parent_id,
+            "reset_order_id": order.get("id"),
+            "progression_key": f"reset:{source_id}->{stage}",
+            "replacement_required": True,
+            "source_type": "reset_replacement",
+            "source": "approved_paid_reset_order",
+            "entitlement_verified": True,
+            "entitlement_reason": "approved_paid_reset_order",
+            "entitlement_label": f"PAID {stage.upper()} RESET",
+            "entitlement_evidence_id": order.get("id"),
+            "target_phase": stage,
+            "target_stage": stage,
+            "current_phase": stage,
+            "current_status": "waiting_mt5",
+            "account_status": "waiting_mt5",
+            "assignment_label": "Assign Fresh Funded MT5" if stage == "funded" else ("Assign Fresh Phase 2 MT5" if stage == "phase2" else "Assign Fresh Phase 1 MT5"),
+            "stage_label": f"PAID RESET · {stage.upper()} · WAITING FOR FRESH MT5",
+            "name": trader.get("name") or trader.get("full_name") or order.get("trader_name") or "Trader",
+            "email": trader.get("email") or order.get("email") or "",
+            "phone": trader.get("phone") or order.get("phone") or "",
+            "account_reference": trader.get("account_reference") or "",
+            "old_mt5_login": old_login,
+            "completed_mt5_login": old_login,
+            "account_size": size,
+            "created_at": order.get("approved_at") or order.get("updated_at") or order.get("created_at") or "",
+        })
+        seen_sources.add(source_id)
+    return out
+
+
 def _purchase_accounts_for_trader(trader, purchases=None):
     """Return account-scoped waiting placeholders from purchases.
 
@@ -16176,6 +16281,13 @@ def np_assignment_center():
         reset_rows = _reset_assignment_rows_from_accounts(
             reset_source_accounts, reset_traders_by_id
         )
+        # Schema-safe paid-reset bridge: an APPROVED reset child order is itself
+        # sufficient evidence for an outstanding same-stage replacement.
+        order_reset_rows = _np_reset_rows_from_approved_orders(
+            reset_source_accounts, reset_traders_by_id
+        )
+        existing_reset_sources = {str(r.get("source_account_id") or "").strip() for r in reset_rows}
+        reset_rows.extend([r for r in order_reset_rows if str(r.get("source_account_id") or "").strip() not in existing_reset_sources])
 
         # Purchase rows must be FIRST-ASSIGNMENT only.
         # If an exact purchase already owns ANY trader_accounts history, it can
