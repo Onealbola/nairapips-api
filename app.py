@@ -22121,6 +22121,35 @@ def _np_ops_build():
         tid = str(p.get("trader_id") or "")
         trader = trader_by_id.get(tid, {})
         rows = accounts_by_purchase.get(pid, [])
+
+        # PAID RESET PAYMENT PROOF — reset orders are financial child records, not
+        # ordinary challenge journeys. Surface them directly in Action Required so
+        # Admin can approve the exact source account without searching Purchases.
+        _reset_note = str(p.get("admin_note") or "")
+        _reset_match = re.search(r"\[NP_RESET_REQUEST:([^:\]]+):([^:\]]+):(phase1|phase2|funded)\]", _reset_note, re.I)
+        if _reset_match:
+            _reset_source_id = str(_reset_match.group(1)).strip()
+            _reset_parent_id = str(_reset_match.group(2)).strip()
+            _reset_stage_name = str(_reset_match.group(3)).strip().lower()
+            _reset_status = _np_ops_lower(p.get("payment_status") or p.get("status"))
+            _source = next((a for a in accounts if str(a.get("id") or "") == _reset_source_id), None) or {}
+            if _reset_status not in {"approved", "paid", "completed", "assigned", "rejected", "cancelled", "canceled", "failed"}:
+                actions.append(_np_ops_make_action(
+                    "action", "reset_payment", "RESET_PAYMENT_REVIEW_REQUIRED",
+                    f"Paid {_reset_stage_name.upper()} reset awaiting approval",
+                    trader, p, _source,
+                    happened=f"Reset payment proof was submitted for {_reset_stage_name.upper()} MT5 {_source.get('mt5_login') or '—'}.",
+                    required=f"Review payment proof and approve this exact {_reset_stage_name.upper()} reset. Approval must create one fresh {_reset_stage_name.upper()} assignment entitlement only.",
+                    evidence={
+                        "reset_order_id": pid, "source_account_id": _reset_source_id,
+                        "parent_purchase_id": _reset_parent_id, "stage": _reset_stage_name,
+                        "payment_status": _reset_status, "payment_proof_url": p.get("payment_proof_url"),
+                    },
+                    occurred_at=p.get("created_at")
+                ))
+            # Do not reinterpret this reset-payment child row as a normal purchase journey.
+            continue
+
         phase1 = [a for a in rows if _np_ops_stage(a) == "phase1"]
         funded = [a for a in rows if _np_ops_stage(a) == "funded"]
         phase2 = [a for a in rows if _np_ops_stage(a) == "phase2"]
@@ -23213,20 +23242,22 @@ def _np_approve_reset_purchase_payment(p, admin_payload=None):
     marker = f"[NP_ENTITLEMENT:{marker_kind}:{reset_order_id}]"
     old_reason = str(source.get("archive_reason") or source.get("breach_reason") or "").strip()
     archive_reason = (old_reason + " | " + marker).strip(" |")
+    # PRODUCTION SCHEMA-SAFE RESET APPROVAL 2026-09-10:
+    # trader_accounts in production does not necessarily contain reset_kind/reset_order_id.
+    # The entitlement identity already lives safely in archive_reason + challenge_purchases.admin_note.
+    # Never make approval depend on optional reset-specific columns.
     source_update = {
         "account_status": f"archived_reset_{stage}",
         "monitoring_enabled": False,
         "archive_reason": archive_reason,
-        "reset_order_id": reset_order_id,
-        "reset_kind": marker_kind,
         "updated_at": now,
         "archived_at": source.get("archived_at") or now,
     }
-    # Preserve access lock if the production schema contains it.
+    # mt5_access_disabled is also optional in older production schemas.
     try:
         source_update["mt5_access_disabled"] = True
         updated_source = supabase.table("trader_accounts").update(source_update).eq("id", source_id).eq("trader_id", trader_id).execute().data or []
-    except Exception:
+    except Exception as _src_exc:
         source_update.pop("mt5_access_disabled", None)
         updated_source = supabase.table("trader_accounts").update(source_update).eq("id", source_id).eq("trader_id", trader_id).execute().data or []
     if not updated_source:
@@ -23242,10 +23273,15 @@ def _np_approve_reset_purchase_payment(p, admin_payload=None):
     if not updated_parent:
         return bad("Reset source was archived but journey reset counter could not be locked. STOP and review before assignment.", 500)
 
+    # Reset orders deliberately live in the normal challenge_purchases schema.
+    # Do not require reset-specific columns that may not exist in production.
     order_update = {
         "payment_status": "approved", "status": "approved_reset_waiting_mt5",
-        "reset_payment_approved_at": now, "approved_at": now, "updated_at": now,
-        "admin_note": f"RESET PAYMENT APPROVED · {stage.upper()} · {marker}",
+        "approved_at": now, "updated_at": now,
+        "admin_note": (
+            f"RESET PAYMENT APPROVED · {stage.upper()} · "
+            f"[NP_RESET_REQUEST:{source_id}:{parent_id}:{stage}] · {marker}"
+        ),
     }
     approved = supabase.table("challenge_purchases").update(order_update).eq("id", reset_order_id).execute().data or []
 
