@@ -23263,10 +23263,11 @@ def _np_approve_reset_purchase_payment(p, admin_payload=None):
     if not updated_source:
         return bad("Reset payment approval could not archive the exact source account safely", 500)
 
+    # Production challenge_purchases does not expose the optional *_source_account_id
+    # columns. Lock the entitlement using only columns already used by this schema.
     parent_update = {
         parent_field: True,
         ("challenge_reset_used_at" if parent_field == "challenge_reset_used" else "funded_reset_used_at"): now,
-        ("challenge_reset_source_account_id" if parent_field == "challenge_reset_used" else "funded_reset_source_account_id"): source_id,
         "updated_at": now,
     }
     updated_parent = supabase.table("challenge_purchases").update(parent_update).eq("id", parent_id).execute().data or []
