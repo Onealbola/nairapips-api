@@ -7550,6 +7550,69 @@ def _second_life_status_payload(purchase, trader_id=None):
         "activated_at": p.get("second_life_activated_at"),
     }
 
+
+def _np_second_life_used_but_unfulfilled(purchase, trader_id):
+    """Return the breached Life-1 source when Second Life was marked used but no Life-2 Phase-1 MT5 was ever actually issued.
+
+    This is a narrow repair authority for interrupted/legacy resets. It does NOT reopen a
+    genuinely consumed Second Life: any later Phase-1 account on the same purchase proves
+    fulfilment and blocks the repair.
+    """
+    p = purchase or {}
+    pid = str(p.get("id") or "").strip()
+    tid = str(trader_id or p.get("trader_id") or "").strip()
+    if not pid or not tid:
+        return None
+    if not _second_life_bool(p.get("second_life_enabled")):
+        return None
+    if not _second_life_bool(p.get("second_life_used")):
+        return None
+
+    rows, seen = [], set()
+    for col in ("purchase_id", "challenge_purchase_id"):
+        try:
+            q = (supabase.table("trader_accounts").select("*")
+                 .eq(col, pid).eq("trader_id", tid).limit(100))
+            for a in (q.execute().data or []):
+                aid = str(a.get("id") or "")
+                if aid and aid not in seen:
+                    seen.add(aid); rows.append(a)
+        except Exception:
+            pass
+
+    def _ts(a):
+        return _dt_score((a or {}).get("assigned_at") or (a or {}).get("started_at")
+                         or (a or {}).get("breached_at") or (a or {}).get("breach_at")
+                         or (a or {}).get("archived_at") or (a or {}).get("created_at")
+                         or (a or {}).get("updated_at"))
+
+    phase1 = [a for a in rows if _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == "phase1"]
+    breached = []
+    for a in phase1:
+        try:
+            is_breach = _np_account_has_breach_evidence(a)
+        except Exception:
+            blob = " ".join(str(a.get(k) or "") for k in ("account_status","status","risk_zone","breach_reason","archive_reason" )).lower()
+            is_breach = "breach" in blob
+        if is_breach:
+            breached.append(a)
+    if not breached:
+        return None
+
+    breached.sort(key=_ts)
+    source = breached[-1]
+    source_time = _ts(source)
+
+    # Any distinct later Phase-1 MT5 on this same purchase proves the free reset was fulfilled.
+    for a in phase1:
+        if str(a.get("id") or "") == str(source.get("id") or ""):
+            continue
+        if not str(a.get("mt5_login") or "").strip():
+            continue
+        if _ts(a) > source_time:
+            return None
+    return source
+
 def _np_public_plan_snapshot_rows():
     """Published public commercial plan snapshot.
 
@@ -8020,6 +8083,21 @@ def admin_second_life_activate():
             return _np_fail("Second Life is not included with this purchase", 409)
         if status.get("used"):
             source_status = str(status.get("source_status") or status.get("status") or "").strip().lower()
+            # INTERRUPTED FREE RESET REPAIR: if Life 2 was marked used but no fresh
+            # Phase-1 MT5 was ever issued on this exact purchase, let the trader
+            # fulfil the owed reset directly. No payment or Admin approval is required.
+            owed_source = None
+            if source_status not in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+                owed_source = _np_second_life_used_but_unfulfilled(p, authed_id)
+                if owed_source:
+                    now = now_iso()
+                    supabase.table("challenge_purchases").update({
+                        "second_life_status": "life2_waiting_mt5",
+                        "lifecycle_state": "phase1_waiting_mt5",
+                        "updated_at": now,
+                    }).eq("id", purchase_id).execute()
+                    p = _second_life_purchase_for_trader(purchase_id, authed_id) or p
+                    source_status = "life2_waiting_mt5"
             if source_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
                 actor = {
                     "name": (admin or {}).get("name") or (admin or {}).get("username") or "admin",
@@ -23511,7 +23589,34 @@ def _np_trader_reset_opportunities_exact_payout_20260908():
         )
         by_id = {str(a.get("id") or "").strip(): a for a in rows if a.get("id")}
 
-        # FIRST AUTHORITY: exact PAID payout source. This is the only account that
+        # FIRST AUTHORITY: an included Phase-1 reset / Second Life that was marked
+        # used but never actually received a Life-2 MT5 is still OWED. Expose it
+        # directly to the trader; activation is self-service and requires no approval.
+        try:
+            purchases = (supabase.table("challenge_purchases").select("*")
+                         .eq("trader_id", authed_id).order("created_at", desc=True)
+                         .limit(100).execute().data or [])
+        except Exception:
+            purchases = []
+        for purchase in purchases:
+            owed_source = _np_second_life_used_but_unfulfilled(purchase, authed_id)
+            if not owed_source:
+                continue
+            return _np_ok({"success": True, "opportunity": {
+                "eligible": True,
+                "kind": "free_second_life",
+                "reason": "second_life_marked_used_but_unfulfilled",
+                "title": "Your Free Phase 1 Reset Is Ready",
+                "subtitle": "NairaPips still owes this challenge one included Phase 1 reset. Activate it now and a fresh Phase 1 MT5 will be issued automatically when eligible inventory is available. No payment or Admin approval is required.",
+                "stage": "phase1",
+                "account_size": clean(owed_source.get("account_size") or owed_source.get("start_balance") or purchase.get("account_size") or 0),
+                "source_account_id": owed_source.get("id"),
+                "source_mt5_login": owed_source.get("mt5_login"),
+                "purchase_id": purchase.get("id"),
+                "price": 0,
+            }})
+
+        # SECOND AUTHORITY: exact PAID payout source. This is the only account that
         # may represent a post-payout renewal on the Recovery card.
         try:
             paid_payouts = (
