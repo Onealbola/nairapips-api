@@ -23281,11 +23281,20 @@ def _np_approve_purchase_router_20260907():
                 _note = str(_row.get("admin_note") or "")
                 _ptype = str(_row.get("purchase_type") or "challenge").strip().lower()
                 if "[NP_RESET_REQUEST:" in _note:
-                    return bad(
-                        "This is a RESET PAYMENT PROOF, not a new Challenge purchase. "
-                        "Open the trader's Admin card and use Confirm Reset Paid on the exact breached account.",
-                        409
-                    )
+                    # RESET APPROVAL BRIDGE — payment proofs are stored in the normal
+                    # challenge_purchases table for schema compatibility. Their exact
+                    # source account + parent journey + stage live in NP_RESET_REQUEST.
+                    # Route the Admin Approve action directly into the paid-reset
+                    # authority instead of rejecting it as a normal purchase.
+                    m = re.search(r"\[NP_RESET_REQUEST:([^:\]]+):([^:\]]+):(phase1|phase2|funded)\]", _note, re.I)
+                    if not m:
+                        return bad("Reset payment proof is missing its exact source/journey marker. Approval stopped for safety.", 409)
+                    _reset_row = dict(_row)
+                    _reset_row["purchase_type"] = "reset"
+                    _reset_row["reset_source_account_id"] = str(m.group(1)).strip()
+                    _reset_row["reset_parent_purchase_id"] = str(m.group(2)).strip()
+                    _reset_row["reset_stage"] = str(m.group(3)).strip().lower()
+                    return _np_approve_reset_purchase_payment(_reset_row, d)
                 if _ptype == "reset":
                     return _np_approve_reset_purchase_payment(_row, d)
         except Exception as e:
