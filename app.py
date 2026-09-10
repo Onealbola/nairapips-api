@@ -5180,7 +5180,9 @@ def migrate_active_trader_accounts():
 
 
 FROM_EMAIL = os.getenv("FROM_EMAIL") or "support@nairapips.com"
-ADMIN_ALERT_EMAIL = os.getenv("ADMIN_ALERT_EMAIL") or FROM_EMAIL
+# OWNER COPY SAFETY: keep the owner/admin notification recipient independent of sender config.
+OWNER_ALERT_EMAIL = os.getenv("OWNER_ALERT_EMAIL") or "nifemilife3@gmail.com"
+ADMIN_ALERT_EMAIL = os.getenv("ADMIN_ALERT_EMAIL") or OWNER_ALERT_EMAIL
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 
 # ================================
@@ -5380,7 +5382,24 @@ def send_email_safe(to_email, subject, message):
         return False
 
 def send_admin_alert(subject, message):
-    return send_email_safe(ADMIN_ALERT_EMAIL, subject, message)
+    """Send operational alerts to Admin and always preserve the owner copy.
+
+    Production safety: a missing/stale ADMIN_ALERT_EMAIL must never silently stop
+    the owner copy. Recipients are de-duplicated so the same inbox gets one email.
+    """
+    recipients = []
+    for _addr in (ADMIN_ALERT_EMAIL, OWNER_ALERT_EMAIL):
+        _addr = str(_addr or "").strip()
+        if _addr and _addr.lower() not in {x.lower() for x in recipients}:
+            recipients.append(_addr)
+    sent_any = False
+    for _addr in recipients:
+        try:
+            if send_email_safe(_addr, subject, message):
+                sent_any = True
+        except Exception as _admin_email_exc:
+            print("ADMIN ALERT EMAIL ERROR:", _addr, str(_admin_email_exc))
+    return sent_any
 
 def email_money(value):
     try:
