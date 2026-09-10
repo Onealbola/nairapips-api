@@ -3039,15 +3039,18 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
                 f'{closing}'
                 f'Your dashboard: {dashboard_url}'
             )
-            send_account_status_email(
+            _assignment_mail_ok = send_assignment_email_with_owner_copy(
                 trader,
                 subject,
                 intro,
                 details
             )
-            send_admin_alert(
-                f'NairaPips {assignment_label} MT5 assigned',
-                f'MT5 {mt5.get("mt5_login")} assigned to {trader_name} ({trader_email}) for {assignment_label}. Emailed credentials to trader.'
+            print(
+                "MT5 ASSIGN EMAIL+BCC:",
+                "SENT" if _assignment_mail_ok else "FAILED",
+                trader_email,
+                "owner_copy=", OWNER_ALERT_EMAIL,
+                "mt5=", mt5.get("mt5_login")
             )
     except Exception as _email_err:
         print('MT5 ASSIGN EMAIL ERROR:', str(_email_err))
@@ -5662,7 +5665,7 @@ def _np_followup_finalize(item, marker, ok_send, provider_response="", error_tex
 def text_to_html_content(message):
     return "<p>" + html.escape(str(message or "")).replace("\n", "<br>") + "</p>"
 
-def send_email_brevo(to_email, subject, html_content):
+def send_email_brevo(to_email, subject, html_content, bcc_email=None):
     try:
         if not to_email:
             _log_email_bank(to_email, subject, status="failed", message=html_content, error="Missing recipient email")
@@ -5680,6 +5683,9 @@ def send_email_brevo(to_email, subject, html_content):
             "subject": subject,
             "htmlContent": html_content
         }
+        _bcc = str(bcc_email or "").strip()
+        if _bcc and _bcc.lower() != str(to_email or "").strip().lower():
+            payload["bcc"] = [{"email": _bcc}]
         res = requests.post(
             "https://api.brevo.com/v3/smtp/email",
             headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
@@ -5709,6 +5715,33 @@ def send_email_safe(to_email, subject, message):
     except Exception as e:
         print("BREVO EMAIL ERROR:", str(e))
         return False
+
+def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
+    """Send the trader assignment email and BCC the owner in the SAME Brevo request.
+
+    This is deliberately independent of send_admin_alert(). If the trader email is
+    accepted by Brevo, the owner copy is part of that same provider transaction, so
+    assignment copies cannot silently disappear while trader credentials still send.
+    """
+    if not trader:
+        return False
+    to_email = str(trader.get("email") or "").strip()
+    if not to_email:
+        return False
+    name = trader.get("name") or trader.get("trader_name") or "Trader"
+    body = f"""Hello {name},
+
+{title}
+
+{details}
+
+NairaPips Team"""
+    return send_email_brevo(
+        to_email,
+        subject,
+        text_to_html_content(body),
+        bcc_email=OWNER_ALERT_EMAIL,
+    )
 
 def send_admin_alert(subject, message):
     """Send operational alerts to Admin and always preserve the owner copy.
