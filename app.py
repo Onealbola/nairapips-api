@@ -8269,7 +8269,21 @@ def second_life_activate():
         status = _second_life_status_payload(p, authed_id)
         if not status.get("enabled"):
             return _np_fail("Second Life is not included with this purchase", 409)
-        if status.get("used"):
+        # SELF-SERVICE REPAIR AUTHORITY — 2026-09-10
+        # Historical/interrupted records can say second_life_used=true even though no
+        # Life-2 Phase-1 MT5 was ever issued. In that exact case the business still
+        # owes the trader the included Phase-1 reset. A real later Phase-1 MT5 on the
+        # same purchase blocks this repair, so a genuinely consumed reset never reopens.
+        repair_source = _np_second_life_used_but_unfulfilled(p, authed_id) if status.get("used") else None
+        if status.get("used") and repair_source:
+            status = dict(status)
+            status["used"] = False
+            status["eligible_now"] = True
+            status["breached_account_id"] = repair_source.get("id")
+            status["breached_at"] = repair_source.get("breach_at") or repair_source.get("breached_at") or repair_source.get("archived_at")
+            status["source_status"] = "available_on_admin_correction"
+            status["status"] = "available_on_eligible_breach"
+        elif status.get("used"):
             source_status = str(status.get("source_status") or status.get("status") or "").strip().lower()
             if source_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
                 retried = _np_retry_waiting_second_life_assignment(
