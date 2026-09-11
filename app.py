@@ -25120,3 +25120,52 @@ def progression_report():
 
 # NP_FIX: SECOND_LIFE_WAITING_RETRY_AUTO_ASSIGN_2026_09_09
 # NP_FIX: MULTI_FUNDED_PARALLEL_JOURNEYS_2026_09_09
+
+# =============================================================================
+# NP TRUE EOF RESET ROUTE AUTHORITY — 2026-09-11
+# IMPORTANT: This MUST remain at the physical end of app.py.
+# A later legacy override at the bottom of the historical file was replacing the
+# earlier Second-Life reconciler. Capture the ACTUAL final route now and wrap it.
+# =============================================================================
+_NP_TRUE_EOF_RESET_VIEW = app.view_functions.get("trader_reset_opportunities")
+
+
+def _np_true_eof_trader_reset_opportunities_20260911():
+    result = _NP_TRUE_EOF_RESET_VIEW()
+    try:
+        response = app.make_response(result)
+        data = response.get_json(silent=True) or {}
+        opportunity = data.get("opportunity")
+        if opportunity is None and isinstance(data.get("data"), dict):
+            opportunity = data["data"].get("opportunity")
+
+        # Only reconcile the zero-cost included Phase-1 / Second-Life entitlement.
+        # Paid resets, payout renewals and all other recovery routes are untouched.
+        if not opportunity or str((opportunity or {}).get("kind") or "").strip().lower() != "free_second_life":
+            return response
+
+        requested = str(request.args.get("trader_id") or "").strip()
+        authed_id, auth_error = _authenticated_trader_id_for_request(requested)
+        if auth_error or not authed_id:
+            return response
+
+        # Use the already-defined forensic reconciler. It never allocates another MT5;
+        # it only proves whether the trader's existing current live Phase-1 account
+        # already fulfilled this exact reset and repairs stale linkage when safe.
+        if _np_final_reconcile_fulfilled_second_life(authed_id, opportunity):
+            return _np_ok({
+                "success": True,
+                "opportunity": None,
+                "reconciled": True,
+                "authority": "true_eof_reset_route_20260911",
+            })
+        return response
+    except Exception as exc:
+        print("TRUE EOF RESET ROUTE RECONCILER SKIPPED:", exc)
+        return result
+
+
+if _NP_TRUE_EOF_RESET_VIEW:
+    app.view_functions["trader_reset_opportunities"] = _np_true_eof_trader_reset_opportunities_20260911
+
+# NP_RELEASE: TRUE_EOF_SECOND_LIFE_RESET_ROUTE_AUTHORITY_2026_09_11
