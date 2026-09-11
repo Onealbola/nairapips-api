@@ -7157,6 +7157,41 @@ def _np_bootstrap_lifecycle_authority(trader, accounts, purchases, plan_by_id):
                     active_life2 = a
                     break
 
+            # REPAIR-SAFE CURRENT-POINTER FALLBACK (2026-09-11):
+            # A small number of early automation rows received a fresh Phase-1 MT5 but
+            # the child trader_accounts row was not linked back to the purchase.  The
+            # trader.current_account_id is still exact and points at the MT5.  Without
+            # this fallback the bootstrap incorrectly re-opens the consumed reset after
+            # the later refresh, making the fresh MT5 blink and disappear.
+            #
+            # Adopt ONLY an unlinked/same-purchase current pointer, never an account
+            # belonging to another purchase.  It must be live Phase 1, same size and
+            # newer than the breached source.  This is display/lifecycle inference only;
+            # it does not create an entitlement or allocate another MT5.
+            if active_life2 is None and source is not None:
+                pointer_id = str(trader.get("current_account_id") or "").strip()
+                pointer = next((a for a in accounts if str(a.get("id") or "").strip() == pointer_id), None) if pointer_id else None
+                if pointer:
+                    pstage = _normalize_lifecycle_stage(pointer.get("stage") or pointer.get("phase"))
+                    pst = str(pointer.get("account_status") or pointer.get("status") or "").strip().lower()
+                    plogin = str(pointer.get("mt5_login") or "").strip()
+                    ppid = str(pointer.get("purchase_id") or pointer.get("challenge_purchase_id") or "").strip()
+                    live_ok = pst in {"assigned_active", "active", "current_active", "phase1_active", "approved_active"}
+                    try:
+                        breach_ok = not _np_account_has_breach_evidence(pointer)
+                    except Exception:
+                        pblob = " ".join(str(pointer.get(k) or "") for k in ("account_status","status","risk_zone","breach_reason","archive_reason")).lower()
+                        breach_ok = not any(x in pblob for x in ("breach","archive","closed","locked","disabled","reset"))
+                    source_ts = _dt_score(source.get("breached_at") or source.get("breach_at") or source.get("archived_at") or source.get("updated_at") or source.get("created_at"))
+                    pointer_ts = _dt_score(pointer.get("assigned_at") or pointer.get("started_at") or pointer.get("created_at") or pointer.get("updated_at"))
+                    expected_size = clean(purchase.get("account_size") or source.get("account_size") or source.get("start_balance") or 0)
+                    pointer_size = clean(pointer.get("account_size") or pointer.get("start_balance") or 0)
+                    size_ok = (not expected_size or not pointer_size or int(expected_size) == int(pointer_size))
+                    lineage_ok = (not ppid) or ppid == purchase_id
+                    time_ok = (not source_ts) or (pointer_ts and pointer_ts > source_ts)
+                    if pstage == "phase1" and live_ok and plogin and breach_ok and lineage_ok and size_ok and time_ok:
+                        active_life2 = pointer
+
         # PASS and BREACH are different exits from Life 1:
         # - PASS -> challenge completed -> Funded progression.
         # - BREACH -> Second Life available (if unused).
@@ -8239,6 +8274,39 @@ def _np_second_life_used_but_unfulfilled(purchase, trader_id):
             continue
         if _ts(a) > source_time:
             return None
+
+    # EARLY-AUTOMATION LINK REPAIR GUARD (2026-09-11):
+    # Some fresh reset MT5 rows were created correctly and promoted to
+    # traders.current_account_id, but the account row missed purchase_id.  Such a row
+    # must count as fulfilment or the recovery endpoint keeps returning the same reset
+    # opportunity and the dashboard flips back after its deferred refresh.
+    try:
+        tr = get_trader_by_id(tid) or {}
+        pointer_id = str(tr.get("current_account_id") or "").strip()
+        if pointer_id:
+            pointer_rows = (supabase.table("trader_accounts").select("*")
+                            .eq("id", pointer_id).eq("trader_id", tid).limit(1).execute().data or [])
+            if pointer_rows:
+                cand = pointer_rows[0]
+                cand_pid = str(cand.get("purchase_id") or cand.get("challenge_purchase_id") or "").strip()
+                cand_stage = _normalize_lifecycle_stage(cand.get("stage") or cand.get("phase"))
+                cand_status = str(cand.get("account_status") or cand.get("status") or "").strip().lower()
+                cand_login = str(cand.get("mt5_login") or "").strip()
+                expected_size = clean(p.get("account_size") or source.get("account_size") or source.get("start_balance") or 0)
+                cand_size = clean(cand.get("account_size") or cand.get("start_balance") or 0)
+                size_ok = (not expected_size or not cand_size or int(expected_size) == int(cand_size))
+                lineage_ok = (not cand_pid) or cand_pid == pid
+                live_ok = cand_status in {"assigned_active","active","current_active","phase1_active","approved_active"}
+                try:
+                    clean_live = not _np_account_has_breach_evidence(cand)
+                except Exception:
+                    cblob = " ".join(str(cand.get(k) or "") for k in ("account_status","status","risk_zone","breach_reason","archive_reason")).lower()
+                    clean_live = not any(x in cblob for x in ("breach","archive","closed","locked","disabled","reset"))
+                if (cand_stage == "phase1" and cand_login and live_ok and clean_live
+                        and lineage_ok and size_ok and _ts(cand) > source_time):
+                    return None
+    except Exception:
+        pass
     return source
 
 def _np_public_plan_snapshot_rows():
