@@ -3074,7 +3074,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         if not pointer_rows:
             raise RuntimeError("fresh MT5 assigned but current_account_id pointer was not persisted")
         trader_row = pointer_rows[0]
-        _invalidate_trader_bootstrap_cache(trader.get("id")) if '_invalidate_trader_bootstrap_cache' in globals() else None
+        _invalidate_trader_bootstrap_cache(trader.get("id"))
         _audit_safe("lifecycle", "current_account_promoted",
                     f"Fresh {stage} MT5 {account.get('mt5_login')} promoted to current dashboard account",
                     staff or {"name":"system","username":"system","role":"system"}, account.get("id"))
@@ -6919,6 +6919,33 @@ def delete_trader():
 _TRADER_BOOTSTRAP_CACHE = {}
 _ADMIN_BOOTSTRAP_CACHE = {"ts": 0, "payload": None}
 TRADER_BOOTSTRAP_TTL_SECONDS = 5
+
+
+def _invalidate_trader_bootstrap_cache(trader_id=None):
+    """Invalidate trader bootstrap cache after any lifecycle/MT5 mutation.
+
+    This is intentionally conservative. A stale 5-second bootstrap can overwrite a
+    freshly assigned reset account in the browser during login/background retries.
+    Clearing this tiny cache is safer than allowing an old lifecycle snapshot to
+    become authoritative after a successful assignment.
+    """
+    try:
+        if not trader_id:
+            _TRADER_BOOTSTRAP_CACHE.clear()
+            return
+        tid = str(trader_id).strip().lower()
+        doomed = [k for k in list(_TRADER_BOOTSTRAP_CACHE.keys()) if f"|{tid}|" in f"|{str(k).lower()}|"]
+        if doomed:
+            for k in doomed:
+                _TRADER_BOOTSTRAP_CACHE.pop(k, None)
+        else:
+            # Cache keys may vary by lookup generation; fail safe by clearing all.
+            _TRADER_BOOTSTRAP_CACHE.clear()
+    except Exception:
+        try:
+            _TRADER_BOOTSTRAP_CACHE.clear()
+        except Exception:
+            pass
 ADMIN_BOOTSTRAP_TTL_SECONDS = 45
 _NP_SYNC_LOCK = __import__("threading").Lock()
 _NP_SYNC_STATE = {"running": False, "started_at": None, "finished_at": None, "last_result": None, "last_error": None}
@@ -8160,6 +8187,13 @@ def _np_second_life_used_but_unfulfilled(purchase, trader_id):
     if not _second_life_bool(p.get("second_life_enabled")):
         return None
     if not _second_life_bool(p.get("second_life_used")):
+        return None
+
+    # A purchase explicitly marked Life 2 active has already been fulfilled.
+    # Never resurrect its reset card merely because an older breached Life-1 row
+    # still exists or a delayed read cannot immediately see the child account.
+    sl_status = str(p.get("second_life_status") or "").strip().lower()
+    if sl_status in {"life2_active", "active", "fulfilled", "completed"}:
         return None
 
     rows, seen = [], set()
