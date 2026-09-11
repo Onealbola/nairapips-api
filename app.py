@@ -2638,6 +2638,78 @@ def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=N
                         {'name':'system','username':'system','role':'system'}, trader_id)
             return None
 
+    # SOURCE-CONSUMPTION HARD LOCK 2026-09-11:
+    # A historical PASS or Second-Life activation may never be replayed after its
+    # successor later breaches/archives. Active-only checks are insufficient.
+    try:
+        if purchase_id and reason == "lifecycle_progression":
+            source_id = str((source_account or {}).get("id") or "").strip()
+            source_time = _np_parse_dt_safe(
+                (source_account or {}).get("passed_at")
+                or (source_account or {}).get("archived_at")
+                or (source_account or {}).get("updated_at")
+                or (source_account or {}).get("created_at")
+            )
+            hist = (supabase.table("trader_accounts").select("*")
+                    .eq("purchase_id", purchase_id).eq("trader_id", trader_id)
+                    .order("created_at", desc=False).limit(300).execute().data or [])
+            successors = []
+            for row in hist:
+                if str(row.get("id") or "").strip() == source_id:
+                    continue
+                if _normalize_lifecycle_stage(row.get("stage") or row.get("phase")) != stage:
+                    continue
+                if not str(row.get("mt5_login") or "").strip():
+                    continue
+                row_time = _np_parse_dt_safe(row.get("created_at") or row.get("started_at") or row.get("updated_at"))
+                if source_time and row_time and row_time <= source_time:
+                    continue
+                successors.append(row)
+            if successors:
+                chosen = successors[0]
+                _audit_safe("automation", "source_entitlement_replay_blocked",
+                            f"{reason}: source {source_id} already produced successor MT5 {chosen.get('mt5_login')}; no new MT5",
+                            {"name":"system","username":"system","role":"system"}, source_id)
+                return {"account": chosen, "trader": get_trader_by_id(trader_id) or trader, "already_fulfilled": True}
+
+        if purchase_id and reason == "second_life":
+            activated_at = _np_parse_dt_safe((purchase or {}).get("second_life_activated_at"))
+            hist = (supabase.table("trader_accounts").select("*")
+                    .eq("purchase_id", purchase_id).eq("trader_id", trader_id)
+                    .order("created_at", desc=False).limit(300).execute().data or [])
+            delivered = []
+            for row in hist:
+                if _normalize_lifecycle_stage(row.get("stage") or row.get("phase")) != "phase1":
+                    continue
+                if not str(row.get("mt5_login") or "").strip():
+                    continue
+                row_time = _np_parse_dt_safe(row.get("created_at") or row.get("started_at") or row.get("updated_at"))
+                if activated_at and row_time and row_time < activated_at:
+                    continue
+                # Life-2 rows created at/after the activation are fulfillment even if
+                # they later breach/archive; entitlement cannot be replayed.
+                if activated_at:
+                    delivered.append(row)
+            if delivered:
+                chosen = delivered[0]
+                try:
+                    supabase.table("challenge_purchases").update({
+                        "second_life_status": "life2_active",
+                        "lifecycle_state": "phase1_active" if str(chosen.get("account_status") or "").lower() in {"assigned_active","active","phase1_active","current_active"} else "life2_consumed",
+                        "updated_at": now_iso(),
+                    }).eq("id", purchase_id).eq("trader_id", trader_id).execute()
+                except Exception:
+                    pass
+                _audit_safe("automation", "second_life_replay_blocked",
+                            f"second_life: purchase {purchase_id} already delivered MT5 {chosen.get('mt5_login')}; entitlement permanently consumed",
+                            {"name":"system","username":"system","role":"system"}, purchase_id)
+                return {"account": chosen, "trader": get_trader_by_id(trader_id) or trader, "already_fulfilled": True}
+    except Exception as replay_guard_exc:
+        _audit_safe("automation", "source_replay_guard_error",
+                    f"FAIL-CLOSED source replay guard: {replay_guard_exc}; purchase={purchase_id}; reason={reason}",
+                    {"name":"system","username":"system","role":"system"}, trader_id)
+        return None
+
     mt5 = _np_pick_fresh_mt5(size, stage)
     if not mt5:
         _audit_safe("mt5_pool", "auto_assignment_waiting", f"{reason}: WAITING_FOR_MT5_INVENTORY; no fresh <=7-day MT5 for {stage} size {size}",
@@ -2683,102 +2755,21 @@ def _np_inventory_wait_alert(stage, account_size, reason, trader=None):
 
 
 def _np_resume_waiting_zero_cost_automations(trigger="inventory_added"):
-    """Best-effort retry of only already-verified, zero-cost waiting entitlements.
+    """SAFETY 2026-09-11: broad historical inventory sweep is disabled.
 
-    Safety: existing entitlement validators remain authoritative. This function does
-    not create entitlements, approve payments, guess owners, or loosen MT5 rules.
-    It only retries queues that are already waiting because inventory was absent.
+    Automatic MT5 delivery is event-driven only. Adding MT5 inventory must never scan
+    historical pass/payout/reset rows and manufacture/replay old entitlements. Waiting
+    cases remain waiting and can be resumed only by their exact verified event/authority.
     """
-    summary = {"phase_progression": 0, "free_phase1_reset": 0, "payout_renewal": 0, "errors": 0}
+    summary = {"phase_progression": 0, "free_phase1_reset": 0, "payout_renewal": 0, "errors": 0, "broad_retry_disabled": True}
     try:
-        # 1) PASSED -> next stage (including old-plan Phase1 -> Funded).
-        # Use the existing deterministic phase-assignment queue so consumed historical
-        # passes cannot be resurrected by this retry worker.
-        try:
-            for row in (_fetch_phase_assignment_queue() or [])[:250]:
-                target = _normalize_lifecycle_stage(row.get("target_stage") or row.get("target_phase"))
-                source_id = str(row.get("source_account_id") or row.get("completed_account_id") or "").strip()
-                trader_id = str(row.get("trader_id") or "").strip()
-                if not source_id or not trader_id or target not in ACCOUNT_STAGES:
-                    continue
-                srcs = supabase.table("trader_accounts").select("*").eq("id", source_id).eq("trader_id", trader_id).limit(1).execute().data or []
-                if not srcs:
-                    continue
-                source = srcs[0]
-                trader = get_trader_by_id(trader_id) or {}
-                purchase = _safe_purchase_for_account(source)
-                size = clean(source.get("account_size") or source.get("start_balance") or (purchase or {}).get("account_size") or 0)
-                if not _np_pick_fresh_mt5(size, target):
-                    continue
-                result = _np_auto_assign_waiting_stage(trader, target, purchase, source, "lifecycle_progression")
-                if result:
-                    summary["phase_progression"] += 1
-        except Exception as exc:
-            summary["errors"] += 1
-            print("INVENTORY RETRY PHASE PROGRESSION ERROR:", exc)
-
-        # 2) New-plan INCLUDED Phase1 reset that is already activated and waiting.
-        # Old plans remain excluded by launch-date + explicit Second-Life authority.
-        try:
-            launch = datetime(2026, 9, 9, 0, 0, 0, tzinfo=timezone.utc)
-            purchases = supabase.table("challenge_purchases").select("*").order("created_at", desc=False).limit(1500).execute().data or []
-            for purchase in purchases:
-                sl_status = str(purchase.get("second_life_status") or "").strip().lower()
-                if sl_status not in {"life2_waiting_mt5", "waiting_mt5"}:
-                    continue
-                if not (_second_life_bool(purchase.get("second_life_enabled")) and _second_life_bool(purchase.get("second_life_used"))):
-                    continue
-                created_raw = str(purchase.get("created_at") or "").strip()
-                try:
-                    created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00")) if created_raw else None
-                    if created_dt and created_dt.tzinfo is None:
-                        created_dt = created_dt.replace(tzinfo=timezone.utc)
-                except Exception:
-                    created_dt = None
-                if created_dt is None or created_dt < launch:
-                    continue
-                trader_id = str(purchase.get("trader_id") or "").strip()
-                if not trader_id:
-                    continue
-                trader = get_trader_by_id(trader_id) or {}
-                size = clean(purchase.get("account_size") or trader.get("account_size") or 0)
-                if not _np_pick_fresh_mt5(size, "phase1"):
-                    continue
-                result = _np_auto_assign_waiting_stage(trader, "phase1", purchase, None, "second_life")
-                if result:
-                    try:
-                        supabase.table("challenge_purchases").update({
-                            "second_life_status": "life2_active",
-                            "lifecycle_state": "phase1_active",
-                            "updated_at": now_iso(),
-                        }).eq("id", purchase.get("id")).execute()
-                    except Exception:
-                        pass
-                    summary["free_phase1_reset"] += 1
-        except Exception as exc:
-            summary["errors"] += 1
-            print("INVENTORY RETRY FREE RESET ERROR:", exc)
-
-        # 3) PAID payout -> fresh Funded renewal. The payout row itself is authority;
-        # _np_auto_post_payout_renewal is idempotent and proves exact owner/source.
-        try:
-            paid_rows = supabase.table("payouts").select("*").order("created_at", desc=True).limit(300).execute().data or []
-            for payout in paid_rows:
-                if payout_status(payout) != "paid":
-                    continue
-                result = _np_auto_post_payout_renewal(payout)
-                if result and not result.get("already_fulfilled"):
-                    summary["payout_renewal"] += 1
-        except Exception as exc:
-            summary["errors"] += 1
-            print("INVENTORY RETRY PAYOUT RENEWAL ERROR:", exc)
-
-        if any(summary[k] for k in ("phase_progression", "free_phase1_reset", "payout_renewal")):
-            _audit_safe("automation", "inventory_retry_completed", f"trigger={trigger} summary={summary}",
-                        {"name":"system","username":"system","role":"system"}, "")
-    except Exception as exc:
-        summary["errors"] += 1
-        print("INVENTORY RETRY WORKER ERROR:", exc)
+        _audit_safe(
+            "automation", "broad_inventory_retry_blocked",
+            f"trigger={trigger}; historical sweep disabled; event-only automation authority",
+            {"name":"system","username":"system","role":"system"}, ""
+        )
+    except Exception:
+        pass
     return summary
 
 # === NAIRAPIPS ZERO-COST AUTOMATION V1 — 2026-09-10 ===
@@ -2907,6 +2898,41 @@ def _np_auto_post_payout_renewal(payout):
                         f'PAYOUT AUTO BLOCKED: {green_reason}; payout={payout_id}; source_account={source_id}',
                         {'name':'system','username':'system','role':'system'},source_id)
             return None
+        # EXACT PAYOUT REPLAY LOCK 2026-09-11:
+        # A paid payout may produce one successor only. Search all later Funded rows,
+        # including archived/breached history, not only the currently active row.
+        try:
+            paid_time = _np_parse_dt_safe(payout.get("paid_at") or payout.get("updated_at") or payout.get("created_at"))
+            source_time = _np_parse_dt_safe(source.get("archived_at") or source.get("updated_at") or source.get("created_at"))
+            cutoff_time = paid_time or source_time
+            later = []
+            for row in all_rows:
+                if str(row.get("id") or "").strip() == source_id:
+                    continue
+                if _normalize_lifecycle_stage(row.get("stage") or row.get("phase")) != "funded":
+                    continue
+                if not str(row.get("mt5_login") or "").strip():
+                    continue
+                # Prefer exact journey lineage; never borrow another purchase.
+                if purchase and str(row.get("purchase_id") or "").strip() != str(purchase.get("id") or "").strip():
+                    continue
+                rt = _np_parse_dt_safe(row.get("created_at") or row.get("started_at") or row.get("updated_at"))
+                if cutoff_time and rt and rt <= cutoff_time:
+                    continue
+                later.append(row)
+            if later:
+                chosen = later[0]
+                _np_stamp_exact_payout_consumed_20260908(source, chosen, trader_id)
+                _audit_safe("automation", "payout_replay_blocked",
+                            f"payout={payout_id} already produced Funded MT5 {chosen.get('mt5_login')}; no new MT5",
+                            {"name":"system","username":"system","role":"system"}, payout_id)
+                return {"account": chosen, "already_fulfilled": True}
+        except Exception as payout_guard_exc:
+            _audit_safe("automation", "payout_replay_guard_error",
+                        f"FAIL-CLOSED payout replay guard: {payout_guard_exc}; payout={payout_id}",
+                        {"name":"system","username":"system","role":"system"}, payout_id)
+            return None
+
         # Close the paid source before assignment; preserve it as immutable history.
         old_reason=str(source.get('archive_reason') or '').strip()
         marker=f'[NP_ENTITLEMENT:post_payout_renewal:{payout_id}]'
@@ -25169,3 +25195,509 @@ if _NP_TRUE_EOF_RESET_VIEW:
     app.view_functions["trader_reset_opportunities"] = _np_true_eof_trader_reset_opportunities_20260911
 
 # NP_RELEASE: TRUE_EOF_SECOND_LIFE_RESET_ROUTE_AUTHORITY_2026_09_11
+
+# ============================================================================
+# NAIRAPIPS ENTITLEMENT KILL-SWITCH AUTHORITY — 2026-09-11
+# One exact event -> one exact successor -> entitlement is permanently dead.
+# This block is intentionally LAST so older compatibility helpers cannot weaken it.
+# ============================================================================
+
+_NP_PRE_KILL_AUTO_ASSIGN = _np_auto_assign_waiting_stage
+_NP_PRE_KILL_PAYOUT_AUTO = _np_auto_post_payout_renewal
+_NP_PRE_KILL_RESET_ENTITLEMENT = _np_reset_entitlement_for_source
+
+
+def _np_kill_blob(row):
+    row = row or {}
+    return " ".join(str(row.get(k) or "") for k in (
+        "archive_reason", "reset_reason", "admin_note", "message", "account_status", "status"
+    )).lower()
+
+
+def _np_account_is_recalled_or_excluded(row):
+    blob = _np_kill_blob(row)
+    return any(x in blob for x in (
+        "wrong_assignment_recalled", "recalled_wrong_assignment",
+        "np_terminal:recalled_wrong_assignment", "np_excluded_from_progression"
+    ))
+
+
+def _np_exact_later_successor(source, trader_id, purchase_id, target_stage):
+    """Find any genuine later successor in ALL history, not only active accounts."""
+    source = source or {}
+    source_id = str(source.get("id") or "").strip()
+    if not source_id or not trader_id or not purchase_id:
+        return None
+    source_time = _np_parse_dt_safe(
+        source.get("passed_at") or source.get("archived_at") or source.get("reset_at")
+        or source.get("updated_at") or source.get("created_at")
+    )
+    rows = (supabase.table("trader_accounts").select("*")
+            .eq("trader_id", trader_id).eq("purchase_id", purchase_id)
+            .order("created_at", desc=False).limit(500).execute().data or [])
+    candidates = []
+    for row in rows:
+        if str(row.get("id") or "").strip() == source_id:
+            continue
+        if _account_is_recalled_or_excluded(row):
+            continue
+        if _normalize_lifecycle_stage(row.get("stage") or row.get("phase")) != target_stage:
+            continue
+        if not str(row.get("mt5_login") or "").strip():
+            continue
+        parent_refs = {
+            str(row.get("previous_trader_account_id") or "").strip(),
+            str(row.get("replaces_trader_account_id") or "").strip(),
+            str(row.get("reset_source_account_id") or "").strip(),
+        }
+        if source_id in parent_refs:
+            return row
+        row_time = _np_parse_dt_safe(row.get("assigned_at") or row.get("started_at") or row.get("created_at") or row.get("updated_at"))
+        if source_time and row_time and row_time <= source_time:
+            continue
+        candidates.append(row)
+    return candidates[0] if candidates else None
+
+
+def _account_is_recalled_or_excluded(row):
+    return _np_account_is_recalled_or_excluded(row)
+
+
+def _np_append_account_marker(account_id, trader_id, marker):
+    """Best-effort durable marker using existing archive_reason; no new schema required."""
+    if not account_id or not marker:
+        return
+    try:
+        rows = (supabase.table("trader_accounts").select("id,archive_reason")
+                .eq("id", account_id).eq("trader_id", trader_id).limit(1).execute().data or [])
+        if not rows:
+            return
+        old = str(rows[0].get("archive_reason") or "").strip()
+        if marker.lower() in old.lower():
+            return
+        supabase.table("trader_accounts").update({
+            "archive_reason": (old + " | " + marker).strip(" |"),
+            "updated_at": now_iso(),
+        }).eq("id", account_id).eq("trader_id", trader_id).execute()
+    except Exception as exc:
+        print("ENTITLEMENT KILL MARKER SKIPPED:", account_id, exc)
+
+
+def _np_append_purchase_marker(purchase_id, trader_id, marker):
+    if not purchase_id or not marker:
+        return
+    try:
+        rows = (supabase.table("challenge_purchases").select("id,admin_note")
+                .eq("id", purchase_id).eq("trader_id", trader_id).limit(1).execute().data or [])
+        if not rows:
+            return
+        old = str(rows[0].get("admin_note") or "").strip()
+        if marker.lower() in old.lower():
+            return
+        supabase.table("challenge_purchases").update({
+            "admin_note": (old + " | " + marker).strip(" |"),
+            "updated_at": now_iso(),
+        }).eq("id", purchase_id).eq("trader_id", trader_id).execute()
+    except Exception as exc:
+        print("PURCHASE KILL MARKER SKIPPED:", purchase_id, exc)
+
+
+def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"):
+    """Final automatic stage gate: a pass/Second-Life event can create one child only."""
+    trader = trader or {}
+    purchase = purchase or {}
+    source_account = source_account or None
+    trader_id = str(trader.get("id") or "").strip()
+    purchase_id = str(purchase.get("id") or "").strip()
+    stage = _normalize_lifecycle_stage(stage)
+
+    if reason not in {"lifecycle_progression", "second_life"}:
+        return None
+    if not trader_id or not purchase_id or stage not in ACCOUNT_STAGES:
+        return None
+
+    # Every automatic journey must be Automation Generation (9 Sep 2026+).
+    if not _np_automation_generation_purchase(purchase):
+        _audit_safe("automation", "legacy_auto_blocked",
+                    f"AUTO BLOCKED pre-cutoff journey purchase={purchase_id} reason={reason}",
+                    {"name":"system","username":"system","role":"system"}, trader_id)
+        return None
+
+    if reason == "lifecycle_progression":
+        if not source_account:
+            return None
+        source_id = str(source_account.get("id") or "").strip()
+        if not source_id or str(source_account.get("purchase_id") or "").strip() != purchase_id:
+            return None
+        blob = _np_kill_blob(source_account)
+        if "np_consumed:phase_pass:" in blob or "np_consumed:lifecycle_progression:" in blob:
+            _audit_safe("automation", "phase_pass_replay_blocked",
+                        f"source={source_id} already permanently consumed", {"name":"system","username":"system","role":"system"}, source_id)
+            return None
+        existing = _np_exact_later_successor(source_account, trader_id, purchase_id, stage)
+        if existing:
+            marker = f"[NP_CONSUMED:PHASE_PASS:{source_id}] replacement_account_id={existing.get('id')} replacement_mt5={existing.get('mt5_login')}"
+            _np_append_account_marker(source_id, trader_id, marker)
+            return {"account": existing, "trader": get_trader_by_id(trader_id) or trader, "already_fulfilled": True}
+
+    if reason == "second_life":
+        pblob = str(purchase.get("admin_note") or "").lower()
+        if "np_consumed:second_life:" in pblob:
+            _audit_safe("automation", "second_life_replay_blocked",
+                        f"purchase={purchase_id} Second Life already permanently consumed",
+                        {"name":"system","username":"system","role":"system"}, purchase_id)
+            return None
+        # If ANY genuine Life-2 Phase1 child already exists after the breached Life-1 source,
+        # Second Life is dead forever even if that child later breaches.
+        try:
+            rows = (supabase.table("trader_accounts").select("*")
+                    .eq("trader_id", trader_id).eq("purchase_id", purchase_id)
+                    .order("created_at", desc=False).limit(500).execute().data or [])
+            phase1_rows = [r for r in rows if _normalize_lifecycle_stage(r.get("stage") or r.get("phase")) == "phase1"
+                           and str(r.get("mt5_login") or "").strip() and not _np_account_is_recalled_or_excluded(r)]
+            # A 2-Lives journey can legitimately have Life1 + Life2, never a third Phase1 from the same entitlement.
+            if len(phase1_rows) >= 2:
+                child = phase1_rows[-1]
+                marker = f"[NP_CONSUMED:SECOND_LIFE:{purchase_id}] replacement_account_id={child.get('id')} replacement_mt5={child.get('mt5_login')}"
+                _np_append_purchase_marker(purchase_id, trader_id, marker)
+                return {"account": child, "trader": get_trader_by_id(trader_id) or trader, "already_fulfilled": True}
+        except Exception as exc:
+            _audit_safe("automation", "second_life_guard_error",
+                        f"FAIL-CLOSED second life history check: {exc}; purchase={purchase_id}",
+                        {"name":"system","username":"system","role":"system"}, purchase_id)
+            return None
+
+    result = _NP_PRE_KILL_AUTO_ASSIGN(trader, stage, purchase, source_account, reason)
+    if not result:
+        return None
+    account = result.get("account") if isinstance(result, dict) else None
+    if not account:
+        return result
+
+    if reason == "lifecycle_progression" and source_account:
+        source_id = str(source_account.get("id") or "").strip()
+        marker = f"[NP_CONSUMED:PHASE_PASS:{source_id}] replacement_account_id={account.get('id')} replacement_mt5={account.get('mt5_login')}"
+        _np_append_account_marker(source_id, trader_id, marker)
+    elif reason == "second_life":
+        marker = f"[NP_CONSUMED:SECOND_LIFE:{purchase_id}] replacement_account_id={account.get('id')} replacement_mt5={account.get('mt5_login')}"
+        _np_append_purchase_marker(purchase_id, trader_id, marker)
+    return result
+
+
+def _np_auto_post_payout_renewal(payout):
+    """Final payout law: ONE exact paid payout_id can create ONE Funded successor only."""
+    payout = payout or {}
+    payout_id = str(payout.get("id") or "").strip()
+    trader_id = str(payout.get("trader_id") or "").strip()
+    source_id = str(payout.get("trader_account_id") or "").strip()
+    if not payout_id or not trader_id or not source_id or payout_status(payout) != "paid":
+        return None
+
+    srcs = (supabase.table("trader_accounts").select("*")
+            .eq("id", source_id).eq("trader_id", trader_id).limit(1).execute().data or [])
+    if not srcs:
+        return None
+    source = srcs[0]
+    if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "funded":
+        return None
+    purchase = _safe_purchase_for_account(source)
+    if not purchase or not _np_automation_generation_purchase(purchase):
+        _audit_safe("automation", "legacy_payout_auto_blocked",
+                    f"payout={payout_id} source={source_id} pre-cutoff/missing journey; manual only",
+                    {"name":"system","username":"system","role":"system"}, payout_id)
+        return None
+
+    # Exact payout must belong to exact source/login.
+    payout_login = str(payout.get("mt5_login") or "").strip()
+    source_login = str(source.get("mt5_login") or "").strip()
+    if payout_login and source_login and payout_login != source_login:
+        return None
+
+    blob = _np_kill_blob(source)
+    completed_token = f"np_consumed:payout:{payout_id}".lower()
+    if completed_token in blob or f"np_payout_renewal_completed:{payout_id}".lower() in blob:
+        _audit_safe("automation", "payout_replay_blocked",
+                    f"payout={payout_id} already consumed; no new Funded MT5",
+                    {"name":"system","username":"system","role":"system"}, payout_id)
+        return {"already_fulfilled": True}
+
+    all_rows = (supabase.table("trader_accounts").select("*")
+                .eq("trader_id", trader_id).order("created_at", desc=False).limit(500).execute().data or [])
+    existing = _np_exact_post_payout_replacement_20260908(source, payout, all_rows, get_trader_by_id(trader_id) or {})
+    if existing:
+        marker = f"[NP_CONSUMED:PAYOUT:{payout_id}] replacement_account_id={existing.get('id')} replacement_mt5={existing.get('mt5_login')}"
+        _np_append_account_marker(source_id, trader_id, marker)
+        _np_stamp_exact_payout_consumed_20260908(source, existing, trader_id)
+        return {"account": existing, "already_fulfilled": True}
+
+    # Atomic source claim. Two simultaneous payout handlers cannot both win.
+    original_status = str(source.get("account_status") or "").strip()
+    if original_status in {"payout_renewal_assigning", "payout_renewal_waiting_mt5"}:
+        _audit_safe("automation", "payout_claim_already_held",
+                    f"payout={payout_id} source={source_id} status={original_status}",
+                    {"name":"system","username":"system","role":"system"}, payout_id)
+        return None
+    claim_marker = f"[NP_PAYOUT_CLAIM:{payout_id}]"
+    old_reason = str(source.get("archive_reason") or "").strip()
+    claimed = (supabase.table("trader_accounts").update({
+        "account_status": "payout_renewal_assigning",
+        "monitoring_enabled": False,
+        "archive_reason": (old_reason + " | " + claim_marker).strip(" |"),
+        "updated_at": now_iso(),
+    }).eq("id", source_id).eq("trader_id", trader_id).eq("account_status", original_status).execute().data or [])
+    if not claimed:
+        _audit_safe("automation", "payout_concurrent_claim_blocked",
+                    f"payout={payout_id} source={source_id}; another worker won the claim",
+                    {"name":"system","username":"system","role":"system"}, payout_id)
+        return None
+
+    trader = get_trader_by_id(trader_id)
+    if not trader:
+        return None
+    size = clean(source.get("account_size") or source.get("start_balance") or payout.get("account_size") or 0)
+    green, green_reason = _np_green_automation_authority(trader, purchase, source, "funded")
+    if not green or not size:
+        _audit_safe("automation", "review_required",
+                    f"PAYOUT CLAIM BLOCKED after claim: {green_reason}; payout={payout_id}; source={source_id}",
+                    {"name":"system","username":"system","role":"system"}, payout_id)
+        return None
+
+    mt5 = _np_pick_fresh_mt5(size, "funded")
+    if not mt5:
+        supabase.table("trader_accounts").update({
+            "account_status": "payout_renewal_waiting_mt5", "updated_at": now_iso()
+        }).eq("id", source_id).eq("trader_id", trader_id).execute()
+        _np_inventory_wait_alert("funded", size, f"exact paid payout {payout_id}", trader)
+        return None
+
+    try:
+        account, updated = _assign_mt5_to_trader(
+            trader, mt5, "funded", purchase,
+            {"name":"system","username":"system","role":"system"},
+            f"AUTO PAYOUT RENEWAL payout_id={payout_id}; source_account={source_id}"
+        )
+    except Exception as exc:
+        # Never release the claim back to an inferable state. Manual review can resume exact payout.
+        supabase.table("trader_accounts").update({
+            "account_status": "payout_renewal_waiting_mt5", "updated_at": now_iso(),
+            "archive_reason": (old_reason + " | " + claim_marker + f" | ASSIGN_ERROR={str(exc)[:180]}").strip(" |")
+        }).eq("id", source_id).eq("trader_id", trader_id).execute()
+        _audit_safe("automation", "payout_assignment_failed_closed",
+                    f"payout={payout_id} source={source_id}: {exc}",
+                    {"name":"system","username":"system","role":"system"}, payout_id)
+        return None
+
+    marker = f"[NP_CONSUMED:PAYOUT:{payout_id}] replacement_account_id={account.get('id')} replacement_mt5={account.get('mt5_login')}"
+    # Preserve exact payout ID in durable history. This is the kill switch.
+    supabase.table("trader_accounts").update({
+        "account_status": "archived",
+        "monitoring_enabled": False,
+        "archive_reason": (str((claimed[0] if claimed else source).get("archive_reason") or old_reason) + " | " + marker).strip(" |"),
+        "updated_at": now_iso(),
+    }).eq("id", source_id).eq("trader_id", trader_id).execute()
+    _np_stamp_exact_payout_consumed_20260908(dict(source, archive_reason=old_reason), account, trader_id)
+    _audit_safe("automation", "payout_renewal_auto",
+                f"payout={payout_id} source={source_id} -> ONE Funded MT5 {account.get('mt5_login')} ENTITLEMENT KILLED",
+                {"name":"system","username":"system","role":"system"}, payout_id)
+    return {"account": account, "trader": updated, "mt5": mt5}
+
+
+def _np_verify_exact_paid_reset_order(source, trader, order_id, expected_kind):
+    """Paid reset is valid only when its exact reset child order is approved and tied to this source."""
+    source = source or {}; trader = trader or {}
+    source_id = str(source.get("id") or "").strip()
+    trader_id = str(source.get("trader_id") or trader.get("id") or "").strip()
+    if not source_id or not trader_id or not order_id:
+        return False
+    try:
+        rows = (supabase.table("challenge_purchases").select("*")
+                .eq("id", order_id).eq("trader_id", trader_id).limit(1).execute().data or [])
+        if not rows:
+            return False
+        order = rows[0]
+        status = str(order.get("payment_status") or order.get("status") or "").strip().lower()
+        if status not in {"approved", "paid", "completed", "assigned", "approved_reset_waiting_mt5"}:
+            return False
+        note = str(order.get("admin_note") or "")
+        explicit_source = str(order.get("reset_source_account_id") or "").strip()
+        if explicit_source:
+            if explicit_source != source_id:
+                return False
+        elif f"[NP_RESET_REQUEST:{source_id}:" not in note:
+            return False
+        marker = f"[NP_ENTITLEMENT:{expected_kind}:{order_id}]".lower()
+        if marker not in _np_kill_blob(source):
+            return False
+        return True
+    except Exception as exc:
+        print("PAID RESET EXACT ORDER VERIFY FAILED CLOSED:", exc)
+        return False
+
+
+def _np_reset_entitlement_for_source(source, trader=None):
+    """Final reset authority: consumed source is terminal; paid resets need exact approved order."""
+    source = source or {}; trader = trader or {}
+    if source.get("reset_consumed_at") or source.get("reset_replacement_account_id"):
+        return {"eligible": False, "reason": "reset_already_consumed", "label": "RESET ALREADY CONSUMED"}
+    blob = _np_kill_blob(source)
+    if "np_consumed:paid_reset:" in blob or "reset_consumed replacement_account_id=" in blob:
+        return {"eligible": False, "reason": "reset_already_consumed", "label": "RESET ALREADY CONSUMED"}
+
+    stage = _np_reset_stage(source)
+    if stage in {"phase1", "phase2"}:
+        m = re.search(r"\[np_entitlement:challenge_reset_paid:([^\]]+)\]", blob, re.I)
+        if m:
+            oid = str(m.group(1) or "").strip()
+            if _np_verify_exact_paid_reset_order(source, trader, oid, "challenge_reset_paid"):
+                return {"eligible": True, "reason": "challenge_reset_paid", "label": f"PAID {stage.upper()} RESET", "target_stage": stage, "evidence_id": oid}
+            return {"eligible": False, "reason": "paid_reset_order_not_verified"}
+
+    if stage == "funded":
+        m = re.search(r"\[np_entitlement:funded_reset_paid:([^\]]+)\]", blob, re.I)
+        if m:
+            oid = str(m.group(1) or "").strip()
+            if _np_verify_exact_paid_reset_order(source, trader, oid, "funded_reset_paid"):
+                return {"eligible": True, "reason": "funded_reset_paid", "label": "PAID FUNDED RESET", "target_stage": "funded", "evidence_id": oid}
+            return {"eligible": False, "reason": "paid_reset_order_not_verified"}
+
+    # Payout renewal entitlement is allowed only for an exact payout marker and only if not consumed.
+    if stage == "funded":
+        pm = re.search(r"\[np_entitlement:post_payout_renewal:([^\]]+)\]", blob, re.I)
+        if pm:
+            pid = str(pm.group(1) or "").strip()
+            if f"np_consumed:payout:{pid}" in blob or f"np_payout_renewal_completed:{pid}" in blob:
+                return {"eligible": False, "reason": "payout_renewal_already_consumed"}
+            try:
+                prows = (supabase.table("payouts").select("id,status,trader_id,trader_account_id")
+                         .eq("id", pid).eq("trader_id", str(source.get("trader_id") or ""))
+                         .eq("trader_account_id", str(source.get("id") or "")).limit(1).execute().data or [])
+                if prows and str(prows[0].get("status") or "").strip().lower() == "paid":
+                    return {"eligible": True, "reason": "post_payout_renewal", "label": "PAYOUT PAID · RENEW FUNDED", "target_stage": "funded", "evidence_id": pid}
+            except Exception:
+                return {"eligible": False, "reason": "payout_verification_failed"}
+
+    # Second Life must remain Phase1-only and exact-purchase controlled by existing generation checks.
+    ent = _NP_PRE_KILL_RESET_ENTITLEMENT(source, trader)
+    if not ent.get("eligible"):
+        return ent
+    reason = str(ent.get("reason") or "")
+    if reason in {"funded_reset_paid", "challenge_reset_paid", "post_payout_renewal", "post_payout_renewal_legacy_latest_only"}:
+        # Never accept weak/generic legacy inference for money-sensitive replacement rights.
+        return {"eligible": False, "reason": "exact_entitlement_required"}
+    if reason == "second_life_free_reset" and stage != "phase1":
+        return {"eligible": False, "reason": "second_life_stage_mismatch"}
+    return ent
+
+
+# Preserve the broad-retry shutdown even if another older helper is imported later.
+def _np_resume_waiting_zero_cost_automations(trigger="inventory_added"):
+    summary = {"phase_progression": 0, "free_phase1_reset": 0, "payout_renewal": 0, "errors": 0, "broad_retry_disabled": True, "event_only": True}
+    try:
+        _audit_safe("automation", "broad_inventory_retry_blocked",
+                    f"trigger={trigger}; EVENT-ONLY authority; no historical sweep",
+                    {"name":"system","username":"system","role":"system"}, "")
+    except Exception:
+        pass
+    return summary
+
+
+# ============================================================================
+# NAIRAPIPS PHASE-1 BREACH / SECOND-LIFE FINAL KILL LAW — 2026-09-11
+# Must remain physically last. A breach never guesses a replacement stage.
+# Phase1 Life1 breach -> at most ONE included Phase1 Life2 on Automation Generation.
+# Phase1 Life2 breach -> NOTHING automatic. Funded breach -> NOTHING automatic.
+# ============================================================================
+_NP_PRE_FINAL_PHASE1_BREACH_AUTO = _np_auto_free_phase1_reset_after_breach
+
+
+def _np_auto_free_phase1_reset_after_breach(trader, breached_account):
+    trader = trader or {}
+    source = breached_account or {}
+    trader_id = str(trader.get("id") or source.get("trader_id") or "").strip()
+    source_id = str(source.get("id") or "").strip()
+    purchase_id = str(source.get("purchase_id") or "").strip()
+    stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+
+    # ABSOLUTE STAGE FIREWALL: Funded/Phase2/unknown breaches can never enter Second Life.
+    if not trader_id or not source_id or not purchase_id or stage != "phase1":
+        try:
+            _audit_safe("automation", "breach_auto_stage_blocked",
+                        f"BREACH AUTO BLOCKED source={source_id} stage={stage or 'unknown'}; Phase1 Second-Life only",
+                        {"name":"system","username":"system","role":"system"}, source_id or trader_id)
+        except Exception:
+            pass
+        return None
+
+    try:
+        prows = (supabase.table("challenge_purchases").select("*")
+                 .eq("id", purchase_id).eq("trader_id", trader_id).limit(1).execute().data or [])
+    except Exception as exc:
+        print("PHASE1 BREACH PURCHASE VERIFY FAILED CLOSED:", exc)
+        return None
+    if not prows:
+        return None
+    purchase = prows[0]
+
+    # Only Automation Generation purchases (9 Sep 2026+) may self-fulfil Second Life.
+    if not _np_automation_generation_purchase(purchase):
+        return None
+    if not _second_life_bool(purchase.get("second_life_enabled")):
+        return None
+
+    pblob = str(purchase.get("admin_note") or "").lower()
+    sl_used = _second_life_bool(purchase.get("second_life_used"))
+    sl_status = str(purchase.get("second_life_status") or "").strip().lower()
+
+    # PERMANENT KILL: once Life2 was claimed/issued, a later breach can never create Life3.
+    if sl_used or "np_consumed:second_life:" in pblob or sl_status in {
+        "life2_active", "life2_breached", "life2_closed", "life2_consumed", "consumed"
+    }:
+        try:
+            _audit_safe("automation", "life2_breach_terminal",
+                        f"NO AUTO REPLACEMENT: Second Life already consumed purchase={purchase_id} source={source_id}",
+                        {"name":"system","username":"system","role":"system"}, source_id)
+        except Exception:
+            pass
+        return None
+
+    # Historical child check is authoritative even if flags are stale: two Phase1 MT5s means Life2 existed.
+    try:
+        rows = (supabase.table("trader_accounts").select("*")
+                .eq("trader_id", trader_id).eq("purchase_id", purchase_id)
+                .order("created_at", desc=False).limit(500).execute().data or [])
+        phase1 = [r for r in rows
+                  if _normalize_lifecycle_stage(r.get("stage") or r.get("phase")) == "phase1"
+                  and str(r.get("mt5_login") or "").strip()
+                  and not _np_account_is_recalled_or_excluded(r)]
+        if len(phase1) >= 2:
+            child = phase1[-1]
+            _np_append_purchase_marker(
+                purchase_id, trader_id,
+                f"[NP_CONSUMED:SECOND_LIFE:{purchase_id}] replacement_account_id={child.get('id')} replacement_mt5={child.get('mt5_login')}"
+            )
+            try:
+                supabase.table("challenge_purchases").update({
+                    "second_life_used": True,
+                    "life_number": 2,
+                    "second_life_status": "life2_active" if str(child.get("account_status") or "").lower() in {"assigned_active","active","current_active","phase1_active","live"} else "life2_consumed",
+                    "updated_at": now_iso(),
+                }).eq("id", purchase_id).eq("trader_id", trader_id).execute()
+            except Exception:
+                pass
+            return None
+    except Exception as exc:
+        print("PHASE1 BREACH HISTORY VERIFY FAILED CLOSED:", exc)
+        return None
+
+    # Life1 is genuinely eligible. Existing helper performs atomic False->True claim before MT5 allocation.
+    result = _NP_PRE_FINAL_PHASE1_BREACH_AUTO(trader, source)
+    if not result:
+        return None
+    account = result.get("account") if isinstance(result, dict) else None
+    if account:
+        _np_append_purchase_marker(
+            purchase_id, trader_id,
+            f"[NP_CONSUMED:SECOND_LIFE:{purchase_id}] replacement_account_id={account.get('id')} replacement_mt5={account.get('mt5_login')}"
+        )
+    return result
+
