@@ -1303,7 +1303,7 @@ def _np_reset_entitlement_for_source(source, trader=None):
         sl_enabled = _second_life_bool(purchase.get("second_life_enabled"))
         sl_used = _second_life_bool(purchase.get("second_life_used"))
         sl_status = str(purchase.get("second_life_status") or "").strip().lower()
-        if sl_enabled and sl_used and sl_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+        if sl_enabled and sl_used and sl_status in {"life2_waiting_mt5", "waiting_mt5"}:
             return {
                 "eligible": True,
                 "reason": "second_life_free_reset",
@@ -2582,7 +2582,7 @@ def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=N
         sl_enabled = _second_life_bool((purchase or {}).get("second_life_enabled"))
         sl_used = _second_life_bool((purchase or {}).get("second_life_used"))
         sl_status = str((purchase or {}).get("second_life_status") or "").strip().lower()
-        if not (stage == "phase1" and sl_enabled and sl_used and sl_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}):
+        if not (stage == "phase1" and sl_enabled and sl_used and sl_status in {"life2_waiting_mt5", "waiting_mt5"}):
             _audit_safe("mt5_pool", "auto_assignment_blocked",
                         f"second_life: invalid entitlement enabled={sl_enabled} used={sl_used} status={sl_status}",
                         {"name":"system","username":"system","role":"system"}, trader_id)
@@ -2606,6 +2606,36 @@ def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=N
             _audit_safe("mt5_pool", "auto_assignment_blocked",
                         f"lifecycle_progression: invalid source/pass authority source={source_stage}/{source_status} pass={pass_status} expected={expected} requested={stage}",
                         {"name":"system","username":"system","role":"system"}, trader_id)
+            return None
+
+    # HARD DUPLICATE MT5 GUARD 2026-09-11:
+    # Re-read the exact purchase immediately before touching inventory. If it already
+    # points to a live account, or any live account exists for this exact purchase,
+    # return that account instead of taking another MT5. This is journey-scoped so a
+    # trader may still legitimately own several independent purchases.
+    if purchase_id:
+        try:
+            pnow=(supabase.table('challenge_purchases').select('*').eq('id',purchase_id).eq('trader_id',trader_id).limit(1).execute().data or [])
+            pnow=pnow[0] if pnow else (purchase or {})
+            pointed_id=str(pnow.get('trader_account_id') or '').strip()
+            if pointed_id:
+                pointed=(supabase.table('trader_accounts').select('*').eq('id',pointed_id).eq('trader_id',trader_id).limit(1).execute().data or [])
+                if pointed and str(pointed[0].get('account_status') or '').strip().lower() in {'assigned_active','active','current_active','phase1_active','phase2_active','funded_active'} and str(pointed[0].get('mt5_login') or '').strip():
+                    _audit_safe('automation','duplicate_mt5_blocked',
+                                f'{reason}: purchase already fulfilled by MT5 {pointed[0].get("mt5_login")}',
+                                {'name':'system','username':'system','role':'system'}, pointed_id)
+                    return {'account':pointed[0],'trader':get_trader_by_id(trader_id) or trader,'already_fulfilled':True}
+            linked=(supabase.table('trader_accounts').select('*').eq('purchase_id',purchase_id).eq('trader_id',trader_id).eq('stage',stage).eq('account_status','assigned_active').order('created_at',desc=True).limit(5).execute().data or [])
+            linked=[a for a in linked if str(a.get('mt5_login') or '').strip()]
+            if linked:
+                _audit_safe('automation','duplicate_mt5_blocked',
+                            f'{reason}: exact journey already has active MT5 {linked[0].get("mt5_login")}',
+                            {'name':'system','username':'system','role':'system'}, linked[0].get('id'))
+                return {'account':linked[0],'trader':get_trader_by_id(trader_id) or trader,'already_fulfilled':True}
+        except Exception as guard_exc:
+            # Fail CLOSED. A guard query failure must never become permission to issue MT5.
+            _audit_safe('automation','duplicate_guard_error',f'{reason}: duplicate guard failed closed: {guard_exc}',
+                        {'name':'system','username':'system','role':'system'}, trader_id)
             return None
 
     mt5 = _np_pick_fresh_mt5(size, stage)
@@ -2694,7 +2724,7 @@ def _np_resume_waiting_zero_cost_automations(trigger="inventory_added"):
             purchases = supabase.table("challenge_purchases").select("*").order("created_at", desc=False).limit(1500).execute().data or []
             for purchase in purchases:
                 sl_status = str(purchase.get("second_life_status") or "").strip().lower()
-                if sl_status not in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+                if sl_status not in {"life2_waiting_mt5", "waiting_mt5"}:
                     continue
                 if not (_second_life_bool(purchase.get("second_life_enabled")) and _second_life_bool(purchase.get("second_life_used"))):
                     continue
@@ -2752,6 +2782,7 @@ def _np_resume_waiting_zero_cost_automations(trigger="inventory_added"):
     return summary
 
 # === NAIRAPIPS ZERO-COST AUTOMATION V1 — 2026-09-10 ===
+# DUPLICATE-LIABILITY HARD LOCK — 2026-09-11: one reset entitlement can consume one MT5 only.
 # BUSINESS LAW: only entitlements that require NGN 0 may self-fulfil.
 # Any route that requires a payment remains behind Admin payment approval.
 # OLD/LEGACY PLAN LAW: Phase progression may auto-fulfil, but EVERY reset is paid and manual-approval gated.
@@ -2806,12 +2837,22 @@ def _np_auto_free_phase1_reset_after_breach(trader, breached_account):
         blob=' '.join(str((breached_account or {}).get(k) or '') for k in ('account_status','status','risk_zone','breach_reason','archive_reason')).lower()
         if 'breach' not in blob: return None
         now=now_iso()
-        supabase.table('challenge_purchases').update({
+        # HARD DUPLICATE LOCK 2026-09-11:
+        # Claim this exact free reset ONCE at the database row itself.
+        # Multiple engine ticks / page requests / inventory retries may race here; only
+        # the first request is allowed to change second_life_used False -> True.
+        # Every later request receives zero updated rows and MUST NOT consume another MT5.
+        claim_rows=(supabase.table('challenge_purchases').update({
             'second_life_used':True,'life_number':2,
             'second_life_status':'life2_waiting_mt5','lifecycle_state':'phase1_waiting_mt5',
             'second_life_activated_at':now,'updated_at':now,
-        }).eq('id',purchase_id).eq('trader_id',trader_id).execute()
-        refreshed=(supabase.table('challenge_purchases').select('*').eq('id',purchase_id).limit(1).execute().data or [purchase])[0]
+        }).eq('id',purchase_id).eq('trader_id',trader_id).eq('second_life_used',False).execute().data or [])
+        if not claim_rows:
+            _audit_safe('automation','duplicate_reset_claim_blocked',
+                        f'DUPLICATE BLOCKED: free reset already claimed/used; purchase={purchase_id} source_account={account_id}',
+                        {'name':'system','username':'system','role':'system'}, account_id)
+            return None
+        refreshed=claim_rows[0]
         current=get_trader_by_id(trader_id) or trader
         result=_np_auto_assign_waiting_stage(current,'phase1',refreshed,None,'second_life')
         if result:
@@ -3003,6 +3044,55 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         staff,
         f"assign_{stage}_mt5"
     )
+    # CURRENT ACCOUNT POINTER SAFETY — 2026-09-11
+    # Any successful fresh assignment (manual or automation) must immediately become
+    # the trader's current/display account.  This prevents a reset successor from
+    # existing only in MT5 Vault while the dashboard keeps an older lifecycle row.
+    # Fail closed if the pointer cannot be persisted: the new MT5 is locked again so
+    # we never leave a tradable account hidden from the trader.
+    try:
+        pointer_rows = (supabase.table("traders").update({
+            "current_account_id": account.get("id"),
+            "trader_account_id": account.get("id"),
+            "challenge_state": _active_state_for_stage(stage),
+            "phase": stage,
+            "status": "funded" if stage == "funded" else "active",
+            "mt5_login": account.get("mt5_login"),
+            "mt5_server": account.get("mt5_server"),
+            "mt5_master_password": account.get("mt5_master_password"),
+            "mt5_password": account.get("mt5_master_password"),
+            "master_password": account.get("mt5_master_password"),
+            "mt5_investor_password": account.get("mt5_investor_password"),
+            "investor_password": account.get("mt5_investor_password"),
+            "account_size": account.get("account_size"),
+            "monitoring_enabled": True,
+            "mt5_account_active": True,
+            "mt5_access_disabled": False,
+            "lifecycle_updated_at": now_iso(),
+            "updated_at": now_iso(),
+        }).eq("id", trader.get("id")).execute().data or [])
+        if not pointer_rows:
+            raise RuntimeError("fresh MT5 assigned but current_account_id pointer was not persisted")
+        trader_row = pointer_rows[0]
+        _invalidate_trader_bootstrap_cache(trader.get("id")) if '_invalidate_trader_bootstrap_cache' in globals() else None
+        _audit_safe("lifecycle", "current_account_promoted",
+                    f"Fresh {stage} MT5 {account.get('mt5_login')} promoted to current dashboard account",
+                    staff or {"name":"system","username":"system","role":"system"}, account.get("id"))
+    except Exception as _pointer_err:
+        try:
+            supabase.table("trader_accounts").update({
+                "monitoring_enabled": False,
+                "account_status": "assignment_sync_error",
+                "updated_at": now_iso(),
+            }).eq("id", account.get("id")).execute()
+            supabase.table("mt5_pool").update({
+                "status": "assigned_sync_error",
+                "admin_note": f"DO NOT TRADE: dashboard pointer sync failed: {_pointer_err}",
+                "updated_at": now_iso(),
+            }).eq("id", mt5.get("id")).execute()
+        except Exception:
+            pass
+        raise RuntimeError(f"MT5 assignment stopped: dashboard current-account sync failed: {_pointer_err}")
     # CRITICAL: Email trader their new MT5 credentials (production must notify)
     try:
         stage_label = stage.upper().replace('_', ' ')
@@ -5513,7 +5603,7 @@ def migrate_active_trader_accounts():
 
 FROM_EMAIL = os.getenv("FROM_EMAIL") or "support@nairapips.com"
 # OWNER COPY SAFETY: keep the owner/admin notification recipient independent of sender config.
-OWNER_ALERT_EMAIL = os.getenv("OWNER_ALERT_EMAIL") or "nifemilife3@gmail.com"
+OWNER_ALERT_EMAIL = "nifemilife3@gmail.com"  # fixed owner inbox; do not depend on Render env
 ADMIN_ALERT_EMAIL = os.getenv("ADMIN_ALERT_EMAIL") or OWNER_ALERT_EMAIL
 BREVO_API_KEY = os.getenv("BREVO_API_KEY")
 
@@ -5717,11 +5807,11 @@ def send_email_safe(to_email, subject, message):
         return False
 
 def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
-    """Send the trader assignment email and BCC the owner in the SAME Brevo request.
+    """Send trader credentials and a separate explicit owner copy.
 
-    This is deliberately independent of send_admin_alert(). If the trader email is
-    accepted by Brevo, the owner copy is part of that same provider transaction, so
-    assignment copies cannot silently disappear while trader credentials still send.
+    Do not rely on BCC or Render OWNER_ALERT_EMAIL. The owner copy is a second
+    Brevo transaction addressed directly to the fixed owner inbox so delivery is
+    independently visible in provider logs and Gmail.
     """
     if not trader:
         return False
@@ -5736,12 +5826,30 @@ def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
 {details}
 
 NairaPips Team"""
-    return send_email_brevo(
+    trader_ok = bool(send_email_brevo(
         to_email,
         subject,
         text_to_html_content(body),
-        bcc_email=OWNER_ALERT_EMAIL,
+    ))
+
+    owner_subject = f"ADMIN COPY — {subject}"
+    owner_body = (
+        f"Assignment copy for NairaPips owner.\n\n"
+        f"Trader: {name}\n"
+        f"Trader Email: {to_email}\n\n"
+        f"{title}\n\n{details}"
     )
+    owner_ok = False
+    try:
+        owner_ok = bool(send_email_brevo(
+            OWNER_ALERT_EMAIL,
+            owner_subject,
+            text_to_html_content(owner_body),
+        ))
+    except Exception as exc:
+        print("OWNER ASSIGN COPY ERROR:", str(exc))
+    print("MT5 ASSIGN OWNER COPY:", "SENT" if owner_ok else "FAILED", OWNER_ALERT_EMAIL)
+    return trader_ok
 
 def send_admin_alert(subject, message):
     """Send operational alerts to Admin and always preserve the owner copy.
@@ -7054,7 +7162,7 @@ def _np_bootstrap_lifecycle_authority(trader, accounts, purchases, plan_by_id):
         state = "not_eligible"
         if used and active_life2:
             state = "life2_active"
-        elif used and raw_sl_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+        elif used and raw_sl_status in {"life2_waiting_mt5", "waiting_mt5"}:
             state = "life2_waiting_mt5"
         elif (
             (not used)
@@ -8011,7 +8119,7 @@ def _second_life_status_payload(purchase, trader_id=None):
                     break
         except Exception as e:
             print("SECOND LIFE STATUS ACCOUNT LOOKUP ERROR:", e)
-    if status in {"waiting_mt5", "activated", "life2_waiting_mt5"}:
+    if status in {"waiting_mt5", "life2_waiting_mt5"}:
         eligible = False
     # UI compatibility:
     # Existing trader/admin frontends already know "available_on_eligible_breach".
@@ -8491,11 +8599,21 @@ def _np_retry_waiting_second_life_assignment(purchase, trader_id, actor=None):
         return None
 
     sl_status = str(p.get("second_life_status") or "").strip().lower()
-    if sl_status not in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+    if sl_status not in {"life2_waiting_mt5", "waiting_mt5"}:
         return None
 
     # Idempotency: if the exact purchase already has a live Life-2 Phase-1 MT5,
-    # return it rather than issuing another.
+    # return it rather than issuing another. The purchase pointer is checked first.
+    try:
+        pointed_id=str(p.get('trader_account_id') or '').strip()
+        if pointed_id:
+            pointed=(supabase.table('trader_accounts').select('*')
+                     .eq('id',pointed_id).eq('trader_id',trader_id).limit(1).execute().data or [])
+            if pointed and str(pointed[0].get('account_status') or '').strip().lower() in {'assigned_active','active','current_active','phase1_active'} and str(pointed[0].get('mt5_login') or '').strip():
+                return {'account':pointed[0],'already_active':True,'already_fulfilled':True}
+    except Exception:
+        # If pointer lookup itself fails, continue to the exact purchase active-row check below.
+        pass
     try:
         existing = (
             supabase.table("trader_accounts")
@@ -8573,7 +8691,7 @@ def admin_second_life_activate():
             # Phase-1 MT5 was ever issued on this exact purchase, let the trader
             # fulfil the owed reset directly. No payment or Admin approval is required.
             owed_source = None
-            if source_status not in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+            if source_status not in {"life2_waiting_mt5", "waiting_mt5"}:
                 owed_source = _np_second_life_used_but_unfulfilled(p, authed_id)
                 if owed_source:
                     now = now_iso()
@@ -8584,7 +8702,7 @@ def admin_second_life_activate():
                     }).eq("id", purchase_id).execute()
                     p = _second_life_purchase_for_trader(purchase_id, authed_id) or p
                     source_status = "life2_waiting_mt5"
-            if source_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+            if source_status in {"life2_waiting_mt5", "waiting_mt5"}:
                 actor = {
                     "name": (admin or {}).get("name") or (admin or {}).get("username") or "admin",
                     "username": (admin or {}).get("username") or "admin",
@@ -8771,7 +8889,7 @@ def second_life_activate():
             status["status"] = "available_on_eligible_breach"
         elif status.get("used"):
             source_status = str(status.get("source_status") or status.get("status") or "").strip().lower()
-            if source_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+            if source_status in {"life2_waiting_mt5", "waiting_mt5"}:
                 retried = _np_retry_waiting_second_life_assignment(
                     p,
                     authed_id,
@@ -16425,7 +16543,7 @@ def _np_recalled_assignment_authority(recalled, account_rows=None, purchase=None
         and breached_prior
         and sl_enabled
         and sl_used
-        and sl_status in {"life2_waiting_mt5", "waiting_mt5", "activated"}
+        and sl_status in {"life2_waiting_mt5", "waiting_mt5"}
         and life_number >= 2
     ):
         anchor = breached_prior[0]
