@@ -20576,6 +20576,245 @@ try:
 except Exception as e:
     print("[BOOT] Scheduler start skipped:", e)
 
+
+
+# =============================================================================
+# NAIRAPIPS FINAL SECOND-LIFE FULFILMENT RECONCILER — 2026-09-11
+# Purpose: stop a stale reset opportunity from reopening AFTER a fresh Phase-1
+# MT5 has already been assigned and promoted to traders.current_account_id.
+# This wrapper runs LAST, after every older trader_reset_opportunities override.
+# It never allocates an MT5. It only reconciles a proven already-assigned account.
+# =============================================================================
+
+_NP_PREVIOUS_TRADER_RESET_OPPORTUNITIES_VIEW = app.view_functions.get("trader_reset_opportunities")
+
+
+def _np_dt_score_safe_final(row):
+    try:
+        return _dt_score(
+            (row or {}).get("assigned_at")
+            or (row or {}).get("started_at")
+            or (row or {}).get("created_at")
+            or (row or {}).get("updated_at")
+        )
+    except Exception:
+        return 0
+
+
+def _np_final_reconcile_fulfilled_second_life(trader_id, opportunity):
+    """Return True only when the reset opportunity is already fulfilled.
+
+    Evidence required:
+      * opportunity is the exact free Second-Life/Phase-1 reset;
+      * source breached account exists and belongs to this trader;
+      * traders.current_account_id points to a LIVE Phase-1 MT5;
+      * account size agrees;
+      * current account is newer than the breached source;
+      * current account either belongs to this same purchase OR has no purchase
+        linkage at all (the known early-automation write defect).
+
+    A different purchase_id is never adopted. That protects parallel/new purchases.
+    """
+    opp = opportunity or {}
+    if str(opp.get("kind") or "").strip().lower() != "free_second_life":
+        return False
+
+    pid = str(opp.get("purchase_id") or "").strip()
+    source_id = str(opp.get("source_account_id") or "").strip()
+    if not trader_id or not pid or not source_id:
+        return False
+
+    trader_rows = (
+        supabase.table("traders").select("*")
+        .eq("id", trader_id).limit(1).execute().data or []
+    )
+    if not trader_rows:
+        return False
+    trader = trader_rows[0]
+    current_id = str(trader.get("current_account_id") or trader.get("trader_account_id") or "").strip()
+    if not current_id:
+        return False
+
+    source_rows = (
+        supabase.table("trader_accounts").select("*")
+        .eq("id", source_id).eq("trader_id", trader_id).limit(1).execute().data or []
+    )
+    current_rows = (
+        supabase.table("trader_accounts").select("*")
+        .eq("id", current_id).eq("trader_id", trader_id).limit(1).execute().data or []
+    )
+    if not source_rows or not current_rows:
+        return False
+
+    source = source_rows[0]
+    current = current_rows[0]
+    if str(current.get("id") or "") == str(source.get("id") or ""):
+        return False
+
+    # Source must genuinely be the breached Phase-1 row advertised by the opportunity.
+    if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "phase1":
+        return False
+    try:
+        if not _np_account_has_breach_evidence(source):
+            return False
+    except Exception:
+        source_blob = " ".join(str(source.get(k) or "") for k in (
+            "account_status", "status", "risk_zone", "breach_reason", "archive_reason"
+        )).lower()
+        if "breach" not in source_blob:
+            return False
+
+    # Current pointer must be a genuine clean live Phase-1 MT5.
+    if _normalize_lifecycle_stage(current.get("stage") or current.get("phase")) != "phase1":
+        return False
+    if not str(current.get("mt5_login") or "").strip():
+        return False
+    current_status = str(current.get("account_status") or current.get("status") or "").strip().lower()
+    if current_status not in {"assigned_active", "active", "current_active", "phase1_active", "approved_active"}:
+        return False
+    try:
+        if _np_account_has_breach_evidence(current):
+            return False
+    except Exception:
+        current_blob = " ".join(str(current.get(k) or "") for k in (
+            "account_status", "status", "risk_zone", "breach_reason", "archive_reason"
+        )).lower()
+        if any(x in current_blob for x in ("breach", "archive", "closed", "locked", "disabled", "reset")):
+            return False
+
+    # Same account size, and the replacement must have been assigned after the source.
+    expected_size = clean(opp.get("account_size") or source.get("account_size") or source.get("start_balance") or 0)
+    current_size = clean(current.get("account_size") or current.get("start_balance") or 0)
+    if expected_size and current_size and int(expected_size) != int(current_size):
+        return False
+    source_time = _dt_score(
+        source.get("breached_at") or source.get("breach_at") or source.get("archived_at")
+        or source.get("reset_at") or source.get("updated_at") or source.get("created_at")
+    )
+    current_time = _np_dt_score_safe_final(current)
+    if source_time and current_time and current_time <= source_time:
+        return False
+
+    # Never steal an account from another purchase/journey.
+    current_pid = str(current.get("purchase_id") or current.get("challenge_purchase_id") or "").strip()
+    if current_pid and current_pid != pid:
+        return False
+
+    purchase_rows = (
+        supabase.table("challenge_purchases").select("*")
+        .eq("id", pid).eq("trader_id", trader_id).limit(1).execute().data or []
+    )
+    if not purchase_rows:
+        return False
+    purchase = purchase_rows[0]
+    if not _second_life_bool(purchase.get("second_life_enabled")):
+        return False
+
+    now = now_iso()
+
+    # Repair the missing account->purchase link only when it is blank. Never overwrite
+    # a different purchase relationship.
+    if not current_pid:
+        supabase.table("trader_accounts").update({
+            "purchase_id": pid,
+            "updated_at": now,
+        }).eq("id", current.get("id")).eq("trader_id", trader_id).execute()
+
+    # Permanently record that the already-issued account IS Life 2.
+    purchase_update = {
+        "second_life_used": True,
+        "life_number": 2,
+        "second_life_status": "life2_active",
+        "lifecycle_state": "phase1_active",
+        "trader_account_id": current.get("id"),
+        "assigned_mt5_id": current.get("mt5_pool_id"),
+        "mt5_login": current.get("mt5_login"),
+        "mt5_server": current.get("mt5_server"),
+        "updated_at": now,
+    }
+    # Existing schemas may reject a nullable optional column. Retry without it.
+    try:
+        supabase.table("challenge_purchases").update(purchase_update).eq("id", pid).eq("trader_id", trader_id).execute()
+    except Exception:
+        purchase_update.pop("assigned_mt5_id", None)
+        supabase.table("challenge_purchases").update(purchase_update).eq("id", pid).eq("trader_id", trader_id).execute()
+
+    # Mark the exact breached source as consumed when these columns are available.
+    try:
+        old_reason = str(source.get("archive_reason") or "").strip()
+        marker = f"reset_consumed replacement_account_id={current.get('id')} replacement_mt5={current.get('mt5_login')}"
+        supabase.table("trader_accounts").update({
+            "reset_consumed_at": now,
+            "reset_replacement_account_id": current.get("id"),
+            "archive_reason": (old_reason + " | " + marker).strip(" |"),
+            "updated_at": now,
+        }).eq("id", source_id).eq("trader_id", trader_id).execute()
+    except Exception as exc:
+        print("FINAL SECOND LIFE SOURCE STAMP SKIPPED:", exc)
+
+    # Keep trader mirror aligned with the proven live account.
+    try:
+        supabase.table("traders").update({
+            "current_account_id": current.get("id"),
+            "trader_account_id": current.get("id"),
+            "challenge_state": "phase1_active",
+            "phase": "phase1",
+            "status": "active",
+            "mt5_login": current.get("mt5_login"),
+            "mt5_server": current.get("mt5_server"),
+            "account_size": current.get("account_size") or current.get("start_balance"),
+            "monitoring_enabled": True,
+            "mt5_account_active": True,
+            "updated_at": now,
+        }).eq("id", trader_id).execute()
+    except Exception as exc:
+        print("FINAL SECOND LIFE TRADER MIRROR REPAIR SKIPPED:", exc)
+
+    try:
+        _invalidate_trader_bootstrap_cache(trader_id)
+    except Exception:
+        pass
+    _audit_safe(
+        "second_life", "fulfilled_reconciled",
+        f"Existing fresh Phase1 MT5 {current.get('mt5_login')} reconciled as Life 2 for purchase={pid}; source={source.get('mt5_login')}",
+        {"name":"system","username":"system","role":"system"}, pid,
+    )
+    print("FINAL SECOND LIFE RECONCILED:", trader_id, pid, source.get("mt5_login"), "->", current.get("mt5_login"))
+    return True
+
+
+def _np_final_trader_reset_opportunities_20260911():
+    # Preserve OPTIONS/auth/paid-reset/payout behavior from the established route.
+    result = _NP_PREVIOUS_TRADER_RESET_OPPORTUNITIES_VIEW()
+    try:
+        response = app.make_response(result)
+        data = response.get_json(silent=True) or {}
+        opportunity = data.get("opportunity")
+        if opportunity is None and isinstance(data.get("data"), dict):
+            opportunity = data["data"].get("opportunity")
+        if not opportunity or str(opportunity.get("kind") or "").strip().lower() != "free_second_life":
+            return response
+
+        requested = str(request.args.get("trader_id") or "").strip()
+        authed_id, auth_error = _authenticated_trader_id_for_request(requested)
+        if auth_error or not authed_id:
+            return response
+
+        if _np_final_reconcile_fulfilled_second_life(authed_id, opportunity):
+            # The account was already delivered. Recovery UI must close immediately.
+            return _np_ok({"success": True, "opportunity": None, "reconciled": True})
+        return response
+    except Exception as exc:
+        # Fail closed on reconciliation errors: do not mutate entitlement state here;
+        # return the established route response unchanged.
+        print("FINAL RESET OPPORTUNITY RECONCILER SKIPPED:", exc)
+        return result
+
+
+if _NP_PREVIOUS_TRADER_RESET_OPPORTUNITIES_VIEW:
+    app.view_functions["trader_reset_opportunities"] = _np_final_trader_reset_opportunities_20260911
+
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
