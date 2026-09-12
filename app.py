@@ -27879,3 +27879,420 @@ app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_cuto
 
 NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "CLEAN_JOURNEY_CUTOVER_2026_09_12"
 
+
+
+# ============================================================================
+# NAIRAPIPS CUTOVER MIGRATION BRIDGE V7 — 12 SEP 2026
+#
+# PURPOSE
+# -------
+# 12-Sep is the clean automation boundary, but a NEW paid reset transaction
+# created/approved on or after the cutoff may lawfully continue an OLD purchase
+# journey.  The old history remains evidence; the new reset transaction becomes
+# the clean automation bridge.
+#
+# HARD LAW
+# --------
+# * Ordinary pre-cutoff history cannot create automation entitlement.
+# * Exact paid reset order approved on/after cutoff CAN create exactly ONE
+#   replacement entitlement for its exact source account + parent journey.
+# * The replacement stage MUST equal the reset source stage.
+# * The reset order is a CHILD transaction; it never becomes a new challenge
+#   purchase journey.
+# * After replacement assignment, the existing consumption code permanently
+#   consumes the exact reset entitlement.
+# ============================================================================
+
+_NP_CLEAN_CUTOVER = datetime(2026, 9, 12, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def _np_cutover_dt(value):
+    try:
+        if not value:
+            return None
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _np_cutover_reset_order_is_new(order):
+    """A reset becomes a clean migration event only when approved on/after cutoff."""
+    order = order or {}
+    st = str(order.get("payment_status") or order.get("status") or "").strip().lower()
+    if st not in {"approved", "paid", "completed", "assigned", "approved_reset_waiting_mt5"}:
+        return False
+    dt = _np_cutover_dt(order.get("approved_at") or order.get("updated_at") or order.get("created_at"))
+    return bool(dt and dt >= _NP_CLEAN_CUTOVER)
+
+
+def _np_cutover_exact_reset_bridge(source_account, parent_purchase=None, trader=None):
+    """Return one exact post-cutover paid reset bridge or None.
+
+    No trader-level inference.  Evidence must agree on:
+      source account id + parent purchase id + stage + approved reset order id.
+    """
+    source = source_account or {}
+    parent = parent_purchase or _safe_purchase_for_account(source) or {}
+    trader = trader or get_trader_by_id(source.get("trader_id")) or {}
+
+    source_id = str(source.get("id") or "").strip()
+    trader_id = str(source.get("trader_id") or trader.get("id") or "").strip()
+    parent_id = str(parent.get("id") or source.get("purchase_id") or source.get("challenge_purchase_id") or "").strip()
+    stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+
+    if not source_id or not trader_id or not parent_id or stage not in {"phase1", "phase2", "funded"}:
+        return None
+
+    try:
+        _roots, reset_orders = _np_ja_root_and_reset_orders(trader_id)
+        order = _np_ja_reset_order(
+            reset_orders, source_id, parent_id, stage, approved_only=True
+        )
+    except Exception as exc:
+        print("CUTOVER RESET BRIDGE lookup failed:", exc)
+        return None
+
+    if not order or not _np_cutover_reset_order_is_new(order):
+        return None
+
+    order_id = str(order.get("id") or "").strip()
+    if not order_id:
+        return None
+
+    expected_kind = "funded_reset_paid" if stage == "funded" else "challenge_reset_paid"
+
+    # The source must contain the exact order-specific entitlement marker.
+    blob = _np_kill_blob(source)
+    exact_marker = f"[np_entitlement:{expected_kind}:{order_id}]".lower()
+    if exact_marker not in blob:
+        return None
+
+    # Reuse the production exact-order verifier when available.
+    try:
+        if not _np_verify_exact_paid_reset_order(source, trader, order_id, expected_kind):
+            return None
+    except Exception as exc:
+        print("CUTOVER RESET BRIDGE exact verification failed:", exc)
+        return None
+
+    # Already consumed means this bridge is historical only.
+    if source.get("reset_consumed_at") or source.get("reset_replacement_account_id"):
+        return {
+            "eligible": False,
+            "consumed": True,
+            "order": order,
+            "order_id": order_id,
+            "source_account_id": source_id,
+            "parent_purchase_id": parent_id,
+            "stage": stage,
+            "target_stage": stage,
+            "reason": expected_kind,
+        }
+
+    return {
+        "eligible": True,
+        "consumed": False,
+        "order": order,
+        "order_id": order_id,
+        "source_account_id": source_id,
+        "source_mt5": source.get("mt5_login"),
+        "parent_purchase_id": parent_id,
+        "stage": stage,
+        "target_stage": stage,
+        "reason": expected_kind,
+        "approved_at": order.get("approved_at") or order.get("updated_at") or order.get("created_at"),
+    }
+
+
+def _np_cutover_bridge_for_journey(trader_id, journey_id):
+    """Find an exact NEW reset transaction that legally re-opens one legacy journey."""
+    trader_id = str(trader_id or "").strip()
+    journey_id = str(journey_id or "").strip()
+    if not trader_id or not journey_id:
+        return None
+
+    try:
+        accounts = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", trader_id).eq("purchase_id", journey_id)
+            .order("created_at", desc=False).limit(1000).execute().data or []
+        )
+    except Exception:
+        accounts = []
+
+    candidates = []
+    for source in accounts:
+        bridge = _np_cutover_exact_reset_bridge(source)
+        if bridge and bridge.get("eligible"):
+            candidates.append((bridge, source))
+
+    if not candidates:
+        return None
+
+    # If more than one independent exact reset bridge is simultaneously open on
+    # one journey, fail closed. Staff must reconcile before another MT5 leaves.
+    if len(candidates) > 1:
+        return {
+            "blocked": True,
+            "reason": "MULTIPLE_OPEN_POST_CUTOVER_RESET_BRIDGES",
+            "candidates": [
+                {
+                    "order_id": b.get("order_id"),
+                    "source_account_id": b.get("source_account_id"),
+                    "source_mt5": b.get("source_mt5"),
+                    "stage": b.get("stage"),
+                }
+                for b, _s in candidates
+            ],
+        }
+
+    bridge, source = candidates[0]
+    bridge = dict(bridge)
+    bridge["source_account"] = source
+    return bridge
+
+
+# ---------------------------------------------------------------------------
+# Journey bundle: legacy stays read-only UNLESS an exact post-cutover reset
+# transaction legally bridges that exact old journey into clean automation.
+# ---------------------------------------------------------------------------
+_np_cutover_bundle_v6_core = _np_all_journeys_preserved_v5
+
+def _np_all_journeys_preserved_v5(trader_id):
+    bundle = _np_cutover_bundle_v6_core(trader_id)
+
+    for j in bundle.get("journeys") or []:
+        jid = str(j.get("journey_id") or j.get("purchase_id") or "").strip()
+        purchase = j.get("purchase") or {}
+
+        # Native 12-Sep+ purchase: normal clean automation.
+        if _np_automation_generation_purchase(purchase):
+            j["control_mode"] = "CLEAN_AUTOMATION"
+            j["cutover_date"] = _NP_CLEAN_CUTOVER.isoformat()
+            continue
+
+        # Legacy purchase: only a NEW exact reset order may bridge it.
+        bridge = _np_cutover_bridge_for_journey(trader_id, jid)
+        if bridge and bridge.get("blocked"):
+            j["control_mode"] = "CLEAN_MIGRATION_BLOCKED"
+            j["state"] = "BLOCKED"
+            j["blocked"] = True
+            j["accountability_status"] = "BLOCKED"
+            j["outstanding_entitlement"] = None
+            j.setdefault("problems", []).append({
+                "code": bridge.get("reason"),
+                "message": "More than one post-cutover paid reset is open on this legacy journey. Assignment blocked until reconciled.",
+                "candidates": bridge.get("candidates") or [],
+            })
+            continue
+
+        if bridge and bridge.get("eligible"):
+            # Reconstruct with the original Journey Authority, which already
+            # understands exact reset child orders attached to the parent journey.
+            try:
+                live = _np_ja_journey_authority_pre_root_isolation(trader_id, jid)
+            except Exception:
+                live = None
+
+            if isinstance(live, dict):
+                # Preserve V5 historical account/payout visibility while restoring
+                # the exact outstanding entitlement from the authority.
+                hist_accounts = list(j.get("accounts") or [])
+                hist_payouts = list(j.get("payouts") or [])
+                merged = dict(j)
+                merged.update(live)
+
+                def _merge_rows(primary, secondary):
+                    out, seen = [], set()
+                    for row in list(primary or []) + list(secondary or []):
+                        key = str((row or {}).get("id") or (row or {}).get("mt5_login") or "")
+                        if key and key in seen:
+                            continue
+                        if key:
+                            seen.add(key)
+                        out.append(row)
+                    return out
+
+                merged["accounts"] = _merge_rows(live.get("accounts"), hist_accounts)
+                merged["payouts"] = _merge_rows(live.get("payouts"), hist_payouts)
+                j.clear()
+                j.update(merged)
+
+            # Force the exact migration entitlement in case an older reconstruction
+            # path returned sparse legacy state.
+            source = bridge.get("source_account") or {}
+            stage = bridge.get("target_stage")
+            ent_key = f"reset:{bridge.get('order_id')}:{bridge.get('source_account_id')}:{stage}"
+            j["control_mode"] = "CLEAN_MIGRATION_RESET"
+            j["cutover_date"] = _NP_CLEAN_CUTOVER.isoformat()
+            j["migration_bridge"] = {
+                "type": "PAID_RESET",
+                "order_id": bridge.get("order_id"),
+                "source_account_id": bridge.get("source_account_id"),
+                "source_mt5": bridge.get("source_mt5"),
+                "parent_purchase_id": bridge.get("parent_purchase_id"),
+                "target_stage": stage,
+                "approved_at": bridge.get("approved_at"),
+            }
+            j["state"] = "WAITING_MT5"
+            j["closed"] = False
+            j["blocked"] = False
+            j["accountability_status"] = "RECONCILED"
+            j["outstanding_entitlement"] = {
+                "entitlement_key": ent_key,
+                "entitlement_type": f"paid_{stage}_reset",
+                "source_event_type": "reset_payment_approved",
+                "source_account_id": bridge.get("source_account_id"),
+                "source_mt5": bridge.get("source_mt5"),
+                "evidence_id": bridge.get("order_id"),
+                "target_stage": stage,
+                "status": "AVAILABLE",
+                "reason": f"{stage.upper()} RESET PAYMENT APPROVED ON/AFTER 12 SEP → NEW {stage.upper()} MT5 REQUIRED",
+            }
+            j["next_action"] = "ASSIGN_MT5"
+
+            ledger = list(j.get("ledger") or [])
+            already = any(
+                str(x.get("type") or "") == "CUTOVER_MIGRATION_RESET_APPROVED"
+                and str(x.get("evidence_id") or "") == str(bridge.get("order_id") or "")
+                for x in ledger
+            )
+            if not already:
+                ledger.append({
+                    "type": "CUTOVER_MIGRATION_RESET_APPROVED",
+                    "at": bridge.get("approved_at"),
+                    "journey_id": jid,
+                    "purchase_id": jid,
+                    "source_account_id": bridge.get("source_account_id"),
+                    "mt5_login": bridge.get("source_mt5"),
+                    "stage": stage,
+                    "evidence_id": bridge.get("order_id"),
+                    "detail": (
+                        f"12 SEP MIGRATION BRIDGE · PAID {stage.upper()} RESET APPROVED "
+                        f"→ NEW {stage.upper()} MT5 ENTITLEMENT AVAILABLE"
+                    ),
+                })
+                ledger = [x for x in ledger if x.get("at")]
+                ledger.sort(key=lambda x: _np_ja_score(x.get("at")))
+                j["ledger"] = ledger
+            continue
+
+        # No new qualifying transaction: legacy remains visible but inert.
+        j["control_mode"] = "LEGACY_READ_ONLY"
+        j["cutover_date"] = _NP_CLEAN_CUTOVER.isoformat()
+        j["outstanding_entitlement"] = None
+        if str(j.get("state") or "").upper() not in {"HISTORICAL", "HISTORICAL_UNLINKED"}:
+            j["state"] = "LEGACY_READ_ONLY"
+        j["closed"] = False
+        j["accountability_status"] = "LEGACY_READ_ONLY"
+
+    bundle["cutover_date"] = _NP_CLEAN_CUTOVER.isoformat()
+    return bundle
+
+
+# ---------------------------------------------------------------------------
+# Automation firewall: old purchases remain blocked EXCEPT for an exact
+# post-cutover paid reset bridge on the exact source account.
+# ---------------------------------------------------------------------------
+_np_cutover_auto_assign_v6_core = _np_cutover_auto_assign_core
+
+def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"):
+    purchase = purchase or {}
+    source = source_account or {}
+    target_stage = _normalize_lifecycle_stage(stage)
+
+    if _np_automation_generation_purchase(purchase):
+        return _np_cutover_auto_assign_v6_core(trader, stage, purchase, source_account, reason)
+
+    bridge = _np_cutover_exact_reset_bridge(source, purchase, trader)
+    if (
+        bridge
+        and bridge.get("eligible")
+        and _normalize_lifecycle_stage(bridge.get("target_stage")) == target_stage
+    ):
+        try:
+            _audit_safe(
+                "automation",
+                "cutover_reset_migration_allowed",
+                (
+                    f"12-SEP RESET BRIDGE allowed; order={bridge.get('order_id')}; "
+                    f"source_account={bridge.get('source_account_id')}; "
+                    f"source_mt5={bridge.get('source_mt5')}; "
+                    f"parent_journey={bridge.get('parent_purchase_id')}; "
+                    f"target={target_stage}"
+                ),
+                {"name":"system","username":"system","role":"system"},
+                bridge.get("order_id") or bridge.get("source_account_id"),
+            )
+        except Exception:
+            pass
+        return _np_cutover_auto_assign_v6_core(trader, stage, purchase, source_account, reason)
+
+    try:
+        _audit_safe(
+            "automation","legacy_cutover_blocked",
+            (
+                f"CUTOVER 12-SEP blocked; purchase={purchase.get('id')}; "
+                f"source={source.get('id')}; target={target_stage}; reason={reason}"
+            ),
+            {"name":"system","username":"system","role":"system"},
+            source.get("id") or (trader or {}).get("id"),
+        )
+    except Exception:
+        pass
+    return None
+
+
+# Final route rebinding so Admin receives migration-aware authority.
+def _np_admin_journey_authority_cutover_v7():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    journey_id = str(request.args.get("journey_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+
+    try:
+        bundle = _np_all_journeys_preserved_v5(trader_id)
+        if journey_id:
+            journey = next(
+                (j for j in bundle.get("journeys") or [] if str(j.get("journey_id") or "") == journey_id),
+                None,
+            )
+            if not journey:
+                return _np_fail("journey not found", 404)
+            return _np_ok({
+                "journey": journey,
+                "cutover_date": bundle.get("cutover_date"),
+                "identity_trader_ids": bundle.get("identity_trader_ids") or [],
+                "identity_profiles": bundle.get("identity_profiles") or [],
+                "reconciliation": bundle.get("reconciliation") or [],
+                "history_debug": bundle.get("history_debug") or {},
+                "generated_at": now_iso(),
+            })
+
+        return _np_ok({
+            "journeys": bundle.get("journeys") or [],
+            "cutover_date": bundle.get("cutover_date"),
+            "identity_trader_ids": bundle.get("identity_trader_ids") or [],
+            "identity_profiles": bundle.get("identity_profiles") or [],
+            "reconciliation": bundle.get("reconciliation") or [],
+            "history_debug": bundle.get("history_debug") or {},
+            "generated_at": now_iso(),
+        })
+    except Exception as exc:
+        print("JOURNEY AUTHORITY CUTOVER V7 ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_cutover_v7
+
+NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "CUTOVER_RESET_MIGRATION_BRIDGE_V7_2026_09_12"
+
