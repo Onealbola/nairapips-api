@@ -27744,3 +27744,138 @@ app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v5
 
 NAIRAPIPS_JOURNEY_HISTORY_RELEASE = "PRESERVE_ALL_HISTORY_NORMALIZED_IDENTITY_V5_2026_09_12"
 
+
+
+# ============================================================================
+# NAIRAPIPS CLEAN PRODUCTION CUTOVER — 12 SEP 2026
+#
+# FINAL BUSINESS LAW:
+#   - Anything before 12-Sep-2026 is LEGACY / READ-ONLY for automation purposes.
+#   - Every challenge purchase created on/after 12-Sep-2026 starts a NEW journey.
+#   - Automation can only act inside those clean journeys.
+#   - No legacy pass, payout, reset, breach or account may create a new MT5.
+#   - One trader may own many clean journeys simultaneously.
+# ============================================================================
+
+_NP_AUTOMATION_GENERATION_CUTOFF = datetime(2026, 9, 12, 0, 0, 0, tzinfo=timezone.utc)
+
+def _np_automation_generation_purchase(purchase):
+    if not purchase:
+        return False
+    # Reset-payment rows are children of an existing journey, not a new journey root.
+    note = str(purchase.get("admin_note") or "")
+    ptype = str(purchase.get("purchase_type") or "challenge").strip().lower()
+    if "[NP_RESET_REQUEST:" in note or ptype == "reset":
+        return False
+    created = _np_parse_dt_safe(purchase.get("created_at"))
+    return bool(created and created >= _NP_AUTOMATION_GENERATION_CUTOFF)
+
+def _np_cutover_mode_for_purchase(purchase):
+    return "CLEAN_AUTOMATION" if _np_automation_generation_purchase(purchase) else "LEGACY_READ_ONLY"
+
+# Wrap the authority bundle so staff can clearly see which journeys are
+# automation-controlled and which are historical only.
+_np_cutover_all_journeys_core = _np_all_journeys_preserved_v5
+
+def _np_all_journeys_preserved_v5(trader_id):
+    bundle = _np_cutover_all_journeys_core(trader_id)
+    for j in bundle.get("journeys") or []:
+        p = j.get("purchase") or {}
+        mode = _np_cutover_mode_for_purchase(p)
+        j["control_mode"] = mode
+        j["cutover_date"] = _NP_AUTOMATION_GENERATION_CUTOFF.isoformat()
+        if mode == "LEGACY_READ_ONLY":
+            # Legacy history remains visible but can never manufacture a fresh
+            # automation entitlement after the clean cutover.
+            j["outstanding_entitlement"] = None
+            if str(j.get("state") or "").upper() not in {"HISTORICAL","HISTORICAL_UNLINKED"}:
+                j["state"] = "LEGACY_READ_ONLY"
+            j["closed"] = False
+            j["accountability_status"] = "LEGACY_READ_ONLY"
+    bundle["cutover_date"] = _NP_AUTOMATION_GENERATION_CUTOFF.isoformat()
+    return bundle
+
+# Final automation firewall: even if any older helper is called directly,
+# pre-cutover journeys cannot obtain an automatic MT5.
+_np_cutover_auto_assign_core = _np_auto_assign_waiting_stage
+
+def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"):
+    if not _np_automation_generation_purchase(purchase):
+        try:
+            _audit_safe(
+                "automation","legacy_cutover_blocked",
+                f"CUTOVER 12-SEP: auto assignment blocked; purchase={(purchase or {}).get('id')}; target={stage}; reason={reason}",
+                {"name":"system","username":"system","role":"system"},
+                (source_account or {}).get("id") or (trader or {}).get("id")
+            )
+        except Exception:
+            pass
+        return None
+    return _np_cutover_auto_assign_core(trader, stage, purchase, source_account, reason)
+
+_np_cutover_payout_renewal_core = _np_auto_post_payout_renewal
+
+def _np_auto_post_payout_renewal(payout):
+    payout = payout or {}
+    source_id = str(payout.get("trader_account_id") or payout.get("account_id") or "").strip()
+    if source_id:
+        rows = supabase.table("trader_accounts").select("*").eq("id", source_id).limit(1).execute().data or []
+        if rows:
+            source = rows[0]
+            purchase = _safe_purchase_for_account(source)
+            if not _np_automation_generation_purchase(purchase):
+                try:
+                    _audit_safe(
+                        "automation","legacy_payout_cutover_blocked",
+                        f"CUTOVER 12-SEP: paid payout renewal automation blocked; payout={payout.get('id')}; source={source_id}",
+                        {"name":"system","username":"system","role":"system"},
+                        payout.get("id") or source_id
+                    )
+                except Exception:
+                    pass
+                return None
+    return _np_cutover_payout_renewal_core(payout)
+
+# Rebind Journey Authority route so the control_mode annotations are always returned.
+def _np_admin_journey_authority_cutover_v6():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    journey_id = str(request.args.get("journey_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+    try:
+        bundle = _np_all_journeys_preserved_v5(trader_id)
+        if journey_id:
+            journey = next((j for j in bundle["journeys"] if str(j.get("journey_id") or "") == journey_id), None)
+            if not journey:
+                return _np_fail("journey not found", 404)
+            return _np_ok({
+                "journey": journey,
+                "cutover_date": bundle.get("cutover_date"),
+                "identity_trader_ids": bundle.get("identity_trader_ids") or [],
+                "identity_profiles": bundle.get("identity_profiles") or [],
+                "reconciliation": bundle.get("reconciliation") or [],
+                "history_debug": bundle.get("history_debug") or {},
+                "generated_at": now_iso(),
+            })
+        return _np_ok({
+            "journeys": bundle["journeys"],
+            "cutover_date": bundle.get("cutover_date"),
+            "identity_trader_ids": bundle.get("identity_trader_ids") or [],
+            "identity_profiles": bundle.get("identity_profiles") or [],
+            "reconciliation": bundle.get("reconciliation") or [],
+            "history_debug": bundle.get("history_debug") or {},
+            "generated_at": now_iso(),
+        })
+    except Exception as exc:
+        print("JOURNEY AUTHORITY CUTOVER V6 ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_cutover_v6
+
+NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "CLEAN_JOURNEY_CUTOVER_2026_09_12"
+
