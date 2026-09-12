@@ -27476,3 +27476,271 @@ app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v4
 
 NAIRAPIPS_JOURNEY_HISTORY_RELEASE = "PRESERVE_ALL_HISTORY_V4_2026_09_12"
 
+
+
+# ============================================================================
+# NAIRAPIPS JOURNEY HISTORY PRESERVATION V5 — 2026-09-12
+#
+# WHY V4 COULD STILL SHOW ONLY ONE JOURNEY:
+# V4 searched duplicate trader profiles using raw exact DB values first.
+# That misses identities stored with:
+#   - phone 0704... vs +234704...
+#   - mixed-case / whitespace email
+#   - duplicate trader rows created at different times
+#
+# V5 builds an exact-normalized identity graph from ALL trader rows, then gathers
+# every purchase/account/payout belonging to any trader row with the SAME exact
+# normalized email OR exact normalized phone.
+#
+# It NEVER joins by name alone.
+# ============================================================================
+
+def _np_identity_trader_rows_v5(trader_id):
+    trader_id = str(trader_id or "").strip()
+    base_rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+    if not base_rows:
+        return []
+    base = base_rows[0]
+
+    base_email = _np_norm_email(base.get("email"))
+    base_phone = _np_norm_phone(base.get("phone") or base.get("whatsapp") or base.get("telephone"))
+
+    # NairaPips currently has a few hundred traders. Pulling the trader identity
+    # directory is intentionally bounded and lets us compare normalized values
+    # locally instead of trusting raw-format equality.
+    directory = supabase.table("traders").select("*").limit(10000).execute().data or []
+
+    matches = {}
+    for r in directory:
+        rid = str(r.get("id") or "").strip()
+        if not rid:
+            continue
+        remail = _np_norm_email(r.get("email"))
+        rphone = _np_norm_phone(r.get("phone") or r.get("whatsapp") or r.get("telephone"))
+
+        same_email = bool(base_email and remail and remail == base_email)
+        same_phone = bool(base_phone and rphone and rphone == base_phone)
+
+        if rid == trader_id or same_email or same_phone:
+            matches[rid] = r
+
+    # Fail closed against accidental over-linking:
+    # if neither email nor phone exists, only the exact trader row is allowed.
+    if not base_email and not base_phone:
+        return [base]
+
+    return list(matches.values())
+
+
+def _np_collect_trader_history_v5(trader_ids):
+    trader_ids = [str(x or "").strip() for x in trader_ids if str(x or "").strip()]
+    purchases, accounts, payouts = [], [], []
+
+    for tid in trader_ids:
+        # Each query is independent so one legacy table anomaly does not erase
+        # the rest of the history.
+        try:
+            purchases.extend(
+                supabase.table("challenge_purchases").select("*")
+                .eq("trader_id", tid).order("created_at", desc=False).limit(5000).execute().data or []
+            )
+        except Exception as exc:
+            print("V5 purchases history query failed", tid, exc)
+
+        try:
+            accounts.extend(
+                supabase.table("trader_accounts").select("*")
+                .eq("trader_id", tid).order("created_at", desc=False).limit(5000).execute().data or []
+            )
+        except Exception as exc:
+            print("V5 accounts history query failed", tid, exc)
+
+        try:
+            payouts.extend(
+                supabase.table("payouts").select("*")
+                .eq("trader_id", tid).order("created_at", desc=False).limit(5000).execute().data or []
+            )
+        except Exception as exc:
+            print("V5 payouts history query failed", tid, exc)
+
+    def dedupe(rows):
+        out, seen = [], set()
+        for r in rows:
+            key = str(r.get("id") or "").strip()
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            out.append(r)
+        return out
+
+    return dedupe(purchases), dedupe(accounts), dedupe(payouts)
+
+
+def _np_all_journeys_preserved_v5(trader_id):
+    aliases = _np_identity_trader_rows_v5(trader_id)
+    trader_ids = [str(t.get("id") or "").strip() for t in aliases if t.get("id")]
+    if not trader_ids:
+        trader_ids = [str(trader_id)]
+
+    purchases, accounts, payouts = _np_collect_trader_history_v5(trader_ids)
+
+    reconciliation = []
+    for tid in trader_ids:
+        try:
+            reconciliation.append(_np_post9_reconcile_trader_journeys(tid, apply=True))
+        except Exception as exc:
+            reconciliation.append({
+                "ok": False,
+                "trader_id": tid,
+                "changes": [],
+                "conflicts": [{"code": "RECONCILE_ERROR", "message": str(exc)}],
+            })
+
+    # Real purchase roots only. Reset-payment orders are children.
+    roots = [p for p in purchases if not _np_is_reset_order_row(p)]
+    roots.sort(key=lambda p: _np_ja_score(p.get("created_at")))
+
+    journeys = []
+    for root in roots:
+        pid = str(root.get("id") or "").strip()
+        if not pid:
+            continue
+        journeys.append(_np_history_journey_from_root(root, accounts, payouts))
+
+    # Preserve accounts not represented in a visible purchase root.
+    represented = set()
+    for j in journeys:
+        for a in j.get("accounts") or []:
+            represented.add(str(a.get("id") or a.get("mt5_login") or "").strip())
+
+    for a in accounts:
+        aid = str(a.get("id") or a.get("mt5_login") or "").strip()
+        if not aid or aid in represented:
+            continue
+
+        pid = str(a.get("purchase_id") or a.get("challenge_purchase_id") or "").strip()
+        jid = pid if pid else f"ACCOUNT:{aid}"
+        acc_id = str(a.get("id") or "").strip()
+        apays = [
+            p for p in payouts
+            if str(p.get("trader_account_id") or p.get("account_id") or "").strip() == acc_id
+        ]
+
+        journeys.append({
+            "ok": False,
+            "blocked": False,
+            "trader_id": a.get("trader_id"),
+            "journey_id": jid,
+            "purchase_id": pid or None,
+            "purchase": None,
+            "state": "HISTORICAL_UNLINKED",
+            "closed": False,
+            "accountability_status": "HISTORICAL",
+            "historical_preserved": True,
+            "accounts": [_decorate_account_for_api(a)],
+            "payouts": apays,
+            "ledger": [],
+            "problems": [{
+                "code": "HISTORICAL_ACCOUNT_WITHOUT_VISIBLE_PURCHASE_ROOT",
+                "message": f"MT5 {a.get('mt5_login')} is preserved but its purchase root is missing/unresolved."
+            }],
+            "outstanding_entitlement": None,
+            "accountability": {
+                "entitlements_created": 0,
+                "entitlements_consumed": 0,
+                "wrong_assignments_recalled_unused": 0,
+                "wrong_assignments_recalled_with_activity": 0,
+                "delivered_mt5": 1,
+                "outstanding_entitlement": 0,
+                "balance": 0,
+                "status": "HISTORICAL",
+            },
+        })
+
+    def jtime(j):
+        p = j.get("purchase") or {}
+        vals = [_np_ja_score(p.get("created_at"))]
+        vals += [
+            _np_ja_score(a.get("assigned_at") or a.get("created_at"))
+            for a in (j.get("accounts") or [])
+        ]
+        return max(vals or [0])
+
+    journeys.sort(key=jtime, reverse=True)
+
+    return {
+        "journeys": journeys,
+        "identity_trader_ids": trader_ids,
+        "identity_profiles": [{
+            "id": t.get("id"),
+            "name": t.get("full_name") or t.get("name"),
+            "email": t.get("email"),
+            "phone": t.get("phone") or t.get("whatsapp") or t.get("telephone"),
+        } for t in aliases],
+        "reconciliation": reconciliation,
+
+        # Diagnostic counts are intentionally returned to Admin so we can prove
+        # what the backend found without guessing from the UI.
+        "history_debug": {
+            "identity_profiles_found": len(trader_ids),
+            "purchase_rows_found": len(purchases),
+            "root_purchase_journeys_found": len(roots),
+            "trader_accounts_found": len(accounts),
+            "payout_rows_found": len(payouts),
+            "journeys_returned": len(journeys),
+        },
+    }
+
+
+def _np_admin_journey_authority_v5():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    journey_id = str(request.args.get("journey_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+
+    try:
+        bundle = _np_all_journeys_preserved_v5(trader_id)
+
+        if journey_id:
+            journey = next(
+                (j for j in bundle["journeys"] if str(j.get("journey_id") or "") == journey_id),
+                None
+            )
+            if not journey:
+                return _np_fail("journey not found in preserved trader history", 404)
+
+            return _np_ok({
+                "journey": journey,
+                "identity_trader_ids": bundle["identity_trader_ids"],
+                "identity_profiles": bundle["identity_profiles"],
+                "reconciliation": bundle["reconciliation"],
+                "history_debug": bundle["history_debug"],
+                "generated_at": now_iso(),
+            })
+
+        return _np_ok({
+            "journeys": bundle["journeys"],
+            "identity_trader_ids": bundle["identity_trader_ids"],
+            "identity_profiles": bundle["identity_profiles"],
+            "reconciliation": bundle["reconciliation"],
+            "history_debug": bundle["history_debug"],
+            "generated_at": now_iso(),
+        })
+
+    except Exception as exc:
+        print("JOURNEY AUTHORITY V5 ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+# Real route handler replacement.
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v5
+
+NAIRAPIPS_JOURNEY_HISTORY_RELEASE = "PRESERVE_ALL_HISTORY_NORMALIZED_IDENTITY_V5_2026_09_12"
+
