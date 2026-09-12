@@ -26688,3 +26688,466 @@ if _np_ja_approve_purchase_view_core:
 # Marker for deployment / support.
 NAIRAPIPS_JOURNEY_AUTHORITY_RELEASE = "JOURNEY_AUTHORITY_STAFF_SAFE_2026_09_12"
 
+
+
+# ============================================================================
+# NAIRAPIPS JOURNEY ROOT ISOLATION V3 — 2026-09-12
+#
+# CRITICAL GLOBAL LAW FROM 09-SEP-2026:
+#   NEW CHALLENGE PURCHASE = NEW JOURNEY, ALWAYS.
+#   The trader may have many simultaneous journeys.
+#   A later purchase must NEVER be interpreted as Life 3 / reset / continuation
+#   of an earlier purchase.
+#
+# This patch also corrects an earlier wrapper mistake: the production Flask
+# endpoint for /approve_challenge_purchase is named "approve_purchase", not
+# "approve_challenge_purchase".  The previous safety wrapper therefore did not
+# attach to the real route.
+# ============================================================================
+
+def _np_post9_root_purchase(p):
+    """True only for a real new challenge purchase created on/after 09-Sep-2026."""
+    if not p or not _np_automation_generation_purchase(p):
+        return False
+    note = str(p.get("admin_note") or "")
+    ptype = str(p.get("purchase_type") or "challenge").strip().lower()
+    if "[NP_RESET_REQUEST:" in note or ptype == "reset":
+        return False
+    return True
+
+
+def _np_post9_exact_account_claim(purchase, accounts):
+    """Return an account only when the purchase itself identifies it exactly.
+
+    Evidence strength:
+      1) purchase.trader_account_id == account.id
+      2) purchase.assigned_mt5_id == account.mt5_pool_id
+      3) purchase.mt5_login == account.mt5_login (unique for this trader)
+
+    We never infer from trader name, account size, plan, time proximity or email.
+    """
+    purchase = purchase or {}
+    accounts = accounts or []
+    tid = str(purchase.get("trader_id") or "").strip()
+    rows = [a for a in accounts if str(a.get("trader_id") or "").strip() == tid]
+
+    aid = str(purchase.get("trader_account_id") or "").strip()
+    if aid:
+        hit = [a for a in rows if str(a.get("id") or "").strip() == aid]
+        if len(hit) == 1:
+            return hit[0], "purchase.trader_account_id"
+
+    pool_id = str(purchase.get("assigned_mt5_id") or "").strip()
+    if pool_id:
+        hit = [a for a in rows if str(a.get("mt5_pool_id") or "").strip() == pool_id]
+        if len(hit) == 1:
+            return hit[0], "purchase.assigned_mt5_id"
+
+    login = str(purchase.get("mt5_login") or "").strip()
+    if login:
+        hit = [a for a in rows if str(a.get("mt5_login") or "").strip() == login]
+        if len(hit) == 1:
+            return hit[0], "purchase.mt5_login"
+
+    return None, None
+
+
+def _np_post9_reconcile_trader_journeys(trader_id, apply=True):
+    """Deterministically repair post-09-Sep journey ownership.
+
+    This function does NOT guess.  It moves an account to a purchase only when
+    the purchase row itself has an exact account/MT5 mirror proving ownership.
+
+    That solves the real production case:
+      old journey breaches -> trader makes a NEW purchase -> new MT5 must be
+      Life 1 of the new purchase, not Life 3 of the old journey.
+    """
+    trader_id = str(trader_id or "").strip()
+    if not trader_id:
+        return {"ok": False, "trader_id": trader_id, "changes": [], "conflicts": [{"code":"MISSING_TRADER_ID"}]}
+
+    purchases = (
+        supabase.table("challenge_purchases").select("*")
+        .eq("trader_id", trader_id)
+        .order("created_at", desc=False).limit(2000).execute().data or []
+    )
+    accounts = (
+        supabase.table("trader_accounts").select("*")
+        .eq("trader_id", trader_id)
+        .order("created_at", desc=False).limit(2000).execute().data or []
+    )
+
+    roots = [p for p in purchases if _np_post9_root_purchase(p)]
+    proposed = []
+    conflicts = []
+    account_claims = {}
+
+    for p in roots:
+        pid = str(p.get("id") or "").strip()
+        a, evidence = _np_post9_exact_account_claim(p, accounts)
+        if not a:
+            # A pending purchase with no account yet is normal.
+            continue
+        aid = str(a.get("id") or "").strip()
+        account_claims.setdefault(aid, []).append({
+            "purchase_id": pid,
+            "evidence": evidence,
+            "mt5_login": a.get("mt5_login"),
+        })
+
+    # One account can never be the root/current mirror of two independent purchases.
+    for aid, claims in account_claims.items():
+        unique = {str(c.get("purchase_id")) for c in claims}
+        if len(unique) > 1:
+            conflicts.append({
+                "code": "ACCOUNT_CLAIMED_BY_MULTIPLE_PURCHASES",
+                "account_id": aid,
+                "claims": claims,
+            })
+
+    conflicted_accounts = {c.get("account_id") for c in conflicts}
+
+    for p in roots:
+        pid = str(p.get("id") or "").strip()
+        a, evidence = _np_post9_exact_account_claim(p, accounts)
+        if not a:
+            continue
+        aid = str(a.get("id") or "").strip()
+        if aid in conflicted_accounts:
+            continue
+
+        current_pid = str(a.get("purchase_id") or a.get("challenge_purchase_id") or "").strip()
+        if current_pid == pid:
+            continue
+
+        proposed.append({
+            "account_id": aid,
+            "mt5_login": a.get("mt5_login"),
+            "from_purchase_id": current_pid or None,
+            "to_purchase_id": pid,
+            "evidence": evidence,
+        })
+
+    changes = []
+    if apply:
+        for ch in proposed:
+            aid = ch["account_id"]
+            pid = ch["to_purchase_id"]
+
+            # Re-read immediately before mutation.  Never overwrite a concurrent
+            # correction or cross-trader row.
+            rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", aid).eq("trader_id", trader_id).limit(1).execute().data or []
+            )
+            if not rows:
+                conflicts.append({"code":"ACCOUNT_DISAPPEARED_DURING_RECONCILE","account_id":aid})
+                continue
+            row = rows[0]
+            now_pid = str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip()
+            if now_pid == pid:
+                continue
+
+            # The target purchase must still explicitly claim this exact account.
+            target_rows = (
+                supabase.table("challenge_purchases").select("*")
+                .eq("id", pid).eq("trader_id", trader_id).limit(1).execute().data or []
+            )
+            if not target_rows:
+                conflicts.append({"code":"TARGET_PURCHASE_NOT_FOUND","account_id":aid,"purchase_id":pid})
+                continue
+            target = target_rows[0]
+            exact, evidence = _np_post9_exact_account_claim(target, [row])
+            if not exact:
+                conflicts.append({
+                    "code":"TARGET_PURCHASE_NO_LONGER_CLAIMS_ACCOUNT",
+                    "account_id":aid, "purchase_id":pid
+                })
+                continue
+
+            supabase.table("trader_accounts").update({
+                "purchase_id": pid,
+                "journey_source": "post9_exact_purchase_reconciliation",
+                "updated_at": now_iso(),
+            }).eq("id", aid).eq("trader_id", trader_id).execute()
+
+            try:
+                _audit_safe(
+                    "journey_authority",
+                    "post9_purchase_reconciled",
+                    (
+                        f"MT5 {row.get('mt5_login')} account={aid} moved from "
+                        f"journey={now_pid or 'UNLINKED'} to NEW PURCHASE journey={pid}; "
+                        f"evidence={evidence}"
+                    ),
+                    {"name":"system","username":"system","role":"system"},
+                    aid,
+                )
+            except Exception:
+                pass
+
+            changes.append({
+                **ch,
+                "applied": True,
+            })
+
+    return {
+        "ok": not bool(conflicts),
+        "trader_id": trader_id,
+        "cutoff": _NP_AUTOMATION_GENERATION_CUTOFF.isoformat(),
+        "root_purchases_checked": len(roots),
+        "changes": changes if apply else proposed,
+        "conflicts": conflicts,
+    }
+
+
+def _np_post9_assert_purchase_account_ownership(trader, purchase, account=None):
+    """Hard ownership firewall for all post-09-Sep automated/staff actions."""
+    if not _np_post9_root_purchase(purchase):
+        return True
+    tid = str((trader or {}).get("id") or "").strip()
+    pid = str((purchase or {}).get("id") or "").strip()
+    if not tid or str((purchase or {}).get("trader_id") or "").strip() != tid:
+        raise ValueError("ACTION BLOCKED — purchase/trader ownership mismatch")
+    if account:
+        if str(account.get("trader_id") or "").strip() != tid:
+            raise ValueError("ACTION BLOCKED — account/trader ownership mismatch")
+        if str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip() != pid:
+            raise ValueError("ACTION BLOCKED — account belongs to another journey")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Global MT5 assignment firewall.
+# Every account created for a post-09-Sep purchase must be born with that exact
+# purchase_id.  It may not inherit a trader's previous purchase/journey.
+# ---------------------------------------------------------------------------
+_np_assign_mt5_to_trader_pre_root_isolation = _assign_mt5_to_trader
+
+def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="MT5 assigned"):
+    if purchase and _np_post9_root_purchase(purchase):
+        _np_post9_assert_purchase_account_ownership(trader, purchase)
+    result = _np_assign_mt5_to_trader_pre_root_isolation(trader, mt5, stage, purchase, staff, note)
+    account, trader_row = result
+
+    if purchase and _np_post9_root_purchase(purchase):
+        pid = str(purchase.get("id") or "").strip()
+        tid = str((trader or {}).get("id") or "").strip()
+        aid = str((account or {}).get("id") or "").strip()
+        actual_pid = str((account or {}).get("purchase_id") or (account or {}).get("challenge_purchase_id") or "").strip()
+
+        if actual_pid != pid:
+            # Fail closed, but preserve the transaction record for forensic review.
+            try:
+                supabase.table("trader_accounts").update({
+                    "account_status": "assignment_quarantined",
+                    "monitoring_enabled": False,
+                    "archive_reason": (
+                        f"POST9 JOURNEY OWNERSHIP FAILURE: expected purchase_id={pid}, "
+                        f"actual={actual_pid or 'NULL'}"
+                    ),
+                    "updated_at": now_iso(),
+                }).eq("id", aid).eq("trader_id", tid).execute()
+            except Exception:
+                pass
+            raise ValueError("ASSIGNMENT QUARANTINED — new MT5 was not bound to the exact purchase journey")
+
+        try:
+            supabase.table("trader_accounts").update({
+                "journey_source": "post9_purchase_root_immutable",
+                "updated_at": now_iso(),
+            }).eq("id", aid).eq("trader_id", tid).eq("purchase_id", pid).execute()
+        except Exception:
+            pass
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Correctly wrap the REAL Flask endpoint: "approve_purchase".
+# Previous version looked up "approve_challenge_purchase", which is the URL,
+# not the endpoint function name, so that wrapper was not attached.
+# ---------------------------------------------------------------------------
+_np_post9_approve_purchase_core = app.view_functions.get("approve_purchase")
+
+def _np_post9_approve_purchase_route():
+    if request.method == "OPTIONS":
+        return _np_post9_approve_purchase_core()
+
+    d = request.get_json(silent=True) or {}
+    pid = str(d.get("id") or d.get("purchase_id") or "").strip()
+
+    if pid:
+        rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
+        if rows:
+            p = rows[0]
+            if _np_post9_root_purchase(p):
+                tid = str(p.get("trader_id") or "").strip()
+
+                # Repair exact historical ownership before making a new decision.
+                if tid:
+                    _np_post9_reconcile_trader_journeys(tid, apply=True)
+
+                # NEW PURCHASE = NEW JOURNEY.  Existing accounts on OTHER purchases
+                # belonging to this trader are irrelevant and must never block or be
+                # consumed by this purchase.
+                own = (
+                    supabase.table("trader_accounts").select("id,mt5_login,purchase_id,account_status")
+                    .eq("trader_id", tid).eq("purchase_id", pid).limit(100).execute().data or []
+                )
+                if own:
+                    return _np_fail(
+                        "This purchase already owns MT5/account history. "
+                        "It cannot be approved again or used as another life.",
+                        409
+                    )
+
+    resp = _np_post9_approve_purchase_core()
+
+    # After a successful approval, prove the new account belongs to this exact
+    # purchase.  This is verification, not inference.
+    try:
+        status_code = getattr(resp, "status_code", 200)
+        if pid and status_code < 400:
+            rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
+            p = rows[0] if rows else None
+            if p and _np_post9_root_purchase(p):
+                tid = str(p.get("trader_id") or "").strip()
+                all_accounts = (
+                    supabase.table("trader_accounts").select("*")
+                    .eq("trader_id", tid).limit(2000).execute().data or []
+                )
+                a, evidence = _np_post9_exact_account_claim(p, all_accounts)
+                if not a:
+                    raise ValueError("POST9 APPROVAL VERIFY FAILED — purchase does not identify its assigned account")
+                if str(a.get("purchase_id") or "").strip() != pid:
+                    # Deterministic exact repair is safe here.
+                    supabase.table("trader_accounts").update({
+                        "purchase_id": pid,
+                        "journey_source": "post9_purchase_root_verified",
+                        "updated_at": now_iso(),
+                    }).eq("id", a.get("id")).eq("trader_id", tid).execute()
+                _audit_safe(
+                    "journey_authority",
+                    "new_purchase_new_journey_verified",
+                    f"NEW PURCHASE journey={pid} owns MT5={a.get('mt5_login')} account={a.get('id')} evidence={evidence}",
+                    _admin_from_payload(d),
+                    pid,
+                )
+    except Exception as exc:
+        print("POST9 PURCHASE/JOURNEY VERIFY ERROR:", exc)
+
+    return resp
+
+if _np_post9_approve_purchase_core:
+    app.view_functions["approve_purchase"] = _np_post9_approve_purchase_route
+
+
+# ---------------------------------------------------------------------------
+# Make authority reconstruction self-heal exact post-09-Sep purchase ownership
+# before it decides whether automation may continue.
+# ---------------------------------------------------------------------------
+_np_ja_journey_authority_pre_root_isolation = _np_ja_journey_authority
+
+def _np_ja_journey_authority(trader_id, journey_id):
+    try:
+        _np_post9_reconcile_trader_journeys(trader_id, apply=True)
+    except Exception as exc:
+        print("POST9 JOURNEY RECONCILE SKIPPED:", exc)
+    return _np_ja_journey_authority_pre_root_isolation(trader_id, journey_id)
+
+
+# Rebind the API route to the new self-healing authority function.
+def _np_admin_journey_authority_v3():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    journey_id = str(request.args.get("journey_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+    try:
+        rec = _np_post9_reconcile_trader_journeys(trader_id, apply=True)
+        if journey_id:
+            data = _np_ja_journey_authority(trader_id, journey_id)
+            return _np_ok({"journey": data, "reconciliation": rec, "generated_at": now_iso()})
+        return _np_ok({
+            "journeys": _np_ja_all_for_trader(trader_id),
+            "reconciliation": rec,
+            "generated_at": now_iso()
+        })
+    except Exception as exc:
+        print("JOURNEY AUTHORITY V3 ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v3
+
+
+@app.route("/admin_reconcile_post9_journeys", methods=["POST", "OPTIONS"])
+def admin_reconcile_post9_journeys():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+
+    d = request.get_json(silent=True) or {}
+    trader_id = str(d.get("trader_id") or "").strip()
+    apply = str(d.get("mode") or "apply").lower() != "preview"
+
+    try:
+        if trader_id:
+            report = _np_post9_reconcile_trader_journeys(trader_id, apply=apply)
+            return _np_ok({"report": report, "mode": "apply" if apply else "preview"})
+
+        # Global reconciliation from 09-Sep forward.
+        post9 = (
+            supabase.table("challenge_purchases").select("trader_id,created_at,admin_note,purchase_type")
+            .gte("created_at", _NP_AUTOMATION_GENERATION_CUTOFF.isoformat())
+            .limit(10000).execute().data or []
+        )
+        trader_ids = []
+        seen = set()
+        for p in post9:
+            tid = str(p.get("trader_id") or "").strip()
+            if not tid or tid in seen:
+                continue
+            if "[NP_RESET_REQUEST:" in str(p.get("admin_note") or ""):
+                continue
+            if str(p.get("purchase_type") or "challenge").lower() == "reset":
+                continue
+            seen.add(tid)
+            trader_ids.append(tid)
+
+        reports = []
+        totals = {"traders":0, "changes":0, "conflicts":0}
+        for tid in trader_ids:
+            rep = _np_post9_reconcile_trader_journeys(tid, apply=apply)
+            reports.append(rep)
+            totals["traders"] += 1
+            totals["changes"] += len(rep.get("changes") or [])
+            totals["conflicts"] += len(rep.get("conflicts") or [])
+
+        _audit_safe(
+            "journey_authority",
+            "global_post9_reconciliation",
+            f"mode={'apply' if apply else 'preview'} traders={totals['traders']} changes={totals['changes']} conflicts={totals['conflicts']}",
+            staff,
+            "post9-global",
+        )
+
+        return _np_ok({
+            "mode": "apply" if apply else "preview",
+            "cutoff": _NP_AUTOMATION_GENERATION_CUTOFF.isoformat(),
+            "totals": totals,
+            "reports": reports,
+        })
+    except Exception as exc:
+        print("GLOBAL POST9 RECONCILIATION ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+NAIRAPIPS_JOURNEY_ROOT_ISOLATION_RELEASE = "POST9_NEW_PURCHASE_NEW_JOURNEY_V3_2026_09_12"
+
