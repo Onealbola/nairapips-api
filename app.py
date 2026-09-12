@@ -25701,3 +25701,990 @@ def _np_auto_free_phase1_reset_after_breach(trader, breached_account):
         )
     return result
 
+
+
+# ============================================================================
+# NAIRAPIPS JOURNEY AUTHORITY — STAFF-SAFE OPERATING SYSTEM
+# 2026-09-12
+#
+# PERMANENT LAW:
+#   1 purchase = 1 journey.
+#   One trader may own many journeys at once.
+#   No entitlement / MT5 / payout / reset may cross journey boundaries.
+#   Every continuation must have one immediate legal parent event.
+#   No valid parent event = journey closed = assignment blocked.
+#   Recalled wrong assignments remain in history; unused recall reopens the SAME
+#   entitlement, never creates a new one.
+# ============================================================================
+
+_NP_JA_CUTOFF = datetime(2026, 9, 9, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def _np_ja_dt(v):
+    try:
+        raw = str(v or "").strip()
+        if not raw:
+            return None
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _np_ja_score(v):
+    d = _np_ja_dt(v)
+    return d.timestamp() if d else 0.0
+
+
+def _np_ja_stage(a):
+    return _normalize_lifecycle_stage((a or {}).get("stage") or (a or {}).get("phase") or "phase1")
+
+
+def _np_ja_blob(row):
+    row = row or {}
+    return " ".join(str(row.get(k) or "") for k in (
+        "account_status", "status", "risk_zone", "archive_reason", "breach_reason",
+        "reset_reason", "admin_note", "message", "lifecycle_state", "journey_source",
+    )).lower()
+
+
+def _np_ja_is_recalled(a):
+    blob = _np_ja_blob(a)
+    return any(x in blob for x in (
+        "wrong_assignment_recalled",
+        "recalled_wrong_assignment",
+        "np_terminal:recalled_wrong_assignment",
+        "np_excluded_from_progression",
+    ))
+
+
+def _np_ja_is_breached(a):
+    try:
+        if _np_account_has_breach_evidence(a or {}):
+            return True
+    except Exception:
+        pass
+    return "breach" in _np_ja_blob(a)
+
+
+def _np_ja_is_passed(a):
+    a = a or {}
+    blob = _np_ja_blob(a)
+    return bool(
+        "passed" in blob
+        or "target_hit" in blob
+        or str(a.get("phase_pass_status") or "").lower() in {"phase1_passed", "phase2_passed"}
+        or str(a.get("risk_zone") or "").lower() == "passed"
+    )
+
+
+def _np_ja_is_active(a):
+    return str((a or {}).get("account_status") or (a or {}).get("status") or "").strip().lower() in {
+        "assigned_active", "active", "current_active", "phase1_active",
+        "phase2_active", "funded_active", "funded", "live", "approved_active"
+    }
+
+
+def _np_ja_reset_marker(note):
+    m = re.search(r"\[NP_RESET_REQUEST:([^:\]]+):([^:\]]+):(phase1|phase2|funded)\]", str(note or ""), re.I)
+    if not m:
+        return None
+    return {
+        "source_account_id": str(m.group(1)).strip(),
+        "parent_purchase_id": str(m.group(2)).strip(),
+        "stage": str(m.group(3)).strip().lower(),
+    }
+
+
+def _np_ja_root_and_reset_orders(trader_id):
+    rows = (
+        supabase.table("challenge_purchases").select("*")
+        .eq("trader_id", trader_id)
+        .order("created_at", desc=False)
+        .limit(2000).execute().data or []
+    )
+    roots, reset_orders = [], []
+    for p in rows:
+        marker = _np_ja_reset_marker(p.get("admin_note"))
+        if marker:
+            p = dict(p)
+            p["_np_reset_marker"] = marker
+            reset_orders.append(p)
+        else:
+            roots.append(p)
+    return roots, reset_orders
+
+
+def _np_ja_account_has_trades(account):
+    aid = str((account or {}).get("id") or "").strip()
+    login = str((account or {}).get("mt5_login") or "").strip()
+    try:
+        if aid:
+            rows = supabase.table("trader_trades").select("id").eq("trader_account_id", aid).limit(1).execute().data or []
+            if rows:
+                return True
+        if login:
+            rows = supabase.table("trader_trades").select("id").eq("mt5_login", login).limit(1).execute().data or []
+            if rows:
+                return True
+    except Exception:
+        # Recall reversibility is fail-closed if trade evidence cannot be checked.
+        return True
+    return False
+
+
+def _np_ja_reset_order(reset_orders, source_account_id, parent_purchase_id, stage, approved_only=True):
+    source_account_id = str(source_account_id or "").strip()
+    parent_purchase_id = str(parent_purchase_id or "").strip()
+    stage = _normalize_lifecycle_stage(stage)
+    matches = []
+    for order in reset_orders or []:
+        m = order.get("_np_reset_marker") or _np_ja_reset_marker(order.get("admin_note"))
+        if not m:
+            continue
+        if str(m.get("source_account_id") or "") != source_account_id:
+            continue
+        if str(m.get("parent_purchase_id") or "") != parent_purchase_id:
+            continue
+        if _normalize_lifecycle_stage(m.get("stage")) != stage:
+            continue
+        st = str(order.get("payment_status") or order.get("status") or "").strip().lower()
+        if approved_only and st not in {
+            "approved", "paid", "completed", "assigned", "approved_reset_waiting_mt5"
+        }:
+            continue
+        matches.append(order)
+    matches.sort(key=lambda r: _np_ja_score(r.get("approved_at") or r.get("updated_at") or r.get("created_at")))
+    return matches[-1] if matches else None
+
+
+def _np_ja_paid_payouts_for_account(payouts, account_id):
+    out = []
+    for p in payouts or []:
+        if str(p.get("trader_account_id") or p.get("account_id") or "").strip() != str(account_id or "").strip():
+            continue
+        st = str(p.get("status") or "").strip().lower()
+        if p.get("paid_at") or st == "paid":
+            out.append(p)
+    out.sort(key=lambda r: _np_ja_score(r.get("paid_at") or r.get("updated_at") or r.get("created_at")))
+    return out
+
+
+def _np_ja_purchase_approved(p):
+    st = str((p or {}).get("payment_status") or (p or {}).get("status") or "").strip().lower()
+    return bool(
+        (p or {}).get("approved_at")
+        or st in {"approved", "approved_active", "paid", "completed", "assigned", "active"}
+    )
+
+
+def _np_ja_account_time(a):
+    return _np_ja_score((a or {}).get("assigned_at") or (a or {}).get("started_at") or (a or {}).get("created_at"))
+
+
+def _np_ja_human_money(v):
+    try:
+        return f"₦{float(v or 0):,.0f}"
+    except Exception:
+        return "₦0"
+
+
+def _np_ja_journey_authority(trader_id, journey_id):
+    """Reconstruct one purchase journey from evidence only.
+
+    This is deliberately fail-closed.  It does not use trader-level "latest" payout,
+    pass or reset flags to authorise a journey.
+    """
+    trader_id = str(trader_id or "").strip()
+    journey_id = str(journey_id or "").strip()
+    if not trader_id or not journey_id:
+        return {"ok": False, "blocked": True, "reason": "missing_trader_or_journey"}
+
+    roots, reset_orders = _np_ja_root_and_reset_orders(trader_id)
+    purchase = next((p for p in roots if str(p.get("id") or "") == journey_id), None)
+    if not purchase:
+        return {
+            "ok": False, "blocked": True, "journey_id": journey_id,
+            "reason": "journey_purchase_not_found",
+            "accountability_status": "BLOCKED",
+            "state": "BLOCKED",
+            "outstanding_entitlement": None,
+        }
+
+    accounts = (
+        supabase.table("trader_accounts").select("*")
+        .eq("trader_id", trader_id).eq("purchase_id", journey_id)
+        .limit(1000).execute().data or []
+    )
+    accounts.sort(key=_np_ja_account_time)
+
+    account_ids = [str(a.get("id") or "") for a in accounts if a.get("id")]
+    payouts = []
+    if account_ids:
+        # Supabase Python client support for in_ varies by version, so query trader and filter locally.
+        payouts = (
+            supabase.table("payouts").select("*")
+            .eq("trader_id", trader_id)
+            .order("created_at", desc=False).limit(2000).execute().data or []
+        )
+        payouts = [p for p in payouts if str(p.get("trader_account_id") or p.get("account_id") or "") in set(account_ids)]
+
+    recalled = [a for a in accounts if _np_ja_is_recalled(a)]
+    recalled_unused, recalled_used = [], []
+    for a in recalled:
+        (recalled_used if _np_ja_account_has_trades(a) else recalled_unused).append(a)
+
+    # Unused wrong assignments remain in history but do NOT consume a journey entitlement.
+    legal_accounts = [a for a in accounts if a not in recalled_unused]
+    # A recalled account with trade activity is not safely reversible; block the journey.
+    problems = []
+    if recalled_used:
+        problems.append({
+            "code": "RECALL_NOT_REVERSIBLE",
+            "message": f"{len(recalled_used)} recalled MT5 account(s) contain trading activity and cannot restore entitlement automatically.",
+            "accounts": [a.get("mt5_login") for a in recalled_used],
+        })
+
+    active_rows = [a for a in legal_accounts if _np_ja_is_active(a)]
+    if len(active_rows) > 1:
+        problems.append({
+            "code": "MULTIPLE_ACTIVE_ACCOUNTS_IN_ONE_JOURNEY",
+            "message": f"{len(active_rows)} active accounts exist inside one purchase journey.",
+            "accounts": [a.get("mt5_login") for a in active_rows],
+        })
+
+    second_life = _second_life_bool(purchase.get("second_life_enabled"))
+    ledger = []
+    entitlements_created = []
+    entitlements_consumed = []
+    transition_reasons = {}
+
+    if purchase.get("created_at"):
+        ledger.append({
+            "type": "PURCHASE",
+            "at": purchase.get("created_at"),
+            "journey_id": journey_id,
+            "purchase_id": journey_id,
+            "amount": purchase.get("final_fee") or purchase.get("amount_due") or purchase.get("fee") or purchase.get("price"),
+            "detail": f"Challenge purchase · {purchase.get('plan_name') or purchase.get('selected_plan') or 'Plan'}",
+        })
+    if _np_ja_purchase_approved(purchase):
+        ledger.append({
+            "type": "PURCHASE_APPROVED",
+            "at": purchase.get("approved_at") or purchase.get("assigned_at") or purchase.get("updated_at") or purchase.get("created_at"),
+            "journey_id": journey_id,
+            "purchase_id": journey_id,
+            "detail": "PAYMENT APPROVED · initial Phase 1 entitlement created",
+        })
+
+    initial_key = f"purchase:{journey_id}:phase1"
+    if _np_ja_purchase_approved(purchase):
+        entitlements_created.append(initial_key)
+
+    # Validate the chain one account at a time.  A later account may only exist if
+    # the immediately preceding legal account created its entitlement.
+    phase1_count_before = 0
+    previous = None
+    for idx, account in enumerate(legal_accounts):
+        aid = str(account.get("id") or "")
+        mt5 = str(account.get("mt5_login") or "")
+        stg = _np_ja_stage(account)
+        assigned_at = account.get("assigned_at") or account.get("started_at") or account.get("created_at")
+        authority_type = None
+        authority_key = None
+        authority_detail = None
+        source_account_id = None
+        source_mt5 = None
+        evidence_id = None
+
+        if previous is None:
+            if not _np_ja_purchase_approved(purchase):
+                problems.append({
+                    "code": "INITIAL_ASSIGNMENT_WITHOUT_APPROVED_PURCHASE",
+                    "message": f"MT5 {mt5} exists before a proven approved purchase.",
+                    "account_id": aid,
+                })
+            if stg != "phase1":
+                problems.append({
+                    "code": "INITIAL_STAGE_INVALID",
+                    "message": f"Initial journey account MT5 {mt5} is {stg.upper()}, expected PHASE1.",
+                    "account_id": aid,
+                })
+            authority_type = "initial_purchase"
+            authority_key = initial_key
+            authority_detail = "PAYMENT APPROVED → NEW PHASE 1 MT5 ASSIGNED"
+        else:
+            source_account_id = str(previous.get("id") or "")
+            source_mt5 = str(previous.get("mt5_login") or "")
+            prev_stage = _np_ja_stage(previous)
+
+            if prev_stage in {"phase1", "phase2"} and _np_ja_is_passed(previous):
+                expected = "funded" if prev_stage == "phase1" else "funded"
+                authority_type = "phase_pass"
+                authority_key = f"pass:{source_account_id}:{expected}"
+                authority_detail = f"{prev_stage.upper()} PASSED → NEW {expected.upper()} MT5 ASSIGNED"
+                ledger.append({
+                    "type": "ENTITLEMENT_CREATED",
+                    "at": previous.get("passed_at") or previous.get("archived_at") or previous.get("updated_at"),
+                    "journey_id": journey_id,
+                    "purchase_id": journey_id,
+                    "source_account_id": source_account_id,
+                    "mt5_login": source_mt5,
+                    "stage": expected,
+                    "detail": f"{prev_stage.upper()} PASS ENTITLEMENT AVAILABLE → {expected.upper()}",
+                    "entitlement_key": authority_key,
+                })
+                if stg != expected:
+                    problems.append({
+                        "code": "PASS_TARGET_STAGE_MISMATCH",
+                        "message": f"MT5 {mt5} is {stg.upper()} but MT5 {source_mt5} pass only authorised {expected.upper()}.",
+                        "source_account_id": source_account_id,
+                    })
+
+            elif _np_ja_is_breached(previous):
+                if prev_stage == "phase1" and second_life and phase1_count_before <= 1:
+                    authority_type = "second_life"
+                    authority_key = f"breach:{source_account_id}:second_life"
+                    authority_detail = "LIFE 1 BREACHED → NEW PHASE 1 MT5 ASSIGNED (SECOND LIFE)"
+                    ledger.append({
+                        "type": "ENTITLEMENT_CREATED",
+                        "at": previous.get("breached_at") or previous.get("archived_at") or previous.get("updated_at"),
+                        "journey_id": journey_id,
+                        "purchase_id": journey_id,
+                        "source_account_id": source_account_id,
+                        "mt5_login": source_mt5,
+                        "stage": "phase1",
+                        "detail": "SECOND LIFE ENTITLEMENT AVAILABLE → PHASE 1",
+                        "entitlement_key": authority_key,
+                    })
+                    if stg != "phase1":
+                        problems.append({
+                            "code": "SECOND_LIFE_TARGET_STAGE_MISMATCH",
+                            "message": f"Second Life from MT5 {source_mt5} may only create PHASE1, not {stg.upper()}.",
+                            "source_account_id": source_account_id,
+                        })
+                else:
+                    order = _np_ja_reset_order(reset_orders, source_account_id, journey_id, prev_stage, approved_only=True)
+                    if order:
+                        evidence_id = str(order.get("id") or "")
+                        authority_type = f"paid_{prev_stage}_reset"
+                        authority_key = f"reset:{evidence_id}:{source_account_id}:{prev_stage}"
+                        authority_detail = f"{prev_stage.upper()} BREACHED + RESET PAYMENT APPROVED → NEW {prev_stage.upper()} MT5 ASSIGNED"
+                        ledger.append({
+                            "type": "RESET_PAYMENT_APPROVED",
+                            "at": order.get("approved_at") or order.get("updated_at") or order.get("created_at"),
+                            "journey_id": journey_id,
+                            "purchase_id": journey_id,
+                            "source_account_id": source_account_id,
+                            "mt5_login": source_mt5,
+                            "stage": prev_stage,
+                            "amount": order.get("final_fee") or order.get("amount_due") or order.get("fee"),
+                            "detail": f"RESET PAYMENT APPROVED · {prev_stage.upper()} · entitlement created",
+                        })
+                        ledger.append({
+                            "type": "ENTITLEMENT_CREATED",
+                            "at": order.get("approved_at") or order.get("updated_at") or order.get("created_at"),
+                            "journey_id": journey_id,
+                            "purchase_id": journey_id,
+                            "source_account_id": source_account_id,
+                            "mt5_login": source_mt5,
+                            "stage": prev_stage,
+                            "detail": f"PAID {prev_stage.upper()} RESET ENTITLEMENT AVAILABLE",
+                            "entitlement_key": authority_key,
+                        })
+                        if stg != prev_stage:
+                            problems.append({
+                                "code": "RESET_TARGET_STAGE_MISMATCH",
+                                "message": f"Paid {prev_stage.upper()} reset for MT5 {source_mt5} may only create {prev_stage.upper()}, not {stg.upper()}.",
+                                "source_account_id": source_account_id,
+                            })
+                    elif prev_stage == "funded":
+                        paid = _np_ja_paid_payouts_for_account(payouts, source_account_id)
+                        paid_before_child = [p for p in paid if _np_ja_score(p.get("paid_at") or p.get("updated_at")) <= _np_ja_account_time(account)]
+                        if paid_before_child:
+                            payout = paid_before_child[-1]
+                            evidence_id = str(payout.get("id") or "")
+                            authority_type = "payout_renewal"
+                            authority_key = f"payout:{evidence_id}:renewal"
+                            authority_detail = "PAYOUT PAID → NEW FUNDED MT5 ASSIGNED"
+                            ledger.append({
+                                "type": "ENTITLEMENT_CREATED",
+                                "at": payout.get("paid_at") or payout.get("updated_at"),
+                                "journey_id": journey_id,
+                                "purchase_id": journey_id,
+                                "source_account_id": source_account_id,
+                                "mt5_login": source_mt5,
+                                "stage": "funded",
+                                "detail": "PAID PAYOUT RENEWAL ENTITLEMENT AVAILABLE → FUNDED",
+                                "entitlement_key": authority_key,
+                            })
+                            if stg != "funded":
+                                problems.append({
+                                    "code": "PAYOUT_RENEWAL_STAGE_MISMATCH",
+                                    "message": f"Paid payout on MT5 {source_mt5} may only create FUNDED, not {stg.upper()}.",
+                                    "source_account_id": source_account_id,
+                                })
+                        else:
+                            problems.append({
+                                "code": "UNAUTHORISED_CONTINUATION_AFTER_BREACH",
+                                "message": f"MT5 {source_mt5} breached and no Second Life, paid reset or paid payout authorised MT5 {mt5}.",
+                                "source_account_id": source_account_id,
+                                "account_id": aid,
+                            })
+                    else:
+                        problems.append({
+                            "code": "UNAUTHORISED_CONTINUATION_AFTER_BREACH",
+                            "message": f"MT5 {source_mt5} breached and no legal reset entitlement authorised MT5 {mt5}.",
+                            "source_account_id": source_account_id,
+                            "account_id": aid,
+                        })
+
+            elif prev_stage == "funded":
+                # A funded continuation without a breach is legitimate only after a PAID
+                # payout on that exact funded account.
+                paid = _np_ja_paid_payouts_for_account(payouts, source_account_id)
+                paid_before_child = [p for p in paid if _np_ja_score(p.get("paid_at") or p.get("updated_at")) <= _np_ja_account_time(account)]
+                if paid_before_child:
+                    payout = paid_before_child[-1]
+                    evidence_id = str(payout.get("id") or "")
+                    authority_type = "payout_renewal"
+                    authority_key = f"payout:{evidence_id}:renewal"
+                    authority_detail = "PAYOUT PAID → NEW FUNDED MT5 ASSIGNED"
+                    ledger.append({
+                        "type": "ENTITLEMENT_CREATED",
+                        "at": payout.get("paid_at") or payout.get("updated_at"),
+                        "journey_id": journey_id,
+                        "purchase_id": journey_id,
+                        "source_account_id": source_account_id,
+                        "mt5_login": source_mt5,
+                        "stage": "funded",
+                        "detail": "PAID PAYOUT RENEWAL ENTITLEMENT AVAILABLE → FUNDED",
+                        "entitlement_key": authority_key,
+                    })
+                    if stg != "funded":
+                        problems.append({
+                            "code": "PAYOUT_RENEWAL_STAGE_MISMATCH",
+                            "message": f"Paid payout on MT5 {source_mt5} may only create FUNDED, not {stg.upper()}.",
+                            "source_account_id": source_account_id,
+                        })
+                else:
+                    problems.append({
+                        "code": "FUNDED_CONTINUATION_WITHOUT_PARENT_EVENT",
+                        "message": f"MT5 {mt5} follows funded MT5 {source_mt5} without a paid payout or paid reset parent event.",
+                        "source_account_id": source_account_id,
+                        "account_id": aid,
+                    })
+            else:
+                problems.append({
+                    "code": "ACCOUNT_WITHOUT_IMMEDIATE_PARENT_EVENT",
+                    "message": f"MT5 {mt5} has no proven immediate parent entitlement after MT5 {source_mt5}.",
+                    "source_account_id": source_account_id,
+                    "account_id": aid,
+                })
+
+        if authority_key:
+            entitlements_created.append(authority_key)
+            entitlements_consumed.append(authority_key)
+            transition_reasons[aid] = {
+                "entitlement_key": authority_key,
+                "entitlement_type": authority_type,
+                "source_account_id": source_account_id,
+                "source_mt5": source_mt5,
+                "evidence_id": evidence_id,
+                "detail": authority_detail,
+            }
+
+        ledger.append({
+            "type": "MT5_ASSIGNED",
+            "at": assigned_at,
+            "journey_id": journey_id,
+            "purchase_id": journey_id,
+            "account_id": aid,
+            "source_account_id": source_account_id,
+            "mt5_login": mt5,
+            "previous_mt5": source_mt5,
+            "stage": stg,
+            "detail": (
+                f"NEW MT5 ASSIGNED · {stg.upper()} · {authority_detail or 'AUTHORITY NOT PROVEN'}"
+            ),
+            "authority": transition_reasons.get(aid),
+        })
+        if authority_key:
+            ledger.append({
+                "type": "ENTITLEMENT_CONSUMED",
+                "at": assigned_at,
+                "journey_id": journey_id,
+                "purchase_id": journey_id,
+                "account_id": aid,
+                "source_account_id": source_account_id,
+                "mt5_login": mt5,
+                "stage": stg,
+                "detail": f"ENTITLEMENT CONSUMED → MT5 {mt5}",
+                "entitlement_key": authority_key,
+            })
+
+        if _np_ja_is_recalled(account):
+            ledger.append({
+                "type": "RECALLED",
+                "at": account.get("archived_at") or account.get("updated_at"),
+                "journey_id": journey_id,
+                "purchase_id": journey_id,
+                "account_id": aid,
+                "mt5_login": mt5,
+                "detail": (
+                    "WRONG ASSIGNMENT RECALLED · "
+                    + ("UNUSED — SAME ENTITLEMENT RESTORED" if not _np_ja_account_has_trades(account) else "TRADING ACTIVITY FOUND — RECALL NOT REVERSIBLE")
+                ),
+            })
+        elif _np_ja_is_breached(account):
+            ledger.append({
+                "type": "BREACH",
+                "at": account.get("breached_at") or account.get("breach_at") or account.get("archived_at") or account.get("updated_at"),
+                "journey_id": journey_id,
+                "purchase_id": journey_id,
+                "account_id": aid,
+                "mt5_login": mt5,
+                "stage": stg,
+                "detail": account.get("breach_reason") or account.get("archive_reason") or "ACCOUNT BREACHED",
+            })
+        elif _np_ja_is_passed(account):
+            ledger.append({
+                "type": "PASS",
+                "at": account.get("passed_at") or account.get("archived_at") or account.get("updated_at"),
+                "journey_id": journey_id,
+                "purchase_id": journey_id,
+                "account_id": aid,
+                "mt5_login": mt5,
+                "stage": stg,
+                "detail": f"{stg.upper()} PASSED · progression entitlement created",
+            })
+
+        if stg == "phase1":
+            phase1_count_before += 1
+        previous = account
+
+    # Add payout events to the same journey ledger.
+    for p in payouts:
+        aid = str(p.get("trader_account_id") or p.get("account_id") or "")
+        a = next((x for x in accounts if str(x.get("id") or "") == aid), {})
+        mt5 = p.get("mt5_login") or a.get("mt5_login")
+        requested = p.get("requested_at") or p.get("created_at")
+        if requested:
+            ledger.append({"type":"PAYOUT_REQUESTED","at":requested,"journey_id":journey_id,"account_id":aid,"mt5_login":mt5,"amount":p.get("amount"),"detail":"PAYOUT REQUESTED"})
+        if p.get("approved_at"):
+            ledger.append({"type":"PAYOUT_APPROVED","at":p.get("approved_at"),"journey_id":journey_id,"account_id":aid,"mt5_login":mt5,"amount":p.get("amount"),"detail":"PAYOUT APPROVED"})
+        if p.get("paid_at") or str(p.get("status") or "").lower() == "paid":
+            ledger.append({"type":"PAYOUT_PAID","at":p.get("paid_at") or p.get("updated_at"),"journey_id":journey_id,"account_id":aid,"mt5_login":mt5,"amount":p.get("amount"),"detail":f"PAYOUT PAID · trader share {p.get('payout_split') or 60}%"})
+        if p.get("rejected_at"):
+            ledger.append({"type":"PAYOUT_REJECTED","at":p.get("rejected_at"),"journey_id":journey_id,"account_id":aid,"mt5_login":mt5,"amount":p.get("amount"),"detail":"PAYOUT REJECTED"})
+
+    # Wrong assignment rows excluded above still remain visible and accountable.
+    for a in recalled_unused:
+        ledger.append({
+            "type": "RECALLED",
+            "at": a.get("archived_at") or a.get("updated_at") or a.get("created_at"),
+            "journey_id": journey_id,
+            "purchase_id": journey_id,
+            "account_id": a.get("id"),
+            "mt5_login": a.get("mt5_login"),
+            "detail": "WRONG ASSIGNMENT RECALLED · UNUSED · ORIGINAL ENTITLEMENT RESTORED · JOURNEY RECONCILED",
+        })
+
+    ledger = [x for x in ledger if x.get("at")]
+    ledger.sort(key=lambda x: _np_ja_score(x.get("at")))
+
+    outstanding = None
+    state = "ACTIVE"
+    last = legal_accounts[-1] if legal_accounts else None
+
+    if not problems:
+        if not legal_accounts:
+            if _np_ja_purchase_approved(purchase):
+                outstanding = {
+                    "entitlement_key": initial_key,
+                    "entitlement_type": "initial_purchase",
+                    "source_event_type": "purchase_approved",
+                    "source_account_id": None,
+                    "evidence_id": journey_id,
+                    "target_stage": "phase1",
+                    "status": "AVAILABLE",
+                    "reason": "PAYMENT APPROVED → NEW PHASE 1 MT5 REQUIRED",
+                }
+                if initial_key not in entitlements_created:
+                    entitlements_created.append(initial_key)
+            else:
+                state = "WAITING_PAYMENT"
+
+        elif _np_ja_is_active(last):
+            state = "ACTIVE"
+
+        elif _np_ja_stage(last) in {"phase1", "phase2"} and _np_ja_is_passed(last):
+            target = "funded"
+            key = f"pass:{last.get('id')}:{target}"
+            outstanding = {
+                "entitlement_key": key,
+                "entitlement_type": "phase_pass",
+                "source_event_type": "pass",
+                "source_account_id": last.get("id"),
+                "source_mt5": last.get("mt5_login"),
+                "evidence_id": last.get("id"),
+                "target_stage": target,
+                "status": "AVAILABLE",
+                "reason": f"{_np_ja_stage(last).upper()} PASSED → NEW FUNDED MT5 REQUIRED",
+            }
+            entitlements_created.append(key)
+            state = "WAITING_MT5"
+
+        elif _np_ja_is_breached(last):
+            stg = _np_ja_stage(last)
+            last_id = str(last.get("id") or "")
+            # Exact PAID payout on this same funded source wins before breach reset.
+            if stg == "funded":
+                paid = _np_ja_paid_payouts_for_account(payouts, last_id)
+                if paid:
+                    p = paid[-1]
+                    key = f"payout:{p.get('id')}:renewal"
+                    outstanding = {
+                        "entitlement_key": key,
+                        "entitlement_type": "payout_renewal",
+                        "source_event_type": "payout_paid",
+                        "source_account_id": last_id,
+                        "source_mt5": last.get("mt5_login"),
+                        "evidence_id": p.get("id"),
+                        "target_stage": "funded",
+                        "status": "AVAILABLE",
+                        "reason": "PAYOUT PAID → NEW FUNDED MT5 REQUIRED",
+                    }
+                    entitlements_created.append(key)
+                    state = "WAITING_MT5"
+
+            if outstanding is None and stg == "phase1":
+                phase1_legal_count = sum(1 for a in legal_accounts if _np_ja_stage(a) == "phase1")
+                if second_life and phase1_legal_count == 1:
+                    key = f"breach:{last_id}:second_life"
+                    outstanding = {
+                        "entitlement_key": key,
+                        "entitlement_type": "second_life",
+                        "source_event_type": "breach",
+                        "source_account_id": last_id,
+                        "source_mt5": last.get("mt5_login"),
+                        "evidence_id": last_id,
+                        "target_stage": "phase1",
+                        "status": "AVAILABLE",
+                        "reason": "LIFE 1 BREACHED → NEW PHASE 1 MT5 REQUIRED (SECOND LIFE)",
+                    }
+                    entitlements_created.append(key)
+                    state = "WAITING_MT5"
+
+            if outstanding is None:
+                order = _np_ja_reset_order(reset_orders, last_id, journey_id, stg, approved_only=True)
+                if order:
+                    key = f"reset:{order.get('id')}:{last_id}:{stg}"
+                    outstanding = {
+                        "entitlement_key": key,
+                        "entitlement_type": f"paid_{stg}_reset",
+                        "source_event_type": "reset_payment_approved",
+                        "source_account_id": last_id,
+                        "source_mt5": last.get("mt5_login"),
+                        "evidence_id": order.get("id"),
+                        "target_stage": stg,
+                        "status": "AVAILABLE",
+                        "reason": f"{stg.upper()} BREACHED + RESET PAYMENT APPROVED → NEW {stg.upper()} MT5 REQUIRED",
+                    }
+                    entitlements_created.append(key)
+                    state = "WAITING_MT5"
+                else:
+                    # IMPORTANT BUSINESS LAW:
+                    # A breach with no free/approved entitlement stops the ACCOUNT,
+                    # but does not automatically close the PURCHASE JOURNEY.  The
+                    # same journey may continue later only if an exact paid-reset
+                    # order for this exact breached account is approved.
+                    state = "WAITING_RESET_PAYMENT"
+                    ledger.append({
+                        "type": "RESET_PAYMENT_REQUIRED",
+                        "at": last.get("breached_at") or last.get("archived_at") or last.get("updated_at"),
+                        "journey_id": journey_id,
+                        "purchase_id": journey_id,
+                        "source_account_id": last_id,
+                        "mt5_login": last.get("mt5_login"),
+                        "stage": stg,
+                        "detail": f"{stg.upper()} ACCOUNT STOPPED · NO CURRENT ENTITLEMENT · PAID RESET APPROVAL REQUIRED TO CONTINUE THIS JOURNEY",
+                    })
+
+        elif _np_ja_stage(last) == "funded":
+            paid = _np_ja_paid_payouts_for_account(payouts, last.get("id"))
+            if paid:
+                p = paid[-1]
+                key = f"payout:{p.get('id')}:renewal"
+                outstanding = {
+                    "entitlement_key": key,
+                    "entitlement_type": "payout_renewal",
+                    "source_event_type": "payout_paid",
+                    "source_account_id": last.get("id"),
+                    "source_mt5": last.get("mt5_login"),
+                    "evidence_id": p.get("id"),
+                    "target_stage": "funded",
+                    "status": "AVAILABLE",
+                    "reason": "PAYOUT PAID → NEW FUNDED MT5 REQUIRED",
+                }
+                entitlements_created.append(key)
+                state = "WAITING_MT5"
+
+    # Explicit business closure is different from a breach waiting for payment.
+    purchase_terminal = str(purchase.get("status") or purchase.get("lifecycle_state") or "").strip().lower()
+    if purchase_terminal in {"closed","cancelled","canceled","terminated","journey_closed"} and outstanding is None and not problems:
+        state = "CLOSED"
+        ledger.append({
+            "type": "JOURNEY_CLOSED",
+            "at": purchase.get("updated_at") or now_iso(),
+            "journey_id": journey_id,
+            "purchase_id": journey_id,
+            "detail": "JOURNEY EXPLICITLY CLOSED · NO FURTHER ENTITLEMENT MAY BE CREATED",
+        })
+
+    if problems:
+        state = "BLOCKED"
+        outstanding = None
+
+    # Remove duplicate keys caused by reconstruction.
+    entitlements_created = list(dict.fromkeys([x for x in entitlements_created if x]))
+    entitlements_consumed = list(dict.fromkeys([x for x in entitlements_consumed if x]))
+    outstanding_count = 1 if outstanding else 0
+
+    # ACCOUNTABILITY BALANCE:
+    # every non-recalled delivered MT5 must consume exactly one entitlement.
+    # unused recalls are explicit cancellations/restorations, not disappearing rows.
+    delivered_count = len([a for a in legal_accounts if a.get("mt5_login")])
+    consumed_count = len(entitlements_consumed)
+    recalled_unused_count = len(recalled_unused)
+    balance_ok = bool(
+        not problems
+        and delivered_count == consumed_count
+        and outstanding_count in {0, 1}
+    )
+
+    accountability = "RECONCILED" if balance_ok else "BLOCKED"
+    if not balance_ok and not problems:
+        problems.append({
+            "code": "ENTITLEMENT_BALANCE_MISMATCH",
+            "message": f"Delivered MT5 count {delivered_count} does not match consumed entitlement count {consumed_count}.",
+        })
+        state = "BLOCKED"
+        outstanding = None
+        accountability = "BLOCKED"
+
+    return {
+        "ok": not bool(problems),
+        "blocked": bool(problems),
+        "trader_id": trader_id,
+        "journey_id": journey_id,
+        "purchase_id": journey_id,
+        "purchase": purchase,
+        "state": state,
+        "closed": state == "CLOSED",
+        "next_action": (
+            "BLOCKED_RECONCILIATION_REQUIRED" if state == "BLOCKED"
+            else "RESET_PAYMENT_REQUIRED" if state == "WAITING_RESET_PAYMENT"
+            else "ASSIGN_MT5" if state == "WAITING_MT5"
+            else "WAITING_PAYMENT" if state == "WAITING_PAYMENT"
+            else "NONE"
+        ),
+        "accountability_status": accountability,
+        "accounts": [_decorate_account_for_api(a) for a in accounts],
+        "payouts": payouts,
+        "ledger": ledger,
+        "problems": problems,
+        "outstanding_entitlement": outstanding,
+        "accountability": {
+            "entitlements_created": len(entitlements_created),
+            "entitlements_consumed": consumed_count,
+            "wrong_assignments_recalled_unused": recalled_unused_count,
+            "wrong_assignments_recalled_with_activity": len(recalled_used),
+            "delivered_mt5": delivered_count,
+            "outstanding_entitlement": outstanding_count,
+            "balance": outstanding_count,
+            "status": accountability,
+        },
+    }
+
+
+def _np_ja_all_for_trader(trader_id):
+    trader_id = str(trader_id or "").strip()
+    roots, reset_orders = _np_ja_root_and_reset_orders(trader_id)
+    journeys = []
+    for p in roots:
+        pid = str(p.get("id") or "").strip()
+        if pid:
+            try:
+                journeys.append(_np_ja_journey_authority(trader_id, pid))
+            except Exception as exc:
+                journeys.append({
+                    "ok": False, "blocked": True, "trader_id": trader_id,
+                    "journey_id": pid, "purchase_id": pid, "state": "BLOCKED",
+                    "accountability_status": "BLOCKED",
+                    "outstanding_entitlement": None,
+                    "problems": [{"code":"AUTHORITY_RECONSTRUCTION_ERROR","message":str(exc)}],
+                    "purchase": p, "accounts": [], "payouts": [], "ledger": [],
+                })
+    return journeys
+
+
+@app.route("/admin_journey_authority", methods=["GET", "OPTIONS"])
+def admin_journey_authority():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    journey_id = str(request.args.get("journey_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+    try:
+        if journey_id:
+            data = _np_ja_journey_authority(trader_id, journey_id)
+            return _np_ok({"journey": data, "generated_at": now_iso()})
+        return _np_ok({"journeys": _np_ja_all_for_trader(trader_id), "generated_at": now_iso()})
+    except Exception as exc:
+        print("JOURNEY AUTHORITY ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+def _np_ja_assert_entitlement(trader_id, journey_id, target_stage, source_account_id=None, entitlement_types=None):
+    auth = _np_ja_journey_authority(trader_id, journey_id)
+    if auth.get("blocked"):
+        raise ValueError("Journey blocked: " + "; ".join(x.get("message","") for x in auth.get("problems",[])[:3]))
+    ent = auth.get("outstanding_entitlement")
+    if not ent:
+        if auth.get("state") == "CLOSED":
+            raise ValueError("Journey closed: no valid entitlement remains")
+        raise ValueError("No verified unconsumed assignment entitlement exists on this journey")
+    if _normalize_lifecycle_stage(ent.get("target_stage")) != _normalize_lifecycle_stage(target_stage):
+        raise ValueError(
+            f"Journey entitlement is for {str(ent.get('target_stage')).upper()}, "
+            f"not {str(target_stage).upper()}"
+        )
+    if source_account_id and str(ent.get("source_account_id") or "") != str(source_account_id or ""):
+        raise ValueError("Source account does not match the journey entitlement")
+    if entitlement_types and str(ent.get("entitlement_type") or "") not in set(entitlement_types):
+        raise ValueError("Wrong entitlement type for this assignment path")
+    return auth, ent
+
+
+# ---- Wrap automatic Phase progression / Second Life. ----
+_np_ja_auto_assign_waiting_stage_core = _np_auto_assign_waiting_stage
+
+def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"):
+    pid = str((purchase or {}).get("id") or "").strip()
+    tid = str((trader or {}).get("id") or "").strip()
+    if pid and tid and _np_automation_generation_purchase(purchase):
+        allowed = {"phase_pass"} if reason == "lifecycle_progression" else {"second_life"}
+        auth, ent = _np_ja_assert_entitlement(
+            tid, pid, stage,
+            source_account_id=(source_account or {}).get("id") if source_account else None,
+            entitlement_types=allowed,
+        )
+        _audit_safe(
+            "journey_authority", "automation_authorized",
+            f"journey={pid} entitlement={ent.get('entitlement_key')} target={stage}",
+            {"name":"system","username":"system","role":"system"}, pid
+        )
+    return _np_ja_auto_assign_waiting_stage_core(trader, stage, purchase, source_account, reason)
+
+
+# ---- Wrap automatic paid-payout renewal. ----
+_np_ja_auto_post_payout_renewal_core = _np_auto_post_payout_renewal
+
+def _np_auto_post_payout_renewal(payout):
+    payout = payout or {}
+    source_id = str(payout.get("trader_account_id") or payout.get("account_id") or "").strip()
+    if source_id:
+        rows = supabase.table("trader_accounts").select("*").eq("id", source_id).limit(1).execute().data or []
+        if rows:
+            source = rows[0]
+            tid = str(source.get("trader_id") or "").strip()
+            pid = str(source.get("purchase_id") or "").strip()
+            if tid and pid:
+                prows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
+                purchase = prows[0] if prows else None
+                if purchase and _np_automation_generation_purchase(purchase):
+                    auth, ent = _np_ja_assert_entitlement(
+                        tid, pid, "funded", source_account_id=source_id,
+                        entitlement_types={"payout_renewal"},
+                    )
+                    if str(ent.get("evidence_id") or "") != str(payout.get("id") or ""):
+                        raise ValueError("Paid payout does not match the journey's exact renewal entitlement")
+    return _np_ja_auto_post_payout_renewal_core(payout)
+
+
+# ---- Final assignment-route gate: staff/manual assignment is also journey-safe. ----
+_np_ja_assign_phase_view_core = app.view_functions.get("assign_phase_mt5")
+
+def _np_ja_assign_phase_route():
+    if request.method == "OPTIONS":
+        return _np_ja_assign_phase_view_core()
+    d = request.get_json(silent=True) or {}
+    source_id = str(
+        d.get("completed_account_id") or d.get("source_account_id")
+        or d.get("trader_account_id") or ""
+    ).strip()
+    target_stage = _normalize_lifecycle_stage(d.get("phase") or d.get("target_stage") or d.get("stage") or "")
+    if source_id and target_stage in ACCOUNT_STAGES:
+        rows = supabase.table("trader_accounts").select("*").eq("id", source_id).limit(1).execute().data or []
+        if rows:
+            source = rows[0]
+            tid = str(source.get("trader_id") or d.get("trader_id") or "").strip()
+            pid = str(source.get("purchase_id") or "").strip()
+            if tid and pid:
+                prows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
+                purchase = prows[0] if prows else None
+                if purchase and _np_automation_generation_purchase(purchase):
+                    _np_ja_assert_entitlement(tid, pid, target_stage, source_account_id=source_id)
+    resp = _np_ja_assign_phase_view_core()
+    try:
+        # Reconcile immediately after assignment so the cockpit sees the consumed chain.
+        if source_id:
+            rows = supabase.table("trader_accounts").select("trader_id,purchase_id").eq("id", source_id).limit(1).execute().data or []
+            if rows and rows[0].get("purchase_id"):
+                _np_ja_journey_authority(rows[0].get("trader_id"), rows[0].get("purchase_id"))
+    except Exception as exc:
+        print("JOURNEY AUTHORITY POST-ASSIGN RECONCILE:", exc)
+    return resp
+
+if _np_ja_assign_phase_view_core:
+    app.view_functions["assign_phase_mt5"] = _np_ja_assign_phase_route
+
+
+# ---- Initial purchase assignment gate.  Reset-payment approvals remain untouched. ----
+_np_ja_approve_purchase_view_core = app.view_functions.get("approve_challenge_purchase")
+
+def _np_ja_approve_purchase_route():
+    d = request.get_json(silent=True) or {}
+    pid = str(d.get("id") or d.get("purchase_id") or "").strip()
+    mt5_id = str(d.get("mt5_id") or "").strip()
+    if pid and mt5_id:
+        rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
+        p = rows[0] if rows else None
+        # Reset orders are children of an existing journey, not new journeys.
+        if p and not _np_ja_reset_marker(p.get("admin_note")) and _np_automation_generation_purchase(p):
+            auth = _np_ja_journey_authority(str(p.get("trader_id") or ""), pid)
+            ent = auth.get("outstanding_entitlement")
+            if auth.get("blocked"):
+                return _np_fail("Initial assignment blocked by Journey Authority", 409)
+            if auth.get("accounts"):
+                return _np_fail("This journey already has account history. Use the exact lifecycle action, not purchase approval.", 409)
+            # During payment approval the purchase row may still be pending, so allow only
+            # the first PHASE1 account and no other account history.
+            if ent and ent.get("target_stage") not in {"phase1", None}:
+                return _np_fail("Purchase approval cannot create this target stage", 409)
+    return _np_ja_approve_purchase_view_core()
+
+if _np_ja_approve_purchase_view_core:
+    app.view_functions["approve_challenge_purchase"] = _np_ja_approve_purchase_route
+
+
+# Marker for deployment / support.
+NAIRAPIPS_JOURNEY_AUTHORITY_RELEASE = "JOURNEY_AUTHORITY_STAFF_SAFE_2026_09_12"
+
