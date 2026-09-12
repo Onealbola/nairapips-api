@@ -28296,3 +28296,193 @@ app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_cuto
 
 NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "CUTOVER_RESET_MIGRATION_BRIDGE_V7_2026_09_12"
 
+
+
+# ============================================================================
+# NAIRAPIPS RESET REPLACEMENT RECONCILIATION V8 — 12 SEP 2026
+# ============================================================================
+
+def _np_find_exact_reset_replacement_v8(source, order=None):
+    source = source or {}
+    source_id = str(source.get("id") or "").strip()
+    trader_id = str(source.get("trader_id") or "").strip()
+    parent_id = str(source.get("purchase_id") or source.get("challenge_purchase_id") or "").strip()
+    if not source_id or not trader_id:
+        return None
+
+    order_id = str((order or {}).get("id") or "").strip()
+    blob = _np_kill_blob(source)
+
+    rid = str(source.get("reset_replacement_account_id") or "").strip()
+    if rid:
+        rows = supabase.table("trader_accounts").select("*").eq("id", rid).eq("trader_id", trader_id).limit(1).execute().data or []
+        if rows:
+            return rows[0]
+
+    m = re.search(r"replacement_account_id\s*=\s*([a-f0-9\-]{16,})", blob, re.I)
+    if m:
+        rows = supabase.table("trader_accounts").select("*").eq("id", m.group(1).strip()).eq("trader_id", trader_id).limit(1).execute().data or []
+        if rows:
+            return rows[0]
+
+    m = re.search(r"replacement_mt5\s*=\s*([0-9]+)", blob, re.I)
+    if m:
+        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).eq("mt5_login", m.group(1).strip()).limit(2).execute().data or []
+        if len(rows) == 1:
+            return rows[0]
+
+    try:
+        rows = supabase.table("trader_accounts").select("*").eq("trader_id", trader_id).limit(5000).execute().data or []
+    except Exception:
+        rows = []
+
+    source_time = _np_ja_score(source.get("reset_consumed_at") or source.get("archived_at") or source.get("updated_at") or source.get("created_at"))
+    candidates = []
+    for a in rows:
+        if str(a.get("id") or "") == source_id:
+            continue
+        parent_refs = {
+            str(a.get("parent_account_id") or "").strip(),
+            str(a.get("source_account_id") or "").strip(),
+            str(a.get("replaces_account_id") or "").strip(),
+            str(a.get("reset_source_account_id") or "").strip(),
+        }
+        if source_id in parent_refs:
+            return a
+        apid = str(a.get("purchase_id") or a.get("challenge_purchase_id") or "").strip()
+        if parent_id and apid and apid != parent_id:
+            continue
+        if _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) != _normalize_lifecycle_stage(source.get("stage") or source.get("phase")):
+            continue
+        if _np_ja_account_time(a) <= source_time:
+            continue
+        candidates.append(a)
+
+    if order:
+        order_time = _np_ja_score(order.get("approved_at") or order.get("updated_at") or order.get("created_at"))
+        after_order = [a for a in candidates if _np_ja_account_time(a) >= order_time]
+        if after_order:
+            candidates = after_order
+
+    candidates.sort(key=_np_ja_account_time)
+    if len(candidates) == 1:
+        return candidates[0]
+
+    strong=[]
+    for a in candidates:
+        ablob = " ".join(str(a.get(k) or "") for k in ("archive_reason","reset_reason","admin_note","message")).lower()
+        if (order_id and order_id.lower() in ablob) or source_id.lower() in ablob:
+            strong.append(a)
+    return strong[0] if len(strong)==1 else None
+
+
+def _np_reconcile_consumed_reset_bridge_v8(bridge, source, journey):
+    bridge=bridge or {}; source=source or {}; journey=journey or {}
+    order=bridge.get("order") or {}
+    replacement=_np_find_exact_reset_replacement_v8(source, order)
+    if not replacement:
+        return False
+
+    replacement_id=str(replacement.get("id") or "").strip()
+    replacement_mt5=str(replacement.get("mt5_login") or "").strip()
+    order_id=str(bridge.get("order_id") or order.get("id") or "").strip()
+    now=now_iso()
+
+    try:
+        payload={
+            "reset_consumed_at": source.get("reset_consumed_at") or now,
+            "reset_replacement_account_id": replacement_id,
+            "account_status":"archived",
+            "updated_at":now,
+            "archive_reason":(str(source.get("archive_reason") or "")+f" | reset_consumed replacement_account_id={replacement_id} replacement_mt5={replacement_mt5}").strip(" |"),
+        }
+        try:
+            supabase.table("trader_accounts").update(payload).eq("id",source.get("id")).execute()
+        except Exception:
+            payload.pop("reset_consumed_at",None); payload.pop("reset_replacement_account_id",None)
+            supabase.table("trader_accounts").update(payload).eq("id",source.get("id")).execute()
+    except Exception as exc:
+        print("V8 source reconciliation skipped:",exc)
+
+    if order_id:
+        try:
+            supabase.table("challenge_purchases").update({"status":"completed","updated_at":now}).eq("id",order_id).execute()
+        except Exception:
+            pass
+
+    accounts=list(journey.get("accounts") or [])
+    if not any(str(a.get("id") or "")==replacement_id for a in accounts):
+        accounts.append(_decorate_account_for_api(replacement))
+    journey["accounts"]=accounts
+    stage=_normalize_lifecycle_stage(replacement.get("stage") or replacement.get("phase") or bridge.get("target_stage"))
+    journey["current_account"]=_decorate_account_for_api(replacement)
+    journey["current_mt5"]=replacement_mt5
+    journey["state"]="ACTIVE" if _np_ja_is_active(replacement) else str(replacement.get("account_status") or replacement.get("status") or "ACTIVE").upper()
+    journey["closed"]=False
+    journey["blocked"]=False
+    journey["accountability_status"]="RECONCILED"
+    journey["outstanding_entitlement"]=None
+    journey["next_action"]="NONE"
+    journey["migration_bridge"]={
+        "type":"PAID_RESET","order_id":order_id,"source_account_id":source.get("id"),"source_mt5":source.get("mt5_login"),
+        "replacement_account_id":replacement_id,"replacement_mt5":replacement_mt5,"target_stage":stage,"status":"CONSUMED"
+    }
+
+    ledger=list(journey.get("ledger") or [])
+    if not any(str(x.get("type") or "")=="RESET_REPLACEMENT_ASSIGNED" and str(x.get("mt5_login") or "")==replacement_mt5 for x in ledger):
+        at=replacement.get("assigned_at") or replacement.get("started_at") or replacement.get("created_at") or now
+        ent_key=f"reset:{order_id}:{source.get('id')}:{stage}"
+        ledger.extend([
+            {"type":"RESET_REPLACEMENT_ASSIGNED","at":at,"journey_id":journey.get("journey_id"),"purchase_id":journey.get("purchase_id"),"source_account_id":source.get("id"),"mt5_login":replacement_mt5,"account_id":replacement_id,"stage":stage,"evidence_id":order_id,"detail":f"NEW MT5 ASSIGNED · {stage.upper()} RESET · MT5 {replacement_mt5}"},
+            {"type":"ENTITLEMENT_CONSUMED","at":at,"journey_id":journey.get("journey_id"),"purchase_id":journey.get("purchase_id"),"source_account_id":source.get("id"),"mt5_login":replacement_mt5,"account_id":replacement_id,"stage":stage,"evidence_id":order_id,"entitlement_key":ent_key,"detail":f"RESET ENTITLEMENT CONSUMED → MT5 {replacement_mt5}"},
+        ])
+        ledger=[x for x in ledger if x.get("at")]
+        ledger.sort(key=lambda x:_np_ja_score(x.get("at")))
+        journey["ledger"]=ledger
+    return True
+
+
+_np_cutover_bundle_v7_core=_np_all_journeys_preserved_v5
+
+def _np_all_journeys_preserved_v5(trader_id):
+    bundle=_np_cutover_bundle_v7_core(trader_id)
+    for j in bundle.get("journeys") or []:
+        if str(j.get("control_mode") or "")!="CLEAN_MIGRATION_RESET":
+            continue
+        meta=j.get("migration_bridge") or {}
+        source_id=str(meta.get("source_account_id") or "").strip()
+        order_id=str(meta.get("order_id") or "").strip()
+        if not source_id or not order_id:
+            continue
+        srows=supabase.table("trader_accounts").select("*").eq("id",source_id).limit(1).execute().data or []
+        if not srows:
+            continue
+        source=srows[0]
+        orows=supabase.table("challenge_purchases").select("*").eq("id",order_id).limit(1).execute().data or []
+        order=orows[0] if orows else {}
+        bridge=dict(meta); bridge["order"]=order; bridge["order_id"]=order_id
+        bridge["target_stage"]=bridge.get("target_stage") or _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+        _np_reconcile_consumed_reset_bridge_v8(bridge,source,j)
+    return bundle
+
+
+def _np_admin_journey_authority_cutover_v8():
+    if request.method=="OPTIONS": return _np_ok({})
+    staff=_require_staff_request()
+    if isinstance(staff,tuple): return staff
+    trader_id=str(request.args.get("trader_id") or "").strip(); journey_id=str(request.args.get("journey_id") or "").strip()
+    if not trader_id: return _np_fail("trader_id is required",400)
+    try:
+        bundle=_np_all_journeys_preserved_v5(trader_id)
+        if journey_id:
+            journey=next((j for j in bundle.get("journeys") or [] if str(j.get("journey_id") or "")==journey_id),None)
+            if not journey: return _np_fail("journey not found",404)
+            return _np_ok({"journey":journey,"cutover_date":bundle.get("cutover_date"),"identity_trader_ids":bundle.get("identity_trader_ids") or [],"identity_profiles":bundle.get("identity_profiles") or [],"reconciliation":bundle.get("reconciliation") or [],"history_debug":bundle.get("history_debug") or {},"generated_at":now_iso()})
+        return _np_ok({"journeys":bundle.get("journeys") or [],"cutover_date":bundle.get("cutover_date"),"identity_trader_ids":bundle.get("identity_trader_ids") or [],"identity_profiles":bundle.get("identity_profiles") or [],"reconciliation":bundle.get("reconciliation") or [],"history_debug":bundle.get("history_debug") or {},"generated_at":now_iso()})
+    except Exception as exc:
+        print("JOURNEY AUTHORITY CUTOVER V8 ERROR:",exc)
+        return _np_fail(str(exc),500)
+
+app.view_functions["admin_journey_authority"]=_np_admin_journey_authority_cutover_v8
+NAIRAPIPS_CLEAN_CUTOVER_RELEASE="RESET_REPLACEMENT_RECONCILIATION_V8_2026_09_12"
+
