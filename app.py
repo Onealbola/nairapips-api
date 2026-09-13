@@ -30003,3 +30003,38 @@ def _np_ja_is_passed(a):
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PASS_PREDICATE_UNIFIED_V17_2026_09_13"
 
+
+
+# ============================================================================
+# NAIRAPIPS ADMIN AUTHORITY AUTH-BRIDGE V18 — 13 SEP 2026
+#
+# FORENSIC ROOT CAUSE:
+# Multiple Journey Authority endpoints call _require_staff_request(), including
+# the currently rebound /admin_journey_authority and the PASS->FUNDED authority
+# endpoints. The production file contains those calls but NO definition of that
+# helper. Python compiles undefined names, so deployment succeeds; at request
+# time the endpoints raise NameError and Admin silently falls back to local/read-
+# only rendering. That is why the cockpit keeps saying JOURNEY AUTHORITY NOT
+# AVAILABLE while the ledger already knows FUNDED ACCOUNT OWED.
+#
+# This bridge does one thing only: reuse the EXISTING Admin bearer-auth authority
+# (_require_admin) and adapt its return shape to the legacy callers that expect
+# either an authenticated admin object or a Flask response tuple.
+#
+# It does NOT alter journey rules, cutoff rules, entitlements, MT5 assignment,
+# payout, reset, Second Life, pass detection, or duplicate protection.
+# ============================================================================
+
+def _require_staff_request():
+    admin, auth_response = _require_admin()
+    if auth_response is not None:
+        try:
+            code = int(getattr(auth_response, "status_code", 401) or 401)
+        except Exception:
+            code = 401
+        return (auth_response, code)
+    return admin
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "ADMIN_AUTHORITY_AUTH_BRIDGE_V18_2026_09_13"
+
