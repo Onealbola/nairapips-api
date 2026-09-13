@@ -29556,3 +29556,191 @@ def admin_second_life_status_v14():
 
 NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "ADMIN_SECOND_LIFE_SHARED_AUTHORITY_V14_2026_09_13"
 
+
+
+# ============================================================================
+# NAIRAPIPS CLEAN PASS -> FUNDED AUTOMATION V15 — 13 SEP 2026
+#
+# FORENSIC ROOT CAUSE:
+# MT5/monitoring pass handling can use _pass_specific_account().
+# That function archived the passed account and updated lifecycle state, but did
+# NOT call _np_auto_assign_waiting_stage(). _pass_stage() did.
+#
+# Therefore a legitimate clean 12-Sep+ Phase-1 PASS could record:
+#   PASS -> FUNDED ACCOUNT OWED
+# but never actually fire the Funded auto-assignment.
+#
+# V15 makes both pass paths use the SAME protected assignment authority.
+# No entitlement is invented here; Journey Authority must confirm the exact
+# phase_pass entitlement before the existing MT5 assignment engine can act.
+# ============================================================================
+
+_np_pass_specific_account_v14_core = _pass_specific_account
+
+def _pass_specific_account(trader, account, pass_status, staff=None, note="Stage passed"):
+    updated, archived = _np_pass_specific_account_v14_core(
+        trader, account, pass_status, staff, note
+    )
+
+    try:
+        source = archived or account or {}
+        purchase = _safe_purchase_for_account(source) or _safe_purchase_for_account(account)
+        if purchase and _np_automation_generation_purchase(purchase):
+            plan = _safe_plan_for_purchase(purchase)
+            stage = _normalize_lifecycle_stage(source.get("stage") or account.get("stage"))
+            next_stage = _next_stage_for_lifecycle(stage, source, purchase, plan, updated or trader)
+
+            if next_stage:
+                result = _np_auto_assign_waiting_stage(
+                    updated or trader,
+                    next_stage,
+                    purchase,
+                    source,
+                    "lifecycle_progression",
+                )
+                if result and isinstance(result, dict):
+                    updated = result.get("trader") or updated
+    except Exception as exc:
+        # Pass remains valid; failed assignment remains an outstanding entitlement.
+        # We never manufacture another account on exception.
+        print("V15 CLEAN PASS AUTO ASSIGN DEFERRED:", exc)
+
+    return updated, archived
+
+
+def _np_exact_clean_journey_authority_v15(purchase_id):
+    """Resolve one clean journey by immutable purchase id and its true owner."""
+    pid = str(purchase_id or "").strip()
+    if not pid:
+        raise ValueError("purchase_id is required")
+
+    rows = (
+        supabase.table("challenge_purchases").select("*")
+        .eq("id", pid).limit(1).execute().data or []
+    )
+    if not rows:
+        raise ValueError("purchase not found")
+
+    purchase = rows[0]
+    if not _np_automation_generation_purchase(purchase):
+        raise ValueError("This is not a clean 12-Sep+ automation purchase")
+
+    owner_tid = str(purchase.get("trader_id") or "").strip()
+    if not owner_tid:
+        raise ValueError("purchase owner is missing")
+
+    auth = _np_ja_journey_authority(owner_tid, pid)
+    auth["purchase"] = purchase
+    auth["control_mode"] = "CLEAN_AUTOMATION"
+    auth["trader_id"] = owner_tid
+    return auth
+
+
+@app.route("/admin_journey_authority/exact", methods=["GET", "OPTIONS"])
+def admin_journey_authority_exact_v15():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+
+    pid = str(request.args.get("purchase_id") or "").strip()
+    if not pid:
+        return _np_fail("purchase_id is required", 400)
+
+    try:
+        auth = _np_exact_clean_journey_authority_v15(pid)
+        return _np_ok({
+            "journey": auth,
+            "generated_at": now_iso(),
+            "read_only": True,
+        })
+    except ValueError as exc:
+        return _np_fail(str(exc), 409)
+    except Exception as exc:
+        print("V15 EXACT JOURNEY AUTHORITY ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+@app.route("/admin_journey_authority/reconcile_due", methods=["POST", "OPTIONS"])
+def admin_journey_authority_reconcile_due_v15():
+    """Recover an already-missed clean automation event.
+
+    This is deliberately POST-only and staff-authenticated. It cannot choose a
+    stage or invent an entitlement: target/source come only from Journey Authority.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+
+    d = request.get_json(silent=True) or {}
+    pid = str(d.get("purchase_id") or "").strip()
+    if not pid:
+        return _np_fail("purchase_id is required", 400)
+
+    try:
+        auth = _np_exact_clean_journey_authority_v15(pid)
+
+        if auth.get("blocked"):
+            return _np_fail("Journey Authority has blocked this journey", 409)
+
+        ent = auth.get("outstanding_entitlement") or {}
+        if not ent:
+            return _np_fail("No verified unconsumed assignment entitlement exists", 409)
+
+        # Recovery endpoint is intentionally narrow: only a missed pass->funded
+        # progression may be replayed here.
+        if str(ent.get("entitlement_type") or "") != "phase_pass":
+            return _np_fail("This recovery endpoint only handles missed phase-pass progression", 409)
+
+        target = _normalize_lifecycle_stage(ent.get("target_stage"))
+        if target != "funded":
+            return _np_fail("Verified phase-pass entitlement is not for Funded", 409)
+
+        source_id = str(ent.get("source_account_id") or "").strip()
+        if not source_id:
+            return _np_fail("Journey Authority did not provide an exact source account", 409)
+
+        srows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", source_id).limit(1).execute().data or []
+        )
+        if not srows:
+            return _np_fail("Source account not found", 409)
+        source = srows[0]
+
+        purchase = auth.get("purchase") or {}
+        trader = get_trader_by_id(str(purchase.get("trader_id") or ""))
+        if not trader:
+            return _np_fail("Trader not found", 409)
+
+        result = _np_auto_assign_waiting_stage(
+            trader, "funded", purchase, source, "lifecycle_progression"
+        )
+
+        # Re-read authority after attempted fulfillment.
+        after = _np_exact_clean_journey_authority_v15(pid)
+
+        return _np_ok({
+            "success": True,
+            "result": result,
+            "journey": after,
+            "message": (
+                "Missed clean pass automation replayed through Journey Authority. "
+                "If inventory was available, the Funded entitlement is now consumed."
+            ),
+        })
+
+    except ValueError as exc:
+        return _np_fail(str(exc), 409)
+    except Exception as exc:
+        print("V15 MISSED AUTOMATION RECONCILE ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PASS_TO_FUNDED_SHARED_AUTHORITY_V15_2026_09_13"
+
