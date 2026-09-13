@@ -30038,3 +30038,242 @@ def _require_staff_request():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "ADMIN_AUTHORITY_AUTH_BRIDGE_V18_2026_09_13"
 
+
+
+# ============================================================================
+# NAIRAPIPS VERIFIED AUTOMATION RETRY WORKER V19 — 13 SEP 2026
+#
+# FORENSIC ROOT CAUSE:
+# The production file explicitly disabled the broad inventory retry on 11-Sep:
+#     _np_resume_waiting_zero_cost_automations(...)
+# returned {broad_retry_disabled: True} without retrying anything.
+# Yet inventory alerts promised: "the queue will retry automatically."
+#
+# V19 restores retry WITHOUT restoring unsafe historical sweeping.
+# It retries ONLY current, exact, server-verifiable outstanding obligations:
+#   1) clean 12-Sep+ PHASE1 PASS -> FUNDED, proven by purchase_id + source account
+#   2) already-activated Second Life in life2_waiting_mt5 / waiting_mt5
+#
+# It does NOT infer from trader-wide status, plan size, old payout history or old
+# legacy rows. Every actual MT5 release still goes through the existing protected
+# _np_auto_assign_waiting_stage() duplicate/source-consumption/inventory guards.
+#
+# Retry triggers:
+#   - every fresh MT5 inventory insertion (existing create_mt5 route already calls
+#     _np_resume_waiting_zero_cost_automations dynamically)
+#   - monitoring heartbeat, rate-limited to one sweep per 45 seconds per process
+#
+# Therefore:
+#   no inventory -> entitlement remains due -> add inventory -> automatic retry
+#   transient miss -> next monitoring heartbeat -> automatic retry
+# ============================================================================
+
+_NP_VERIFIED_RETRY_LOCK = __import__('threading').Lock()
+_NP_VERIFIED_RETRY_LAST_TS = 0.0
+_NP_VERIFIED_RETRY_MIN_INTERVAL = 45.0
+
+
+def _np_retry_clean_pass_funded_v19(limit=250):
+    summary = {"checked": 0, "due": 0, "assigned": 0, "already_fulfilled": 0, "waiting_inventory": 0, "errors": 0}
+    try:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .gte("created_at", _NP_AUTOMATION_GENERATION_CUTOFF.isoformat())
+            .order("created_at", desc=False).limit(limit).execute().data or []
+        )
+    except Exception as exc:
+        print("V19 PASS RETRY PURCHASE LOAD FAILED:", exc)
+        summary["errors"] += 1
+        return summary
+
+    for purchase in rows:
+        try:
+            # Child reset-payment rows are never challenge roots.
+            if not _np_automation_generation_purchase(purchase):
+                continue
+
+            pid = str(purchase.get("id") or "").strip()
+            if not pid:
+                continue
+
+            truth = _np_exact_pass_funded_due_v16(pid)
+            summary["checked"] += 1
+
+            if not truth.get("ok"):
+                continue
+            if truth.get("consumed") or truth.get("reason") == "funded_already_assigned":
+                summary["already_fulfilled"] += 1
+                continue
+            if not truth.get("due"):
+                continue
+            if truth.get("entitlement_type") != "phase_pass":
+                continue
+            if _normalize_lifecycle_stage(truth.get("target_stage")) != "funded":
+                continue
+
+            summary["due"] += 1
+            source_id = str(truth.get("source_account_id") or "").strip()
+            trader_id = str(truth.get("trader_id") or purchase.get("trader_id") or "").strip()
+            if not source_id or not trader_id:
+                summary["errors"] += 1
+                continue
+
+            source_rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", source_id).eq("trader_id", trader_id)
+                .limit(1).execute().data or []
+            )
+            if not source_rows:
+                summary["errors"] += 1
+                continue
+
+            trader = get_trader_by_id(trader_id)
+            if not trader:
+                summary["errors"] += 1
+                continue
+
+            result = _np_auto_assign_waiting_stage(
+                trader, "funded", purchase, source_rows[0], "lifecycle_progression"
+            )
+
+            if result:
+                if result.get("already_fulfilled"):
+                    summary["already_fulfilled"] += 1
+                else:
+                    summary["assigned"] += 1
+                    _audit_safe(
+                        "automation", "retry_pass_funded_fulfilled",
+                        f"VERIFIED RETRY: purchase={pid}; source_mt5={truth.get('source_mt5')}; funded_mt5={(result.get('account') or {}).get('mt5_login')}",
+                        {"name":"automation_retry","username":"automation_retry","role":"system"},
+                        source_id,
+                    )
+            else:
+                # Authority remains unconsumed. Usually this means no eligible
+                # fresh Funded MT5 inventory; the next trigger will try again.
+                after = _np_exact_pass_funded_due_v16(pid)
+                if after.get("due"):
+                    summary["waiting_inventory"] += 1
+        except Exception as exc:
+            summary["errors"] += 1
+            print("V19 PASS->FUNDED RETRY ERROR:", exc)
+
+    return summary
+
+
+def _np_retry_waiting_second_lives_v19(limit=250):
+    summary = {"checked": 0, "assigned": 0, "waiting_inventory": 0, "errors": 0}
+    try:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .in_("second_life_status", ["life2_waiting_mt5", "waiting_mt5"])
+            .eq("second_life_used", True)
+            .order("updated_at", desc=False).limit(limit).execute().data or []
+        )
+    except Exception as exc:
+        print("V19 SECOND LIFE RETRY LOAD FAILED:", exc)
+        summary["errors"] += 1
+        return summary
+
+    actor = {"name":"automation_retry","username":"automation_retry","role":"system"}
+    for purchase in rows:
+        try:
+            if not _np_automation_generation_purchase(purchase):
+                continue
+            trader_id = str(purchase.get("trader_id") or "").strip()
+            if not trader_id:
+                continue
+            summary["checked"] += 1
+            result = _np_retry_waiting_second_life_assignment(purchase, trader_id, actor)
+            if result:
+                summary["assigned"] += 1
+            else:
+                summary["waiting_inventory"] += 1
+        except Exception as exc:
+            summary["errors"] += 1
+            print("V19 SECOND LIFE RETRY ERROR:", exc)
+    return summary
+
+
+def _np_resume_waiting_zero_cost_automations(trigger="verified_retry"):
+    """Safe retry queue: exact current obligations only; never historical inference."""
+    summary = {
+        "trigger": trigger,
+        "broad_retry_disabled": True,
+        "verified_retry_enabled": True,
+        "phase_pass_to_funded": {},
+        "second_life": {},
+        "started_at": now_iso(),
+    }
+    try:
+        summary["phase_pass_to_funded"] = _np_retry_clean_pass_funded_v19()
+    except Exception as exc:
+        summary["phase_pass_to_funded"] = {"errors": 1, "error": str(exc)}
+    try:
+        summary["second_life"] = _np_retry_waiting_second_lives_v19()
+    except Exception as exc:
+        summary["second_life"] = {"errors": 1, "error": str(exc)}
+    summary["finished_at"] = now_iso()
+    try:
+        _audit_safe(
+            "automation", "verified_retry_sweep",
+            f"trigger={trigger}; pass_funded={summary.get('phase_pass_to_funded')}; second_life={summary.get('second_life')}",
+            {"name":"automation_retry","username":"automation_retry","role":"system"}, ""
+        )
+    except Exception:
+        pass
+    return summary
+
+
+def _np_maybe_run_verified_retry_v19(trigger="monitoring_heartbeat"):
+    global _NP_VERIFIED_RETRY_LAST_TS
+    now_ts = time.time()
+    if now_ts - float(_NP_VERIFIED_RETRY_LAST_TS or 0) < _NP_VERIFIED_RETRY_MIN_INTERVAL:
+        return None
+    if not _NP_VERIFIED_RETRY_LOCK.acquire(blocking=False):
+        return None
+    try:
+        now_ts = time.time()
+        if now_ts - float(_NP_VERIFIED_RETRY_LAST_TS or 0) < _NP_VERIFIED_RETRY_MIN_INTERVAL:
+            return None
+        _NP_VERIFIED_RETRY_LAST_TS = now_ts
+        return _np_resume_waiting_zero_cost_automations(trigger)
+    finally:
+        _NP_VERIFIED_RETRY_LOCK.release()
+
+
+# Hook the existing MT5 monitoring heartbeat. This keeps retries automatic even
+# when no new inventory upload occurs (e.g. transient DB/network failure).
+_np_apply_monitoring_snapshot_v18_core = _apply_monitoring_snapshot
+
+def _apply_monitoring_snapshot(trader, payload, source="manual"):
+    result = _np_apply_monitoring_snapshot_v18_core(trader, payload, source)
+    try:
+        retry = _np_maybe_run_verified_retry_v19("monitoring_heartbeat")
+        if retry and isinstance(result, dict):
+            result["automation_retry"] = retry
+    except Exception as exc:
+        print("V19 HEARTBEAT RETRY SKIPPED:", exc)
+    return result
+
+
+@app.route("/automation_retry/status", methods=["GET", "OPTIONS"])
+def automation_retry_status_v19():
+    """Read-only operational proof that the retry worker is installed/enabled."""
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "verified_retry_enabled": True,
+        "broad_historical_sweep_enabled": False,
+        "retry_interval_seconds": _NP_VERIFIED_RETRY_MIN_INTERVAL,
+        "triggers": ["monitoring_heartbeat", "mt5_inventory_added"],
+        "last_retry_epoch": _NP_VERIFIED_RETRY_LAST_TS,
+        "release": "VERIFIED_AUTOMATION_RETRY_V19_2026_09_13",
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "VERIFIED_AUTOMATION_RETRY_V19_2026_09_13"
+
