@@ -25970,15 +25970,16 @@ def _np_ja_journey_authority(trader_id, journey_id):
             "amount": purchase.get("final_fee") or purchase.get("amount_due") or purchase.get("fee") or purchase.get("price"),
             "detail": f"Challenge purchase · {purchase.get('plan_name') or purchase.get('selected_plan') or 'Plan'}",
         })
-    if _np_ja_purchase_approved(purchase):
-        ledger.append({
-            "type": "PURCHASE_APPROVED",
-            "at": purchase.get("approved_at") or purchase.get("assigned_at") or purchase.get("updated_at") or purchase.get("created_at"),
-            "journey_id": journey_id,
-            "purchase_id": journey_id,
-            "detail": "PAYMENT APPROVED · initial Phase 1 entitlement created",
-        })
-
+    # Ledger semantics:
+    # A normal challenge purchase does NOT emit a generic PAYMENT APPROVED event.
+    # Purchase approval remains an internal authority for the initial Phase 1
+    # entitlement, but it is not a separate financial event in the journey ledger.
+    #
+    # PAYMENT APPROVED is reserved for a real paid reset/recovery transaction,
+    # which is emitted below as RESET_PAYMENT_APPROVED with its exact reset order.
+    #
+    # This prevents purchase.updated_at / assignment activity from making a later
+    # Funded progression look as if a fresh payment was approved.
     initial_key = f"purchase:{journey_id}:phase1"
     if _np_ja_purchase_approved(purchase):
         entitlements_created.append(initial_key)
@@ -30458,3 +30459,6 @@ def automation_retry_status_v21():
 app.view_functions["automation_retry_status_v19"] = automation_retry_status_v21
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "EXACT_PURCHASE_LINK_AUTOMATION_V21_2026_09_14"
 
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "LEDGER_PAYMENT_SEMANTICS_V22_2026_09_14"
