@@ -29744,3 +29744,222 @@ def admin_journey_authority_reconcile_due_v15():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PASS_TO_FUNDED_SHARED_AUTHORITY_V15_2026_09_13"
 
+
+
+# ============================================================================
+# NAIRAPIPS EXACT PASS -> FUNDED AUTHORITY V16 — 13 SEP 2026
+#
+# PURPOSE:
+# Give clean 12-Sep+ journeys one narrow, deterministic authority for the exact
+# business transition:
+#   PHASE 1 PASSED -> ONE FUNDED MT5
+#
+# It does not use trader-wide latest state. It is keyed only by purchase_id and
+# exact linked accounts (purchase_id OR challenge_purchase_id).
+# ============================================================================
+
+def _np_exact_pass_funded_due_v16(purchase_id):
+    pid = str(purchase_id or "").strip()
+    if not pid:
+        return {"ok": False, "due": False, "reason": "missing_purchase_id"}
+
+    rows = (
+        supabase.table("challenge_purchases").select("*")
+        .eq("id", pid).limit(1).execute().data or []
+    )
+    if not rows:
+        return {"ok": False, "due": False, "reason": "purchase_not_found"}
+
+    purchase = rows[0]
+    if not _np_automation_generation_purchase(purchase):
+        return {"ok": False, "due": False, "reason": "not_clean_automation_purchase"}
+
+    trader_id = str(purchase.get("trader_id") or "").strip()
+    if not trader_id:
+        return {"ok": False, "due": False, "reason": "purchase_owner_missing"}
+
+    # Exact account lineage: support both historical linkage columns.
+    accounts, seen = [], set()
+    for col in ("purchase_id", "challenge_purchase_id"):
+        try:
+            got = (
+                supabase.table("trader_accounts").select("*")
+                .eq("trader_id", trader_id).eq(col, pid)
+                .order("created_at", desc=False).limit(200).execute().data or []
+            )
+            for a in got:
+                aid = str(a.get("id") or "")
+                if aid and aid not in seen:
+                    seen.add(aid)
+                    accounts.append(a)
+        except Exception:
+            pass
+
+    accounts.sort(key=_np_ja_account_time)
+
+    legal = [a for a in accounts if not _np_account_is_recalled_or_excluded(a)]
+    phase1 = [
+        a for a in legal
+        if _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == "phase1"
+    ]
+    passed = [a for a in phase1 if _np_ja_is_passed(a)]
+
+    if not passed:
+        return {
+            "ok": True, "due": False, "reason": "no_exact_phase1_pass",
+            "purchase_id": pid, "trader_id": trader_id,
+        }
+
+    source = sorted(passed, key=_np_ja_account_time)[-1]
+    source_time = _np_ja_account_time(source)
+
+    funded_after = [
+        a for a in legal
+        if _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == "funded"
+        and str(a.get("mt5_login") or "").strip()
+        and _np_ja_account_time(a) >= source_time
+    ]
+
+    if funded_after:
+        funded_after.sort(key=_np_ja_account_time)
+        a = funded_after[0]
+        return {
+            "ok": True,
+            "due": False,
+            "consumed": True,
+            "reason": "funded_already_assigned",
+            "purchase_id": pid,
+            "trader_id": trader_id,
+            "source_account_id": source.get("id"),
+            "source_mt5": source.get("mt5_login"),
+            "replacement_account_id": a.get("id"),
+            "replacement_mt5": a.get("mt5_login"),
+        }
+
+    return {
+        "ok": True,
+        "due": True,
+        "consumed": False,
+        "reason": "phase1_pass_funded_due",
+        "purchase_id": pid,
+        "trader_id": trader_id,
+        "source_account_id": source.get("id"),
+        "source_mt5": source.get("mt5_login"),
+        "target_stage": "funded",
+        "entitlement_type": "phase_pass",
+        "entitlement_status": "AVAILABLE",
+    }
+
+
+@app.route("/admin_pass_funded/status", methods=["GET", "OPTIONS"])
+def admin_pass_funded_status_v16():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+
+    pid = str(request.args.get("purchase_id") or "").strip()
+    try:
+        return _np_ok(_np_exact_pass_funded_due_v16(pid))
+    except Exception as exc:
+        print("V16 PASS FUNDED STATUS ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+@app.route("/admin_pass_funded/fire", methods=["POST", "OPTIONS"])
+def admin_pass_funded_fire_v16():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+
+    d = request.get_json(silent=True) or {}
+    pid = str(d.get("purchase_id") or "").strip()
+
+    try:
+        truth = _np_exact_pass_funded_due_v16(pid)
+        if not truth.get("ok"):
+            return _np_fail(truth.get("reason") or "authority failed", 409)
+        if not truth.get("due"):
+            return _np_fail(truth.get("reason") or "no funded entitlement due", 409)
+        if truth.get("entitlement_type") != "phase_pass":
+            return _np_fail("exact phase-pass entitlement not proven", 409)
+        if _normalize_lifecycle_stage(truth.get("target_stage")) != "funded":
+            return _np_fail("target is not funded", 409)
+
+        purchase_rows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("id", pid).limit(1).execute().data or []
+        )
+        if not purchase_rows:
+            return _np_fail("purchase not found", 409)
+        purchase = purchase_rows[0]
+
+        source_rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", truth.get("source_account_id")).limit(1).execute().data or []
+        )
+        if not source_rows:
+            return _np_fail("source passed account not found", 409)
+        source = source_rows[0]
+
+        trader = get_trader_by_id(str(purchase.get("trader_id") or ""))
+        if not trader:
+            return _np_fail("trader not found", 409)
+
+        # Existing protected assignment engine still owns MT5 release.
+        result = _np_auto_assign_waiting_stage(
+            trader, "funded", purchase, source, "lifecycle_progression"
+        )
+
+        after = _np_exact_pass_funded_due_v16(pid)
+
+        return _np_ok({
+            "success": True,
+            "result": result,
+            "before": truth,
+            "after": after,
+            "message": (
+                "Exact PASS → FUNDED automation executed through the protected "
+                "assignment engine."
+            ),
+        })
+
+    except Exception as exc:
+        print("V16 PASS FUNDED FIRE ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+# Make future specific-account pass handling use the deterministic verifier too.
+_np_pass_specific_account_v15_core = _pass_specific_account
+
+def _pass_specific_account(trader, account, pass_status, staff=None, note="Stage passed"):
+    updated, archived = _np_pass_specific_account_v15_core(
+        trader, account, pass_status, staff, note
+    )
+
+    try:
+        source = archived or account or {}
+        purchase = _safe_purchase_for_account(source) or _safe_purchase_for_account(account)
+        pid = str((purchase or {}).get("id") or "").strip()
+
+        if pid and _np_automation_generation_purchase(purchase):
+            truth = _np_exact_pass_funded_due_v16(pid)
+            if truth.get("due") and truth.get("entitlement_type") == "phase_pass":
+                result = _np_auto_assign_waiting_stage(
+                    updated or trader, "funded", purchase, source, "lifecycle_progression"
+                )
+                if result and isinstance(result, dict):
+                    updated = result.get("trader") or updated
+    except Exception as exc:
+        print("V16 SPECIFIC PASS AUTO FIRE DEFERRED:", exc)
+
+    return updated, archived
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "EXACT_PASS_FUNDED_AUTHORITY_V16_2026_09_13"
+
