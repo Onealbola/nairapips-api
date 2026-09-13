@@ -28752,3 +28752,216 @@ def _np_admin_journey_authority_cutover_v9():
 app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_cutover_v9
 NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "SECOND_LIFE_CUTOVER_BRIDGE_V9_2026_09_13"
 
+
+
+# ============================================================================
+# NAIRAPIPS SECOND LIFE CUTOVER BRIDGE V10 — 13 SEP 2026
+#
+# Fixes the PRE-ACTIVATION state seen in production:
+#   legacy purchase -> Phase 1 breaches after cutoff -> free Second Life is AVAILABLE
+#   but second_life_used is still false.
+#
+# V9 correctly handled ALREADY-ACTIVATED Life 2 waiting for MT5.
+# V10 additionally exposes the exact AVAILABLE entitlement to Admin so staff may
+# activate it from Journey Cockpit. The existing /admin_second_life/activate
+# endpoint remains authoritative and still performs all duplicate/lineage checks.
+# ============================================================================
+
+_np_bundle_v9_core = _np_all_journeys_preserved_v5
+
+def _np_all_journeys_preserved_v5(trader_id):
+    bundle = _np_bundle_v9_core(trader_id)
+
+    for j in bundle.get("journeys") or []:
+        jid = str(j.get("journey_id") or j.get("purchase_id") or "").strip()
+        if not jid:
+            continue
+
+        # Do not disturb native clean automation or already-activated migrations.
+        mode = str(j.get("control_mode") or "")
+        if mode in {
+            "CLEAN_AUTOMATION",
+            "CLEAN_MIGRATION_RESET",
+            "CLEAN_MIGRATION_SECOND_LIFE",
+            "CLEAN_MIGRATION_BLOCKED",
+        }:
+            continue
+
+        purchase = j.get("purchase") or {}
+        if not purchase:
+            try:
+                rows = (
+                    supabase.table("challenge_purchases").select("*")
+                    .eq("id", jid).eq("trader_id", trader_id).limit(1)
+                    .execute().data or []
+                )
+                purchase = rows[0] if rows else {}
+            except Exception:
+                purchase = {}
+        if not purchase:
+            continue
+
+        # This is the exact existing lifecycle authority used by Trader/Admin.
+        try:
+            sl = _second_life_status_payload(purchase, trader_id)
+        except Exception as exc:
+            print("V10 SECOND LIFE AVAILABLE STATUS ERROR:", exc)
+            continue
+
+        # Only promote a genuine, currently eligible, NOT-YET-ACTIVATED Life 2.
+        if not (
+            sl.get("enabled")
+            and not sl.get("used")
+            and sl.get("eligible_now")
+            and sl.get("breached_account_id")
+        ):
+            continue
+
+        source_id = str(sl.get("breached_account_id") or "").strip()
+        source = None
+        try:
+            rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", source_id).eq("trader_id", trader_id).limit(1)
+                .execute().data or []
+            )
+            source = rows[0] if rows else None
+        except Exception:
+            source = None
+        if not source:
+            continue
+
+        # Fail closed if a genuine later Phase-1 child already exists.
+        try:
+            existing = []
+            for col in ("purchase_id", "challenge_purchase_id"):
+                try:
+                    existing += (
+                        supabase.table("trader_accounts").select("*")
+                        .eq("trader_id", trader_id).eq(col, jid)
+                        .order("created_at", desc=False).limit(100).execute().data or []
+                    )
+                except Exception:
+                    pass
+            seen, phase1 = set(), []
+            for a in existing:
+                aid = str(a.get("id") or "")
+                if not aid or aid in seen:
+                    continue
+                seen.add(aid)
+                if _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == "phase1":
+                    phase1.append(a)
+            source_time = _np_ja_account_time(source)
+            later = [
+                a for a in phase1
+                if str(a.get("id") or "") != source_id
+                and _np_ja_account_time(a) > source_time
+                and str(a.get("mt5_login") or "").strip()
+                and not _np_account_is_recalled_or_excluded(a)
+            ]
+            if later:
+                continue
+        except Exception:
+            # On uncertainty, do not create an action entitlement.
+            continue
+
+        j["purchase"] = purchase
+        j["control_mode"] = "CLEAN_MIGRATION_SECOND_LIFE_AVAILABLE"
+        j["state"] = "SECOND_LIFE_AVAILABLE"
+        j["closed"] = False
+        j["blocked"] = False
+        j["accountability_status"] = "RECONCILED"
+        j["next_action"] = "ACTIVATE_SECOND_LIFE"
+        j["outstanding_entitlement"] = {
+            "entitlement_key": f"second_life_activation:{jid}:{source_id}",
+            "entitlement_type": "second_life_activation",
+            "source_event_type": "phase1_breach",
+            "source_account_id": source_id,
+            "source_mt5": source.get("mt5_login"),
+            "evidence_id": jid,
+            "target_stage": "phase1",
+            "status": "AVAILABLE",
+            "reason": "PHASE 1 BREACHED → INCLUDED SECOND LIFE AVAILABLE → ACTIVATE ONCE",
+        }
+        j["migration_bridge"] = {
+            "type": "SECOND_LIFE_AVAILABLE",
+            "purchase_id": jid,
+            "source_account_id": source_id,
+            "source_mt5": source.get("mt5_login"),
+            "target_stage": "phase1",
+            "status": "AVAILABLE",
+        }
+
+        ledger = list(j.get("ledger") or [])
+        if not any(
+            str(x.get("type") or "") == "SECOND_LIFE_ACTIVATION_AVAILABLE"
+            and str(x.get("source_account_id") or "") == source_id
+            for x in ledger
+        ):
+            ledger.append({
+                "type": "SECOND_LIFE_ACTIVATION_AVAILABLE",
+                "at": sl.get("breached_at") or source.get("breached_at") or source.get("breach_at") or now_iso(),
+                "journey_id": jid,
+                "purchase_id": jid,
+                "source_account_id": source_id,
+                "mt5_login": source.get("mt5_login"),
+                "stage": "phase1",
+                "evidence_id": jid,
+                "detail": "PHASE 1 BREACHED → FREE SECOND LIFE AVAILABLE → ACTIVATION REQUIRED",
+            })
+            ledger = [x for x in ledger if x.get("at")]
+            ledger.sort(key=lambda x: _np_ja_score(x.get("at")))
+            j["ledger"] = ledger
+
+    return bundle
+
+
+def _np_admin_journey_authority_cutover_v10():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    journey_id = str(request.args.get("journey_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+
+    try:
+        bundle = _np_all_journeys_preserved_v5(trader_id)
+        if journey_id:
+            journey = next(
+                (j for j in bundle.get("journeys") or []
+                 if str(j.get("journey_id") or "") == journey_id),
+                None
+            )
+            if not journey:
+                return _np_fail("journey not found", 404)
+            return _np_ok({
+                "journey": journey,
+                "cutover_date": bundle.get("cutover_date"),
+                "identity_trader_ids": bundle.get("identity_trader_ids") or [],
+                "identity_profiles": bundle.get("identity_profiles") or [],
+                "reconciliation": bundle.get("reconciliation") or [],
+                "history_debug": bundle.get("history_debug") or {},
+                "generated_at": now_iso(),
+            })
+
+        return _np_ok({
+            "journeys": bundle.get("journeys") or [],
+            "cutover_date": bundle.get("cutover_date"),
+            "identity_trader_ids": bundle.get("identity_trader_ids") or [],
+            "identity_profiles": bundle.get("identity_profiles") or [],
+            "reconciliation": bundle.get("reconciliation") or [],
+            "history_debug": bundle.get("history_debug") or {},
+            "generated_at": now_iso(),
+        })
+    except Exception as exc:
+        print("JOURNEY AUTHORITY CUTOVER V10 ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_cutover_v10
+NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "SECOND_LIFE_PREACTIVATION_CUTOVER_V10_2026_09_13"
+
