@@ -29371,3 +29371,131 @@ def _np_admin_journey_authority_cutover_v12():
 app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_cutover_v12
 NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "SECOND_LIFE_IDENTITY_OWNER_V12_2026_09_13"
 
+
+
+# ============================================================================
+# NAIRAPIPS SECOND LIFE PLAN ENTITLEMENT AUTHORITY V13 — 13 SEP 2026
+#
+# FORENSIC ROOT CAUSE
+# -------------------
+# Trader Dashboard lifecycle authority treats Second Life as enabled when EITHER:
+#   challenge_purchases.second_life_enabled == true
+#   OR challenge_plans.second_life_enabled == true
+#
+# But _second_life_status_payload() — used by Admin activation / Journey migration —
+# previously checked ONLY challenge_purchases.second_life_enabled.
+#
+# Result:
+#   Trader Dashboard: "FREE PHASE 1 RESET AVAILABLE"
+#   Admin/Journey Authority: "LEGACY READ ONLY"
+#
+# This patch changes ONE authority rule only:
+#   Second-Life inclusion is resolved from the exact purchase's exact plan when
+#   the purchase row itself does not carry the flag.
+#
+# It does NOT change:
+#   - 12 Sep cutoff law
+#   - one-event/one-entitlement consumption
+#   - Life 3 prevention
+#   - payout/reset/funded progression
+#   - MT5 inventory release protections
+# ============================================================================
+
+_np_second_life_status_payload_purchase_only_v12 = _second_life_status_payload
+
+def _second_life_status_payload(purchase, trader_id=None):
+    p = dict(purchase or {})
+
+    # If the purchase already carries an explicit Second-Life flag, preserve it.
+    purchase_has_flag = _second_life_bool(p.get("second_life_enabled"))
+
+    if not purchase_has_flag:
+        plan_id = str(
+            p.get("plan_id")
+            or p.get("challenge_plan_id")
+            or ""
+        ).strip()
+
+        if plan_id:
+            try:
+                plan_rows = (
+                    supabase.table("challenge_plans")
+                    .select("id,second_life_enabled,lives_total")
+                    .eq("id", plan_id)
+                    .limit(1)
+                    .execute().data or []
+                )
+                plan = plan_rows[0] if plan_rows else {}
+
+                if _second_life_bool(plan.get("second_life_enabled")):
+                    # Enrich only the in-memory copy. Do not rewrite historical
+                    # purchase rows merely to make the entitlement visible.
+                    p["second_life_enabled"] = True
+                    if not p.get("lives_total"):
+                        p["lives_total"] = int(plan.get("lives_total") or 2)
+            except Exception as exc:
+                print("V13 SECOND LIFE PLAN ENTITLEMENT LOOKUP ERROR:", exc)
+
+    # All existing breach proof, exact purchase lineage, used/unused checks,
+    # waiting-state checks, and duplicate protections remain inside the original
+    # production authority.
+    return _np_second_life_status_payload_purchase_only_v12(p, trader_id)
+
+
+# Rebind Journey Authority after the corrected shared entitlement authority.
+# Existing V12 bundle logic now receives the same Second-Life truth as Trader Bootstrap.
+def _np_admin_journey_authority_cutover_v13():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    journey_id = str(request.args.get("journey_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+
+    try:
+        bundle = _np_all_journeys_preserved_v5(trader_id)
+
+        if journey_id:
+            journey = next(
+                (
+                    j for j in bundle.get("journeys") or []
+                    if str(j.get("journey_id") or "") == journey_id
+                ),
+                None,
+            )
+            if not journey:
+                return _np_fail("journey not found", 404)
+
+            return _np_ok({
+                "journey": journey,
+                "cutover_date": bundle.get("cutover_date"),
+                "identity_trader_ids": bundle.get("identity_trader_ids") or [],
+                "identity_profiles": bundle.get("identity_profiles") or [],
+                "reconciliation": bundle.get("reconciliation") or [],
+                "history_debug": bundle.get("history_debug") or {},
+                "generated_at": now_iso(),
+            })
+
+        return _np_ok({
+            "journeys": bundle.get("journeys") or [],
+            "cutover_date": bundle.get("cutover_date"),
+            "identity_trader_ids": bundle.get("identity_trader_ids") or [],
+            "identity_profiles": bundle.get("identity_profiles") or [],
+            "reconciliation": bundle.get("reconciliation") or [],
+            "history_debug": bundle.get("history_debug") or {},
+            "generated_at": now_iso(),
+        })
+
+    except Exception as exc:
+        print("JOURNEY AUTHORITY CUTOVER V13 ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_cutover_v13
+
+NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "SECOND_LIFE_PLAN_ENTITLEMENT_AUTHORITY_V13_2026_09_13"
+
