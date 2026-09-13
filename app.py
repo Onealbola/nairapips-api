@@ -29963,3 +29963,43 @@ def _pass_specific_account(trader, account, pass_status, staff=None, note="Stage
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "EXACT_PASS_FUNDED_AUTHORITY_V16_2026_09_13"
 
+
+
+# ============================================================================
+# NAIRAPIPS PASS PREDICATE UNIFICATION V17 — 13 SEP 2026
+#
+# FORENSIC ROOT CAUSE:
+# Admin/Trader 360 uses _np_ops_is_passed(), which treats ARCHIVED_PHASE1 /
+# ARCHIVED_PHASE2 as completed-pass evidence.
+#
+# Journey Authority used _np_ja_is_passed(), which did NOT recognise those same
+# terminal states. Therefore the same account could simultaneously appear as:
+#   FULL EVENT LEDGER: PASSED
+#   ACCOUNTABILITY: FUNDED ACCOUNT OWED
+#   JOURNEY AUTHORITY: no_exact_phase1_pass
+#
+# V17 makes Journey Authority use the same pass predicate as the operational
+# ledger. This is a truth-unification fix only. It does not create entitlement
+# from trader-level state and it does not bypass exact purchase/account lineage.
+# ============================================================================
+
+_np_ja_is_passed_v16_core = _np_ja_is_passed
+
+def _np_ja_is_passed(a):
+    a = a or {}
+
+    # Preserve hard recall exclusions first.
+    if _np_ja_is_recalled(a):
+        return False
+
+    # Operational ledger is already the production predicate that generated
+    # the PASSED event visible in Admin. Reuse it so Journey Authority cannot
+    # disagree with the same account row.
+    try:
+        return bool(_np_ops_is_passed(a))
+    except Exception:
+        return bool(_np_ja_is_passed_v16_core(a))
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PASS_PREDICATE_UNIFIED_V17_2026_09_13"
+
