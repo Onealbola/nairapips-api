@@ -29499,3 +29499,60 @@ app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_cuto
 
 NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "SECOND_LIFE_PLAN_ENTITLEMENT_AUTHORITY_V13_2026_09_13"
 
+
+
+# ============================================================================
+# NAIRAPIPS ADMIN SECOND-LIFE AUTHORITY STATUS V14 — 13 SEP 2026
+#
+# Read-only endpoint. It does not create, consume, reserve or assign anything.
+# It lets Admin Journey Cockpit ask the SAME backend Second-Life authority used
+# by the trader lifecycle instead of reconstructing eligibility in JavaScript.
+# ============================================================================
+
+@app.route("/admin_second_life/status", methods=["GET", "OPTIONS"])
+def admin_second_life_status_v14():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    purchase_id = str(request.args.get("purchase_id") or "").strip()
+    if not purchase_id:
+        return _np_fail("purchase_id is required", 400)
+
+    try:
+        rows = (
+            supabase.table("challenge_purchases")
+            .select("*")
+            .eq("id", purchase_id)
+            .limit(1)
+            .execute().data or []
+        )
+        if not rows:
+            return _np_fail("purchase not found", 404)
+
+        purchase = rows[0]
+        owner_trader_id = str(purchase.get("trader_id") or "").strip()
+        if not owner_trader_id:
+            return _np_fail("purchase owner is missing", 409)
+
+        status = _second_life_status_payload(purchase, owner_trader_id)
+
+        return _np_ok({
+            "success": True,
+            "purchase_id": purchase_id,
+            "trader_id": owner_trader_id,
+            "status": status,
+            "generated_at": now_iso(),
+            "read_only": True,
+        })
+
+    except Exception as exc:
+        print("ADMIN SECOND LIFE STATUS V14 ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "ADMIN_SECOND_LIFE_SHARED_AUTHORITY_V14_2026_09_13"
+
