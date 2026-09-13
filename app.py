@@ -30355,3 +30355,106 @@ def automation_retry_status_v20():
 
 app.view_functions["automation_retry_status_v19"] = automation_retry_status_v20
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "VERIFIED_AUTOMATION_HEARTBEAT_V20_2026_09_14"
+
+
+
+# ============================================================================
+# NAIRAPIPS EXACT PURCHASE-LINK NORMALIZATION V21 — 14 SEP 2026
+#
+# FORENSIC ROOT CAUSE:
+# The current Journey Authority correctly supports BOTH trader_accounts.purchase_id
+# and trader_accounts.challenge_purchase_id when proving a clean journey.
+#
+# But the protected automatic assignment chain still contains older hard gates
+# that inspect ONLY source_account.purchase_id.
+#
+# Therefore this valid state can occur:
+#   - Journey Cockpit: PASS -> FUNDED entitlement AVAILABLE
+#   - exact source account belongs to the purchase through challenge_purchase_id
+#   - retry worker wakes correctly
+#   - protected assigner rejects with source_purchase_mismatch
+#   - entitlement remains outstanding forever
+#
+# V21 does NOT relax lineage. It canonicalizes the already-proven exact account
+# linkage in memory:
+#   purchase_id := purchase_id OR challenge_purchase_id
+# before the existing protected assignment chain evaluates it.
+#
+# No database history is rewritten. No trader-wide inference is used.
+# ============================================================================
+
+def _np_canonical_account_purchase_link_v21(account):
+    if not account:
+        return account
+    out = dict(account)
+    canonical = str(
+        out.get("purchase_id")
+        or out.get("challenge_purchase_id")
+        or ""
+    ).strip()
+    if canonical:
+        out["purchase_id"] = canonical
+        out["challenge_purchase_id"] = out.get("challenge_purchase_id") or canonical
+    return out
+
+
+# Unify the GREEN gate itself so every future caller uses exact dual-column lineage.
+_np_green_automation_authority_v20_core = _np_green_automation_authority
+
+def _np_green_automation_authority(trader, purchase, source_account=None, target_stage=None):
+    return _np_green_automation_authority_v20_core(
+        trader,
+        purchase,
+        _np_canonical_account_purchase_link_v21(source_account),
+        target_stage,
+    )
+
+
+# Normalize the exact source before it enters the full wrapper stack.
+_np_auto_assign_waiting_stage_v20_core = _np_auto_assign_waiting_stage
+
+def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"):
+    return _np_auto_assign_waiting_stage_v20_core(
+        trader,
+        stage,
+        purchase,
+        _np_canonical_account_purchase_link_v21(source_account),
+        reason,
+    )
+
+
+# Keep a visible last retry summary so a retry can be distinguished from
+# "no eligible inventory" without changing Admin business controls.
+_NP_VERIFIED_RETRY_LAST_SUMMARY_V21 = None
+_np_resume_waiting_zero_cost_automations_v20_core = _np_resume_waiting_zero_cost_automations
+
+def _np_resume_waiting_zero_cost_automations(trigger="verified_retry"):
+    global _NP_VERIFIED_RETRY_LAST_SUMMARY_V21
+    result = _np_resume_waiting_zero_cost_automations_v20_core(trigger)
+    _NP_VERIFIED_RETRY_LAST_SUMMARY_V21 = result
+    return result
+
+
+def automation_retry_status_v21():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "verified_retry_enabled": True,
+        "engine_heartbeat_enabled": True,
+        "broad_historical_sweep_enabled": False,
+        "retry_interval_seconds": _NP_VERIFIED_RETRY_MIN_INTERVAL,
+        "heartbeat_paths": sorted(_NP_AUTOMATION_HEARTBEAT_PATHS_V20),
+        "last_heartbeat_path": _NP_AUTOMATION_HEARTBEAT_LAST_PATH_V20,
+        "last_heartbeat_at": _NP_AUTOMATION_HEARTBEAT_LAST_AT_V20,
+        "last_retry_epoch": _NP_VERIFIED_RETRY_LAST_TS,
+        "last_retry_summary": _NP_VERIFIED_RETRY_LAST_SUMMARY_V21,
+        "release": "EXACT_PURCHASE_LINK_AUTOMATION_V21_2026_09_14",
+    })
+
+app.view_functions["automation_retry_status_v19"] = automation_retry_status_v21
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "EXACT_PURCHASE_LINK_AUTOMATION_V21_2026_09_14"
+
