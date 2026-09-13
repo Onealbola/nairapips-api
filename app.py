@@ -30277,3 +30277,81 @@ def automation_retry_status_v19():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "VERIFIED_AUTOMATION_RETRY_V19_2026_09_13"
 
+
+# ============================================================================
+# NAIRAPIPS VERIFIED AUTOMATION HEARTBEAT V20 — 14 SEP 2026
+#
+# FORENSIC FIX:
+# V19 correctly installed the verified retry worker, but attached its periodic
+# trigger only to _apply_monitoring_snapshot(). A passed account is archived and
+# can immediately stop producing monitoring snapshots. Some live MT5 engine
+# traffic also reaches /sync_trades and the unified sync paths without calling
+# _apply_monitoring_snapshot(). Therefore an outstanding PASS -> FUNDED debt can
+# remain visible forever even though the engine is alive.
+#
+# V20 does NOT alter entitlement, cutoff, duplicate, pool or assignment rules.
+# It only gives the already-protected V19 retry worker a real production
+# heartbeat from existing MT5/monitoring traffic. V19's 45-second lock/rate
+# limiter remains authoritative, so multiple requests do not create a sweep
+# storm. Inventory creation continues to fire its existing immediate retry.
+# ============================================================================
+
+_NP_AUTOMATION_HEARTBEAT_PATHS_V20 = {
+    "/sync_trades",
+    "/monitoring_snapshot",
+    "/sync_fxblue_account",
+    "/fxblue_webhook",
+    "/account_intelligence_scan",
+    "/np_unified_mt5_sync",
+    "/system_sync_mt5_assignments",
+    "/admin/np_unified_mt5_sync",
+    "/dashboard/np_unified_mt5_sync",
+}
+_NP_AUTOMATION_HEARTBEAT_LAST_PATH_V20 = None
+_NP_AUTOMATION_HEARTBEAT_LAST_AT_V20 = None
+
+@app.before_request
+def _np_verified_automation_heartbeat_v20():
+    """Run only from real engine/sync traffic; never from ordinary Admin browsing."""
+    global _NP_AUTOMATION_HEARTBEAT_LAST_PATH_V20, _NP_AUTOMATION_HEARTBEAT_LAST_AT_V20
+    try:
+        if request.method == "OPTIONS":
+            return None
+        path = str(request.path or "").rstrip("/") or "/"
+        if path not in _NP_AUTOMATION_HEARTBEAT_PATHS_V20:
+            return None
+
+        _NP_AUTOMATION_HEARTBEAT_LAST_PATH_V20 = path
+        _NP_AUTOMATION_HEARTBEAT_LAST_AT_V20 = now_iso()
+        # V19 owns locking + 45-second rate limiting + exact entitlement proof.
+        _np_maybe_run_verified_retry_v19("engine_heartbeat:" + path)
+    except Exception as exc:
+        # A retry problem must never break MT5 trade/snapshot ingestion.
+        print("V20 VERIFIED AUTOMATION HEARTBEAT SKIPPED:", request.path, exc)
+    return None
+
+
+# Upgrade the existing read-only status endpoint so Admin can prove that a real
+# engine path has reached this worker, instead of merely proving V19 was loaded.
+def automation_retry_status_v20():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "verified_retry_enabled": True,
+        "engine_heartbeat_enabled": True,
+        "broad_historical_sweep_enabled": False,
+        "retry_interval_seconds": _NP_VERIFIED_RETRY_MIN_INTERVAL,
+        "triggers": ["engine_heartbeat", "mt5_inventory_added"],
+        "heartbeat_paths": sorted(_NP_AUTOMATION_HEARTBEAT_PATHS_V20),
+        "last_heartbeat_path": _NP_AUTOMATION_HEARTBEAT_LAST_PATH_V20,
+        "last_heartbeat_at": _NP_AUTOMATION_HEARTBEAT_LAST_AT_V20,
+        "last_retry_epoch": _NP_VERIFIED_RETRY_LAST_TS,
+        "release": "VERIFIED_AUTOMATION_HEARTBEAT_V20_2026_09_14",
+    })
+
+app.view_functions["automation_retry_status_v19"] = automation_retry_status_v20
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "VERIFIED_AUTOMATION_HEARTBEAT_V20_2026_09_14"
