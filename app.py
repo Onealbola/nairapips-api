@@ -30986,3 +30986,163 @@ def _np_resume_waiting_zero_cost_automations(trigger="verified_retry"):
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "VERIFIED_PAYOUT_RENEWAL_RETRY_V26_2026_09_14"
+
+
+# ============================================================================
+# NAIRAPIPS PAYOUT-PAID AUTHORITY FIX V27 — 14 SEP 2026
+#
+# ROOT CAUSE
+# ----------
+# The payout-paid hook already called _np_auto_post_payout_renewal(), but an older
+# Journey-Authority wrapper demanded that payout_renewal already be visible as an
+# outstanding cockpit entitlement BEFORE the funded source was archived.
+# While the funded source was still active, Journey Authority returned ACTIVE first,
+# so the wrapper blocked the very payout event that was supposed to create/fulfil
+# the renewal. This is why clean 12-Sep+ PAID payouts could remain "NEW FUNDED MT5
+# REQUIRED" instead of assigning immediately.
+#
+# LAW
+# ---
+# Exact PAID payout row itself is the financial authority.
+# For CLEAN 12-Sep+ purchase journeys, validate exact payout/source/owner/purchase,
+# then call the already-existing kill-switch payout engine directly.
+# Legacy journeys remain blocked from automatic assignment.
+# ============================================================================
+
+_np_auto_post_payout_renewal_v26_wrapper = _np_auto_post_payout_renewal
+
+def _np_auto_post_payout_renewal(payout):
+    payout = payout or {}
+    payout_id = str(payout.get("id") or "").strip()
+    trader_id = str(payout.get("trader_id") or "").strip()
+    source_id = str(payout.get("trader_account_id") or payout.get("account_id") or "").strip()
+
+    if not payout_id or not trader_id or not source_id or payout_status(payout) != "paid":
+        return None
+
+    rows = (
+        supabase.table("trader_accounts").select("*")
+        .eq("id", source_id).eq("trader_id", trader_id)
+        .limit(1).execute().data or []
+    )
+    if not rows:
+        return None
+    source = rows[0]
+
+    if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "funded":
+        return None
+
+    purchase = _safe_purchase_for_account(source)
+    if not purchase:
+        return None
+
+    # Exact source/login match.
+    payout_login = str(payout.get("mt5_login") or "").strip()
+    source_login = str(source.get("mt5_login") or "").strip()
+    if payout_login and source_login and payout_login != source_login:
+        return None
+
+    # Hard cutoff remains authoritative.
+    if not _np_automation_generation_purchase(purchase):
+        _audit_safe(
+            "automation", "legacy_payout_auto_blocked",
+            f"payout={payout_id}; source={source_id}; pre-cutoff journey remains manual",
+            {"name":"system","username":"system","role":"system"}, payout_id
+        )
+        return None
+
+    # The paid payout is the exact entitlement authority. Call the pre-Journey-
+    # assertion kill-switch engine so ACTIVE source state cannot block the event.
+    return _np_ja_auto_post_payout_renewal_core(payout)
+
+
+# ---- Cockpit semantic cleanup: payout renewal preparation is not a breach. ----
+_np_all_journeys_v26_core = _np_all_journeys_preserved_v5
+
+def _np_all_journeys_preserved_v5(trader_id):
+    bundle = _np_all_journeys_v26_core(trader_id)
+
+    for j in bundle.get("journeys") or []:
+        ledger = list(j.get("ledger") or [])
+        if not ledger:
+            continue
+
+        paid_by_account = {}
+        for ev in ledger:
+            if str((ev or {}).get("type") or "").upper() == "PAYOUT_PAID":
+                aid = str(
+                    (ev or {}).get("account_id")
+                    or (ev or {}).get("source_account_id")
+                    or ""
+                ).strip()
+                if aid:
+                    paid_by_account.setdefault(aid, []).append(ev)
+
+        cleaned = []
+        for ev in ledger:
+            ev = dict(ev or {})
+            et = str(ev.get("type") or "").upper()
+            aid = str(ev.get("account_id") or ev.get("source_account_id") or "").strip()
+            detail = str(ev.get("detail") or "")
+            low = detail.lower()
+
+            # A system/admin archival action carrying the exact payout-renewal
+            # entitlement marker is renewal preparation, not market/DD breach.
+            if (
+                et in {"BREACH", "BREACHED"}
+                and aid in paid_by_account
+                and "np_entitlement:post_payout_renewal" in low
+            ):
+                ev["type"] = "PAYOUT_RENEWAL"
+                ev["detail"] = "PAYOUT PAID · FUNDED ACCOUNT CLOSED FOR RENEWAL · FRESH FUNDED MT5 REQUIRED"
+                ev.pop("breach_reason", None)
+
+            cleaned.append(ev)
+
+        j["ledger"] = cleaned
+
+    return bundle
+
+
+# Rebind route once more so Admin receives V27 semantic cleanup.
+def _np_admin_journey_authority_v27():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    journey_id = str(request.args.get("journey_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+
+    try:
+        bundle = _np_all_journeys_preserved_v5(trader_id)
+        payload = {
+            "cutover_date": bundle.get("cutover_date"),
+            "identity_trader_ids": bundle.get("identity_trader_ids") or [],
+            "identity_profiles": bundle.get("identity_profiles") or [],
+            "reconciliation": bundle.get("reconciliation") or [],
+            "history_debug": bundle.get("history_debug") or {},
+            "generated_at": now_iso(),
+        }
+        if journey_id:
+            journey = next(
+                (j for j in bundle.get("journeys") or []
+                 if str(j.get("journey_id") or "") == journey_id),
+                None
+            )
+            if not journey:
+                return _np_fail("journey not found", 404)
+            payload["journey"] = journey
+        else:
+            payload["journeys"] = bundle.get("journeys") or []
+        return _np_ok(payload)
+    except Exception as exc:
+        print("JOURNEY AUTHORITY V27 ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v27
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PAYOUT_PAID_AUTHORITY_FIX_V27_2026_09_14"
