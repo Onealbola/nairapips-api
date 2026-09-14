@@ -33133,3 +33133,329 @@ if _np_mark_paid_v33_core:
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "EXACT_PAYOUT_FUNDED_AUTHORITY_V34_2026_09_14"
+
+
+# ============================================================================
+# NAIRAPIPS ASYNC PAYOUT RENEWAL EXECUTOR V35 — 14 SEP 2026
+#
+# FORENSIC FINDING
+# -----------------
+# The browser reaches the correct exact-PAID-payout endpoint, but the POST can
+# take longer than Admin's 30-second mutation timeout because the protected MT5
+# assignment path performs several Supabase writes, pointer synchronization,
+# audit writes and credential email delivery before returning.
+#
+# FIX
+# ---
+# The HTTP request must NOT wait for that work.
+#
+#   Admin/Mark-Paid -> validate exact payout id -> start background executor
+#   -> return 202 PROCESSING immediately.
+#
+# The executor then runs the already-protected V34 exact payout->Funded engine.
+# A lightweight status endpoint lets Admin poll the result without blocking.
+#
+# This is payout-renewal only. First Phase-1 assignment, PASS->Funded,
+# Second Life and Funded-breach reset are untouched.
+# ============================================================================
+
+_NP_PAYOUT_ASYNC_LOCK_V35 = threading.Lock()
+_NP_PAYOUT_ASYNC_RUNNING_V35 = set()
+_NP_PAYOUT_ASYNC_RESULTS_V35 = {}
+
+# Stop the older payout-renewal sweeper from competing with the exact executor.
+# Existing daemon threads resolve this function dynamically each cycle.
+def _np_retry_pending_payout_renewals_v31(limit=120):
+    return {
+        "checked": 0,
+        "assigned": 0,
+        "fulfilled": 0,
+        "waiting_inventory": 0,
+        "blocked": 0,
+        "busy": 0,
+        "errors": 0,
+        "disabled_by": "ASYNC_EXACT_PAYOUT_EXECUTOR_V35",
+        "finished_at": now_iso(),
+    }
+
+
+def _np_async_payout_result_v35(payout_id):
+    with _NP_PAYOUT_ASYNC_LOCK_V35:
+        return dict(_NP_PAYOUT_ASYNC_RESULTS_V35.get(str(payout_id or "").strip()) or {})
+
+
+def _np_async_payout_set_v35(payout_id, payload):
+    pid = str(payout_id or "").strip()
+    if not pid:
+        return
+    with _NP_PAYOUT_ASYNC_LOCK_V35:
+        current = dict(_NP_PAYOUT_ASYNC_RESULTS_V35.get(pid) or {})
+        current.update(payload or {})
+        current["payout_id"] = pid
+        current["updated_at"] = now_iso()
+        _NP_PAYOUT_ASYNC_RESULTS_V35[pid] = current
+
+
+def _np_async_payout_worker_v35(payout_id, actor=None):
+    pid = str(payout_id or "").strip()
+    try:
+        _np_async_payout_set_v35(pid, {
+            "state": "processing",
+            "processing": True,
+            "assigned": False,
+            "started_at": now_iso(),
+        })
+
+        result = _np_fire_exact_payout_funded_v34(
+            pid,
+            actor or {
+                "name": "payout_async",
+                "username": "payout_async",
+                "role": "system",
+            },
+        ) or {}
+
+        state = str(result.get("state") or "unknown")
+        _np_async_payout_set_v35(pid, {
+            **result,
+            "state": state,
+            "processing": False,
+            "finished_at": now_iso(),
+        })
+        print(
+            "V35 ASYNC PAYOUT RESULT:",
+            pid,
+            state,
+            result.get("reason"),
+            result.get("mt5_login"),
+        )
+    except Exception as exc:
+        err = str(exc)[:500]
+        _np_async_payout_set_v35(pid, {
+            "success": False,
+            "assigned": False,
+            "processing": False,
+            "state": "executor_error",
+            "reason": err,
+            "finished_at": now_iso(),
+        })
+        print("V35 ASYNC PAYOUT EXECUTOR ERROR:", pid, err)
+    finally:
+        with _NP_PAYOUT_ASYNC_LOCK_V35:
+            _NP_PAYOUT_ASYNC_RUNNING_V35.discard(pid)
+
+
+def _np_start_exact_payout_async_v35(payout_id, actor=None):
+    pid = str(payout_id or "").strip()
+    if not pid:
+        return {
+            "success": False,
+            "accepted": False,
+            "state": "blocked",
+            "reason": "missing_payout_id",
+        }
+
+    # Fast immutable-event validation before spawning work.
+    rows = (
+        supabase.table("payouts").select(
+            "id,status,trader_id,trader_account_id,account_id,mt5_login,paid_at,updated_at"
+        )
+        .eq("id", pid).limit(1).execute().data or []
+    )
+    if not rows:
+        return {
+            "success": False,
+            "accepted": False,
+            "state": "blocked",
+            "reason": "payout_not_found",
+        }
+
+    payout = rows[0]
+    if payout_status(payout) != "paid":
+        return {
+            "success": False,
+            "accepted": False,
+            "state": "blocked",
+            "reason": "payout_not_paid",
+        }
+
+    with _NP_PAYOUT_ASYNC_LOCK_V35:
+        if pid in _NP_PAYOUT_ASYNC_RUNNING_V35:
+            current = dict(_NP_PAYOUT_ASYNC_RESULTS_V35.get(pid) or {})
+            return {
+                "success": True,
+                "accepted": True,
+                "processing": True,
+                "state": "processing",
+                "reason": "already_processing",
+                "payout_id": pid,
+                **current,
+            }
+        _NP_PAYOUT_ASYNC_RUNNING_V35.add(pid)
+        _NP_PAYOUT_ASYNC_RESULTS_V35[pid] = {
+            "success": True,
+            "accepted": True,
+            "processing": True,
+            "assigned": False,
+            "state": "queued",
+            "payout_id": pid,
+            "queued_at": now_iso(),
+        }
+
+    t = threading.Thread(
+        target=_np_async_payout_worker_v35,
+        args=(pid, actor),
+        name=f"np-payout-{pid[:8]}",
+        daemon=True,
+    )
+    t.start()
+
+    return {
+        "success": True,
+        "accepted": True,
+        "processing": True,
+        "assigned": False,
+        "state": "queued",
+        "payout_id": pid,
+        "message": "Exact PAID payout accepted. Fresh Funded MT5 assignment is processing.",
+    }
+
+
+# Rebind the endpoint already used by current Admin.
+def admin_retry_exact_payout_renewal_v35():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    d = request.get_json(silent=True) or {}
+    payout_id = str(d.get("payout_id") or d.get("id") or "").strip()
+    if not payout_id:
+        return _np_fail("Exact payout_id is required.", 400)
+
+    actor = {
+        "name": (admin_user or {}).get("name")
+            or (admin_user or {}).get("username")
+            or "admin",
+        "username": (admin_user or {}).get("username") or "admin",
+        "role": (admin_user or {}).get("role") or "admin",
+    }
+    started = _np_start_exact_payout_async_v35(payout_id, actor)
+    if not started.get("success"):
+        return _np_fail(started.get("reason") or "Payout renewal was not accepted.", 409)
+
+    # Deliberately return immediately. Assignment continues on the server.
+    return _np_ok(started, 202)
+
+
+app.view_functions["admin_retry_exact_payout_renewal_v30"] = (
+    admin_retry_exact_payout_renewal_v35
+)
+
+
+@app.route("/admin/payout_renewal_v35/status", methods=["GET", "OPTIONS"])
+def admin_payout_renewal_v35_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    payout_id = str(request.args.get("payout_id") or "").strip()
+    if not payout_id:
+        return _np_fail("payout_id is required.", 400)
+
+    # First return in-process executor state if available.
+    cached = _np_async_payout_result_v35(payout_id)
+    if cached and (
+        cached.get("processing")
+        or cached.get("assigned")
+        or cached.get("already_fulfilled")
+        or cached.get("state") in {
+            "waiting_inventory", "assignment_error",
+            "executor_error", "manual_only", "blocked", "fulfilled"
+        }
+    ):
+        return _np_ok({"success": True, **cached})
+
+    # Durable truth fallback: reconstruct from exact payout/source/successor.
+    truth = _np_exact_payout_funded_due_v34(payout_id) or {}
+    if truth.get("fulfilled"):
+        return _np_ok({
+            "success": True,
+            "processing": False,
+            "assigned": False,
+            "already_fulfilled": True,
+            "state": "fulfilled",
+            "reason": truth.get("reason"),
+            "payout_id": payout_id,
+            "mt5_login": truth.get("mt5_login"),
+            "replacement_account_id": truth.get("replacement_account_id"),
+        })
+
+    if truth.get("due"):
+        return _np_ok({
+            "success": True,
+            "processing": False,
+            "assigned": False,
+            "state": "still_due",
+            "reason": truth.get("reason"),
+            "payout_id": payout_id,
+            "account_size": truth.get("account_size"),
+            "source_mt5": truth.get("source_mt5"),
+        })
+
+    return _np_ok({
+        "success": bool(truth.get("ok")),
+        "processing": False,
+        "assigned": False,
+        "state": "not_due" if truth.get("ok") else "blocked",
+        "reason": truth.get("reason"),
+        "payout_id": payout_id,
+    })
+
+
+# Future MARK PAID must also be non-blocking.
+# Use the pre-V34 core so the HTTP payout transaction is not forced to wait for
+# MT5 assignment. Then enqueue the exact payout once PAID is durable.
+def _np_mark_paid_v35():
+    d = request.get_json(silent=True) or {}
+    payout_id = str(d.get("id") or "").strip()
+
+    response = _np_mark_paid_v33_core()
+
+    if payout_id:
+        try:
+            rows = (
+                supabase.table("payouts").select("id,status")
+                .eq("id", payout_id).limit(1).execute().data or []
+            )
+            if rows and payout_status(rows[0]) == "paid":
+                started = _np_start_exact_payout_async_v35(
+                    payout_id,
+                    {
+                        "name": "payout_paid_hook",
+                        "username": "payout_paid_hook",
+                        "role": "system",
+                    },
+                )
+                print(
+                    "V35 MARK-PAID ASYNC:",
+                    payout_id,
+                    started.get("state"),
+                    started.get("reason"),
+                )
+        except Exception as exc:
+            print("V35 MARK-PAID ASYNC QUEUE ERROR:", payout_id, exc)
+
+    return response
+
+
+if _np_mark_paid_v33_core:
+    app.view_functions["mark_paid"] = _np_mark_paid_v35
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "ASYNC_EXACT_PAYOUT_EXECUTOR_V35_2026_09_14"
