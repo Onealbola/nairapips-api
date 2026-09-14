@@ -33257,9 +33257,7 @@ def _np_start_exact_payout_async_v35(payout_id, actor=None):
 
     # Fast immutable-event validation before spawning work.
     rows = (
-        supabase.table("payouts").select(
-            "id,status,trader_id,trader_account_id,account_id,mt5_login,paid_at,updated_at"
-        )
+        supabase.table("payouts").select("*")
         .eq("id", pid).limit(1).execute().data or []
     )
     if not rows:
@@ -33459,3 +33457,91 @@ if _np_mark_paid_v33_core:
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "ASYNC_EXACT_PAYOUT_EXECUTOR_V35_2026_09_14"
+
+
+# ============================================================================
+# NAIRAPIPS V36 — JSON-SAFE ASYNC PAYOUT START
+# Root cause fixed:
+# V35's fast validator explicitly selected payouts.account_id. Production
+# payouts uses trader_account_id; account_id is not guaranteed to exist.
+# PostgREST therefore raised before Flask could return JSON, and Admin surfaced
+# only "Bad JSON". V36 uses select("*") and JSON-wraps every start failure.
+# ============================================================================
+
+def admin_retry_exact_payout_renewal_v36():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    try:
+        d = request.get_json(silent=True) or {}
+        payout_id = str(d.get("payout_id") or d.get("id") or "").strip()
+        if not payout_id:
+            return _np_fail("Exact payout_id is required.", 400)
+
+        actor = {
+            "name": (admin_user or {}).get("name")
+                or (admin_user or {}).get("username")
+                or "admin",
+            "username": (admin_user or {}).get("username") or "admin",
+            "role": (admin_user or {}).get("role") or "admin",
+        }
+
+        started = _np_start_exact_payout_async_v35(payout_id, actor)
+        if not started.get("success"):
+            return _np_ok({
+                "success": False,
+                "accepted": False,
+                "state": started.get("state") or "blocked",
+                "reason": started.get("reason") or "Payout renewal was not accepted.",
+                "payout_id": payout_id,
+                "release": "V36_JSON_SAFE_ASYNC_START",
+            }, 409)
+
+        return _np_ok({
+            **started,
+            "release": "V36_JSON_SAFE_ASYNC_START",
+        }, 202)
+
+    except Exception as exc:
+        err = str(exc)[:700]
+        print("V36 PAYOUT START ERROR:", err)
+        # Always JSON. Admin must never see opaque "Bad JSON" again.
+        return _np_ok({
+            "success": False,
+            "accepted": False,
+            "state": "start_error",
+            "reason": err,
+            "error": err,
+            "release": "V36_JSON_SAFE_ASYNC_START",
+        }, 500)
+
+
+app.view_functions["admin_retry_exact_payout_renewal_v30"] = (
+    admin_retry_exact_payout_renewal_v36
+)
+
+
+@app.route("/admin/payout_renewal_v36/health", methods=["GET", "OPTIONS"])
+def admin_payout_renewal_v36_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": "V36_JSON_SAFE_ASYNC_START",
+        "payout_fast_select": "select_star",
+        "start_errors_always_json": True,
+        "async_executor": True,
+        "first_assignment_untouched": True,
+        "pass_to_funded_untouched": True,
+        "cockpit_untouched": True,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "V36_JSON_SAFE_ASYNC_START_2026_09_14"
