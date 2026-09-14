@@ -26397,22 +26397,38 @@ def _np_ja_journey_authority(trader_id, journey_id):
                     entitlements_created.append(key)
                     state = "WAITING_MT5"
                 else:
-                    # IMPORTANT BUSINESS LAW:
-                    # A breach with no free/approved entitlement stops the ACCOUNT,
-                    # but does not automatically close the PURCHASE JOURNEY.  The
-                    # same journey may continue later only if an exact paid-reset
-                    # order for this exact breached account is approved.
-                    state = "WAITING_RESET_PAYMENT"
-                    ledger.append({
-                        "type": "RESET_PAYMENT_REQUIRED",
-                        "at": last.get("breached_at") or last.get("archived_at") or last.get("updated_at"),
-                        "journey_id": journey_id,
-                        "purchase_id": journey_id,
-                        "source_account_id": last_id,
-                        "mt5_login": last.get("mt5_login"),
-                        "stage": stg,
-                        "detail": f"{stg.upper()} ACCOUNT STOPPED · NO CURRENT ENTITLEMENT · PAID RESET APPROVAL REQUIRED TO CONTINUE THIS JOURNEY",
-                    })
+                    # IMPORTANT: do not invent a generic paid-reset path here.
+                    # Reuse the EXISTING production reset-policy authority, which
+                    # already knows when the journey has exhausted its legal reset:
+                    #   - 2-Lives challenge: Life 2 breach = terminal
+                    #   - Funded: one paid Funded reset only; replacement breach = terminal
+                    # If policy says terminal, Journey Authority must close instead of
+                    # rendering RESET PAYMENT REQUIRED.
+                    policy = _np_reset_policy(last, trader) or {}
+                    if str(policy.get("kind") or "").strip().lower() == "terminal":
+                        state = "CLOSED"
+                        ledger.append({
+                            "type": "JOURNEY_CLOSED",
+                            "at": last.get("breached_at") or last.get("archived_at") or last.get("updated_at"),
+                            "journey_id": journey_id,
+                            "purchase_id": journey_id,
+                            "source_account_id": last_id,
+                            "mt5_login": last.get("mt5_login"),
+                            "stage": stg,
+                            "detail": "JOURNEY CLOSED · RESET ENTITLEMENT EXHAUSTED · BUY A NEW CHALLENGE",
+                        })
+                    else:
+                        state = "WAITING_RESET_PAYMENT"
+                        ledger.append({
+                            "type": "RESET_PAYMENT_REQUIRED",
+                            "at": last.get("breached_at") or last.get("archived_at") or last.get("updated_at"),
+                            "journey_id": journey_id,
+                            "purchase_id": journey_id,
+                            "source_account_id": last_id,
+                            "mt5_login": last.get("mt5_login"),
+                            "stage": stg,
+                            "detail": f"{stg.upper()} ACCOUNT STOPPED · RESET PAYMENT REQUIRED",
+                        })
 
         elif _np_ja_stage(last) == "funded":
             paid = _np_ja_paid_payouts_for_account(payouts, last.get("id"))
@@ -30462,3 +30478,6 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "EXACT_PURCHASE_LINK_AUTOMATION_V21_2026_09
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "LEDGER_PAYMENT_SEMANTICS_V22_2026_09_14"
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "JOURNEY_TERMINAL_POLICY_BRIDGE_V23_2026_09_14"
