@@ -32566,3 +32566,570 @@ def admin_payout_renewal_v33_status():
 _np_start_payout_renewal_worker_v33()
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PAYOUT_RENEWAL_STALE_CLAIM_RECOVERY_V33_2026_09_14"
+
+
+# ============================================================================
+# NAIRAPIPS EXACT PAYOUT -> FUNDED AUTOMATION V34 — 14 SEP 2026
+#
+# BUILT FROM THE SAME PATTERN THAT FIXED THE FIRST CLEAN PASS -> FUNDED CASE:
+#   immutable business event -> exact source -> exact purchase -> exact target
+#   -> existing protected MT5 assigner -> re-read truth.
+#
+# IMPORTANT:
+# - PAID payout_id is the immutable event authority.
+# - No Journey-Cockpit state is required to authorize assignment.
+# - No background-thread heartbeat is required for the PAID event itself.
+# - Existing first Phase-1 assignment and PASS -> Funded logic are untouched.
+# - Pre-12-Sep journeys remain manual-only.
+# ============================================================================
+
+def _np_exact_payout_funded_due_v34(payout_id):
+    payout_id = str(payout_id or "").strip()
+    if not payout_id:
+        return {"ok": False, "due": False, "reason": "missing_payout_id"}
+
+    prows = (
+        supabase.table("payouts").select("*")
+        .eq("id", payout_id).limit(1).execute().data or []
+    )
+    if not prows:
+        return {"ok": False, "due": False, "reason": "payout_not_found"}
+
+    payout = prows[0]
+    if payout_status(payout) != "paid":
+        return {
+            "ok": True, "due": False, "reason": "payout_not_paid",
+            "payout_id": payout_id,
+        }
+
+    trader_id = str(payout.get("trader_id") or "").strip()
+    source_id = str(
+        payout.get("trader_account_id")
+        or payout.get("account_id")
+        or ""
+    ).strip()
+    if not trader_id or not source_id:
+        return {
+            "ok": False, "due": False, "reason": "missing_exact_payout_linkage",
+            "payout_id": payout_id,
+        }
+
+    srows = (
+        supabase.table("trader_accounts").select("*")
+        .eq("id", source_id).eq("trader_id", trader_id)
+        .limit(1).execute().data or []
+    )
+    if not srows:
+        return {
+            "ok": False, "due": False, "reason": "source_account_not_found",
+            "payout_id": payout_id,
+        }
+
+    source = srows[0]
+    if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "funded":
+        return {
+            "ok": False, "due": False, "reason": "source_not_funded",
+            "payout_id": payout_id, "source_account_id": source_id,
+        }
+
+    payout_login = str(payout.get("mt5_login") or "").strip()
+    source_login = str(source.get("mt5_login") or "").strip()
+    if payout_login and source_login and payout_login != source_login:
+        return {
+            "ok": False, "due": False, "reason": "payout_source_mt5_mismatch",
+            "payout_id": payout_id, "source_account_id": source_id,
+        }
+
+    purchase = _safe_purchase_for_account(source)
+    if not purchase:
+        return {
+            "ok": False, "due": False, "reason": "source_purchase_not_found",
+            "payout_id": payout_id, "source_account_id": source_id,
+        }
+
+    purchase_id = str(purchase.get("id") or "").strip()
+    source_purchase_id = str(
+        source.get("purchase_id")
+        or source.get("challenge_purchase_id")
+        or ""
+    ).strip()
+
+    if str(purchase.get("trader_id") or "").strip() != trader_id:
+        return {
+            "ok": False, "due": False, "reason": "purchase_owner_mismatch",
+            "payout_id": payout_id, "purchase_id": purchase_id,
+        }
+
+    # Exact lineage supports BOTH columns, exactly like the working V16
+    # PASS -> FUNDED authority did.
+    if source_purchase_id and source_purchase_id != purchase_id:
+        return {
+            "ok": False, "due": False, "reason": "source_purchase_mismatch",
+            "payout_id": payout_id, "purchase_id": purchase_id,
+            "source_purchase_id": source_purchase_id,
+        }
+
+    if not _np_automation_generation_purchase(purchase):
+        return {
+            "ok": True, "due": False, "manual_only": True,
+            "reason": "pre_cutover_manual_only",
+            "payout_id": payout_id, "purchase_id": purchase_id,
+            "source_account_id": source_id,
+        }
+
+    trader = get_trader_by_id(trader_id)
+    if not trader:
+        return {
+            "ok": False, "due": False, "reason": "trader_not_found",
+            "payout_id": payout_id,
+        }
+
+    all_accounts = (
+        supabase.table("trader_accounts").select("*")
+        .eq("trader_id", trader_id)
+        .order("created_at", desc=False).limit(500)
+        .execute().data or []
+    )
+
+    existing = _np_exact_post_payout_replacement_20260908(
+        source, payout, all_accounts, trader
+    )
+    if existing:
+        _np_stamp_exact_payout_consumed_20260908(
+            source, existing, trader_id
+        )
+        marker = (
+            f"[NP_CONSUMED:PAYOUT:{payout_id}] "
+            f"replacement_account_id={existing.get('id')} "
+            f"replacement_mt5={existing.get('mt5_login')}"
+        )
+        _np_append_account_marker(source_id, trader_id, marker)
+        return {
+            "ok": True, "due": False, "fulfilled": True,
+            "reason": "exact_successor_exists",
+            "payout_id": payout_id,
+            "trader_id": trader_id,
+            "purchase_id": purchase_id,
+            "source_account_id": source_id,
+            "source_mt5": source_login,
+            "target_stage": "funded",
+            "replacement_account_id": existing.get("id"),
+            "mt5_login": existing.get("mt5_login"),
+        }
+
+    size = clean(
+        source.get("account_size")
+        or source.get("start_balance")
+        or payout.get("account_size")
+        or purchase.get("account_size")
+        or 0
+    )
+
+    if not size:
+        return {
+            "ok": False, "due": False, "reason": "missing_account_size",
+            "payout_id": payout_id, "source_account_id": source_id,
+        }
+
+    return {
+        "ok": True,
+        "due": True,
+        "reason": "exact_paid_payout_funded_due",
+        "entitlement_type": "payout_renewal",
+        "payout_id": payout_id,
+        "trader_id": trader_id,
+        "purchase_id": purchase_id,
+        "source_account_id": source_id,
+        "source_mt5": source_login,
+        "target_stage": "funded",
+        "account_size": size,
+        "payout": payout,
+        "source": source,
+        "purchase": purchase,
+        "trader": trader,
+    }
+
+
+def _np_fire_exact_payout_funded_v34(payout_id, actor=None):
+    truth = _np_exact_payout_funded_due_v34(payout_id)
+
+    if not truth.get("ok"):
+        return {
+            "success": False,
+            "assigned": False,
+            "state": "blocked",
+            "reason": truth.get("reason"),
+            "truth": truth,
+        }
+
+    if truth.get("fulfilled"):
+        return {
+            "success": True,
+            "assigned": False,
+            "already_fulfilled": True,
+            "state": "fulfilled",
+            "reason": truth.get("reason"),
+            "mt5_login": truth.get("mt5_login"),
+            "replacement_account_id": truth.get("replacement_account_id"),
+            "truth": truth,
+        }
+
+    if truth.get("manual_only"):
+        return {
+            "success": True,
+            "assigned": False,
+            "manual_only": True,
+            "state": "manual_only",
+            "reason": truth.get("reason"),
+            "truth": truth,
+        }
+
+    if not truth.get("due"):
+        return {
+            "success": True,
+            "assigned": False,
+            "state": "not_due",
+            "reason": truth.get("reason"),
+            "truth": truth,
+        }
+
+    payout = truth["payout"]
+    source = truth["source"]
+    purchase = truth["purchase"]
+    trader = truth["trader"]
+
+    payout_id = truth["payout_id"]
+    trader_id = truth["trader_id"]
+    source_id = truth["source_account_id"]
+    size = truth["account_size"]
+
+    # Exact lineage GREEN check, but do not depend on mutable cockpit state.
+    # Use both historical linkage columns, mirroring V16 exact-pass authority.
+    if str(purchase.get("trader_id") or "").strip() != trader_id:
+        return {
+            "success": False, "assigned": False,
+            "state": "blocked", "reason": "purchase_owner_mismatch",
+            "truth": truth,
+        }
+
+    source_pid = str(
+        source.get("purchase_id")
+        or source.get("challenge_purchase_id")
+        or ""
+    ).strip()
+    if source_pid and source_pid != truth["purchase_id"]:
+        return {
+            "success": False, "assigned": False,
+            "state": "blocked", "reason": "source_purchase_mismatch",
+            "truth": truth,
+        }
+
+    # Re-check successor immediately before touching the source.
+    current_accounts = (
+        supabase.table("trader_accounts").select("*")
+        .eq("trader_id", trader_id)
+        .order("created_at", desc=False).limit(500)
+        .execute().data or []
+    )
+    existing = _np_exact_post_payout_replacement_20260908(
+        source, payout, current_accounts, trader
+    )
+    if existing:
+        _np_stamp_exact_payout_consumed_20260908(
+            source, existing, trader_id
+        )
+        return {
+            "success": True, "assigned": False,
+            "already_fulfilled": True, "state": "fulfilled",
+            "reason": "successor_appeared_before_fire",
+            "mt5_login": existing.get("mt5_login"),
+            "replacement_account_id": existing.get("id"),
+        }
+
+    # Normalize any old stuck payout-renewal state into ONE exact assignment claim.
+    live_rows = (
+        supabase.table("trader_accounts").select("*")
+        .eq("id", source_id).eq("trader_id", trader_id)
+        .limit(1).execute().data or []
+    )
+    if not live_rows:
+        return {
+            "success": False, "assigned": False,
+            "state": "blocked", "reason": "source_disappeared",
+        }
+
+    live_source = live_rows[0]
+    live_status = str(
+        live_source.get("account_status")
+        or live_source.get("status")
+        or ""
+    ).strip().lower()
+
+    # Do not disturb a genuinely active claim less than 20s old.
+    if live_status == "payout_renewal_assigning":
+        updated_dt = _np_parse_dt_safe(live_source.get("updated_at"))
+        if updated_dt:
+            age = (datetime.now(timezone.utc) - updated_dt).total_seconds()
+            if age < 20:
+                return {
+                    "success": True, "assigned": False,
+                    "waiting": True, "state": "busy",
+                    "reason": "exact_assignment_claim_active",
+                }
+
+    old_reason = str(live_source.get("archive_reason") or "").strip()
+    entitlement_marker = f"[NP_ENTITLEMENT:post_payout_renewal:{payout_id}]"
+    claim_marker = f"[NP_PAYOUT_CLAIM:{payout_id}]"
+
+    reason_parts = old_reason
+    if entitlement_marker.lower() not in reason_parts.lower():
+        reason_parts = (reason_parts + " | " + entitlement_marker).strip(" |")
+    if claim_marker.lower() not in reason_parts.lower():
+        reason_parts = (reason_parts + " | " + claim_marker).strip(" |")
+
+    # Exact source is closed BEFORE assignment so the existing assigner sees no
+    # competing active account for the same purchase.
+    supabase.table("trader_accounts").update({
+        "account_status": "payout_renewal_assigning",
+        "monitoring_enabled": False,
+        "archive_reason": reason_parts,
+        "updated_at": now_iso(),
+    }).eq("id", source_id).eq("trader_id", trader_id).execute()
+
+    mt5 = _np_pick_fresh_mt5(size, "funded")
+    if not mt5:
+        supabase.table("trader_accounts").update({
+            "account_status": "payout_renewal_waiting_mt5",
+            "monitoring_enabled": False,
+            "updated_at": now_iso(),
+            "archive_reason": reason_parts,
+        }).eq("id", source_id).eq("trader_id", trader_id).execute()
+
+        _np_inventory_wait_alert(
+            "funded", size, f"exact payout renewal {payout_id}", trader
+        )
+
+        return {
+            "success": True, "assigned": False,
+            "waiting": True, "state": "waiting_inventory",
+            "reason": "no_eligible_funded_mt5",
+            "account_size": size,
+        }
+
+    try:
+        account, updated = _assign_mt5_to_trader(
+            trader,
+            mt5,
+            "funded",
+            purchase,
+            actor or {
+                "name": "payout_automation",
+                "username": "payout_automation",
+                "role": "system",
+            },
+            (
+                f"EXACT PAYOUT RENEWAL V34 payout_id={payout_id}; "
+                f"source_account={source_id}"
+            ),
+        )
+    except Exception as exc:
+        # Persist the REAL assignment error instead of silently circling.
+        error_text = str(exc)[:300]
+        supabase.table("trader_accounts").update({
+            "account_status": "payout_renewal_waiting_mt5",
+            "monitoring_enabled": False,
+            "updated_at": now_iso(),
+            "archive_reason": (
+                reason_parts + f" | V34_ASSIGN_ERROR={error_text}"
+            ).strip(" |"),
+        }).eq("id", source_id).eq("trader_id", trader_id).execute()
+
+        _audit_safe(
+            "automation", "v34_exact_payout_assignment_failed",
+            (
+                f"payout={payout_id}; source={source_id}; "
+                f"size={size}; mt5={(mt5 or {}).get('mt5_login')}; "
+                f"error={error_text}"
+            ),
+            actor or {
+                "name": "payout_automation",
+                "username": "payout_automation",
+                "role": "system",
+            },
+            payout_id,
+        )
+
+        return {
+            "success": False,
+            "assigned": False,
+            "state": "assignment_error",
+            "reason": error_text,
+            "account_size": size,
+            "selected_mt5": (mt5 or {}).get("mt5_login"),
+        }
+
+    consumed_marker = (
+        f"[NP_CONSUMED:PAYOUT:{payout_id}] "
+        f"replacement_account_id={account.get('id')} "
+        f"replacement_mt5={account.get('mt5_login')}"
+    )
+
+    supabase.table("trader_accounts").update({
+        "account_status": "archived",
+        "monitoring_enabled": False,
+        "archive_reason": (
+            reason_parts + " | " + consumed_marker
+        ).strip(" |"),
+        "updated_at": now_iso(),
+    }).eq("id", source_id).eq("trader_id", trader_id).execute()
+
+    _np_stamp_exact_payout_consumed_20260908(
+        dict(live_source, archive_reason=reason_parts),
+        account,
+        trader_id,
+    )
+
+    _audit_safe(
+        "automation", "v34_exact_payout_renewal_assigned",
+        (
+            f"payout={payout_id}; source={source_id} -> "
+            f"Funded MT5 {account.get('mt5_login')}"
+        ),
+        actor or {
+            "name": "payout_automation",
+            "username": "payout_automation",
+            "role": "system",
+        },
+        payout_id,
+    )
+
+    after = _np_exact_payout_funded_due_v34(payout_id)
+
+    return {
+        "success": True,
+        "assigned": True,
+        "state": "assigned",
+        "reason": "exact_paid_payout_fulfilled",
+        "payout_id": payout_id,
+        "replacement_account_id": account.get("id"),
+        "mt5_login": account.get("mt5_login"),
+        "account_size": size,
+        "after": after,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Exact recovery endpoint — mirrors the V16 PASS -> FUNDED fire route that
+# successfully recovered yesterday's missed automation.
+# ---------------------------------------------------------------------------
+@app.route("/admin/fire_exact_payout_renewal_v34", methods=["POST", "OPTIONS"])
+def admin_fire_exact_payout_renewal_v34():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    d = request.get_json(silent=True) or {}
+    payout_id = str(d.get("payout_id") or d.get("id") or "").strip()
+    if not payout_id:
+        return _np_fail("Exact payout_id is required.", 400)
+
+    result = _np_fire_exact_payout_funded_v34(
+        payout_id,
+        {
+            "name": (admin_user or {}).get("name")
+                or (admin_user or {}).get("username")
+                or "admin",
+            "username": (admin_user or {}).get("username") or "admin",
+            "role": (admin_user or {}).get("role") or "admin",
+        },
+    )
+
+    status = 200 if result.get("success") else 409
+    return _np_ok(result, status)
+
+
+# Existing Admin V36/V37 already calls /admin/retry_exact_payout_renewal.
+# Rebind THAT endpoint to this exact V34 fire path so the current UI does not
+# need another redesign or another manual MT5-selection workflow.
+def admin_retry_exact_payout_renewal_v34():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    d = request.get_json(silent=True) or {}
+    payout_id = str(d.get("payout_id") or d.get("id") or "").strip()
+    if not payout_id:
+        return _np_fail("Exact payout_id is required.", 400)
+
+    result = _np_fire_exact_payout_funded_v34(
+        payout_id,
+        {
+            "name": (admin_user or {}).get("name")
+                or (admin_user or {}).get("username")
+                or "admin",
+            "username": (admin_user or {}).get("username") or "admin",
+            "role": (admin_user or {}).get("role") or "admin",
+        },
+    )
+    return _np_ok(result, 200 if result.get("success") else 409)
+
+
+app.view_functions["admin_retry_exact_payout_renewal_v30"] = (
+    admin_retry_exact_payout_renewal_v34
+)
+
+
+# ---------------------------------------------------------------------------
+# FUTURE PAYOUTS: hook the exact PAID event itself, exactly like V15/V16 hooked
+# the exact PASS event. The original production route still marks payment PAID,
+# sends mail and writes audit history. V34 only fulfils the resulting MT5 product.
+# ---------------------------------------------------------------------------
+_np_mark_paid_v33_core = app.view_functions.get("mark_paid")
+
+def _np_mark_paid_v34():
+    d = request.get_json(silent=True) or {}
+    payout_id = str(d.get("id") or "").strip()
+
+    response = _np_mark_paid_v33_core()
+
+    if payout_id:
+        try:
+            prows = (
+                supabase.table("payouts").select("*")
+                .eq("id", payout_id).limit(1).execute().data or []
+            )
+            if prows and payout_status(prows[0]) == "paid":
+                fire = _np_fire_exact_payout_funded_v34(
+                    payout_id,
+                    {
+                        "name": "payout_paid_hook",
+                        "username": "payout_paid_hook",
+                        "role": "system",
+                    },
+                )
+                print(
+                    "V34 MARK-PAID PAYOUT RENEWAL:",
+                    payout_id,
+                    fire.get("state"),
+                    fire.get("reason"),
+                    fire.get("mt5_login"),
+                )
+        except Exception as exc:
+            # Payment itself remains PAID. Exact entitlement remains recoverable
+            # through the retry endpoint; never roll back the financial record.
+            print("V34 MARK-PAID EXACT PAYOUT FIRE DEFERRED:", exc)
+
+    return response
+
+
+if _np_mark_paid_v33_core:
+    app.view_functions["mark_paid"] = _np_mark_paid_v34
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "EXACT_PAYOUT_FUNDED_AUTHORITY_V34_2026_09_14"
