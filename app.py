@@ -32363,3 +32363,206 @@ def admin_payout_renewal_v32_status():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PAYOUT_TABLE_AUTHORITY_V32_2026_09_14"
+
+
+# ============================================================================
+# NAIRAPIPS PAYOUT RENEWAL STALE-CLAIM RECOVERY V33 — 14 SEP 2026
+#
+# FORENSIC ROOT CAUSE
+# -------------------
+# V32 introduced an atomic state "payout_renewal_assigning" so two workers
+# cannot issue two MT5s. That lock had NO LEASE EXPIRY.
+#
+# If a Render worker was restarted, timed out, or crashed after taking the claim
+# but before completing assignment, the source stayed "payout_renewal_assigning"
+# forever. Every future retry then returned:
+#     busy -> assignment_claim_held
+# and the customer remained "OWES 1 FUNDED MT5" permanently.
+#
+# V33 gives that claim a lease. A claim older than 90 seconds is safely released
+# back to payout_renewal_waiting_mt5 and retried from the exact PAID payout.
+#
+# This patch touches payout-renewal only. It does NOT modify:
+#   * purchase -> first Phase 1 assignment
+#   * Phase 1 pass -> first Funded assignment
+#   * Second Life
+#   * paid Funded breach reset
+#   * legacy/manual pre-12-Sep journeys
+# ============================================================================
+
+_NP_PAYOUT_RENEWAL_CLAIM_LEASE_SECONDS_V33 = 90
+_NP_PAYOUT_RENEWAL_WORKER_INTERVAL_V33 = 15
+
+
+def _np_claim_is_stale_v33(source):
+    source = source or {}
+    status = str(source.get("account_status") or "").strip().lower()
+    if status != "payout_renewal_assigning":
+        return False
+
+    dt = _np_parse_dt_safe(
+        source.get("updated_at")
+        or source.get("reset_at")
+        or source.get("archived_at")
+        or source.get("created_at")
+    )
+    if not dt:
+        # Fail safe: an assigning claim without any timestamp cannot own a
+        # permanent lock. Treat it as stale and let exact payout authority retry.
+        return True
+
+    age = (datetime.now(timezone.utc) - dt).total_seconds()
+    return age >= _NP_PAYOUT_RENEWAL_CLAIM_LEASE_SECONDS_V33
+
+
+def _np_release_stale_payout_claim_v33(source, payout_id):
+    """Release only ONE exact expired payout-renewal claim."""
+    source = source or {}
+    source_id = str(source.get("id") or "").strip()
+    trader_id = str(source.get("trader_id") or "").strip()
+    if not source_id or not trader_id:
+        return False
+
+    if not _np_claim_is_stale_v33(source):
+        return False
+
+    old_reason = str(source.get("archive_reason") or "").strip()
+    release_marker = (
+        f"[NP_PAYOUT_CLAIM_RECOVERED:{payout_id}:{now_iso()}]"
+    )
+    new_reason = (
+        old_reason
+        if release_marker.lower() in old_reason.lower()
+        else (old_reason + " | " + release_marker).strip(" |")
+    )
+
+    rows = (
+        supabase.table("trader_accounts").update({
+            "account_status": "payout_renewal_waiting_mt5",
+            "monitoring_enabled": False,
+            "archive_reason": new_reason,
+            "updated_at": now_iso(),
+        })
+        .eq("id", source_id)
+        .eq("trader_id", trader_id)
+        .eq("account_status", "payout_renewal_assigning")
+        .execute().data or []
+    )
+
+    if rows:
+        _audit_safe(
+            "automation",
+            "payout_renewal_stale_claim_recovered",
+            f"payout={payout_id}; source={source_id}; expired assigning claim released for retry",
+            {"name":"payout_automation","username":"payout_automation","role":"system"},
+            payout_id,
+        )
+        return True
+    return False
+
+
+# Keep V32 as the canonical exact-payout processor, but recover an abandoned
+# claim before allowing its "busy forever" branch to run.
+_np_process_exact_paid_payout_v32_core = _np_process_exact_paid_payout_v32
+
+def _np_process_exact_paid_payout_v32(payout):
+    payout = payout or {}
+    payout_id = str(payout.get("id") or "").strip()
+    trader_id = str(payout.get("trader_id") or "").strip()
+    source_id = str(
+        payout.get("trader_account_id")
+        or payout.get("account_id")
+        or ""
+    ).strip()
+
+    if payout_id and trader_id and source_id and payout_status(payout) == "paid":
+        try:
+            rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", source_id)
+                .eq("trader_id", trader_id)
+                .limit(1).execute().data or []
+            )
+            if rows:
+                source = rows[0]
+                if _np_claim_is_stale_v33(source):
+                    _np_release_stale_payout_claim_v33(source, payout_id)
+        except Exception as exc:
+            print("V33 STALE PAYOUT CLAIM RECOVERY ERROR:", exc)
+
+    # Re-read and execute the existing V32 exact-authority law.
+    return _np_process_exact_paid_payout_v32_core(payout)
+
+
+# Replace the existing V31 daemon loop with a faster payout-only loop.
+# The old thread may already exist in some Gunicorn workers, but it resolves
+# _np_retry_pending_payout_renewals_v31 dynamically and therefore gets the V33
+# stale-claim recovery automatically. New workers use this 15s cadence.
+def _np_payout_renewal_worker_loop_v33():
+    time.sleep(3)
+    while True:
+        try:
+            if _NP_PAYOUT_RENEWAL_WORKER_LOCK_V31.acquire(blocking=False):
+                try:
+                    summary = _np_retry_pending_payout_renewals_v31()
+                    globals()["_NP_PAYOUT_RENEWAL_LAST_SUMMARY_V33"] = summary
+                finally:
+                    _NP_PAYOUT_RENEWAL_WORKER_LOCK_V31.release()
+        except Exception as exc:
+            print("V33 PAYOUT RENEWAL WORKER ERROR:", exc)
+        time.sleep(_NP_PAYOUT_RENEWAL_WORKER_INTERVAL_V33)
+
+
+# Start one additional V33 supervisor per process only when V31 was already
+# started. It shares the SAME lock, so V31 and V33 cannot process concurrently.
+_NP_PAYOUT_RENEWAL_WORKER_STARTED_V33 = False
+
+def _np_start_payout_renewal_worker_v33():
+    global _NP_PAYOUT_RENEWAL_WORKER_STARTED_V33
+    if _NP_PAYOUT_RENEWAL_WORKER_STARTED_V33:
+        return
+    if str(os.getenv("NAIRAPIPS_DISABLE_PAYOUT_RENEWAL_WORKER") or "").strip().lower() in {"1","true","yes"}:
+        return
+
+    _NP_PAYOUT_RENEWAL_WORKER_STARTED_V33 = True
+    t = threading.Thread(
+        target=_np_payout_renewal_worker_loop_v33,
+        name="nairapips-payout-renewal-v33",
+        daemon=True,
+    )
+    t.start()
+    print("V33 payout renewal supervisor started: 15s retry + 90s stale-claim recovery")
+
+
+# Exact Admin retry uses the V33-wrapped processor automatically because V32
+# looks up _np_process_exact_paid_payout_v32 at request time.
+
+
+@app.route("/admin/payout_renewal_v33/status", methods=["GET", "OPTIONS"])
+def admin_payout_renewal_v33_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    return _np_ok({
+        "success": True,
+        "authority": "EXACT_PAID_PAYOUT",
+        "claim_lease_seconds": _NP_PAYOUT_RENEWAL_CLAIM_LEASE_SECONDS_V33,
+        "worker_interval_seconds": _NP_PAYOUT_RENEWAL_WORKER_INTERVAL_V33,
+        "v31_worker_started": bool(globals().get("_NP_PAYOUT_RENEWAL_WORKER_STARTED_V31")),
+        "v33_worker_started": _NP_PAYOUT_RENEWAL_WORKER_STARTED_V33,
+        "cockpit_read_only": True,
+        "first_assignment_untouched": True,
+        "phase_pass_assignment_untouched": True,
+        "legacy_auto_assignment": False,
+        "last_summary": globals().get("_NP_PAYOUT_RENEWAL_LAST_SUMMARY_V33")
+            or globals().get("_NP_PAYOUT_RENEWAL_LAST_SUMMARY_V31"),
+        "release": "PAYOUT_RENEWAL_STALE_CLAIM_RECOVERY_V33_2026_09_14",
+    })
+
+
+_np_start_payout_renewal_worker_v33()
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PAYOUT_RENEWAL_STALE_CLAIM_RECOVERY_V33_2026_09_14"
