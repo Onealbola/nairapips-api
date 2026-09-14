@@ -31379,3 +31379,189 @@ def _np_resume_waiting_zero_cost_automations(trigger="verified_retry"):
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "EXACT_PAID_PAYOUT_SWEEP_V29_2026_09_14"
+
+
+# ============================================================================
+# NAIRAPIPS NON-BLOCKING PAYOUT RENEWAL V30 — 14 SEP 2026
+#
+# FORENSIC CORRECTION
+# -------------------
+# V28/V29 attached automation work to /admin_journey_authority reads.
+# Journey Cockpit is a READ screen; it must never wait for payout scans,
+# retry sweeps or MT5 assignment. This final override restores that contract.
+#
+# New/clean payout renewals still fire from the existing MARK PAID hook.
+# Already-stuck clean payout renewals may be retried through ONE exact,
+# authenticated, idempotent endpoint without blocking Cockpit rendering.
+# ============================================================================
+
+# 1) Ordinary Admin browsing must never be an automation heartbeat.
+try:
+    _NP_AUTOMATION_HEARTBEAT_PATHS_V20.discard("/admin_journey_authority")
+    _NP_AUTOMATION_HEARTBEAT_PATHS_V20.discard("/admin_journey_authority/exact")
+except Exception:
+    pass
+
+# 2) Remove V29 broad paid-payout sweep from the generic retry chain.
+#    Restore the exact pre-V29 retry chain (V26/V28 core).
+try:
+    _np_resume_waiting_zero_cost_automations = _np_resume_waiting_zero_cost_automations_v28_core
+except Exception:
+    pass
+
+# 3) Journey Authority becomes READ-ONLY / fast again.
+#    V27 already includes the payout semantic cleanup but performs no retry/sweep.
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v27
+
+
+@app.route("/admin/retry_exact_payout_renewal", methods=["POST", "OPTIONS"])
+def admin_retry_exact_payout_renewal_v30():
+    """Retry ONE exact PAID payout renewal without blocking Journey Cockpit.
+
+    Security:
+      * authenticated Admin only
+      * exact payout id
+      * exact payout/source/trader ownership
+      * exact Funded source
+      * exact clean purchase on/after 12 Sep
+      * exact existing replacement blocks replay
+      * existing payout-renewal engine remains authoritative
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    d = request.get_json(silent=True) or {}
+    payout_id = str(d.get("payout_id") or d.get("id") or "").strip()
+    if not payout_id:
+        return _np_fail("Exact payout_id is required.", 400)
+
+    try:
+        prows = (
+            supabase.table("payouts").select("*")
+            .eq("id", payout_id).limit(1).execute().data or []
+        )
+        if not prows:
+            return _np_fail("Payout not found.", 404)
+
+        payout = prows[0]
+        if payout_status(payout) != "paid":
+            return _np_fail("Only a PAID payout can create a payout renewal.", 409)
+
+        trader_id = str(payout.get("trader_id") or "").strip()
+        source_id = str(payout.get("trader_account_id") or payout.get("account_id") or "").strip()
+        if not trader_id or not source_id:
+            return _np_fail("Payout is missing exact trader/account linkage.", 409)
+
+        srows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", source_id).eq("trader_id", trader_id)
+            .limit(1).execute().data or []
+        )
+        if not srows:
+            return _np_fail("Exact payout source account was not found.", 404)
+
+        source = srows[0]
+        if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "funded":
+            return _np_fail("Payout source is not a Funded account.", 409)
+
+        payout_login = str(payout.get("mt5_login") or "").strip()
+        source_login = str(source.get("mt5_login") or "").strip()
+        if payout_login and source_login and payout_login != source_login:
+            return _np_fail("Payout MT5 does not match the exact source account.", 409)
+
+        purchase = _safe_purchase_for_account(source)
+        if not purchase:
+            return _np_fail("Exact source purchase could not be verified.", 409)
+
+        if str(purchase.get("trader_id") or "").strip() != trader_id:
+            return _np_fail("Purchase/trader ownership mismatch.", 409)
+
+        if not _np_automation_generation_purchase(purchase):
+            return _np_ok({
+                "success": True,
+                "assigned": False,
+                "manual_only": True,
+                "message": "Pre-12 Sep journey remains manual-only.",
+                "payout_id": payout_id,
+            })
+
+        trader = get_trader_by_id(trader_id) or {}
+        all_accounts = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", trader_id)
+            .order("created_at", desc=False).limit(500).execute().data or []
+        )
+
+        existing = _np_exact_post_payout_replacement_20260908(
+            source, payout, all_accounts, trader
+        )
+        if existing:
+            _np_stamp_exact_payout_consumed_20260908(source, existing, trader_id)
+            return _np_ok({
+                "success": True,
+                "assigned": False,
+                "already_fulfilled": True,
+                "message": "Payout renewal already has its exact Funded replacement.",
+                "payout_id": payout_id,
+                "replacement_account_id": existing.get("id"),
+                "mt5_login": existing.get("mt5_login"),
+            })
+
+        # Reuse the exact existing retry/claim logic. No new assignment law.
+        result = _np_resume_exact_waiting_payout_renewal_v26(
+            payout, source, purchase
+        )
+
+        if result and result.get("account"):
+            account = result.get("account") or {}
+            return _np_ok({
+                "success": True,
+                "assigned": not bool(result.get("already_fulfilled")),
+                "already_fulfilled": bool(result.get("already_fulfilled")),
+                "message": (
+                    "Fresh Funded MT5 assigned automatically."
+                    if not result.get("already_fulfilled")
+                    else "Payout renewal was already fulfilled."
+                ),
+                "payout_id": payout_id,
+                "replacement_account_id": account.get("id"),
+                "mt5_login": account.get("mt5_login"),
+            })
+
+        return _np_ok({
+            "success": True,
+            "assigned": False,
+            "waiting": True,
+            "message": "Verified payout renewal remains pending eligible Funded MT5 inventory.",
+            "payout_id": payout_id,
+        })
+
+    except Exception as exc:
+        print("V30 EXACT PAYOUT RENEWAL RETRY ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+# Read-only proof for operations.
+@app.route("/admin/payout_renewal_v30/status", methods=["GET", "OPTIONS"])
+def admin_payout_renewal_v30_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "cockpit_read_only": True,
+        "cockpit_automation_heartbeat": False,
+        "mark_paid_auto_assignment": True,
+        "exact_retry_endpoint": True,
+        "legacy_auto_assignment": False,
+        "release": "NON_BLOCKING_PAYOUT_RENEWAL_V30_2026_09_14",
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "NON_BLOCKING_PAYOUT_RENEWAL_V30_2026_09_14"
