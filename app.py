@@ -31146,3 +31146,85 @@ def _np_admin_journey_authority_v27():
 app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v27
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PAYOUT_PAID_AUTHORITY_FIX_V27_2026_09_14"
+
+
+# ============================================================================
+# NAIRAPIPS PAYOUT-RENEWAL LIVE TRIGGER V28 — 14 SEP 2026
+#
+# PURPOSE
+# -------
+# V27 corrected PAID payout authority and V26 added exact payout-renewal retry.
+# The remaining production gap was TRIGGERING: the verified retry worker only
+# woke from selected MT5-engine paths. If those paths were quiet after a payout
+# was marked PAID, a valid clean 12-Sep+ payout renewal could remain outstanding.
+#
+# V28 does NOT relax entitlement rules. It only lets the EXISTING verified retry
+# worker wake when Admin opens/refreshes Journey Cockpit, in addition to engine
+# heartbeat and inventory-added triggers.
+#
+# This is safe because the retry worker itself still requires:
+#   * clean 12-Sep+ purchase
+#   * exact trader + purchase + source account
+#   * exact PAID payout
+#   * exact payout_renewal entitlement
+#   * no existing successor
+#   * fresh eligible Funded MT5 inventory
+# Legacy journeys remain manual-only.
+# ============================================================================
+
+# Add Cockpit authority reads to the already rate-limited verified heartbeat.
+try:
+    _NP_AUTOMATION_HEARTBEAT_PATHS_V20.update({
+        "/admin_journey_authority",
+        "/admin_journey_authority/exact",
+    })
+except Exception:
+    pass
+
+
+_np_admin_journey_authority_v27_core = _np_admin_journey_authority_v27
+
+def _np_admin_journey_authority_v28():
+    if request.method == "OPTIONS":
+        return _np_admin_journey_authority_v27_core()
+
+    # Authentication is still performed by the existing V27 route.
+    # Wake the existing verified retry worker BEFORE the journey is rebuilt so
+    # the same refresh can show the newly assigned Funded MT5 if fulfilment succeeds.
+    try:
+        _np_maybe_run_verified_retry_v19("admin_journey_authority_refresh")
+    except Exception as exc:
+        # Never break Admin rendering because a retry attempt failed.
+        print("V28 ADMIN JOURNEY RETRY WAKE SKIPPED:", exc)
+
+    return _np_admin_journey_authority_v27_core()
+
+
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v28
+
+
+# Upgrade retry status so operations can prove Cockpit-trigger wake is installed.
+def automation_retry_status_v28():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "verified_retry_enabled": True,
+        "engine_heartbeat_enabled": True,
+        "cockpit_refresh_retry_enabled": True,
+        "broad_historical_sweep_enabled": False,
+        "retry_interval_seconds": _NP_VERIFIED_RETRY_MIN_INTERVAL,
+        "heartbeat_paths": sorted(_NP_AUTOMATION_HEARTBEAT_PATHS_V20),
+        "last_heartbeat_path": _NP_AUTOMATION_HEARTBEAT_LAST_PATH_V20,
+        "last_heartbeat_at": _NP_AUTOMATION_HEARTBEAT_LAST_AT_V20,
+        "last_retry_epoch": _NP_VERIFIED_RETRY_LAST_TS,
+        "last_retry_summary": globals().get("_NP_VERIFIED_RETRY_LAST_SUMMARY_V21"),
+        "release": "PAYOUT_RENEWAL_LIVE_TRIGGER_V28_2026_09_14",
+    })
+
+app.view_functions["automation_retry_status_v19"] = automation_retry_status_v28
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PAYOUT_RENEWAL_LIVE_TRIGGER_V28_2026_09_14"
