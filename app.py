@@ -33545,3 +33545,282 @@ def admin_payout_renewal_v36_health():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "V36_JSON_SAFE_ASYNC_START_2026_09_14"
+
+
+# ============================================================================
+# NAIRAPIPS V37 — ASYNC BUSY-CLAIM RECOVERY + APP CONTEXT
+# 14 SEP 2026
+#
+# WHAT THE CAPTURED YELLOW MESSAGE PROVED
+# ---------------------------------------
+# "Exact PAID payout accepted — assigning fresh Funded MT5 in background..."
+# proves:
+#   1. Admin sent the exact payout id successfully.
+#   2. Backend accepted the PAID payout.
+#   3. V36 JSON/start layer is working.
+#
+# Therefore the remaining failure is AFTER acceptance.
+#
+# FORENSIC DEFECT
+# ---------------
+# V34 intentionally returns BUSY when the exact payout source is already in
+# payout_renewal_assigning and that claim is younger than 20 seconds.
+# V35/V36 background executor treated that BUSY result as terminal. It did NOT
+# wait for the short claim lease to expire and retry. This allowed a perfectly
+# valid payout renewal to stay owed forever after overlapping attempts.
+#
+# V37:
+#   - runs the exact executor inside Flask app_context()
+#   - retries BUSY claims automatically
+#   - retries short inventory waits automatically
+#   - persists the last real state on the source account for cross-worker truth
+#   - still uses the existing V34 exact payout -> Funded assigner
+#   - does not touch first assignment / pass->funded / second life / reset
+# ============================================================================
+
+_NP_PAYOUT_V37_MAX_ATTEMPTS = 18
+_NP_PAYOUT_V37_BUSY_SLEEP = 5
+_NP_PAYOUT_V37_INVENTORY_SLEEP = 15
+
+
+def _np_v37_source_for_payout(payout_id):
+    try:
+        rows = (
+            supabase.table("payouts").select("*")
+            .eq("id", str(payout_id or "").strip())
+            .limit(1).execute().data or []
+        )
+        if not rows:
+            return None, None
+        p = rows[0]
+        sid = str(p.get("trader_account_id") or p.get("account_id") or "").strip()
+        tid = str(p.get("trader_id") or "").strip()
+        if not sid or not tid:
+            return p, None
+        srows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", sid).eq("trader_id", tid)
+            .limit(1).execute().data or []
+        )
+        return p, (srows[0] if srows else None)
+    except Exception:
+        return None, None
+
+
+def _np_v37_persist_checkpoint(payout_id, state, reason="", attempt=None):
+    p, source = _np_v37_source_for_payout(payout_id)
+    if not source:
+        return
+
+    source_id = str(source.get("id") or "").strip()
+    trader_id = str(source.get("trader_id") or "").strip()
+    if not source_id or not trader_id:
+        return
+
+    old = str(source.get("archive_reason") or "").strip()
+    marker = (
+        f"[NP_PAYOUT_V37:{str(state or '').upper()}"
+        f":attempt={attempt if attempt is not None else '-'}"
+        f":{str(reason or '')[:160]}]"
+    )
+    # Keep the record bounded; we only need the latest forensic checkpoint.
+    cleaned = re.sub(
+        r"\s*\|\s*\[NP_PAYOUT_V37:[^\]]*\]",
+        "",
+        old,
+        flags=re.I,
+    ).strip(" |")
+    new_reason = (cleaned + " | " + marker).strip(" |")
+
+    try:
+        supabase.table("trader_accounts").update({
+            "archive_reason": new_reason,
+            "updated_at": now_iso(),
+        }).eq("id", source_id).eq("trader_id", trader_id).execute()
+    except Exception as exc:
+        print("V37 CHECKPOINT WRITE FAILED:", payout_id, exc)
+
+
+# Replace the V35 background worker with a retrying worker.
+def _np_async_payout_worker_v35(payout_id, actor=None):
+    pid = str(payout_id or "").strip()
+    terminal = None
+
+    try:
+        with app.app_context():
+            _np_async_payout_set_v35(pid, {
+                "state": "processing",
+                "processing": True,
+                "assigned": False,
+                "started_at": now_iso(),
+                "attempt": 0,
+            })
+            _np_v37_persist_checkpoint(pid, "PROCESSING", "executor_started", 0)
+
+            for attempt in range(1, _NP_PAYOUT_V37_MAX_ATTEMPTS + 1):
+                _np_async_payout_set_v35(pid, {
+                    "state": "processing",
+                    "processing": True,
+                    "assigned": False,
+                    "attempt": attempt,
+                })
+
+                result = _np_fire_exact_payout_funded_v34(
+                    pid,
+                    actor or {
+                        "name": "payout_async",
+                        "username": "payout_async",
+                        "role": "system",
+                    },
+                ) or {}
+
+                state = str(result.get("state") or "unknown").strip().lower()
+                reason = str(result.get("reason") or "").strip()
+                terminal = result
+
+                print(
+                    "V37 PAYOUT ATTEMPT:",
+                    pid,
+                    "attempt=", attempt,
+                    "state=", state,
+                    "reason=", reason,
+                    "mt5=", result.get("mt5_login"),
+                )
+                _np_v37_persist_checkpoint(pid, state, reason, attempt)
+
+                # SUCCESS / idempotent success.
+                if state in {"assigned", "fulfilled"} or result.get("assigned") or result.get("already_fulfilled"):
+                    _np_async_payout_set_v35(pid, {
+                        **result,
+                        "processing": False,
+                        "state": "assigned" if result.get("assigned") else "fulfilled",
+                        "attempt": attempt,
+                        "finished_at": now_iso(),
+                    })
+                    return
+
+                # Exact claim younger than its lease: wait; do NOT abandon entitlement.
+                if state == "busy":
+                    time.sleep(_NP_PAYOUT_V37_BUSY_SLEEP)
+                    continue
+
+                # Inventory can be transient. Retry for a bounded period automatically.
+                if state == "waiting_inventory":
+                    if attempt < _NP_PAYOUT_V37_MAX_ATTEMPTS:
+                        time.sleep(_NP_PAYOUT_V37_INVENTORY_SLEEP)
+                        continue
+                    break
+
+                # A transient DB/assignment error gets a few safe retries.
+                if state in {"assignment_error", "executor_error"}:
+                    if attempt < 4:
+                        time.sleep(_NP_PAYOUT_V37_BUSY_SLEEP)
+                        continue
+                    break
+
+                # manual_only / blocked / not_due are genuine terminal decisions.
+                break
+
+            result = terminal or {
+                "success": False,
+                "assigned": False,
+                "state": "executor_error",
+                "reason": "executor_finished_without_result",
+            }
+            _np_async_payout_set_v35(pid, {
+                **result,
+                "processing": False,
+                "attempt": _NP_PAYOUT_V37_MAX_ATTEMPTS,
+                "finished_at": now_iso(),
+            })
+
+    except Exception as exc:
+        err = str(exc)[:700]
+        _np_v37_persist_checkpoint(pid, "EXECUTOR_ERROR", err, -1)
+        _np_async_payout_set_v35(pid, {
+            "success": False,
+            "assigned": False,
+            "processing": False,
+            "state": "executor_error",
+            "reason": err,
+            "finished_at": now_iso(),
+        })
+        print("V37 ASYNC PAYOUT EXECUTOR ERROR:", pid, err)
+
+    finally:
+        with _NP_PAYOUT_ASYNC_LOCK_V35:
+            _NP_PAYOUT_ASYNC_RUNNING_V35.discard(pid)
+
+
+# Make status durable across multiple Gunicorn workers.
+# In-memory result is used first; source checkpoint/truth is the cross-worker fallback.
+def admin_payout_renewal_v37_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    payout_id = str(request.args.get("payout_id") or "").strip()
+    if not payout_id:
+        return _np_fail("payout_id is required.", 400)
+
+    cached = _np_async_payout_result_v35(payout_id)
+    if cached:
+        return _np_ok({"success": True, **cached})
+
+    truth = _np_exact_payout_funded_due_v34(payout_id) or {}
+    p, source = _np_v37_source_for_payout(payout_id)
+    blob = str((source or {}).get("archive_reason") or "")
+    checkpoint = ""
+    m = re.search(r"\[NP_PAYOUT_V37:([^\]]+)\]", blob, re.I)
+    if m:
+        checkpoint = str(m.group(1) or "")
+
+    if truth.get("fulfilled"):
+        return _np_ok({
+            "success": True,
+            "processing": False,
+            "already_fulfilled": True,
+            "state": "fulfilled",
+            "reason": truth.get("reason"),
+            "payout_id": payout_id,
+            "mt5_login": truth.get("mt5_login"),
+            "replacement_account_id": truth.get("replacement_account_id"),
+            "checkpoint": checkpoint,
+        })
+
+    return _np_ok({
+        "success": True,
+        "processing": bool(
+            str((source or {}).get("account_status") or "").lower()
+            == "payout_renewal_assigning"
+        ),
+        "assigned": False,
+        "state": (
+            "processing"
+            if str((source or {}).get("account_status") or "").lower()
+               == "payout_renewal_assigning"
+            else "still_due" if truth.get("due") else "blocked"
+        ),
+        "reason": truth.get("reason"),
+        "payout_id": payout_id,
+        "account_size": truth.get("account_size"),
+        "source_mt5": truth.get("source_mt5"),
+        "checkpoint": checkpoint,
+    })
+
+
+# Rebind existing V35 status endpoint to V37 durable status.
+app.view_functions["admin_payout_renewal_v35_status"] = (
+    admin_payout_renewal_v37_status
+)
+
+
+@app.route("/admin/payout_renewal_v37/status", methods=["GET", "OPTIONS"])
+def admin_payout_renewal_v37_status_alias():
+    return admin_payout_renewal_v37_status()
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "V37_ASYNC_BUSY_CLAIM_RECOVERY_2026_09_14"
