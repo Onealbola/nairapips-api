@@ -31228,3 +31228,154 @@ def automation_retry_status_v28():
 app.view_functions["automation_retry_status_v19"] = automation_retry_status_v28
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PAYOUT_RENEWAL_LIVE_TRIGGER_V28_2026_09_14"
+
+
+# ============================================================================
+# NAIRAPIPS EXACT PAID-PAYOUT SWEEP V29 — 14 SEP 2026
+#
+# FINAL GAP FOUND
+# ---------------
+# Clean payout renewal was still depending on Journey Authority being healthy
+# enough to expose payout_renewal before the retry worker could act.
+# The financial authority is actually the exact PAID payout row itself.
+#
+# V29 therefore adds a tiny idempotent sweep:
+#   exact PAID payout -> exact Funded source -> exact clean 12-Sep+ purchase
+#   -> if no exact replacement exists -> invoke existing payout-renewal engine.
+#
+# No legacy auto-fire. No inferred payout. No generic trader-state assignment.
+# Existing duplicate/successor/MT5-vault guards remain authoritative.
+# ============================================================================
+
+_NP_PAYOUT_SWEEP_LOCK = threading.Lock()
+_NP_PAYOUT_SWEEP_LAST_TS = 0.0
+_NP_PAYOUT_SWEEP_MIN_INTERVAL = 20
+
+def _np_exact_paid_payout_sweep_v29(limit=200):
+    global _NP_PAYOUT_SWEEP_LAST_TS
+
+    now_ts = time.time()
+    if now_ts - _NP_PAYOUT_SWEEP_LAST_TS < _NP_PAYOUT_SWEEP_MIN_INTERVAL:
+        return {"skipped": "rate_limited"}
+
+    if not _NP_PAYOUT_SWEEP_LOCK.acquire(blocking=False):
+        return {"skipped": "already_running"}
+
+    summary = {"checked": 0, "due": 0, "assigned": 0, "fulfilled": 0, "blocked": 0, "errors": 0}
+    try:
+        _NP_PAYOUT_SWEEP_LAST_TS = now_ts
+
+        rows = (
+            supabase.table("payouts").select("*")
+            .eq("status", "paid")
+            .order("paid_at", desc=True)
+            .limit(limit).execute().data or []
+        )
+
+        for payout in rows:
+            try:
+                payout_id = str(payout.get("id") or "").strip()
+                trader_id = str(payout.get("trader_id") or "").strip()
+                source_id = str(payout.get("trader_account_id") or payout.get("account_id") or "").strip()
+                if not payout_id or not trader_id or not source_id:
+                    continue
+
+                summary["checked"] += 1
+
+                srows = (
+                    supabase.table("trader_accounts").select("*")
+                    .eq("id", source_id).eq("trader_id", trader_id)
+                    .limit(1).execute().data or []
+                )
+                if not srows:
+                    summary["blocked"] += 1
+                    continue
+                source = srows[0]
+
+                if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "funded":
+                    summary["blocked"] += 1
+                    continue
+
+                # Exact payout/source login agreement where payout carries login.
+                payout_login = str(payout.get("mt5_login") or "").strip()
+                source_login = str(source.get("mt5_login") or "").strip()
+                if payout_login and source_login and payout_login != source_login:
+                    summary["blocked"] += 1
+                    continue
+
+                purchase = _safe_purchase_for_account(source)
+                if not purchase or not _np_automation_generation_purchase(purchase):
+                    # Pre-cutoff remains manual-only.
+                    continue
+
+                # Fail closed on owner mismatch.
+                if str(purchase.get("trader_id") or "").strip() != trader_id:
+                    summary["blocked"] += 1
+                    continue
+
+                trader = get_trader_by_id(trader_id) or {}
+                all_accounts = (
+                    supabase.table("trader_accounts").select("*")
+                    .eq("trader_id", trader_id)
+                    .order("created_at", desc=False).limit(500).execute().data or []
+                )
+
+                existing = _np_exact_post_payout_replacement_20260908(
+                    source, payout, all_accounts, trader
+                )
+                if existing:
+                    _np_stamp_exact_payout_consumed_20260908(source, existing, trader_id)
+                    summary["fulfilled"] += 1
+                    continue
+
+                summary["due"] += 1
+
+                # Use the existing exact PAID-payout assignment engine. It still
+                # enforces purchase lineage, stage, size, fresh MT5 and replay locks.
+                result = _np_auto_post_payout_renewal(payout)
+                if result and result.get("account"):
+                    if result.get("already_fulfilled"):
+                        summary["fulfilled"] += 1
+                    else:
+                        summary["assigned"] += 1
+
+            except Exception as exc:
+                summary["errors"] += 1
+                print("V29 EXACT PAID PAYOUT SWEEP ITEM ERROR:", exc)
+
+        globals()["_NP_PAYOUT_SWEEP_LAST_SUMMARY_V29"] = summary
+        return summary
+    finally:
+        _NP_PAYOUT_SWEEP_LOCK.release()
+
+
+# Wake exact PAID payout sweep on Cockpit refresh, then run the existing journey route.
+_np_admin_journey_authority_v28_core = _np_admin_journey_authority_v28
+
+def _np_admin_journey_authority_v29():
+    if request.method == "OPTIONS":
+        return _np_admin_journey_authority_v28_core()
+    try:
+        _np_exact_paid_payout_sweep_v29()
+    except Exception as exc:
+        print("V29 PAYOUT SWEEP WAKE ERROR:", exc)
+    return _np_admin_journey_authority_v28_core()
+
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v29
+
+
+# Also wake it from the existing verified retry entry point used by engine/inventory.
+_np_resume_waiting_zero_cost_automations_v28_core = _np_resume_waiting_zero_cost_automations
+
+def _np_resume_waiting_zero_cost_automations(trigger="verified_retry"):
+    result = _np_resume_waiting_zero_cost_automations_v28_core(trigger)
+    if not isinstance(result, dict):
+        result = {"trigger": trigger}
+    try:
+        result["exact_paid_payout_sweep"] = _np_exact_paid_payout_sweep_v29()
+    except Exception as exc:
+        result["exact_paid_payout_sweep"] = {"errors": 1, "error": str(exc)}
+    return result
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "EXACT_PAID_PAYOUT_SWEEP_V29_2026_09_14"
