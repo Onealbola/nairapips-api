@@ -30753,3 +30753,236 @@ def _np_admin_journey_authority_cutover_v25():
 
 app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_cutover_v25
 NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "LEGACY_PAYOUT_RENEWAL_COCKPIT_BRIDGE_V25_2026_09_14"
+
+
+# ============================================================================
+# NAIRAPIPS VERIFIED PAYOUT-RENEWAL RETRY V26 — 14 SEP 2026
+# Clean 12-Sep+ PAID payout renewals retry automatically if the immediate
+# PAID-event assignment misses because of inventory or transient failure.
+# Legacy journeys remain manual-only.
+# ============================================================================
+
+def _np_resume_exact_waiting_payout_renewal_v26(payout, source, purchase):
+    payout = payout or {}
+    source = source or {}
+    purchase = purchase or {}
+
+    payout_id = str(payout.get("id") or "").strip()
+    trader_id = str(payout.get("trader_id") or source.get("trader_id") or "").strip()
+    source_id = str(source.get("id") or payout.get("trader_account_id") or "").strip()
+
+    if not payout_id or not trader_id or not source_id:
+        return None
+    if payout_status(payout) != "paid":
+        return None
+    if str(payout.get("trader_account_id") or "").strip() != source_id:
+        return None
+    if str(source.get("trader_id") or "").strip() != trader_id:
+        return None
+    if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "funded":
+        return None
+    if not _np_automation_generation_purchase(purchase):
+        return None
+
+    payout_login = str(payout.get("mt5_login") or "").strip()
+    source_login = str(source.get("mt5_login") or "").strip()
+    if payout_login and source_login and payout_login != source_login:
+        return None
+
+    trader = get_trader_by_id(trader_id)
+    if not trader:
+        return None
+
+    all_rows = (
+        supabase.table("trader_accounts").select("*")
+        .eq("trader_id", trader_id)
+        .order("created_at", desc=False).limit(500).execute().data or []
+    )
+    existing = _np_exact_post_payout_replacement_20260908(source, payout, all_rows, trader)
+    if existing:
+        _np_stamp_exact_payout_consumed_20260908(source, existing, trader_id)
+        return {"account": existing, "already_fulfilled": True}
+
+    status = str(source.get("account_status") or "").strip().lower()
+    blob = _np_kill_blob(source)
+    claim_token = f"np_payout_claim:{payout_id}".lower()
+
+    # Normal exact PAID-event engine handles any non-held state.
+    if status not in {"payout_renewal_waiting_mt5", "payout_renewal_assigning"}:
+        return _np_auto_post_payout_renewal(payout)
+
+    # Do not collide with an active assignment worker.
+    if status == "payout_renewal_assigning":
+        return None
+
+    # Resume only the exact payout claim that originally entered waiting state.
+    if claim_token not in blob:
+        _audit_safe(
+            "automation", "payout_retry_claim_mismatch",
+            f"source={source_id}; payout={payout_id}; waiting source lacks exact claim marker",
+            {"name":"automation_retry","username":"automation_retry","role":"system"}, payout_id
+        )
+        return None
+
+    size = clean(source.get("account_size") or source.get("start_balance") or payout.get("account_size") or 0)
+    green, green_reason = _np_green_automation_authority(trader, purchase, source, "funded")
+    if not green or not size:
+        _audit_safe(
+            "automation", "payout_retry_review_required",
+            f"payout={payout_id}; source={source_id}; green={green}; reason={green_reason}; size={size}",
+            {"name":"automation_retry","username":"automation_retry","role":"system"}, payout_id
+        )
+        return None
+
+    mt5 = _np_pick_fresh_mt5(size, "funded")
+    if not mt5:
+        _np_inventory_wait_alert("funded", size, f"verified payout renewal retry {payout_id}", trader)
+        return None
+
+    try:
+        account, updated = _assign_mt5_to_trader(
+            trader, mt5, "funded", purchase,
+            {"name":"automation_retry","username":"automation_retry","role":"system"},
+            f"VERIFIED RETRY PAYOUT RENEWAL payout_id={payout_id}; source_account={source_id}"
+        )
+    except Exception as exc:
+        supabase.table("trader_accounts").update({
+            "account_status": "payout_renewal_waiting_mt5",
+            "updated_at": now_iso(),
+            "archive_reason": (
+                str(source.get("archive_reason") or "")
+                + f" | RETRY_ASSIGN_ERROR={str(exc)[:180]}"
+            ).strip(" |"),
+        }).eq("id", source_id).eq("trader_id", trader_id).execute()
+        _audit_safe(
+            "automation", "payout_retry_assignment_failed",
+            f"payout={payout_id}; source={source_id}; error={exc}",
+            {"name":"automation_retry","username":"automation_retry","role":"system"}, payout_id
+        )
+        return None
+
+    marker = (
+        f"[NP_CONSUMED:PAYOUT:{payout_id}] "
+        f"replacement_account_id={account.get('id')} "
+        f"replacement_mt5={account.get('mt5_login')}"
+    )
+    supabase.table("trader_accounts").update({
+        "account_status": "archived",
+        "monitoring_enabled": False,
+        "archive_reason": (str(source.get("archive_reason") or "") + " | " + marker).strip(" |"),
+        "updated_at": now_iso(),
+    }).eq("id", source_id).eq("trader_id", trader_id).execute()
+
+    _np_stamp_exact_payout_consumed_20260908(source, account, trader_id)
+    _audit_safe(
+        "automation", "retry_payout_renewal_fulfilled",
+        f"VERIFIED RETRY payout={payout_id}; source={source_id} -> funded_mt5={account.get('mt5_login')}",
+        {"name":"automation_retry","username":"automation_retry","role":"system"}, payout_id
+    )
+    return {"account": account, "trader": updated, "mt5": mt5}
+
+
+def _np_retry_clean_payout_renewals_v26(limit=250):
+    summary = {"checked": 0, "due": 0, "assigned": 0, "already_fulfilled": 0, "waiting_inventory": 0, "errors": 0}
+
+    try:
+        purchases = (
+            supabase.table("challenge_purchases").select("*")
+            .gte("created_at", _NP_AUTOMATION_GENERATION_CUTOFF.isoformat())
+            .order("created_at", desc=False).limit(limit).execute().data or []
+        )
+    except Exception as exc:
+        print("V26 PAYOUT RETRY PURCHASE LOAD FAILED:", exc)
+        summary["errors"] += 1
+        return summary
+
+    for purchase in purchases:
+        try:
+            if not _np_automation_generation_purchase(purchase):
+                continue
+
+            pid = str(purchase.get("id") or "").strip()
+            trader_id = str(purchase.get("trader_id") or "").strip()
+            if not pid or not trader_id:
+                continue
+
+            auth = _np_ja_journey_authority(trader_id, pid) or {}
+            ent = auth.get("outstanding_entitlement") or {}
+            if str(ent.get("entitlement_type") or "").strip().lower() != "payout_renewal":
+                continue
+            if _normalize_lifecycle_stage(ent.get("target_stage")) != "funded":
+                continue
+
+            summary["checked"] += 1
+            summary["due"] += 1
+
+            payout_id = str(ent.get("evidence_id") or "").strip()
+            source_id = str(ent.get("source_account_id") or "").strip()
+            if not payout_id or not source_id:
+                summary["errors"] += 1
+                continue
+
+            prows = (
+                supabase.table("payouts").select("*")
+                .eq("id", payout_id).eq("trader_id", trader_id)
+                .eq("trader_account_id", source_id)
+                .limit(1).execute().data or []
+            )
+            if not prows or payout_status(prows[0]) != "paid":
+                summary["errors"] += 1
+                continue
+            payout = prows[0]
+
+            srows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", source_id).eq("trader_id", trader_id)
+                .limit(1).execute().data or []
+            )
+            if not srows:
+                summary["errors"] += 1
+                continue
+            source = srows[0]
+
+            before_rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("trader_id", trader_id)
+                .order("created_at", desc=False).limit(500).execute().data or []
+            )
+            existing = _np_exact_post_payout_replacement_20260908(
+                source, payout, before_rows, get_trader_by_id(trader_id) or {}
+            )
+            if existing:
+                _np_stamp_exact_payout_consumed_20260908(source, existing, trader_id)
+                summary["already_fulfilled"] += 1
+                continue
+
+            result = _np_resume_exact_waiting_payout_renewal_v26(payout, source, purchase)
+            if result:
+                if result.get("already_fulfilled"):
+                    summary["already_fulfilled"] += 1
+                else:
+                    summary["assigned"] += 1
+            else:
+                summary["waiting_inventory"] += 1
+
+        except Exception as exc:
+            summary["errors"] += 1
+            print("V26 PAYOUT RENEWAL RETRY ERROR:", exc)
+
+    return summary
+
+
+_np_resume_waiting_zero_cost_automations_v25_core = _np_resume_waiting_zero_cost_automations
+
+def _np_resume_waiting_zero_cost_automations(trigger="verified_retry"):
+    result = _np_resume_waiting_zero_cost_automations_v25_core(trigger)
+    if not isinstance(result, dict):
+        result = {"trigger": trigger}
+    try:
+        result["payout_renewal"] = _np_retry_clean_payout_renewals_v26()
+    except Exception as exc:
+        result["payout_renewal"] = {"errors": 1, "error": str(exc)}
+    return result
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "VERIFIED_PAYOUT_RENEWAL_RETRY_V26_2026_09_14"
