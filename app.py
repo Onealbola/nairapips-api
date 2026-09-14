@@ -26397,22 +26397,58 @@ def _np_ja_journey_authority(trader_id, journey_id):
                     entitlements_created.append(key)
                     state = "WAITING_MT5"
                 else:
-                    # IMPORTANT BUSINESS LAW:
-                    # A breach with no free/approved entitlement stops the ACCOUNT,
-                    # but does not automatically close the PURCHASE JOURNEY.  The
-                    # same journey may continue later only if an exact paid-reset
-                    # order for this exact breached account is approved.
-                    state = "WAITING_RESET_PAYMENT"
-                    ledger.append({
-                        "type": "RESET_PAYMENT_REQUIRED",
-                        "at": last.get("breached_at") or last.get("archived_at") or last.get("updated_at"),
-                        "journey_id": journey_id,
-                        "purchase_id": journey_id,
-                        "source_account_id": last_id,
-                        "mt5_login": last.get("mt5_login"),
-                        "stage": stg,
-                        "detail": f"{stg.upper()} ACCOUNT STOPPED · NO CURRENT ENTITLEMENT · PAID RESET APPROVAL REQUIRED TO CONTINUE THIS JOURNEY",
-                    })
+                    # TERMINAL ENTITLEMENT LAW:
+                    # Decide from the authority that CREATED the current breached MT5.
+                    # This reuses the journey reconstruction already completed above
+                    # and does not call another policy/helper or mutate any production data.
+                    current_authority = transition_reasons.get(last_id) or {}
+                    current_entitlement_type = str(
+                        current_authority.get("entitlement_type") or ""
+                    ).strip().lower()
+
+                    # These accounts are the final entitled account of their branch:
+                    # - Second Life (Life 2) breach -> challenge journey closed.
+                    # - One paid Funded Reset replacement breach -> journey closed.
+                    # - Payout Renewal replacement breach -> journey closed.
+                    terminal_types = {
+                        "second_life",
+                        "paid_funded_reset",
+                        "payout_renewal",
+                    }
+
+                    if current_entitlement_type in terminal_types:
+                        state = "CLOSED"
+                        if current_entitlement_type == "second_life":
+                            close_detail = "LIFE 2 BREACHED · 2 LIVES CONSUMED · BUY A NEW CHALLENGE"
+                        elif current_entitlement_type == "paid_funded_reset":
+                            close_detail = "FUNDED RESET BREACHED · RESET ENTITLEMENT CONSUMED · BUY A NEW CHALLENGE"
+                        else:
+                            close_detail = "PAYOUT RENEWAL ACCOUNT BREACHED · JOURNEY CLOSED · BUY A NEW CHALLENGE"
+
+                        ledger.append({
+                            "type": "JOURNEY_CLOSED",
+                            "at": last.get("breached_at") or last.get("archived_at") or last.get("updated_at"),
+                            "journey_id": journey_id,
+                            "purchase_id": journey_id,
+                            "source_account_id": last_id,
+                            "mt5_login": last.get("mt5_login"),
+                            "stage": stg,
+                            "detail": close_detail,
+                        })
+                    else:
+                        # A first eligible breach that has not exhausted its permitted
+                        # reset path may still wait for exact payment + Admin approval.
+                        state = "WAITING_RESET_PAYMENT"
+                        ledger.append({
+                            "type": "RESET_PAYMENT_REQUIRED",
+                            "at": last.get("breached_at") or last.get("archived_at") or last.get("updated_at"),
+                            "journey_id": journey_id,
+                            "purchase_id": journey_id,
+                            "source_account_id": last_id,
+                            "mt5_login": last.get("mt5_login"),
+                            "stage": stg,
+                            "detail": f"{stg.upper()} ACCOUNT STOPPED · RESET PAYMENT REQUIRED",
+                        })
 
         elif _np_ja_stage(last) == "funded":
             paid = _np_ja_paid_payouts_for_account(payouts, last.get("id"))
