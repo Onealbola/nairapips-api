@@ -30498,3 +30498,258 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "EXACT_PURCHASE_LINK_AUTOMATION_V21_2026_09
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "LEDGER_PAYMENT_SEMANTICS_V22_2026_09_14"
+
+
+# ============================================================================
+# NAIRAPIPS LEGACY PAYOUT RENEWAL COCKPIT BRIDGE V25 — 14 SEP 2026
+#
+# PURPOSE
+# -------
+# Pre-cutover purchase journeys remain READ-ONLY for automatic assignment.
+# But when an exact Funded account on that old journey receives a PAID payout
+# on/after 12 Sep, production already creates a verified payout-renewal
+# obligation. The old standalone assignment card already sees that obligation.
+#
+# V25 does TWO presentation/authority-bridge corrections only:
+#   1) expose that exact already-verified payout-renewal obligation INSIDE
+#      Journey Cockpit as a MANUAL staff assignment action;
+#   2) suppress the false "BREACHED" ledger interpretation caused when the
+#      payout source is archived/reset to prepare the renewal.
+#
+# HARD SAFETY
+# -----------
+# * No automatic MT5 is enabled for a pre-cutover purchase.
+# * No entitlement is created from history alone.
+# * Exact PAID payout + exact source account + existing payout-renewal marker
+#   are required.
+# * If an exact funded successor already exists, no assignment is exposed.
+# * Existing assignment endpoint remains authoritative.
+# ============================================================================
+
+_np_bundle_v24_core = _np_all_journeys_preserved_v5
+
+def _np_all_journeys_preserved_v5(trader_id):
+    bundle = _np_bundle_v24_core(trader_id)
+
+    # Allowed normalized identities for this customer; never cross customer borders.
+    allowed_ids = set(str(x or "").strip() for x in (bundle.get("identity_trader_ids") or []) if str(x or "").strip())
+    if str(trader_id or "").strip():
+        allowed_ids.add(str(trader_id).strip())
+
+    for j in bundle.get("journeys") or []:
+        # Native clean journeys and existing migration bridges remain untouched.
+        if str(j.get("control_mode") or "") != "LEGACY_READ_ONLY":
+            continue
+
+        jid = str(j.get("journey_id") or j.get("purchase_id") or "").strip()
+        if not jid or jid.startswith("ACCOUNT:"):
+            continue
+
+        account_ids = {
+            str((a or {}).get("id") or "").strip()
+            for a in (j.get("accounts") or [])
+            if str((a or {}).get("id") or "").strip()
+        }
+        if not account_ids:
+            continue
+
+        paid_candidates = [
+            p for p in (j.get("payouts") or [])
+            if str((p or {}).get("status") or "").strip().lower() == "paid"
+            and str((p or {}).get("trader_account_id") or (p or {}).get("account_id") or "").strip() in account_ids
+            and _np_cutover_dt((p or {}).get("paid_at") or (p or {}).get("updated_at") or (p or {}).get("created_at"))
+            and _np_cutover_dt((p or {}).get("paid_at") or (p or {}).get("updated_at") or (p or {}).get("created_at")) >= _NP_CLEAN_CUTOVER
+        ]
+        paid_candidates.sort(
+            key=lambda p: _np_ja_score((p or {}).get("paid_at") or (p or {}).get("updated_at") or (p or {}).get("created_at")),
+            reverse=True,
+        )
+
+        promoted = False
+        for payout in paid_candidates:
+            source_id = str(payout.get("trader_account_id") or payout.get("account_id") or "").strip()
+            if not source_id:
+                continue
+
+            # Fetch the exact raw source; decorated UI history is not entitlement evidence.
+            try:
+                srows = (
+                    supabase.table("trader_accounts").select("*")
+                    .eq("id", source_id).limit(1).execute().data or []
+                )
+                source = srows[0] if srows else None
+            except Exception as exc:
+                print("V25 PAYOUT RENEWAL SOURCE LOOKUP ERROR:", exc)
+                source = None
+            if not source:
+                continue
+
+            owner_tid = str(source.get("trader_id") or "").strip()
+            if not owner_tid or owner_tid not in allowed_ids:
+                continue
+            if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "funded":
+                continue
+
+            # Reuse the EXISTING production entitlement authority. This must prove
+            # the post-payout renewal marker / exact paid payout source.
+            try:
+                trader_row = get_trader_by_id(owner_tid) or {}
+                ent = _np_reset_entitlement_for_source(source, trader_row) or {}
+            except Exception as exc:
+                print("V25 PAYOUT RENEWAL ENTITLEMENT VERIFY ERROR:", exc)
+                continue
+
+            ent_reason = str(ent.get("reason") or "").strip().lower()
+            if not (ent.get("eligible") and ent_reason.startswith("post_payout_renewal")):
+                continue
+
+            # Fetch exact owner accounts so fulfilled renewals can never reopen.
+            try:
+                raw_accounts = (
+                    supabase.table("trader_accounts").select("*")
+                    .eq("trader_id", owner_tid).limit(1000).execute().data or []
+                )
+            except Exception:
+                raw_accounts = []
+
+            replacement = _np_exact_post_payout_replacement_20260908(
+                source, payout, raw_accounts, trader_row
+            )
+            if replacement:
+                # Already fulfilled. Keep this legacy journey history-only.
+                continue
+
+            payout_id = str(payout.get("id") or "").strip()
+            paid_at = payout.get("paid_at") or payout.get("updated_at") or payout.get("created_at")
+            source_mt5 = source.get("mt5_login") or payout.get("mt5_login")
+
+            j["trader_id"] = owner_tid
+            j["control_mode"] = "CLEAN_MIGRATION_PAYOUT_RENEWAL"
+            j["state"] = "WAITING_MT5"
+            j["closed"] = False
+            j["blocked"] = False
+            j["accountability_status"] = "RECONCILED"
+            j["next_action"] = "ASSIGN_MT5"
+            j["outstanding_entitlement"] = {
+                "entitlement_key": f"payout:{payout_id}:renewal",
+                "entitlement_type": "payout_renewal",
+                "source_event_type": "payout_paid",
+                "source_account_id": source_id,
+                "source_mt5": source_mt5,
+                "evidence_id": payout_id,
+                "target_stage": "funded",
+                "status": "AVAILABLE",
+                "reason": "PAYOUT PAID → FRESH FUNDED MT5 REQUIRED",
+                "trader_id": owner_tid,
+            }
+            j["migration_bridge"] = {
+                "type": "PAYOUT_RENEWAL",
+                "payout_id": payout_id,
+                "source_account_id": source_id,
+                "source_mt5": source_mt5,
+                "target_stage": "funded",
+                "status": "AVAILABLE",
+                "paid_at": paid_at,
+            }
+
+            # Cockpit semantics only: an archive/reset operation performed AFTER the
+            # payout to prepare the renewal is not a trading breach.
+            old_ledger = list(j.get("ledger") or [])
+            paid_score = _np_ja_score(paid_at)
+            clean_ledger = []
+            for ev in old_ledger:
+                ev_type = str((ev or {}).get("type") or "").strip().upper()
+                ev_source = str(
+                    (ev or {}).get("source_account_id")
+                    or (ev or {}).get("account_id")
+                    or ""
+                ).strip()
+                ev_mt5 = str((ev or {}).get("mt5_login") or "").strip()
+                ev_score = _np_ja_score((ev or {}).get("at"))
+                same_source = (
+                    ev_source == source_id
+                    or (source_mt5 and ev_mt5 == str(source_mt5))
+                )
+                if ev_type in {"BREACH", "BREACHED"} and same_source and ev_score >= paid_score:
+                    continue
+                clean_ledger.append(ev)
+
+            ent_key = f"payout:{payout_id}:renewal"
+            if not any(
+                str((ev or {}).get("type") or "").upper() == "ENTITLEMENT_CREATED"
+                and str((ev or {}).get("entitlement_key") or "") == ent_key
+                for ev in clean_ledger
+            ):
+                clean_ledger.append({
+                    "type": "ENTITLEMENT_CREATED",
+                    "at": paid_at,
+                    "journey_id": jid,
+                    "purchase_id": jid,
+                    "source_account_id": source_id,
+                    "mt5_login": source_mt5,
+                    "stage": "funded",
+                    "evidence_id": payout_id,
+                    "entitlement_key": ent_key,
+                    "detail": "PAYOUT PAID → FRESH FUNDED MT5 ENTITLEMENT AVAILABLE",
+                })
+
+            clean_ledger = [ev for ev in clean_ledger if (ev or {}).get("at")]
+            clean_ledger.sort(key=lambda ev: _np_ja_score((ev or {}).get("at")))
+            j["ledger"] = clean_ledger
+
+            acc = dict(j.get("accountability") or {})
+            acc["outstanding_entitlement"] = 1
+            acc["balance"] = 1
+            acc["status"] = "RECONCILED"
+            j["accountability"] = acc
+
+            promoted = True
+            break
+
+        if promoted:
+            continue
+
+    return bundle
+
+
+def _np_admin_journey_authority_cutover_v25():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    journey_id = str(request.args.get("journey_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+
+    try:
+        bundle = _np_all_journeys_preserved_v5(trader_id)
+        payload = {
+            "cutover_date": bundle.get("cutover_date"),
+            "identity_trader_ids": bundle.get("identity_trader_ids") or [],
+            "identity_profiles": bundle.get("identity_profiles") or [],
+            "reconciliation": bundle.get("reconciliation") or [],
+            "history_debug": bundle.get("history_debug") or {},
+            "generated_at": now_iso(),
+        }
+        if journey_id:
+            journey = next(
+                (j for j in bundle.get("journeys") or []
+                 if str(j.get("journey_id") or "") == journey_id),
+                None
+            )
+            if not journey:
+                return _np_fail("journey not found", 404)
+            payload["journey"] = journey
+        else:
+            payload["journeys"] = bundle.get("journeys") or []
+        return _np_ok(payload)
+    except Exception as exc:
+        print("JOURNEY AUTHORITY V25 PAYOUT BRIDGE ERROR:", exc)
+        return _np_fail(str(exc), 500)
+
+
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_cutover_v25
+NAIRAPIPS_CLEAN_CUTOVER_RELEASE = "LEGACY_PAYOUT_RENEWAL_COCKPIT_BRIDGE_V25_2026_09_14"
