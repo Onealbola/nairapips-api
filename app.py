@@ -31565,3 +31565,398 @@ def admin_payout_renewal_v30_status():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "NON_BLOCKING_PAYOUT_RENEWAL_V30_2026_09_14"
+
+
+# ============================================================================
+# NAIRAPIPS SERVER-SIDE PAYOUT RENEWAL WORKER V31 — 14 SEP 2026
+#
+# WHY THIS EXISTS
+# ---------------
+# The Cockpit is now correctly READ-ONLY and fast. Payout renewal must therefore
+# retry on the SERVER, not depend on an Admin page being open.
+#
+# V31 watches only explicit payout-renewal waiting sources:
+#   - payout_renewal_waiting_mt5
+#   - archived_reset_funded carrying an exact post_payout_renewal marker
+#
+# It never scans ordinary Funded accounts and never infers entitlement from
+# trader status. Every candidate must prove:
+#   exact payout id -> PAID -> exact source -> exact trader -> exact Funded stage
+#   -> exact clean purchase (12 Sep+) -> no exact successor already exists.
+#
+# Concurrency safety:
+# candidate row is atomically claimed by account_status before MT5 assignment.
+# Multiple Render workers may wake, but only one can win the exact DB claim.
+# ============================================================================
+
+_NP_PAYOUT_RENEWAL_WORKER_INTERVAL_V31 = 45
+_NP_PAYOUT_RENEWAL_WORKER_STARTED_V31 = False
+_NP_PAYOUT_RENEWAL_WORKER_LOCK_V31 = threading.Lock()
+_NP_PAYOUT_RENEWAL_LAST_SUMMARY_V31 = None
+
+
+def _np_extract_exact_payout_id_v31(source):
+    blob = _np_kill_blob(source)
+    for pattern in (
+        r"\[np_entitlement:post_payout_renewal:([^\]]+)\]",
+        r"\[np_payout_claim:([^\]]+)\]",
+        r"\[np_payout_paid:([^\]]+)\]",
+    ):
+        m = re.search(pattern, blob, re.I)
+        if m:
+            return str(m.group(1) or "").strip()
+    return ""
+
+
+def _np_resume_one_payout_renewal_v31(source):
+    source = source or {}
+    source_id = str(source.get("id") or "").strip()
+    trader_id = str(source.get("trader_id") or "").strip()
+    original_status = str(source.get("account_status") or source.get("status") or "").strip().lower()
+
+    if not source_id or not trader_id:
+        return {"state": "blocked", "reason": "missing_identity"}
+
+    if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "funded":
+        return {"state": "blocked", "reason": "not_funded"}
+
+    if original_status not in {"payout_renewal_waiting_mt5", "archived_reset_funded"}:
+        return {"state": "ignored", "reason": "not_waiting_status"}
+
+    payout_id = _np_extract_exact_payout_id_v31(source)
+    if not payout_id:
+        return {"state": "blocked", "reason": "missing_exact_payout_marker"}
+
+    prows = (
+        supabase.table("payouts").select("*")
+        .eq("id", payout_id)
+        .eq("trader_id", trader_id)
+        .eq("trader_account_id", source_id)
+        .limit(1).execute().data or []
+    )
+    if not prows:
+        return {"state": "blocked", "reason": "exact_payout_not_found"}
+
+    payout = prows[0]
+    if payout_status(payout) != "paid":
+        return {"state": "blocked", "reason": "payout_not_paid"}
+
+    payout_login = str(payout.get("mt5_login") or "").strip()
+    source_login = str(source.get("mt5_login") or "").strip()
+    if payout_login and source_login and payout_login != source_login:
+        return {"state": "blocked", "reason": "mt5_mismatch"}
+
+    purchase = _safe_purchase_for_account(source)
+    if not purchase:
+        return {"state": "blocked", "reason": "missing_purchase"}
+
+    if str(purchase.get("trader_id") or "").strip() != trader_id:
+        return {"state": "blocked", "reason": "purchase_owner_mismatch"}
+
+    if not _np_automation_generation_purchase(purchase):
+        return {"state": "manual_only", "reason": "pre_cutover"}
+
+    trader = get_trader_by_id(trader_id)
+    if not trader:
+        return {"state": "blocked", "reason": "missing_trader"}
+
+    # Replay protection before attempting a claim.
+    all_accounts = (
+        supabase.table("trader_accounts").select("*")
+        .eq("trader_id", trader_id)
+        .order("created_at", desc=False).limit(500).execute().data or []
+    )
+    existing = _np_exact_post_payout_replacement_20260908(
+        source, payout, all_accounts, trader
+    )
+    if existing:
+        _np_stamp_exact_payout_consumed_20260908(source, existing, trader_id)
+        marker = (
+            f"[NP_CONSUMED:PAYOUT:{payout_id}] "
+            f"replacement_account_id={existing.get('id')} "
+            f"replacement_mt5={existing.get('mt5_login')}"
+        )
+        _np_append_account_marker(source_id, trader_id, marker)
+        return {
+            "state": "fulfilled",
+            "mt5_login": existing.get("mt5_login"),
+            "account_id": existing.get("id"),
+        }
+
+    # Atomic DB claim. This is the cross-worker lock.
+    claim_marker = f"[NP_PAYOUT_CLAIM:{payout_id}]"
+    old_reason = str(source.get("archive_reason") or "").strip()
+    new_reason = old_reason
+    if claim_marker.lower() not in old_reason.lower():
+        new_reason = (old_reason + " | " + claim_marker).strip(" |")
+
+    claimed = (
+        supabase.table("trader_accounts").update({
+            "account_status": "payout_renewal_assigning",
+            "monitoring_enabled": False,
+            "archive_reason": new_reason,
+            "updated_at": now_iso(),
+        })
+        .eq("id", source_id)
+        .eq("trader_id", trader_id)
+        .eq("account_status", original_status)
+        .execute().data or []
+    )
+    if not claimed:
+        return {"state": "busy", "reason": "another_worker_claimed"}
+
+    size = clean(
+        source.get("account_size")
+        or source.get("start_balance")
+        or payout.get("account_size")
+        or 0
+    )
+    green, green_reason = _np_green_automation_authority(
+        trader, purchase, source, "funded"
+    )
+    if not green or not size:
+        supabase.table("trader_accounts").update({
+            "account_status": "payout_renewal_waiting_mt5",
+            "updated_at": now_iso(),
+            "archive_reason": (
+                new_reason + f" | V31_REVIEW={green_reason or 'missing_size'}"
+            ).strip(" |"),
+        }).eq("id", source_id).eq("trader_id", trader_id).execute()
+        return {"state": "blocked", "reason": green_reason or "missing_size"}
+
+    mt5 = _np_pick_fresh_mt5(size, "funded")
+    if not mt5:
+        supabase.table("trader_accounts").update({
+            "account_status": "payout_renewal_waiting_mt5",
+            "updated_at": now_iso(),
+            "archive_reason": new_reason,
+        }).eq("id", source_id).eq("trader_id", trader_id).execute()
+        _np_inventory_wait_alert(
+            "funded", size, f"server retry payout renewal {payout_id}", trader
+        )
+        return {"state": "waiting_inventory", "size": size}
+
+    try:
+        account, updated = _assign_mt5_to_trader(
+            trader, mt5, "funded", purchase,
+            {"name":"automation_worker","username":"automation_worker","role":"system"},
+            f"V31 SERVER PAYOUT RENEWAL payout_id={payout_id}; source_account={source_id}"
+        )
+    except Exception as exc:
+        supabase.table("trader_accounts").update({
+            "account_status": "payout_renewal_waiting_mt5",
+            "updated_at": now_iso(),
+            "archive_reason": (
+                new_reason + f" | V31_ASSIGN_ERROR={str(exc)[:180]}"
+            ).strip(" |"),
+        }).eq("id", source_id).eq("trader_id", trader_id).execute()
+        _audit_safe(
+            "automation", "v31_payout_assignment_failed",
+            f"payout={payout_id}; source={source_id}; error={exc}",
+            {"name":"automation_worker","username":"automation_worker","role":"system"},
+            payout_id
+        )
+        return {"state": "assignment_error", "reason": str(exc)[:180]}
+
+    consumed_marker = (
+        f"[NP_CONSUMED:PAYOUT:{payout_id}] "
+        f"replacement_account_id={account.get('id')} "
+        f"replacement_mt5={account.get('mt5_login')}"
+    )
+    supabase.table("trader_accounts").update({
+        "account_status": "archived",
+        "monitoring_enabled": False,
+        "archive_reason": (new_reason + " | " + consumed_marker).strip(" |"),
+        "updated_at": now_iso(),
+    }).eq("id", source_id).eq("trader_id", trader_id).execute()
+
+    _np_stamp_exact_payout_consumed_20260908(source, account, trader_id)
+    _audit_safe(
+        "automation", "v31_payout_renewal_assigned",
+        f"payout={payout_id}; source={source_id}; funded_mt5={account.get('mt5_login')}",
+        {"name":"automation_worker","username":"automation_worker","role":"system"},
+        payout_id
+    )
+
+    return {
+        "state": "assigned",
+        "mt5_login": account.get("mt5_login"),
+        "account_id": account.get("id"),
+    }
+
+
+def _np_retry_pending_payout_renewals_v31(limit=120):
+    global _NP_PAYOUT_RENEWAL_LAST_SUMMARY_V31
+
+    summary = {
+        "checked": 0,
+        "assigned": 0,
+        "fulfilled": 0,
+        "waiting_inventory": 0,
+        "blocked": 0,
+        "busy": 0,
+        "errors": 0,
+        "started_at": now_iso(),
+    }
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .in_("account_status", ["payout_renewal_waiting_mt5", "archived_reset_funded"])
+            .order("updated_at", desc=True)
+            .limit(limit).execute().data or []
+        )
+    except Exception as exc:
+        summary["errors"] += 1
+        summary["error"] = str(exc)
+        _NP_PAYOUT_RENEWAL_LAST_SUMMARY_V31 = summary
+        return summary
+
+    for source in rows:
+        # archived_reset_funded is considered ONLY when an exact payout-renewal marker exists.
+        if str(source.get("account_status") or "").strip().lower() == "archived_reset_funded":
+            blob = _np_kill_blob(source)
+            if "post_payout_renewal" not in blob:
+                continue
+
+        summary["checked"] += 1
+        try:
+            result = _np_resume_one_payout_renewal_v31(source)
+            state = str((result or {}).get("state") or "blocked")
+            if state == "assigned":
+                summary["assigned"] += 1
+            elif state == "fulfilled":
+                summary["fulfilled"] += 1
+            elif state == "waiting_inventory":
+                summary["waiting_inventory"] += 1
+            elif state == "busy":
+                summary["busy"] += 1
+            elif state in {"manual_only", "ignored"}:
+                pass
+            else:
+                summary["blocked"] += 1
+        except Exception as exc:
+            summary["errors"] += 1
+            print("V31 PAYOUT RENEWAL ITEM ERROR:", exc)
+
+    summary["finished_at"] = now_iso()
+    _NP_PAYOUT_RENEWAL_LAST_SUMMARY_V31 = summary
+    return summary
+
+
+def _np_payout_renewal_worker_loop_v31():
+    # Small startup delay so Gunicorn/Render can finish loading the app.
+    time.sleep(8)
+    while True:
+        try:
+            if _NP_PAYOUT_RENEWAL_WORKER_LOCK_V31.acquire(blocking=False):
+                try:
+                    _np_retry_pending_payout_renewals_v31()
+                finally:
+                    _NP_PAYOUT_RENEWAL_WORKER_LOCK_V31.release()
+        except Exception as exc:
+            print("V31 PAYOUT RENEWAL WORKER ERROR:", exc)
+        time.sleep(_NP_PAYOUT_RENEWAL_WORKER_INTERVAL_V31)
+
+
+def _np_start_payout_renewal_worker_v31():
+    global _NP_PAYOUT_RENEWAL_WORKER_STARTED_V31
+    if _NP_PAYOUT_RENEWAL_WORKER_STARTED_V31:
+        return
+    if str(os.getenv("NAIRAPIPS_DISABLE_PAYOUT_RENEWAL_WORKER") or "").strip().lower() in {"1","true","yes"}:
+        print("V31 payout renewal worker disabled by environment.")
+        return
+    _NP_PAYOUT_RENEWAL_WORKER_STARTED_V31 = True
+    t = threading.Thread(
+        target=_np_payout_renewal_worker_loop_v31,
+        name="nairapips-payout-renewal-v31",
+        daemon=True,
+    )
+    t.start()
+    print("V31 payout renewal worker started: 45s exact retry interval")
+
+
+# Replace V30 exact retry implementation with the same server-safe worker logic.
+def admin_retry_exact_payout_renewal_v31():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    d = request.get_json(silent=True) or {}
+    payout_id = str(d.get("payout_id") or d.get("id") or "").strip()
+    if not payout_id:
+        return _np_fail("Exact payout_id is required.", 400)
+
+    prows = (
+        supabase.table("payouts").select("*")
+        .eq("id", payout_id).limit(1).execute().data or []
+    )
+    if not prows:
+        return _np_fail("Payout not found.", 404)
+
+    payout = prows[0]
+    if payout_status(payout) != "paid":
+        return _np_fail("Only a PAID payout can create a payout renewal.", 409)
+
+    source_id = str(payout.get("trader_account_id") or payout.get("account_id") or "").strip()
+    trader_id = str(payout.get("trader_id") or "").strip()
+    srows = (
+        supabase.table("trader_accounts").select("*")
+        .eq("id", source_id).eq("trader_id", trader_id)
+        .limit(1).execute().data or []
+    )
+    if not srows:
+        return _np_fail("Exact payout source account was not found.", 404)
+
+    result = _np_resume_one_payout_renewal_v31(srows[0]) or {}
+    state = str(result.get("state") or "")
+    return _np_ok({
+        "success": True,
+        "assigned": state == "assigned",
+        "already_fulfilled": state == "fulfilled",
+        "waiting": state in {"waiting_inventory", "busy"},
+        "state": state,
+        "message": (
+            "Fresh Funded MT5 assigned automatically."
+            if state == "assigned"
+            else "Payout renewal already fulfilled."
+            if state == "fulfilled"
+            else "Verified payout renewal is waiting for eligible Funded MT5 inventory."
+            if state == "waiting_inventory"
+            else "Another automation worker is already processing this payout renewal."
+            if state == "busy"
+            else f"Payout renewal not assigned: {result.get('reason') or state}"
+        ),
+        "payout_id": payout_id,
+        "mt5_login": result.get("mt5_login"),
+        "replacement_account_id": result.get("account_id"),
+    })
+
+
+app.view_functions["admin_retry_exact_payout_renewal_v30"] = admin_retry_exact_payout_renewal_v31
+
+
+@app.route("/admin/payout_renewal_v31/status", methods=["GET", "OPTIONS"])
+def admin_payout_renewal_v31_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "server_worker_enabled": _NP_PAYOUT_RENEWAL_WORKER_STARTED_V31,
+        "interval_seconds": _NP_PAYOUT_RENEWAL_WORKER_INTERVAL_V31,
+        "cockpit_read_only": True,
+        "legacy_auto_assignment": False,
+        "last_summary": _NP_PAYOUT_RENEWAL_LAST_SUMMARY_V31,
+        "release": "SERVER_SIDE_PAYOUT_RENEWAL_WORKER_V31_2026_09_14",
+    })
+
+
+_np_start_payout_renewal_worker_v31()
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "SERVER_SIDE_PAYOUT_RENEWAL_WORKER_V31_2026_09_14"
