@@ -26405,24 +26405,47 @@ def _np_ja_journey_authority(trader_id, journey_id):
                         current_authority.get("entitlement_type") or ""
                     ).strip().lower()
 
-                    # These accounts are the final entitled account of their branch:
-                    # - Second Life (Life 2) breach -> challenge journey closed.
-                    # - One paid Funded Reset replacement breach -> journey closed.
-                    # - Payout Renewal replacement breach -> journey closed.
-                    terminal_types = {
-                        "second_life",
-                        "paid_funded_reset",
-                        "payout_renewal",
-                    }
+                    # TERMINAL / RESET LAW — corrected 15 Sep 2026
+                    #
+                    # A payout-renewal replacement is NOT the one-time Funded breach reset.
+                    # Therefore, if that payout-renewal Funded account later breaches, the
+                    # journey must still offer its one paid Funded reset UNLESS that Funded
+                    # reset was already consumed earlier in this exact journey.
+                    #
+                    # Strong journey-scoped proof that the one Funded reset was actually CONSUMED:
+                    # at least one legal account in this journey was genuinely created
+                    # from a paid_funded_reset entitlement. Approval/reservation alone is
+                    # not consumption and must not close a payout-renewal branch.
+                    funded_reset_already_consumed = bool(
+                        any(
+                            str(
+                                (transition_reasons.get(str((a or {}).get("id") or "")) or {})
+                                .get("entitlement_type")
+                                or ""
+                            ).strip().lower() == "paid_funded_reset"
+                            for a in legal_accounts
+                        )
+                    )
 
-                    if current_entitlement_type in terminal_types:
+                    terminal_now = (
+                        current_entitlement_type in {"second_life", "paid_funded_reset"}
+                        or (
+                            current_entitlement_type == "payout_renewal"
+                            and funded_reset_already_consumed
+                        )
+                    )
+
+                    if terminal_now:
                         state = "CLOSED"
                         if current_entitlement_type == "second_life":
                             close_detail = "LIFE 2 BREACHED · 2 LIVES CONSUMED · BUY A NEW CHALLENGE"
                         elif current_entitlement_type == "paid_funded_reset":
                             close_detail = "FUNDED RESET BREACHED · RESET ENTITLEMENT CONSUMED · BUY A NEW CHALLENGE"
                         else:
-                            close_detail = "PAYOUT RENEWAL ACCOUNT BREACHED · JOURNEY CLOSED · BUY A NEW CHALLENGE"
+                            close_detail = (
+                                "PAYOUT RENEWAL ACCOUNT BREACHED · FUNDED RESET ALREADY CONSUMED "
+                                "· JOURNEY CLOSED · BUY A NEW CHALLENGE"
+                            )
 
                         ledger.append({
                             "type": "JOURNEY_CLOSED",
@@ -26435,8 +26458,8 @@ def _np_ja_journey_authority(trader_id, journey_id):
                             "detail": close_detail,
                         })
                     else:
-                        # A first eligible breach that has not exhausted its permitted
-                        # reset path may still wait for exact payment + Admin approval.
+                        # First Funded breach, including a payout-renewal Funded account,
+                        # still has the journey's one paid Funded reset available.
                         state = "WAITING_RESET_PAYMENT"
                         ledger.append({
                             "type": "RESET_PAYMENT_REQUIRED",
@@ -34249,3 +34272,860 @@ def admin_automation_v41_status():
 
 _np_start_second_life_recovery_v41()
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_SECOND_LIFE_RECOVERY_RELEASE_V41
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "V42_FUNDED_RESET_AFTER_PAYOUT_RENEWAL_2026_09_15"
+
+
+
+# ============================================================================
+# NAIRAPIPS V43 — AUTOMATION GUIDE ENFORCEMENT — 15 SEP 2026
+#
+# ROOT PURCHASE BEFORE 12 SEP 2026 = LEGACY MANUAL
+#   -> Assignment Card + protected manual trigger.
+#
+# ROOT PURCHASE ON/AFTER 12 SEP 2026 = CLEAN AUTOMATION
+#   -> eligible lifecycle actions auto-fire + retry.
+#
+# Later pass/breach/payout/reset/payment/approval dates NEVER reclassify journey.
+# Stage-specific business law still decides whether an entitlement exists.
+# ============================================================================
+
+NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V43 = "V43_AUTOMATION_GUIDE_ENFORCED_2026_09_15"
+_NP_AUTOMATION_GUIDE_CUTOFF_V43 = datetime(2026, 9, 12, 0, 0, 0, tzinfo=timezone.utc)
+
+def _np_root_automation_class_v43(purchase):
+    p = purchase or {}
+    if not str(p.get("id") or "").strip():
+        return "UNKNOWN"
+    note = str(p.get("admin_note") or "")
+    ptype = str(p.get("purchase_type") or "challenge").strip().lower()
+    if "[NP_RESET_REQUEST:" in note or ptype == "reset":
+        return "CHILD_TRANSACTION"
+    created = _np_parse_dt_safe(p.get("created_at"))
+    return "CLEAN_AUTOMATION" if created and created >= _NP_AUTOMATION_GUIDE_CUTOFF_V43 else "LEGACY_MANUAL"
+
+def _np_is_clean_root_v43(purchase):
+    return _np_root_automation_class_v43(purchase) == "CLEAN_AUTOMATION"
+
+
+# FINAL auto-assignment firewall.
+# It deliberately supersedes older migration bridges that let a later event
+# convert a legacy root into automatic assignment.
+_np_auto_assign_waiting_stage_v43_core = _np_auto_assign_waiting_stage
+
+def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"):
+    p = purchase or {}
+    cls = _np_root_automation_class_v43(p)
+    if cls != "CLEAN_AUTOMATION":
+        try:
+            _audit_safe(
+                "automation", "v43_legacy_manual_only",
+                f"Auto blocked by immutable root class={cls}; purchase={p.get('id')}; target={stage}; reason={reason}",
+                {"name":"system","username":"system","role":"system"},
+                (source_account or {}).get("id") or p.get("id") or (trader or {}).get("id"),
+            )
+        except Exception:
+            pass
+        return None
+    return _np_auto_assign_waiting_stage_v43_core(trader, stage, p, source_account, reason)
+
+
+# Normalize Cockpit control mode by ROOT purchase only.
+_np_all_journeys_preserved_v43_core = _np_all_journeys_preserved_v5
+
+def _np_all_journeys_preserved_v5(trader_id):
+    bundle = _np_all_journeys_preserved_v43_core(trader_id)
+    for j in bundle.get("journeys") or []:
+        purchase = j.get("purchase") or {}
+        jid = str(j.get("journey_id") or j.get("purchase_id") or "").strip()
+        if not purchase and jid and not jid.startswith("ACCOUNT:"):
+            try:
+                rows = supabase.table("challenge_purchases").select("*").eq("id", jid).limit(1).execute().data or []
+                purchase = rows[0] if rows else {}
+                if purchase:
+                    j["purchase"] = purchase
+            except Exception:
+                purchase = {}
+
+        cls = _np_root_automation_class_v43(purchase)
+        j["automation_class"] = cls
+        j["automation_class_source"] = "ORIGINAL_CHALLENGE_PURCHASE_DATE"
+        j["automation_cutoff"] = _NP_AUTOMATION_GUIDE_CUTOFF_V43.isoformat()
+
+        if cls == "CLEAN_AUTOMATION":
+            j["control_mode"] = "CLEAN_AUTOMATION"
+            j["automatic_assignment_allowed"] = True
+        elif cls == "LEGACY_MANUAL":
+            j["control_mode"] = "LEGACY_MANUAL"
+            j["automatic_assignment_allowed"] = False
+            if j.get("outstanding_entitlement"):
+                j["next_action"] = "MANUAL_ASSIGN_MT5"
+
+    bundle["automation_cutoff"] = _NP_AUTOMATION_GUIDE_CUTOFF_V43.isoformat()
+    bundle["automation_rule"] = "ROOT BEFORE 12-SEP = LEGACY MANUAL; ROOT ON/AFTER 12-SEP = CLEAN AUTOMATION"
+    return bundle
+
+
+# ---------------------------------------------------------------------------
+# CLEAN PAID RESET AUTOFIRE
+# Financial authority remains unchanged:
+# breach -> reset request -> payment proof -> Admin approval.
+# ONLY AFTER APPROVAL does a clean journey auto-assign the same-stage MT5.
+# Legacy journeys remain manual even when approval happens after 12 Sep.
+# ---------------------------------------------------------------------------
+
+_NP_RESET_AUTOFIRE_INTERVAL_V43 = 20
+_NP_RESET_AUTOFIRE_LOCK_V43 = threading.Lock()
+_NP_RESET_AUTOFIRE_STARTED_V43 = False
+_NP_RESET_AUTOFIRE_LAST_V43 = {}
+
+def _np_reset_order_refs_v43(order):
+    m = re.search(
+        r"\[NP_RESET_REQUEST:([^:\]]+):([^:\]]+):(phase1|phase2|funded)\]",
+        str((order or {}).get("admin_note") or ""),
+        re.I,
+    )
+    if not m:
+        return None
+    return {
+        "source_account_id": str(m.group(1)).strip(),
+        "parent_purchase_id": str(m.group(2)).strip(),
+        "stage": _normalize_lifecycle_stage(m.group(3)),
+    }
+
+def _np_reset_existing_child_v43(source, order):
+    try:
+        child = _np_find_exact_reset_replacement_v8(source, order)
+        if child and str(child.get("mt5_login") or "").strip():
+            return child
+    except Exception:
+        pass
+    return None
+
+def _np_mark_reset_consumed_v43(source, order, parent, child, stage):
+    now = now_iso()
+    source = source or {}
+    order = order or {}
+    parent = parent or {}
+    child = child or {}
+
+    marker = f"reset_consumed replacement_account_id={child.get('id')} replacement_mt5={child.get('mt5_login')}"
+    payload = {
+        "account_status": "archived",
+        "monitoring_enabled": False,
+        "archive_reason": (str(source.get("archive_reason") or "") + " | " + marker).strip(" |"),
+        "updated_at": now,
+        "reset_consumed_at": source.get("reset_consumed_at") or now,
+        "reset_replacement_account_id": child.get("id"),
+    }
+    try:
+        supabase.table("trader_accounts").update(payload).eq("id", source.get("id")).execute()
+    except Exception:
+        payload.pop("reset_consumed_at", None)
+        payload.pop("reset_replacement_account_id", None)
+        supabase.table("trader_accounts").update(payload).eq("id", source.get("id")).execute()
+
+    oid = str(order.get("id") or "").strip()
+    if oid:
+        op = {
+            "status": "completed",
+            "payment_status": "approved",
+            "updated_at": now,
+            "admin_note": (str(order.get("admin_note") or "") + f" | [NP_RESET_AUTOMATION_V43_CONSUMED:{child.get('id')}]").strip(" |"),
+            "reset_entitlement_consumed_at": now,
+            "reset_replacement_account_id": child.get("id"),
+        }
+        for _ in range(4):
+            try:
+                supabase.table("challenge_purchases").update(op).eq("id", oid).execute()
+                break
+            except Exception as exc:
+                mm = re.search(r"Could not find the '([^']+)' column", str(exc), re.I)
+                if not mm or mm.group(1) not in op:
+                    raise
+                op.pop(mm.group(1), None)
+
+    pid = str(parent.get("id") or "").strip()
+    if pid:
+        fld = "funded_reset_replacement_account_id" if stage == "funded" else "challenge_reset_replacement_account_id"
+        try:
+            supabase.table("challenge_purchases").update({fld: child.get("id"), "updated_at": now}).eq("id", pid).execute()
+        except Exception:
+            pass
+
+def _np_auto_fulfill_exact_reset_v43(order):
+    order = order or {}
+    oid = str(order.get("id") or "").strip()
+    refs = _np_reset_order_refs_v43(order)
+    tid = str(order.get("trader_id") or "").strip()
+    if not oid or not refs or not tid:
+        return {"status":"blocked","reason":"missing_exact_reset_identity"}
+
+    sid, pid, stage = refs["source_account_id"], refs["parent_purchase_id"], refs["stage"]
+    if stage not in {"phase1","phase2","funded"}:
+        return {"status":"blocked","reason":"invalid_stage"}
+
+    sr = supabase.table("trader_accounts").select("*").eq("id", sid).eq("trader_id", tid).limit(1).execute().data or []
+    pr = supabase.table("challenge_purchases").select("*").eq("id", pid).eq("trader_id", tid).limit(1).execute().data or []
+    if not sr or not pr:
+        return {"status":"blocked","reason":"source_or_parent_missing"}
+    source, parent = sr[0], pr[0]
+
+    # Original root date decides automation class.
+    if not _np_is_clean_root_v43(parent):
+        return {"status":"legacy_manual","reason":"legacy_root_purchase_manual_only"}
+
+    if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != stage:
+        return {"status":"blocked","reason":"source_stage_mismatch"}
+
+    # 2-Lives challenge replacement is Second-Life logic, never a paid challenge reset.
+    if stage in {"phase1","phase2"} and _second_life_bool(parent.get("second_life_enabled")):
+        return {"status":"blocked","reason":"two_lives_uses_second_life_rule"}
+
+    trader = get_trader_by_id(tid) or {}
+    if not trader:
+        return {"status":"blocked","reason":"trader_missing"}
+
+    kind = "funded_reset_paid" if stage == "funded" else "challenge_reset_paid"
+
+    # Crash-safe claim lease: a worker dying after setting reset_assigning must
+    # not strand an approved reset forever. Young claims are left alone; claims
+    # older than 90 seconds are returned to the approved waiting state.
+    pre_status = str(order.get("status") or "").strip().lower()
+    if pre_status == "reset_assigning":
+        claimed_at = _np_parse_dt_safe(order.get("updated_at") or order.get("approved_at") or order.get("created_at"))
+        age = (datetime.now(timezone.utc) - claimed_at).total_seconds() if claimed_at else 999999
+        if age < 90:
+            return {"status":"busy","reason":"reset_assignment_claim_held"}
+        try:
+            released = (
+                supabase.table("challenge_purchases").update({
+                    "status":"approved_reset_waiting_mt5",
+                    "updated_at":now_iso(),
+                }).eq("id",oid).eq("trader_id",tid).eq("status","reset_assigning")
+                .execute().data or []
+            )
+            if not released:
+                return {"status":"busy","reason":"stale_claim_release_lost_race"}
+            order = released[0]
+        except Exception as exc:
+            return {"status":"busy","reason":f"stale_claim_release_failed:{exc}"}
+
+    if not _np_verify_exact_paid_reset_order(source, trader, oid, kind):
+        return {"status":"blocked","reason":"reset_authority_not_verified"}
+
+    existing = _np_reset_existing_child_v43(source, order)
+    if existing:
+        _np_mark_reset_consumed_v43(source, order, parent, existing, stage)
+        return {"status":"already_fulfilled","mt5_login":existing.get("mt5_login")}
+
+    st = str(order.get("status") or "").strip().lower()
+    if st not in {"approved_reset_waiting_mt5","approved","paid","reset_assigning"}:
+        return {"status":"blocked","reason":f"order_status_{st or 'missing'}"}
+
+    if st != "reset_assigning":
+        try:
+            claimed = (
+                supabase.table("challenge_purchases").update({"status":"reset_assigning","updated_at":now_iso()})
+                .eq("id", oid).eq("trader_id", tid).eq("status", order.get("status"))
+                .execute().data or []
+            )
+        except Exception:
+            claimed = []
+        if not claimed:
+            return {"status":"busy","reason":"claim_not_acquired"}
+
+    # One more replacement check after claim.
+    latest_source = (supabase.table("trader_accounts").select("*").eq("id", sid).eq("trader_id", tid).limit(1).execute().data or [source])[0]
+    latest_order = (supabase.table("challenge_purchases").select("*").eq("id", oid).eq("trader_id", tid).limit(1).execute().data or [order])[0]
+    existing = _np_reset_existing_child_v43(latest_source, latest_order)
+    if existing:
+        _np_mark_reset_consumed_v43(latest_source, latest_order, parent, existing, stage)
+        return {"status":"already_fulfilled","mt5_login":existing.get("mt5_login")}
+
+    size = clean(latest_source.get("account_size") or latest_source.get("start_balance") or parent.get("account_size") or 0)
+    mt5 = _np_pick_fresh_mt5(size, stage)
+    if not mt5:
+        try:
+            supabase.table("challenge_purchases").update({"status":"approved_reset_waiting_mt5","updated_at":now_iso()}).eq("id",oid).eq("trader_id",tid).eq("status","reset_assigning").execute()
+        except Exception:
+            pass
+        return {"status":"waiting_inventory","stage":stage,"account_size":size}
+
+    try:
+        _np_assert_mt5_pool_matches_stage(mt5, stage)
+        auto_ok, auto_reason = _np_mt5_auto_eligible(mt5, size, stage)
+    except Exception as exc:
+        auto_ok, auto_reason = False, str(exc)
+    if not auto_ok:
+        try:
+            supabase.table("challenge_purchases").update({"status":"approved_reset_waiting_mt5","updated_at":now_iso()}).eq("id",oid).eq("trader_id",tid).eq("status","reset_assigning").execute()
+        except Exception:
+            pass
+        return {"status":"waiting_inventory","reason":auto_reason}
+
+    actor = {"name":"clean_reset_automation_v43","username":"clean_reset_automation_v43","role":"system"}
+    try:
+        child, updated = _assign_mt5_to_trader(
+            trader, mt5, stage, parent, actor,
+            f"CLEAN AUTOMATION V43 · {stage.upper()} RESET APPROVED · order={oid} · source={sid}",
+        )
+    except Exception as exc:
+        try:
+            supabase.table("challenge_purchases").update({"status":"approved_reset_waiting_mt5","updated_at":now_iso()}).eq("id",oid).eq("trader_id",tid).eq("status","reset_assigning").execute()
+        except Exception:
+            pass
+        return {"status":"error","reason":str(exc)}
+
+    _np_mark_reset_consumed_v43(latest_source, latest_order, parent, child, stage)
+    try:
+        _audit_safe(
+            "automation","v43_paid_reset_assigned",
+            f"journey={pid}; order={oid}; source={sid}; stage={stage}; replacement={child.get('id')}; mt5={child.get('mt5_login')}",
+            actor, oid
+        )
+    except Exception:
+        pass
+    return {"status":"assigned","stage":stage,"account_id":child.get("id"),"mt5_login":child.get("mt5_login")}
+
+def _np_retry_clean_approved_resets_v43(limit=300):
+    summary = {"scanned":0,"assigned":0,"already_fulfilled":0,"legacy_manual":0,"waiting_inventory":0,"busy":0,"blocked":0,"errors":0}
+    try:
+        rows = supabase.table("challenge_purchases").select("*").eq("payment_status","approved").limit(int(limit)).execute().data or []
+    except Exception as exc:
+        summary["errors"] = 1
+        summary["error"] = str(exc)
+        return summary
+
+    for order in rows:
+        if "[NP_RESET_REQUEST:" not in str(order.get("admin_note") or ""):
+            continue
+        if str(order.get("status") or "").strip().lower() not in {"approved_reset_waiting_mt5","approved","paid","reset_assigning"}:
+            continue
+        summary["scanned"] += 1
+        try:
+            result = _np_auto_fulfill_exact_reset_v43(order) or {}
+            key = str(result.get("status") or "blocked")
+            summary[key if key in summary else "blocked"] += 1
+        except Exception as exc:
+            summary["errors"] += 1
+            print("V43 RESET AUTOFIRE ERROR:", order.get("id"), exc)
+    global _NP_RESET_AUTOFIRE_LAST_V43
+    _NP_RESET_AUTOFIRE_LAST_V43 = summary
+    return summary
+
+def _np_reset_autofire_loop_v43():
+    time.sleep(7)
+    while True:
+        try:
+            if _NP_RESET_AUTOFIRE_LOCK_V43.acquire(blocking=False):
+                try:
+                    r = _np_retry_clean_approved_resets_v43()
+                    if r.get("assigned") or r.get("waiting_inventory") or r.get("errors"):
+                        print("V43 CLEAN RESET AUTOFIRE:", r)
+                finally:
+                    _NP_RESET_AUTOFIRE_LOCK_V43.release()
+        except Exception as exc:
+            print("V43 RESET AUTOFIRE LOOP ERROR:", exc)
+        time.sleep(_NP_RESET_AUTOFIRE_INTERVAL_V43)
+
+def _np_start_reset_autofire_v43():
+    global _NP_RESET_AUTOFIRE_STARTED_V43
+    if _NP_RESET_AUTOFIRE_STARTED_V43:
+        return
+    if str(os.environ.get("NAIRAPIPS_DISABLE_LIFECYCLE_WORKERS","")).strip().lower() in {"1","true","yes","on"}:
+        return
+    _NP_RESET_AUTOFIRE_STARTED_V43 = True
+    threading.Thread(target=_np_reset_autofire_loop_v43, name="nairapips-clean-reset-autofire-v43", daemon=True).start()
+    print("V43 clean paid-reset worker started: 20s interval")
+
+# Hook exact reset approval: clean root starts background fulfilment immediately.
+_np_approve_reset_purchase_payment_v43_core = _np_approve_reset_purchase_payment
+
+def _np_approve_reset_purchase_payment(p, admin_payload=None):
+    resp = _np_approve_reset_purchase_payment_v43_core(p, admin_payload)
+    try:
+        if getattr(resp, "status_code", 200) < 400:
+            oid = str((p or {}).get("id") or "").strip()
+            rows = supabase.table("challenge_purchases").select("*").eq("id",oid).limit(1).execute().data or []
+            order = rows[0] if rows else {}
+            refs = _np_reset_order_refs_v43(order)
+            parent = {}
+            if refs:
+                prows = supabase.table("challenge_purchases").select("*").eq("id",refs["parent_purchase_id"]).limit(1).execute().data or []
+                parent = prows[0] if prows else {}
+            if refs and _np_is_clean_root_v43(parent):
+                threading.Thread(target=lambda: _np_auto_fulfill_exact_reset_v43(order), name=f"nairapips-reset-{oid[:8]}", daemon=True).start()
+    except Exception as exc:
+        print("V43 RESET APPROVAL AUTOFIRE DEFERRED:", exc)
+    return resp
+
+@app.route("/admin/automation_v43/status", methods=["GET","OPTIONS"])
+def admin_automation_v43_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success":True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success":True,
+        "release":NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V43,
+        "cutoff":_NP_AUTOMATION_GUIDE_CUTOFF_V43.isoformat(),
+        "legacy":"Assignment Card + protected manual trigger",
+        "clean":"eligible actions auto-fire + retry",
+        "later_events_reclassify_journey":False,
+        "phase_pass_to_funded":"existing clean worker",
+        "second_life":"existing clean recovery worker",
+        "payout_renewal":"existing exact PAID payout worker",
+        "paid_reset":"V43 after Admin payment approval",
+        "reset_worker_enabled":_NP_RESET_AUTOFIRE_STARTED_V43,
+        "reset_worker_interval_seconds":_NP_RESET_AUTOFIRE_INTERVAL_V43,
+        "last_reset_summary":_NP_RESET_AUTOFIRE_LAST_V43,
+    })
+
+_np_start_reset_autofire_v43()
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V43
+
+
+
+# ============================================================================
+# NAIRAPIPS V44 — RESILIENT AUTOMATION RETRY / FAIR QUEUES — 15 SEP 2026
+#
+# This patch changes RETRY RELIABILITY only. Business entitlements remain under
+# the situation-specific rules already enforced by V43.
+#
+# WHY V44
+# -------
+# With 300+ users, a retry worker must not keep scanning only the first N old
+# rows forever. V44 removes that starvation risk and makes the exact queues fair.
+#
+# CLEAN AUTOMATION retry law:
+#   * no matching MT5 now -> remain waiting -> retry later
+#   * temporary DB/API/assignment error -> entitlement remains unconsumed -> retry
+#   * worker dies mid-claim -> existing 90s claim lease releases it -> retry
+#   * duplicate/success already fulfilled -> idempotent proof stops duplicate MT5
+#   * permanent business-rule block -> NO bypass / NO invented entitlement
+#
+# LEGACY journeys remain manual. Later events never reclassify the root journey.
+# ============================================================================
+
+NAIRAPIPS_AUTOMATION_RETRY_RELEASE_V44 = "V44_RESILIENT_FAIR_RETRY_2026_09_15"
+
+# ---------------------------------------------------------------------------
+# A) PASS -> FUNDED FAIR RETRY
+#
+# V19 originally scanned only the first 250 clean purchases ordered by purchase
+# creation time. Once the business grew past that window, a newer missed pass
+# could sit outside the scan forever. V44 rotates through the actual archived
+# Phase-1 account candidates, then applies the existing exact entitlement proof.
+# ---------------------------------------------------------------------------
+
+_NP_PASS_RETRY_CURSOR_V44 = 0
+_NP_PASS_RETRY_PAGE_V44 = 250
+
+def _np_retry_clean_pass_funded_v19(limit=250):
+    global _NP_PASS_RETRY_CURSOR_V44
+
+    page_size = max(50, min(int(limit or _NP_PASS_RETRY_PAGE_V44), 500))
+    start = int(_NP_PASS_RETRY_CURSOR_V44 or 0)
+    end = start + page_size - 1
+
+    summary = {
+        "checked": 0,
+        "due": 0,
+        "assigned": 0,
+        "already_fulfilled": 0,
+        "waiting_inventory": 0,
+        "errors": 0,
+        "page_start": start,
+        "page_size": page_size,
+    }
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("account_status", "archived_phase1")
+            .order("updated_at", desc=True)
+            .range(start, end)
+            .execute().data or []
+        )
+    except Exception as exc:
+        print("V44 PASS RETRY CANDIDATE LOAD FAILED:", exc)
+        summary["errors"] += 1
+        summary["error"] = str(exc)
+        return summary
+
+    # Fair round-robin: walk the whole candidate population over successive cycles.
+    if len(rows) < page_size:
+        _NP_PASS_RETRY_CURSOR_V44 = 0
+    else:
+        _NP_PASS_RETRY_CURSOR_V44 = start + page_size
+
+    seen_purchases = set()
+
+    for candidate in rows:
+        try:
+            pid = str(candidate.get("purchase_id") or "").strip()
+            if not pid or pid in seen_purchases:
+                continue
+            seen_purchases.add(pid)
+
+            prows = (
+                supabase.table("challenge_purchases").select("*")
+                .eq("id", pid).limit(1).execute().data or []
+            )
+            if not prows:
+                summary["errors"] += 1
+                continue
+            purchase = prows[0]
+
+            # Immutable root-date automation class.
+            if not _np_is_clean_root_v43(purchase):
+                continue
+
+            truth = _np_exact_pass_funded_due_v16(pid)
+            summary["checked"] += 1
+
+            if not truth.get("ok"):
+                continue
+            if truth.get("consumed") or truth.get("reason") == "funded_already_assigned":
+                summary["already_fulfilled"] += 1
+                continue
+            if not truth.get("due"):
+                continue
+            if truth.get("entitlement_type") != "phase_pass":
+                continue
+            if _normalize_lifecycle_stage(truth.get("target_stage")) != "funded":
+                continue
+
+            summary["due"] += 1
+            source_id = str(truth.get("source_account_id") or "").strip()
+            trader_id = str(truth.get("trader_id") or purchase.get("trader_id") or "").strip()
+            if not source_id or not trader_id:
+                summary["errors"] += 1
+                continue
+
+            srows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", source_id).eq("trader_id", trader_id)
+                .limit(1).execute().data or []
+            )
+            trader = get_trader_by_id(trader_id)
+            if not srows or not trader:
+                summary["errors"] += 1
+                continue
+
+            result = _np_auto_assign_waiting_stage(
+                trader, "funded", purchase, srows[0], "lifecycle_progression"
+            )
+
+            if result:
+                if result.get("already_fulfilled"):
+                    summary["already_fulfilled"] += 1
+                else:
+                    summary["assigned"] += 1
+                    try:
+                        _audit_safe(
+                            "automation",
+                            "v44_retry_pass_funded_fulfilled",
+                            (
+                                f"purchase={pid}; source_mt5={truth.get('source_mt5')}; "
+                                f"funded_mt5={(result.get('account') or {}).get('mt5_login')}"
+                            ),
+                            {"name":"automation_retry_v44","username":"automation_retry_v44","role":"system"},
+                            source_id,
+                        )
+                    except Exception:
+                        pass
+            else:
+                # No inventory or another temporary failure leaves exact authority
+                # unconsumed. The next fair cycle comes back to it.
+                after = _np_exact_pass_funded_due_v16(pid)
+                if after.get("due"):
+                    summary["waiting_inventory"] += 1
+
+        except Exception as exc:
+            summary["errors"] += 1
+            print("V44 PASS->FUNDED RETRY ERROR:", exc)
+
+    summary["next_page_start"] = _NP_PASS_RETRY_CURSOR_V44
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# B) SECOND-LIFE FAIR RECOVERY
+#
+# V41's event-recovery scan is retained, but the candidate window now rotates.
+# A breached source that already received Life 2 cannot permanently crowd an
+# older outstanding breach out of the first N rows.
+# ---------------------------------------------------------------------------
+
+_NP_SECOND_LIFE_CURSOR_V44 = 0
+_NP_SECOND_LIFE_PAGE_V44 = 300
+
+def _np_second_life_breach_recovery_cycle_v44(limit=300):
+    global _NP_SECOND_LIFE_CURSOR_V44, _NP_SECOND_LIFE_RECOVERY_LAST_V41
+
+    page_size = max(50, min(int(limit or _NP_SECOND_LIFE_PAGE_V44), 500))
+    start = int(_NP_SECOND_LIFE_CURSOR_V44 or 0)
+    end = start + page_size - 1
+
+    out = {
+        "checked": 0,
+        "eligible": 0,
+        "assigned": 0,
+        "activated_waiting": 0,
+        "skipped": 0,
+        "errors": 0,
+        "page_start": start,
+        "page_size": page_size,
+        "started_at": now_iso(),
+    }
+    actor = {"name":"second_life_recovery_v44","username":"second_life_recovery_v44","role":"system"}
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .in_("account_status", [
+                "breached_archived", "breached", "breach",
+                "breached_locked", "breached_closed"
+            ])
+            .order("updated_at", desc=True)
+            .range(start, end)
+            .execute().data or []
+        )
+    except Exception as exc:
+        out["errors"] += 1
+        out["error"] = "load_breaches: " + str(exc)
+        _NP_SECOND_LIFE_RECOVERY_LAST_V41 = out
+        print("V44 SECOND-LIFE BREACH LOAD ERROR:", exc)
+        return out
+
+    if len(rows) < page_size:
+        _NP_SECOND_LIFE_CURSOR_V44 = 0
+    else:
+        _NP_SECOND_LIFE_CURSOR_V44 = start + page_size
+
+    for source in rows:
+        try:
+            if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "phase1":
+                out["skipped"] += 1
+                continue
+
+            trader_id = str(source.get("trader_id") or "").strip()
+            purchase_id = str(source.get("purchase_id") or "").strip()
+            if not trader_id or not purchase_id:
+                out["skipped"] += 1
+                continue
+
+            prows = (
+                supabase.table("challenge_purchases").select("*")
+                .eq("id", purchase_id).eq("trader_id", trader_id)
+                .limit(1).execute().data or []
+            )
+            if not prows:
+                out["skipped"] += 1
+                continue
+            purchase = prows[0]
+
+            if not _np_is_clean_root_v43(purchase):
+                out["skipped"] += 1
+                continue
+
+            out["checked"] += 1
+            sl = _second_life_status_payload(purchase, trader_id) or {}
+            if not sl.get("enabled"):
+                out["skipped"] += 1
+                continue
+            if _second_life_bool(purchase.get("second_life_used")):
+                out["skipped"] += 1
+                continue
+
+            # Repair only an entitlement snapshot already proven by plan authority.
+            if not _second_life_bool(purchase.get("second_life_enabled")):
+                repaired = (
+                    supabase.table("challenge_purchases").update({
+                        "second_life_enabled": True,
+                        "updated_at": now_iso(),
+                    })
+                    .eq("id", purchase_id)
+                    .eq("trader_id", trader_id)
+                    .eq("second_life_used", False)
+                    .execute().data or []
+                )
+                if repaired:
+                    purchase = repaired[0]
+
+            out["eligible"] += 1
+            trader = get_trader_by_id(trader_id) or {"id": trader_id}
+            result = _np_auto_free_phase1_reset_after_breach(trader, source)
+
+            if result and isinstance(result, dict) and (result.get("account") or {}).get("mt5_login"):
+                out["assigned"] += 1
+                try:
+                    _audit_safe(
+                        "automation",
+                        "v44_second_life_assigned",
+                        (
+                            f"purchase={purchase_id}; source={source.get('id')}; "
+                            f"source_mt5={source.get('mt5_login')}; "
+                            f"replacement_mt5={(result.get('account') or {}).get('mt5_login')}"
+                        ),
+                        actor,
+                        str(source.get("id") or ""),
+                    )
+                except Exception:
+                    pass
+            else:
+                fresh = (
+                    supabase.table("challenge_purchases")
+                    .select("second_life_used,second_life_status")
+                    .eq("id", purchase_id).eq("trader_id", trader_id)
+                    .limit(1).execute().data or []
+                )
+                if (
+                    fresh
+                    and _second_life_bool(fresh[0].get("second_life_used"))
+                    and str(fresh[0].get("second_life_status") or "").lower()
+                    in {"life2_waiting_mt5", "waiting_mt5"}
+                ):
+                    out["activated_waiting"] += 1
+
+        except Exception as exc:
+            out["errors"] += 1
+            print("V44 SECOND-LIFE RECOVERY ERROR:", exc)
+
+    out["next_page_start"] = _NP_SECOND_LIFE_CURSOR_V44
+    out["finished_at"] = now_iso()
+    _NP_SECOND_LIFE_RECOVERY_LAST_V41 = out
+    return out
+
+# Existing V41 daemon resolves this global name each cycle.
+_np_second_life_breach_recovery_cycle_v41 = _np_second_life_breach_recovery_cycle_v44
+
+
+# ---------------------------------------------------------------------------
+# C) PAID RESET RETRY — NARROW EXACT QUEUE
+#
+# V43 scanned the first N rows of *all* approved purchases and then filtered for
+# reset markers in Python. At scale, normal purchases could crowd reset orders
+# out of that window. V44 asks PostgREST only for exact reset-marker rows.
+# ---------------------------------------------------------------------------
+
+_np_retry_clean_approved_resets_v44_fallback = _np_retry_clean_approved_resets_v43
+
+def _np_retry_clean_approved_resets_v43(limit=300):
+    summary = {
+        "scanned": 0,
+        "assigned": 0,
+        "already_fulfilled": 0,
+        "legacy_manual": 0,
+        "waiting_inventory": 0,
+        "busy": 0,
+        "blocked": 0,
+        "errors": 0,
+    }
+
+    try:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("payment_status", "approved")
+            .ilike("admin_note", "%[NP_RESET_REQUEST:%")
+            .in_("status", [
+                "approved_reset_waiting_mt5",
+                "reset_assigning",
+                "approved",
+                "paid",
+            ])
+            .order("updated_at", desc=False)
+            .limit(max(50, min(int(limit or 300), 1000)))
+            .execute().data or []
+        )
+    except Exception as exc:
+        # Never lose retry coverage because one optimized query shape failed.
+        print("V44 NARROW RESET QUEUE LOAD FAILED; USING V43 FALLBACK:", exc)
+        fallback = _np_retry_clean_approved_resets_v44_fallback(limit=limit)
+        fallback["v44_narrow_query_fallback"] = True
+        return fallback
+
+    for order in rows:
+        # Exact marker remains mandatory even after DB-side filtering.
+        if "[NP_RESET_REQUEST:" not in str(order.get("admin_note") or ""):
+            continue
+
+        summary["scanned"] += 1
+        try:
+            result = _np_auto_fulfill_exact_reset_v43(order) or {}
+            key = str(result.get("status") or "blocked")
+            if key in summary:
+                summary[key] += 1
+            else:
+                summary["blocked"] += 1
+
+            # IMPORTANT: waiting_inventory / busy / error / transient block never
+            # consumes the entitlement. The row remains visible to a later cycle.
+            if key == "error":
+                summary["errors"] += 1
+
+        except Exception as exc:
+            summary["errors"] += 1
+            print("V44 RESET RETRY ITEM ERROR:", order.get("id"), exc)
+            # If the exception happened after a reset_assigning claim, V43's 90s
+            # lease recovers the claim and a later cycle retries it.
+
+    global _NP_RESET_AUTOFIRE_LAST_V43
+    _NP_RESET_AUTOFIRE_LAST_V43 = summary
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# D) RETRY HEALTH
+# Payout renewal already has V33's 15s retry + 90s stale-claim recovery.
+# V40/V44 covers Phase-pass and activated Life-2 waiting obligations.
+# V41/V44 covers a missed Life-1 breach activation.
+# V43/V44 covers exact approved paid resets.
+# ---------------------------------------------------------------------------
+
+@app.route("/admin/automation_v44/status", methods=["GET", "OPTIONS"])
+def admin_automation_v44_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_AUTOMATION_RETRY_RELEASE_V44,
+        "root_automation_rule": (
+            "BEFORE 12 SEP 2026 = LEGACY MANUAL; "
+            "ON/AFTER 12 SEP 2026 = CLEAN AUTOMATION"
+        ),
+        "later_events_reclassify_journey": False,
+        "retry_contract": {
+            "no_mt5_inventory": "WAIT_AND_RETRY",
+            "temporary_assignment_error": "ENTITLEMENT_REMAINS_UNCONSUMED_AND_RETRIES",
+            "stale_assignment_claim": "LEASE_RECOVERY_THEN_RETRY",
+            "duplicate_or_already_fulfilled": "IDEMPOTENT_NO_DUPLICATE",
+            "invalid_or_unauthorized_entitlement": "BLOCK_NO_BYPASS",
+        },
+        "workers": {
+            "phase_pass_to_funded": "V40 daemon using V44 fair candidate queue",
+            "second_life_waiting": "V40 retry + V44 fair breach recovery",
+            "payout_renewal": "V33 15s exact retry + 90s stale-claim recovery",
+            "paid_reset": "V43 20s retry + V44 exact reset queue + 90s stale-claim recovery",
+        },
+        "pass_retry_next_page": _NP_PASS_RETRY_CURSOR_V44,
+        "second_life_retry_next_page": _NP_SECOND_LIFE_CURSOR_V44,
+        "last_reset_summary": globals().get("_NP_RESET_AUTOFIRE_LAST_V43"),
+        "last_lifecycle_summary": globals().get("_NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40"),
+        "last_second_life_summary": globals().get("_NP_SECOND_LIFE_RECOVERY_LAST_V41"),
+        "last_payout_summary": (
+            globals().get("_NP_PAYOUT_RENEWAL_LAST_SUMMARY_V33")
+            or globals().get("_NP_PAYOUT_RENEWAL_LAST_SUMMARY_V31")
+        ),
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_RETRY_RELEASE_V44
+
