@@ -9167,7 +9167,22 @@ def approve_purchase():
             if not m: return bad("No fresh MT5 (7 days or less) is AUTO READY for this account size",409)
         if auto_mode:
             auto_ok,auto_reason=_np_mt5_auto_eligible(m,p.get("account_size") or 0,"phase1")
-            if not auto_ok: return bad("Automatic assignment blocked: "+auto_reason,409)
+            if not auto_ok:
+                # Browser/cache may contain an MT5 pool row that looks available
+                # but has already appeared in trader_accounts/history. Automatic
+                # mode must recover by asking the SERVER for the next truly fresh
+                # PHASE1 credential instead of making staff retry manually.
+                print(
+                    "V48 AUTO PURCHASE CANDIDATE REJECTED; SEARCHING NEXT FRESH MT5:",
+                    str(m.get("mt5_login") or ""), auto_reason
+                )
+                m=_np_pick_fresh_mt5(p.get("account_size") or 0,"phase1")
+                if not m:
+                    return bad(
+                        "No genuinely fresh MT5 is currently available for this account size. "
+                        "The purchase remains pending and automation will retry when fresh inventory is available.",
+                        409
+                    )
         try:
             _np_assert_mt5_pool_matches_stage(m, "phase1")
         except ValueError as exc:
@@ -35528,4 +35543,364 @@ def admin_automation_v47_status():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_RELEASE_V47
+
+
+
+# ============================================================================
+# NAIRAPIPS V48 — FRESH MT5 HISTORY GUARD + SELF-HEALING AUTO PICK
+# 15 SEP 2026
+#
+# FIXES
+# -----
+# A pool row marked AVAILABLE is NOT enough.  A login is assignable only when
+# it has NEVER appeared in NairaPips trading history.
+#
+# This patch:
+#   * removes used logins from the Purchase/Cockpit assignable feed;
+#   * checks trader_accounts in bulk before displaying candidates;
+#   * keeps other historical single-use guards;
+#   * makes AUTO purchase assignment skip a stale browser candidate and select
+#     the next genuinely fresh MT5 server-side;
+#   * keeps explicit/manual MT5 selection strict and fail-closed.
+# ============================================================================
+
+NAIRAPIPS_MT5_HISTORY_RELEASE_V48 = "V48_FRESH_MT5_HISTORY_GUARD_2026_09_15"
+
+
+# Mandatory history source: trader_accounts is the operational ownership ledger.
+# Do not fail-open if this query is temporarily unavailable.
+_np_mt5_login_has_any_history_v48_core = _mt5_login_has_any_history
+
+def _mt5_login_has_any_history(mt5_login, exclude_mt5_pool_id=None):
+    login = str(mt5_login or "").strip()
+    if not login:
+        return True, "MT5 login is empty"
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("id,mt5_login")
+            .eq("mt5_login", login).limit(1).execute().data or []
+        )
+    except Exception as exc:
+        print("V48 MANDATORY MT5 HISTORY CHECK FAILED:", login, exc)
+        return True, "MT5 history verification is temporarily unavailable; retry later"
+
+    if rows:
+        return True, f"MT5 {login} already exists in trader_accounts.mt5_login"
+
+    # Preserve every other existing historical protection.
+    return _np_mt5_login_has_any_history_v48_core(
+        login, exclude_mt5_pool_id=exclude_mt5_pool_id
+    )
+
+
+def _np_chunks_v48(values, size=80):
+    vals = [str(v or "").strip() for v in values if str(v or "").strip()]
+    for i in range(0, len(vals), int(size)):
+        yield vals[i:i+int(size)]
+
+
+def _np_used_mt5_logins_batch_v48(pool_rows):
+    """Return logins that are NOT fresh.
+
+    trader_accounts is mandatory and fail-closed. Other historical stores are
+    checked opportunistically exactly like the existing single-login authority.
+    The mt5_pool table itself is also checked for duplicate/prior assignment
+    evidence.
+    """
+    rows = list(pool_rows or [])
+    logins = sorted({
+        str(r.get("mt5_login") or "").strip()
+        for r in rows
+        if str(r.get("mt5_login") or "").strip()
+    })
+    used = set()
+    if not logins:
+        return used
+
+    # 1) Mandatory ownership ledger.
+    for chunk in _np_chunks_v48(logins):
+        try:
+            hist = (
+                supabase.table("trader_accounts").select("mt5_login")
+                .in_("mt5_login", chunk).limit(10000).execute().data or []
+            )
+        except Exception as exc:
+            # Fail closed for the WHOLE batch. It is safer to show no credential
+            # for one retry cycle than to recycle an old live account.
+            raise RuntimeError(
+                "Could not verify MT5 ownership history from trader_accounts"
+            ) from exc
+        for h in hist:
+            lg = str(h.get("mt5_login") or "").strip()
+            if lg:
+                used.add(lg)
+
+    # 2) Other historical stores. Missing optional tables/columns stay compatible.
+    optional_checks = (
+        ("mt5_account_archives", "mt5_login"),
+        ("challenge_purchases", "mt5_login"),
+        ("challenge_purchases", "current_mt5_login"),
+        ("monitoring_events", "mt5_login"),
+        ("monitoring_snapshots", "mt5_login"),
+        ("traders", "mt5_login"),
+    )
+    remaining = [x for x in logins if x not in used]
+    for table, column in optional_checks:
+        if not remaining:
+            break
+        for chunk in _np_chunks_v48(remaining):
+            try:
+                hist = (
+                    supabase.table(table).select(column)
+                    .in_(column, chunk).limit(10000).execute().data or []
+                )
+                for h in hist:
+                    lg = str(h.get(column) or "").strip()
+                    if lg:
+                        used.add(lg)
+            except Exception as exc:
+                print(f"V48 OPTIONAL HISTORY CHECK SKIP {table}.{column}:", exc)
+        remaining = [x for x in remaining if x not in used]
+
+    # 3) mt5_pool itself: duplicate login or old assignment evidence = used.
+    for chunk in _np_chunks_v48(logins):
+        try:
+            pool_hist = (
+                supabase.table("mt5_pool").select(
+                    "id,mt5_login,status,assigned_trader_id,assigned_trader_name,"
+                    "assigned_email,trader_account_id,assigned_at,archived_at,archive_reason"
+                )
+                .in_("mt5_login", chunk).limit(10000).execute().data or []
+            )
+        except Exception as exc:
+            print("V48 MT5 POOL HISTORY CHECK ERROR:", exc)
+            # Existing assignment endpoint still performs the final single-use
+            # guard, so a pool-history query issue does not authorize assignment.
+            pool_hist = []
+
+        by_login = {}
+        for h in pool_hist:
+            lg = str(h.get("mt5_login") or "").strip()
+            if lg:
+                by_login.setdefault(lg, []).append(h)
+
+        for lg, items in by_login.items():
+            if len(items) > 1:
+                used.add(lg)
+                continue
+            h = items[0]
+            evidence = any(str(h.get(k) or "").strip() for k in (
+                "assigned_trader_id", "assigned_trader_name", "assigned_email",
+                "trader_account_id", "assigned_at", "archived_at", "archive_reason"
+            ))
+            st = str(h.get("status") or "").strip().lower()
+            if evidence or st not in {"available", "", "unused", "new", "ready", "open"}:
+                used.add(lg)
+
+    return used
+
+
+def _np_structural_mt5_candidate_v48(m, account_size, target_stage):
+    m = m or {}
+    st = str(m.get("status") or "").strip().lower()
+    if st not in {"available", "unused", "new", "ready", "open", ""}:
+        return False
+    if m.get("assigned_trader_id") or m.get("trader_id") or m.get("trader_account_id"):
+        return False
+    if clean(m.get("account_size")) != clean(account_size):
+        return False
+    if _np_mt5_pool_class(m) != _np_expected_pool_class(target_stage):
+        return False
+    age = _np_mt5_age_days(m)
+    if age is None or age > NP_MT5_AUTO_MAX_AGE_DAYS:
+        return False
+    return True
+
+
+def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
+    """Complete category scan that NEVER returns a login already used in history."""
+    expected_pool = _np_expected_pool_class(target_stage)
+    size = clean(account_size)
+    if not size:
+        return None
+
+    statuses = ["available", "unused", "new", "ready", "open"]
+    page_size = 200
+    max_candidates = 10000
+    start = 0
+    rejected_history = 0
+    structural_rejected = 0
+
+    while start < max_candidates:
+        try:
+            rows = (
+                supabase.table("mt5_pool").select("*")
+                .eq("account_size", size)
+                .eq("pool_class", expected_pool)
+                .in_("status", statuses)
+                .order("created_at", desc=True)
+                .range(start, min(start + page_size - 1, max_candidates - 1))
+                .execute().data or []
+            )
+        except Exception as exc:
+            if expected_pool == "funded":
+                print("V48 FUNDED MT5 PAGE QUERY ERROR:", exc)
+                return None
+            try:
+                rows = (
+                    supabase.table("mt5_pool").select("*")
+                    .eq("account_size", size)
+                    .in_("status", statuses)
+                    .order("created_at", desc=True)
+                    .range(start, min(start + page_size - 1, max_candidates - 1))
+                    .execute().data or []
+                )
+            except Exception as exc2:
+                print("V48 PHASE MT5 PAGE QUERY ERROR:", exc2)
+                return None
+
+        if not rows:
+            break
+
+        structural = []
+        for m in rows:
+            if _np_structural_mt5_candidate_v48(m, size, target_stage):
+                structural.append(m)
+            else:
+                structural_rejected += 1
+
+        try:
+            used = _np_used_mt5_logins_batch_v48(structural)
+        except Exception as exc:
+            print("V48 FRESH MT5 BATCH HISTORY CHECK FAILED:", exc)
+            return None
+
+        for m in structural:
+            login = str(m.get("mt5_login") or "").strip()
+            if login in used:
+                rejected_history += 1
+                continue
+
+            # Final single-login guard immediately before returning.
+            used_one, reason = _mt5_login_has_any_history(
+                login, exclude_mt5_pool_id=m.get("id")
+            )
+            if used_one:
+                rejected_history += 1
+                continue
+            return m
+
+        if len(rows) < page_size:
+            break
+        start += page_size
+
+    print(
+        "V48 NO FRESH MT5 AFTER COMPLETE SCAN:",
+        "pool=", expected_pool,
+        "size=", size,
+        "history_rejected=", rejected_history,
+        "structural_rejected=", structural_rejected,
+    )
+    return None
+
+
+def _np_admin_assignable_mt5_v48():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    try:
+        stage = _normalize_lifecycle_stage(request.args.get("stage") or "phase1")
+        expected_pool = _np_expected_pool_class(stage)
+        candidate_statuses = ["available", "unused", "new", "ready", "open"]
+
+        page_size = 500
+        max_rows = 10000
+        start = 0
+        candidates = []
+        seen_ids = set()
+
+        while start < max_rows:
+            rows = (
+                supabase.table("mt5_pool").select("*")
+                .in_("status", candidate_statuses)
+                .order("created_at", desc=True)
+                .range(start, min(start + page_size - 1, max_rows - 1))
+                .execute().data or []
+            )
+            if not rows:
+                break
+
+            for m in rows:
+                if _np_mt5_pool_class(m) != expected_pool:
+                    continue
+                if (
+                    m.get("assigned_trader_id")
+                    or m.get("trader_id")
+                    or m.get("trader_account_id")
+                ):
+                    continue
+
+                mid = str(m.get("id") or m.get("mt5_login") or "").strip()
+                if not mid or mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                candidates.append(m)
+
+            if len(rows) < page_size:
+                break
+            start += page_size
+
+        # Critical V48 difference: AVAILABLE in mt5_pool is not enough.
+        # Remove any login that already exists in ownership/history.
+        used = _np_used_mt5_logins_batch_v48(candidates)
+
+        out = []
+        seen_logins = set()
+        for m in candidates:
+            login = str(m.get("mt5_login") or "").strip()
+            if not login or login in used or login in seen_logins:
+                continue
+            seen_logins.add(login)
+
+            out.append({
+                "id": m.get("id"),
+                "mt5_login": login,
+                "mt5_server": m.get("mt5_server"),
+                "account_size": m.get("account_size"),
+                "pool_class": _np_mt5_pool_class(m),
+                "plan_name": m.get("plan_name"),
+                "status": m.get("status"),
+                "created_at": m.get("created_at"),
+                "updated_at": m.get("updated_at"),
+                "assigned_trader_id": None,
+                "trader_id": None,
+                "trader_account_id": None,
+            })
+
+        return _np_ok({
+            "success": True,
+            "stage": stage,
+            "pool_class": expected_pool,
+            "count": len(out),
+            "excluded_used_history": len(used),
+            "mt5_pool": out,
+            "data": out,
+            "complete_category_scan": True,
+            "fresh_history_verified": True,
+            "release": NAIRAPIPS_MT5_HISTORY_RELEASE_V48,
+        })
+
+    except Exception as exc:
+        return _np_fail(str(exc), 500)
+
+
+# Replace the V46 route implementation; no duplicate Flask route registration.
+app.view_functions["admin_assignable_mt5_v46"] = _np_admin_assignable_mt5_v48
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MT5_HISTORY_RELEASE_V48
 
