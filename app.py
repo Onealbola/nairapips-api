@@ -33926,3 +33926,75 @@ def admin_payout_bridge_v38_health():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_BRIDGE_RELEASE
+
+
+# ============================================================================
+# NAIRAPIPS V39 — IMMEDIATE VERIFIED ENTITLEMENT KICK — 15 SEP 2026
+# Wakes the EXISTING protected Phase-Pass->Funded + Second-Life retry worker.
+# It changes no entitlement law and does not re-enable payout database sweeps.
+# ============================================================================
+
+NAIRAPIPS_IMMEDIATE_AUTOMATION_RELEASE = "V39_IMMEDIATE_VERIFIED_ENTITLEMENT_KICK_2026_09_15"
+
+@app.route("/admin/automation_kick_v39", methods=["POST", "OPTIONS"])
+def admin_automation_kick_v39():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    started = now_iso()
+    try:
+        result = _np_resume_waiting_zero_cost_automations(
+            "admin_immediate_kick_v39"
+        )
+        _audit_safe(
+            "automation",
+            "immediate_verified_entitlement_kick",
+            f"release={NAIRAPIPS_IMMEDIATE_AUTOMATION_RELEASE}; result={str(result)[:1800]}",
+            admin_user or {"name":"admin","username":"admin","role":"admin"},
+            ""
+        )
+        return _np_ok({
+            "success": True,
+            "release": NAIRAPIPS_IMMEDIATE_AUTOMATION_RELEASE,
+            "started_at": started,
+            "finished_at": now_iso(),
+            "business_rules_changed": False,
+            "payout_sweep_reenabled": False,
+            "result": result,
+        })
+    except Exception as exc:
+        _audit_safe(
+            "automation",
+            "immediate_verified_entitlement_kick_error",
+            str(exc)[:1200],
+            admin_user or {"name":"admin","username":"admin","role":"admin"},
+            ""
+        )
+        return _np_fail(f"Verified automation kick failed: {exc}", 500)
+
+
+@app.route("/admin/automation_kick_v39/health", methods=["GET", "OPTIONS"])
+def admin_automation_kick_v39_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_IMMEDIATE_AUTOMATION_RELEASE,
+        "phase_pass_to_funded": "existing verified worker",
+        "second_life": "existing verified worker",
+        "payout_renewal": "V38 event-driven only",
+        "broad_historical_sweep_enabled": False,
+        "nonexistent_challenge_purchase_id_query_used": False,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_IMMEDIATE_AUTOMATION_RELEASE
+
