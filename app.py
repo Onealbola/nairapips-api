@@ -34122,3 +34122,130 @@ def admin_automation_v40_run_now():
 
 _np_start_lifecycle_worker_v40()
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_LIFECYCLE_WORKER_RELEASE_V40
+
+# ============================================================================
+# NAIRAPIPS V41 — SECOND-LIFE BREACH EVENT RECOVERY WORKER — 15 SEP 2026
+# Repairs the missing event edge: V40 retried only Life2 already ACTIVATED.
+# V41 finds only clean-cutover Phase1 Life1 breaches whose exact purchase still
+# has an unused included Second Life, activates through the existing protected
+# breach authority, and lets that authority allocate the matching fresh MT5.
+# No Funded breach, no paid reset, no legacy purchase, no Life3.
+# ============================================================================
+NAIRAPIPS_SECOND_LIFE_RECOVERY_RELEASE_V41 = "V41_SECOND_LIFE_BREACH_EVENT_RECOVERY_2026_09_15"
+_NP_SECOND_LIFE_RECOVERY_INTERVAL_V41 = 20
+_NP_SECOND_LIFE_RECOVERY_LOCK_V41 = threading.Lock()
+_NP_SECOND_LIFE_RECOVERY_STARTED_V41 = False
+_NP_SECOND_LIFE_RECOVERY_LAST_V41 = {}
+
+
+def _np_second_life_breach_recovery_cycle_v41(limit=300):
+    global _NP_SECOND_LIFE_RECOVERY_LAST_V41
+    out = {"checked":0,"eligible":0,"assigned":0,"activated_waiting":0,"skipped":0,"errors":0,"started_at":now_iso()}
+    actor = {"name":"second_life_recovery","username":"second_life_recovery","role":"system"}
+    try:
+        rows = (supabase.table("trader_accounts").select("*")
+                .in_("account_status", ["breached_archived","breached","breach","breached_locked","breached_closed"])
+                .order("updated_at", desc=False).limit(limit).execute().data or [])
+    except Exception as exc:
+        out["errors"] += 1
+        out["error"] = "load_breaches: " + str(exc)
+        _NP_SECOND_LIFE_RECOVERY_LAST_V41 = out
+        print("V41 BREACH LOAD ERROR:", exc)
+        return out
+
+    for source in rows:
+        try:
+            if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "phase1":
+                out["skipped"] += 1; continue
+            trader_id = str(source.get("trader_id") or "").strip()
+            purchase_id = str(source.get("purchase_id") or "").strip()
+            if not trader_id or not purchase_id:
+                out["skipped"] += 1; continue
+            prows = (supabase.table("challenge_purchases").select("*")
+                     .eq("id", purchase_id).eq("trader_id", trader_id).limit(1).execute().data or [])
+            if not prows:
+                out["skipped"] += 1; continue
+            purchase = prows[0]
+            if not _np_automation_generation_purchase(purchase):
+                out["skipped"] += 1; continue
+            out["checked"] += 1
+
+            # Shared Second-Life authority knows both purchase-snapshot and plan entitlement.
+            sl = _second_life_status_payload(purchase, trader_id) or {}
+            if not sl.get("enabled"):
+                out["skipped"] += 1; continue
+            if _second_life_bool(purchase.get("second_life_used")):
+                out["skipped"] += 1; continue
+
+            # If the plan is authoritative but the purchase snapshot missed the flag,
+            # repair only that entitlement snapshot before calling the protected handler.
+            if not _second_life_bool(purchase.get("second_life_enabled")):
+                repaired = (supabase.table("challenge_purchases").update({
+                    "second_life_enabled": True,
+                    "updated_at": now_iso(),
+                }).eq("id", purchase_id).eq("trader_id", trader_id).eq("second_life_used", False).execute().data or [])
+                if repaired:
+                    purchase = repaired[0]
+
+            out["eligible"] += 1
+            trader = get_trader_by_id(trader_id) or {"id":trader_id}
+            result = _np_auto_free_phase1_reset_after_breach(trader, source)
+            if result and isinstance(result, dict) and (result.get("account") or {}).get("mt5_login"):
+                out["assigned"] += 1
+                _audit_safe("automation","v41_second_life_assigned",
+                            f"V41 exact breach recovery purchase={purchase_id} source={source.get('id')} source_mt5={source.get('mt5_login')} replacement_mt5={(result.get('account') or {}).get('mt5_login')}",
+                            actor, str(source.get("id") or ""))
+            else:
+                # The protected handler may have atomically activated Life2 but found no inventory.
+                fresh = (supabase.table("challenge_purchases").select("second_life_used,second_life_status")
+                         .eq("id", purchase_id).eq("trader_id", trader_id).limit(1).execute().data or [])
+                if fresh and _second_life_bool(fresh[0].get("second_life_used")) and str(fresh[0].get("second_life_status") or "").lower() in {"life2_waiting_mt5","waiting_mt5"}:
+                    out["activated_waiting"] += 1
+        except Exception as exc:
+            out["errors"] += 1
+            print("V41 SECOND-LIFE RECOVERY ERROR:", exc)
+    out["finished_at"] = now_iso()
+    _NP_SECOND_LIFE_RECOVERY_LAST_V41 = out
+    print("V41 SECOND-LIFE RECOVERY CYCLE:", out)
+    return out
+
+
+def _np_second_life_recovery_loop_v41():
+    time.sleep(6)
+    while True:
+        try:
+            if _NP_SECOND_LIFE_RECOVERY_LOCK_V41.acquire(blocking=False):
+                try:
+                    _np_second_life_breach_recovery_cycle_v41()
+                finally:
+                    _NP_SECOND_LIFE_RECOVERY_LOCK_V41.release()
+        except Exception as exc:
+            print("V41 RECOVERY LOOP ERROR:", exc)
+        time.sleep(_NP_SECOND_LIFE_RECOVERY_INTERVAL_V41)
+
+
+def _np_start_second_life_recovery_v41():
+    global _NP_SECOND_LIFE_RECOVERY_STARTED_V41
+    if _NP_SECOND_LIFE_RECOVERY_STARTED_V41:
+        return
+    _NP_SECOND_LIFE_RECOVERY_STARTED_V41 = True
+    threading.Thread(target=_np_second_life_recovery_loop_v41,
+                     name="nairapips-second-life-recovery-v41", daemon=True).start()
+    print("V41 Second-Life breach recovery worker started: 20s interval")
+
+
+@app.route("/admin/automation_v41/status", methods=["GET","OPTIONS"])
+def admin_automation_v41_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success":True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({"success":True,"release":NAIRAPIPS_SECOND_LIFE_RECOVERY_RELEASE_V41,
+                   "worker_enabled":_NP_SECOND_LIFE_RECOVERY_STARTED_V41,
+                   "interval_seconds":_NP_SECOND_LIFE_RECOVERY_INTERVAL_V41,
+                   "last_summary":_NP_SECOND_LIFE_RECOVERY_LAST_V41})
+
+
+_np_start_second_life_recovery_v41()
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_SECOND_LIFE_RECOVERY_RELEASE_V41
