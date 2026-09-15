@@ -35266,3 +35266,266 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MT5_POOL_RELEASE_V45
 
+
+
+# ============================================================================
+# NAIRAPIPS V46 — FAST COMPLETE ASSIGNABLE MT5 FEED — 15 SEP 2026
+# ============================================================================
+# PURPOSE
+# -------
+# Purchase and Journey Cockpit assignment pickers must see the COMPLETE
+# available PHASE/FUNDED category, but they do not need every assigned,
+# historical row or MT5 password in the table.
+#
+# /admin/assignable_mt5:
+#   * Admin-authenticated
+#   * target stage decides PHASE vs FUNDED vault
+#   * pages through all structurally available rows
+#   * returns lightweight, password-free metadata only
+#   * later assignment endpoints remain authoritative for history/safety
+#
+# This removes the timeout created by downloading the entire mt5_pool table.
+# ============================================================================
+
+NAIRAPIPS_MT5_POOL_RELEASE_V46 = "V46_FAST_COMPLETE_ASSIGNABLE_MT5_2026_09_15"
+
+@app.route("/admin/assignable_mt5", methods=["GET", "OPTIONS"])
+def admin_assignable_mt5_v46():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    try:
+        stage = _normalize_lifecycle_stage(request.args.get("stage") or "phase1")
+        expected_pool = _np_expected_pool_class(stage)
+
+        # These are the only statuses staff could ever pick from an assignment
+        # screen. "assigned" is intentionally included only for orphan rows; the
+        # ownership evidence filter below removes genuinely assigned credentials.
+        candidate_statuses = ["available", "unused", "new", "ready", "open", "assigned"]
+
+        page_size = 500
+        max_rows = 10000
+        start = 0
+        out = []
+        seen = set()
+
+        while start < max_rows:
+            rows = (
+                supabase.table("mt5_pool").select("*")
+                .in_("status", candidate_statuses)
+                .order("created_at", desc=True)
+                .range(start, min(start + page_size - 1, max_rows - 1))
+                .execute().data or []
+            )
+
+            if not rows:
+                break
+
+            for m in rows:
+                # Exact business vault. Existing NULL/blank pool_class safely
+                # normalizes to PHASE under current NairaPips authority.
+                if _np_mt5_pool_class(m) != expected_pool:
+                    continue
+
+                # Structural assignment evidence means it is not available.
+                if (
+                    m.get("assigned_trader_id")
+                    or m.get("trader_id")
+                    or m.get("trader_account_id")
+                ):
+                    continue
+
+                mid = str(m.get("id") or m.get("mt5_login") or "").strip()
+                if not mid or mid in seen:
+                    continue
+                seen.add(mid)
+
+                # Passwords are deliberately never sent to dropdown screens.
+                out.append({
+                    "id": m.get("id"),
+                    "mt5_login": m.get("mt5_login"),
+                    "mt5_server": m.get("mt5_server"),
+                    "account_size": m.get("account_size"),
+                    "pool_class": _np_mt5_pool_class(m),
+                    "plan_name": m.get("plan_name"),
+                    "status": m.get("status"),
+                    "created_at": m.get("created_at"),
+                    "updated_at": m.get("updated_at"),
+                    "assigned_trader_id": None,
+                    "trader_id": None,
+                    "trader_account_id": None,
+                })
+
+            if len(rows) < page_size:
+                break
+            start += page_size
+
+        return _np_ok({
+            "success": True,
+            "stage": stage,
+            "pool_class": expected_pool,
+            "count": len(out),
+            "mt5_pool": out,
+            "data": out,
+            "complete_category_scan": True,
+            "release": NAIRAPIPS_MT5_POOL_RELEASE_V46,
+        })
+
+    except Exception as exc:
+        return _np_fail(str(exc), 500)
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MT5_POOL_RELEASE_V46
+
+
+
+# ============================================================================
+# NAIRAPIPS V47 — COCKPIT PRIORITY + LOW-IMPACT RETRY SUPERVISION — 15 SEP 2026
+# ============================================================================
+# The automation remains automatic. This patch only changes HOW aggressively
+# periodic safety-net sweeps use the DB.
+#
+# Event-driven actions remain immediate:
+#   purchase approval, pass/breach event hooks, payout paid, reset approval,
+#   MT5 inventory insertion.
+#
+# Periodic retries remain enabled for misses/no inventory, but run in smaller
+# fair batches and yield briefly when Admin Journey/Cockpit reads are active.
+# ============================================================================
+
+NAIRAPIPS_AUTOMATION_RELEASE_V47 = "V47_COCKPIT_PRIORITY_LOW_IMPACT_RETRY_2026_09_15"
+
+_NP_INTERACTIVE_PRIORITY_UNTIL_V47 = 0.0
+
+def _np_mark_interactive_priority_v47(seconds=15):
+    global _NP_INTERACTIVE_PRIORITY_UNTIL_V47
+    try:
+        _NP_INTERACTIVE_PRIORITY_UNTIL_V47 = max(
+            float(_NP_INTERACTIVE_PRIORITY_UNTIL_V47 or 0.0),
+            time.time() + float(seconds)
+        )
+    except Exception:
+        pass
+
+def _np_interactive_priority_active_v47():
+    try:
+        return time.time() < float(_NP_INTERACTIVE_PRIORITY_UNTIL_V47 or 0.0)
+    except Exception:
+        return False
+
+# Mark the expensive read endpoints as interactive priority without changing
+# their business/data implementation.
+for _ep_v47 in (
+    "admin_trader_360",
+    "admin_journey_authority",
+    "admin_journey_authority_exact",
+    "admin_pass_funded_status",
+    "admin_second_life_status",
+):
+    _core = app.view_functions.get(_ep_v47)
+    if _core:
+        def _make_priority_wrapper_v47(fn):
+            def _wrapped(*args, **kwargs):
+                _np_mark_interactive_priority_v47(18)
+                return fn(*args, **kwargs)
+            _wrapped.__name__ = getattr(fn, "__name__", "v47_priority_wrapped")
+            return _wrapped
+        app.view_functions[_ep_v47] = _make_priority_wrapper_v47(_core)
+
+# Slower safety-net cadence. Immediate event hooks are untouched.
+_NP_LIFECYCLE_WORKER_INTERVAL_V40 = 90
+_NP_SECOND_LIFE_RECOVERY_INTERVAL_V41 = 90
+_NP_RESET_AUTOFIRE_INTERVAL_V43 = 60
+_NP_PAYOUT_RENEWAL_WORKER_INTERVAL_V33 = 30
+if "_NP_PAYOUT_RENEWAL_WORKER_INTERVAL_V31" in globals():
+    _NP_PAYOUT_RENEWAL_WORKER_INTERVAL_V31 = max(
+        30, int(globals().get("_NP_PAYOUT_RENEWAL_WORKER_INTERVAL_V31") or 30)
+    )
+
+# V40 lifecycle sweep: small fair batch. If an Admin Cockpit read is active,
+# skip this cycle; the entitlement remains due and next cycle retries.
+def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
+    global _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40
+    if _np_interactive_priority_active_v47():
+        summary = {
+            "release": NAIRAPIPS_AUTOMATION_RELEASE_V47,
+            "trigger": trigger,
+            "started_at": now_iso(),
+            "finished_at": now_iso(),
+            "deferred_for_admin_read": True,
+            "phase_pass_to_funded": {},
+            "second_life": {},
+            "errors": 0,
+        }
+        _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40 = summary
+        return summary
+
+    summary = {
+        "release": NAIRAPIPS_AUTOMATION_RELEASE_V47,
+        "trigger": trigger,
+        "started_at": now_iso(),
+        "phase_pass_to_funded": {},
+        "second_life": {},
+        "errors": 0,
+    }
+    try:
+        summary["phase_pass_to_funded"] = _np_retry_clean_pass_funded_v19(limit=50)
+    except Exception as exc:
+        summary["errors"] += 1
+        summary["phase_pass_to_funded"] = {"errors":1,"error":str(exc)}
+    try:
+        summary["second_life"] = _np_retry_waiting_second_lives_v19(limit=50)
+    except Exception as exc:
+        summary["errors"] += 1
+        summary["second_life"] = {"errors":1,"error":str(exc)}
+    summary["finished_at"] = now_iso()
+    _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40 = summary
+    return summary
+
+# V41/V44 breach-recovery worker: keep fair cursor, smaller batch.
+_np_second_life_breach_recovery_cycle_v47_core = _np_second_life_breach_recovery_cycle_v44
+def _np_second_life_breach_recovery_cycle_v41(limit=50):
+    if _np_interactive_priority_active_v47():
+        return {
+            "checked":0,"eligible":0,"assigned":0,"activated_waiting":0,
+            "skipped":0,"errors":0,"deferred_for_admin_read":True,
+            "started_at":now_iso(),"finished_at":now_iso()
+        }
+    return _np_second_life_breach_recovery_cycle_v47_core(limit=min(int(limit or 50),50))
+
+# Paid-reset worker: exact queue remains, but bounded safety-net batch.
+_np_retry_clean_approved_resets_v47_core = _np_retry_clean_approved_resets_v43
+def _np_retry_clean_approved_resets_v43(limit=100):
+    if _np_interactive_priority_active_v47():
+        return {
+            "scanned":0,"assigned":0,"already_fulfilled":0,"legacy_manual":0,
+            "waiting_inventory":0,"busy":0,"blocked":0,"errors":0,
+            "deferred_for_admin_read":True
+        }
+    return _np_retry_clean_approved_resets_v47_core(limit=min(int(limit or 100),100))
+
+@app.route("/admin/automation_v47/status", methods=["GET","OPTIONS"])
+def admin_automation_v47_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success":True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success":True,
+        "release":NAIRAPIPS_AUTOMATION_RELEASE_V47,
+        "interactive_priority_active":_np_interactive_priority_active_v47(),
+        "lifecycle_retry_seconds":_NP_LIFECYCLE_WORKER_INTERVAL_V40,
+        "second_life_recovery_seconds":_NP_SECOND_LIFE_RECOVERY_INTERVAL_V41,
+        "reset_retry_seconds":_NP_RESET_AUTOFIRE_INTERVAL_V43,
+        "payout_retry_seconds":_NP_PAYOUT_RENEWAL_WORKER_INTERVAL_V33,
+        "event_driven_automation_unchanged":True,
+        "retry_on_no_inventory_unchanged":True,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_RELEASE_V47
+
