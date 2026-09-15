@@ -35129,3 +35129,140 @@ def admin_automation_v44_status():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_RETRY_RELEASE_V44
 
+
+
+# ============================================================================
+# NAIRAPIPS V45 — FULL MT5 VAULT ACCESS + PAGED AUTOMATION PICKER — 15 SEP 2026
+# ============================================================================
+# UI / operations:
+#   GET /mt5_pool?all=1 returns the complete vault in pages, not a first-page subset.
+#
+# Automation:
+#   _np_pick_fresh_mt5 scans every matching size + vault candidate page until
+#   it finds an eligible MT5 or exhausts that exact category.
+#
+# Existing stage/vault/size/history/age safeguards are NOT weakened.
+# ============================================================================
+
+NAIRAPIPS_MT5_POOL_RELEASE_V45 = "V45_FULL_MT5_VAULT_PAGED_PICKER_2026_09_15"
+
+_np_mt5_pool_route_v45_core = app.view_functions.get("mt5_pool")
+
+def _np_mt5_pool_all_v45():
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    want_all = str(request.args.get("all") or "").strip().lower() in {"1","true","yes","on"}
+    if not want_all:
+        return _np_mt5_pool_route_v45_core()
+
+    try:
+        page_size = 1000
+        max_rows = 20000
+        rows = []
+        start = 0
+        while start < max_rows:
+            batch = (
+                supabase.table("mt5_pool").select("*")
+                .order("created_at", desc=True)
+                .range(start, min(start + page_size - 1, max_rows - 1))
+                .execute().data or []
+            )
+            rows.extend(batch)
+            if len(batch) < page_size:
+                break
+            start += page_size
+
+        # Stable dedupe by database id, falling back to login.
+        seen = set()
+        out = []
+        for row in rows:
+            key = str(row.get("id") or row.get("mt5_login") or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+
+        return jsonify(out)
+    except Exception as exc:
+        return bad(exc)
+
+# Replace the existing endpoint implementation without registering a duplicate route.
+app.view_functions["mt5_pool"] = _np_mt5_pool_all_v45
+
+
+def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
+    """Scan the COMPLETE matching MT5 category in pages.
+
+    No eligible account is missed merely because it fell after the first 80/250
+    rows. The existing exact eligibility authority remains decisive.
+    """
+    expected_pool = _np_expected_pool_class(target_stage)
+    size = clean(account_size)
+    if not size:
+        return None
+
+    statuses = ["available", "unused", "new", "ready", "open"]
+    page_size = 200
+    max_candidates = 10000
+    start = 0
+    rejected = {}
+    total_candidates = 0
+
+    while start < max_candidates:
+        try:
+            q = (
+                supabase.table("mt5_pool").select("*")
+                .eq("account_size", size)
+                .eq("pool_class", expected_pool)
+                .in_("status", statuses)
+                .order("created_at", desc=True)
+                .range(start, min(start + page_size - 1, max_candidates - 1))
+            )
+            rows = q.execute().data or []
+        except Exception as exc:
+            # Migration compatibility remains PHASE-only.
+            if expected_pool == "funded":
+                print("V45 FUNDED MT5 PAGE QUERY ERROR:", exc)
+                return None
+            try:
+                rows = (
+                    supabase.table("mt5_pool").select("*")
+                    .eq("account_size", size)
+                    .in_("status", statuses)
+                    .order("created_at", desc=True)
+                    .range(start, min(start + page_size - 1, max_candidates - 1))
+                    .execute().data or []
+                )
+            except Exception as exc2:
+                print("V45 PHASE MT5 PAGE QUERY ERROR:", exc2)
+                return None
+
+        if not rows:
+            break
+
+        total_candidates += len(rows)
+        for mt5 in rows:
+            ok, reason = _np_mt5_auto_eligible(mt5, size, target_stage)
+            if ok:
+                return mt5
+            rejected[reason] = rejected.get(reason, 0) + 1
+
+        if len(rows) < page_size:
+            break
+        start += page_size
+
+    if total_candidates:
+        print(
+            "V45 NO ELIGIBLE MT5 AFTER FULL CATEGORY SCAN:",
+            "pool=", expected_pool,
+            "size=", size,
+            "candidates=", total_candidates,
+            "rejected=", rejected,
+        )
+    return None
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MT5_POOL_RELEASE_V45
+
