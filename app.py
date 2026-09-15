@@ -33998,3 +33998,127 @@ def admin_automation_kick_v39_health():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_IMMEDIATE_AUTOMATION_RELEASE
 
+
+# ============================================================================
+# NAIRAPIPS V40 — SERVER-SIDE VERIFIED LIFECYCLE AUTOMATION — 15 SEP 2026
+# Fixes the remaining dependency on request/MT5 heartbeat traffic.
+# Runs ONLY the already-protected exact PASS->FUNDED and activated SECOND-LIFE
+# retry functions. Payout renewal remains owned by its separate server worker.
+# No historical inference, no paid-reset bypass, no duplicate entitlement creation.
+# ============================================================================
+
+NAIRAPIPS_LIFECYCLE_WORKER_RELEASE_V40 = "V40_SERVER_SIDE_VERIFIED_LIFECYCLE_AUTOMATION_2026_09_15"
+_NP_LIFECYCLE_WORKER_INTERVAL_V40 = 30
+_NP_LIFECYCLE_WORKER_LOCK_V40 = threading.Lock()
+_NP_LIFECYCLE_WORKER_STARTED_V40 = False
+_NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40 = {
+    "started_at": None,
+    "finished_at": None,
+    "phase_pass_to_funded": {},
+    "second_life": {},
+    "errors": 0,
+}
+
+
+def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
+    global _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40
+    summary = {
+        "release": NAIRAPIPS_LIFECYCLE_WORKER_RELEASE_V40,
+        "trigger": trigger,
+        "started_at": now_iso(),
+        "phase_pass_to_funded": {},
+        "second_life": {},
+        "errors": 0,
+    }
+    try:
+        summary["phase_pass_to_funded"] = _np_retry_clean_pass_funded_v19(limit=250)
+    except Exception as exc:
+        summary["errors"] += 1
+        summary["phase_pass_to_funded"] = {"errors": 1, "error": str(exc)}
+        print("V40 PASS->FUNDED WORKER ERROR:", exc)
+    try:
+        summary["second_life"] = _np_retry_waiting_second_lives_v19(limit=250)
+    except Exception as exc:
+        summary["errors"] += 1
+        summary["second_life"] = {"errors": 1, "error": str(exc)}
+        print("V40 SECOND-LIFE WORKER ERROR:", exc)
+    summary["finished_at"] = now_iso()
+    _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40 = summary
+    try:
+        print("V40 VERIFIED LIFECYCLE CYCLE:", summary)
+    except Exception:
+        pass
+    return summary
+
+
+def _np_lifecycle_worker_loop_v40():
+    # Let Render/Gunicorn finish app startup before the first DB cycle.
+    time.sleep(8)
+    while True:
+        try:
+            if _NP_LIFECYCLE_WORKER_LOCK_V40.acquire(blocking=False):
+                try:
+                    _np_run_verified_lifecycle_cycle_v40("server_worker")
+                finally:
+                    _NP_LIFECYCLE_WORKER_LOCK_V40.release()
+        except Exception as exc:
+            print("V40 VERIFIED LIFECYCLE WORKER LOOP ERROR:", exc)
+        time.sleep(_NP_LIFECYCLE_WORKER_INTERVAL_V40)
+
+
+def _np_start_lifecycle_worker_v40():
+    global _NP_LIFECYCLE_WORKER_STARTED_V40
+    if _NP_LIFECYCLE_WORKER_STARTED_V40:
+        return
+    if str(os.getenv("NAIRAPIPS_DISABLE_LIFECYCLE_WORKER") or "").strip().lower() in {"1", "true", "yes"}:
+        print("V40 verified lifecycle worker disabled by environment.")
+        return
+    _NP_LIFECYCLE_WORKER_STARTED_V40 = True
+    t = threading.Thread(
+        target=_np_lifecycle_worker_loop_v40,
+        name="nairapips-verified-lifecycle-v40",
+        daemon=True,
+    )
+    t.start()
+    print("V40 verified lifecycle worker started: 30s exact retry interval")
+
+
+@app.route("/admin/automation_v40/status", methods=["GET", "OPTIONS"])
+def admin_automation_v40_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_LIFECYCLE_WORKER_RELEASE_V40,
+        "server_worker_enabled": _NP_LIFECYCLE_WORKER_STARTED_V40,
+        "interval_seconds": _NP_LIFECYCLE_WORKER_INTERVAL_V40,
+        "phase_pass_to_funded": "exact verified retry only",
+        "second_life": "activated waiting entitlement only",
+        "payout_renewal": "separate existing payout worker",
+        "paid_resets_bypassed": False,
+        "broad_historical_sweep_enabled": False,
+        "last_summary": _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40,
+    })
+
+
+@app.route("/admin/automation_v40/run_now", methods=["POST", "OPTIONS"])
+def admin_automation_v40_run_now():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    if not _NP_LIFECYCLE_WORKER_LOCK_V40.acquire(blocking=False):
+        return _np_ok({"success": True, "busy": True, "message": "Lifecycle worker is already running."})
+    try:
+        result = _np_run_verified_lifecycle_cycle_v40("admin_run_now")
+        return _np_ok({"success": True, "busy": False, "result": result})
+    finally:
+        _NP_LIFECYCLE_WORKER_LOCK_V40.release()
+
+
+_np_start_lifecycle_worker_v40()
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_LIFECYCLE_WORKER_RELEASE_V40
