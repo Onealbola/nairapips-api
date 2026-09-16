@@ -36103,3 +36103,226 @@ def admin_payout_event_v49_health():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_EVENT_RELEASE_V49
+
+
+
+# ============================================================================
+# NAIRAPIPS V50 — AUTOMATION GUIDE ENFORCEMENT FOR PAYOUT RENEWAL
+# 16 SEP 2026
+#
+# CONTROLLING LAW
+# ---------------
+# ROOT purchase before 12 Sep 2026:
+#   LEGACY -> protected MANUAL assignment when an exact entitlement exists.
+#
+# ROOT purchase on/after 12 Sep 2026:
+#   CLEAN AUTOMATION -> eligible actions auto-fire + retry.
+#
+# A later payout/pass/reset/breach date NEVER changes the journey's automation
+# class. A later event may create an exact entitlement, but it cannot reclassify
+# the journey from LEGACY to CLEAN.
+#
+# Payout cycle law:
+#   PAID -> old Funded cycle closes -> FRESH Funded MT5 required.
+#   Same-MT5 "return to starting capital" is retired from production.
+# ============================================================================
+
+NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V50 = "V50_ROOT_DATE_PAYOUT_RENEWAL_2026_09_16"
+
+_np_all_journeys_preserved_v50_core = _np_all_journeys_preserved_v5
+
+def _np_all_journeys_preserved_v5(trader_id):
+    bundle = _np_all_journeys_preserved_v50_core(trader_id)
+
+    for journey in bundle.get("journeys") or []:
+        purchase = journey.get("purchase") or {}
+        if not purchase:
+            jid = str(journey.get("journey_id") or journey.get("purchase_id") or "").strip()
+            if jid and not jid.startswith("ACCOUNT:"):
+                try:
+                    rows = (
+                        supabase.table("challenge_purchases").select("*")
+                        .eq("id", jid).limit(1).execute().data or []
+                    )
+                    purchase = rows[0] if rows else {}
+                    if purchase:
+                        journey["purchase"] = purchase
+                except Exception:
+                    purchase = {}
+
+        clean_root = bool(purchase and _np_automation_generation_purchase(purchase))
+        ent = journey.get("outstanding_entitlement") or {}
+        ent_type = str(ent.get("entitlement_type") or "").strip().lower()
+        current_mode = str(journey.get("control_mode") or "").strip()
+
+        # V49 was presentation-only, but it relabelled a legacy journey as
+        # CLEAN_MIGRATION_PAYOUT_RENEWAL when a later payout happened after cutoff.
+        # Correct that here: entitlement survives, automation class does not change.
+        if not clean_root:
+            if ent_type == "payout_renewal" or current_mode == "CLEAN_MIGRATION_PAYOUT_RENEWAL":
+                journey["control_mode"] = "LEGACY_MANUAL"
+                journey["automation_class"] = "LEGACY_MANUAL"
+                journey["automatic_assignment_allowed"] = False
+                journey["next_action"] = "MANUAL_ASSIGN_MT5"
+                if ent:
+                    ent["reason"] = (
+                        "LEGACY JOURNEY · PAYOUT PAID → PROTECTED MANUAL FRESH FUNDED MT5 ASSIGNMENT"
+                    )
+                    ent["status"] = "AVAILABLE"
+                    journey["outstanding_entitlement"] = ent
+            elif current_mode in {"", "LEGACY_READ_ONLY"}:
+                journey["control_mode"] = "LEGACY_READ_ONLY"
+                journey["automation_class"] = "LEGACY_MANUAL"
+                journey["automatic_assignment_allowed"] = False
+        else:
+            # Clean roots keep their existing situation-specific clean mode.
+            journey["automation_class"] = "CLEAN_AUTOMATION"
+            journey["automatic_assignment_allowed"] = True
+
+        journey["automation_class_source"] = "ORIGINAL_CHALLENGE_PURCHASE_DATE"
+        journey["automation_cutoff"] = "2026-09-12T00:00:00+00:00"
+
+    bundle["automation_rule"] = (
+        "ROOT PURCHASE BEFORE 12 SEP 2026 = LEGACY MANUAL; "
+        "ROOT PURCHASE ON/AFTER 12 SEP 2026 = CLEAN AUTOMATION; "
+        "LATER EVENTS NEVER RECLASSIFY THE JOURNEY"
+    )
+    return bundle
+
+
+# Retire the old same-MT5 payout-cycle endpoint. NairaPips production always
+# issues a fresh Funded MT5 after a paid payout.
+def _np_retired_same_mt5_cycle_v50():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_fail(
+        "Same-MT5 payout-cycle return is retired. "
+        "NairaPips requires a fresh Funded MT5 after every PAID payout. "
+        "Use the exact payout-renewal assignment path.",
+        409,
+    )
+
+if "admin_complete_funded_payout_cycle" in app.view_functions:
+    app.view_functions["admin_complete_funded_payout_cycle"] = _np_retired_same_mt5_cycle_v50
+
+
+@app.route("/admin/automation_guide_v50/health", methods=["GET", "OPTIONS"])
+def admin_automation_guide_v50_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V50,
+        "cutoff": "2026-09-12T00:00:00+00:00",
+        "legacy": "protected manual assignment",
+        "clean": "auto-fire + retry",
+        "later_events_reclassify_journey": False,
+        "payout_cycle": "PAID -> fresh Funded MT5",
+        "same_mt5_cycle_enabled": False,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V50
+
+
+
+# ============================================================================
+# NAIRAPIPS V51 — NO FALSE PROGRESSION DEBT / ACTIVE-SOURCE FIREWALL
+# 16 SEP 2026
+#
+# The Admin "Other Purchase Progression" card previously inferred debt from
+# stale pass/waiting fields. A live ASSIGNED_ACTIVE Phase account can carry
+# historical pass fields, but it is NOT a completed source and cannot owe a
+# next-stage MT5 merely because of those stale mirrors.
+#
+# Final server law:
+#   * next-stage manual assignment needs an exact COMPLETED/PASSED source;
+#   * an ACTIVE source can never authorize Phase2/Funded progression;
+#   * reset / payout-replacement paths remain handled by their own exact routes;
+#   * duplicate/consumed progression guards remain unchanged.
+# ============================================================================
+
+NAIRAPIPS_PROGRESSION_RELEASE_V51 = "V51_ACTIVE_SOURCE_PROGRESSION_FIREWALL_2026_09_16"
+
+_np_assign_phase_mt5_v51_core = app.view_functions.get("assign_phase_mt5")
+
+def _np_assign_phase_mt5_v51_firewall():
+    if request.method == "OPTIONS":
+        return _np_assign_phase_mt5_v51_core()
+
+    d = request.get_json(silent=True) or {}
+    raw_source = str(
+        d.get("completed_account_id")
+        or d.get("source_account_id")
+        or d.get("trader_account_id")
+        or d.get("passed_account_id")
+        or ""
+    ).strip()
+    target_stage = _normalize_lifecycle_stage(
+        d.get("phase") or d.get("target_stage") or d.get("stage") or ""
+    )
+
+    source_id = raw_source
+    for prefix in ("waiting:", "reset-waiting:", "recall-waiting:"):
+        if source_id.startswith(prefix):
+            if prefix == "waiting:":
+                parts = source_id.split(":")
+                source_id = str(parts[1] if len(parts) > 1 else "").strip()
+            else:
+                source_id = source_id.split(":", 1)[1].strip()
+            break
+
+    if source_id and target_stage in {"phase2", "funded"}:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", source_id).limit(1).execute().data or []
+        )
+        if rows:
+            source = rows[0]
+            status = str(
+                source.get("account_status") or source.get("status") or ""
+            ).strip().lower()
+
+            # A progression source must be completed/passed. Stale risk_zone /
+            # phase_pass_status on a live account must never create MT5 liability.
+            active_statuses = {
+                "assigned_active", "active", "current_active",
+                "phase1_active", "phase2_active",
+                "funded_active", "live", "funded",
+            }
+            if status in active_statuses:
+                return _np_fail(
+                    "Progression assignment blocked: this source account is still ACTIVE. "
+                    "A live account cannot owe a next-stage MT5. Only an exact completed/"
+                    "passed backend progression may assign the next stage.",
+                    409,
+                )
+
+    return _np_assign_phase_mt5_v51_core()
+
+if _np_assign_phase_mt5_v51_core:
+    app.view_functions["assign_phase_mt5"] = _np_assign_phase_mt5_v51_firewall
+
+
+@app.route("/admin/progression_v51/health", methods=["GET", "OPTIONS"])
+def admin_progression_v51_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_PROGRESSION_RELEASE_V51,
+        "active_source_can_authorize_progression": False,
+        "authoritative_phase_queue": "archived_phase1 / archived_phase2 only",
+        "stale_pass_fields_create_mt5_debt": False,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PROGRESSION_RELEASE_V51
+
