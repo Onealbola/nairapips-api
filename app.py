@@ -36485,3 +36485,233 @@ def admin_recovery_assignment_v52_health():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RECOVERY_ASSIGN_RELEASE_V52
 
+
+
+# ============================================================================
+# NAIRAPIPS V53 — EXPLICIT STAFF-ERROR RECOVERY APPROVAL
+# 16 SEP 2026
+#
+# USE CASE
+# --------
+# Staff should have recalled an unused wrong assignment, but instead instructed
+# the trader to breach it. Once a real breach/trade exists, Recall is no longer
+# appropriate. Admin may explicitly approve ONE recovery on that exact archived
+# reset source.
+#
+# SAFETY
+# ------
+# * Requires Admin authentication.
+# * Requires exact trader_id + source trader_account_id.
+# * Source must already be archived_reset_*.
+# * Does NOT create entitlement merely from a breach.
+# * Refuses a consumed/replaced source.
+# * Writes [NP_ENTITLEMENT:admin_recovery] only after explicit Admin approval.
+# * Existing assignment router consumes the entitlement after ONE successful MT5.
+# ============================================================================
+
+NAIRAPIPS_STAFF_RECOVERY_RELEASE_V53 = "V53_EXPLICIT_STAFF_RECOVERY_APPROVAL_2026_09_16"
+
+
+def _np_staff_recovery_child_exists_v53(source):
+    """Fail closed if this exact archived source already produced a direct child."""
+    source = source or {}
+    sid = str(source.get("id") or "").strip()
+    tid = str(source.get("trader_id") or "").strip()
+    if not sid or not tid:
+        return True, None
+
+    if source.get("reset_consumed_at") or source.get("reset_replacement_account_id"):
+        return True, None
+
+    blob = _np_kill_blob(source)
+    if "reset_consumed replacement_account_id=" in blob or "np_consumed:paid_reset:" in blob:
+        return True, None
+
+    try:
+        # Strongest relationship evidence.
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", tid)
+            .limit(500).execute().data or []
+        )
+        for row in rows:
+            if str(row.get("id") or "").strip() == sid:
+                continue
+            parent = str(
+                row.get("previous_trader_account_id")
+                or row.get("replaces_trader_account_id")
+                or ""
+            ).strip()
+            if parent == sid and str(row.get("mt5_login") or "").strip():
+                return True, row
+    except Exception as exc:
+        # Never approve recovery if successor verification itself is unavailable.
+        print("V53 STAFF RECOVERY CHILD VERIFY ERROR:", exc)
+        return True, None
+
+    return False, None
+
+
+@app.route("/admin/approve_staff_recovery", methods=["POST", "OPTIONS"])
+def admin_approve_staff_recovery_v53():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    d = request.get_json(silent=True) or {}
+    trader_id = str(d.get("trader_id") or "").strip()
+    source_id = str(
+        d.get("source_account_id")
+        or d.get("trader_account_id")
+        or ""
+    ).strip()
+    note = str(
+        d.get("reason")
+        or d.get("admin_note")
+        or "Staff instruction error: trader was told to breach instead of recall."
+    ).strip()
+
+    if not trader_id or not source_id:
+        return _np_fail("Exact trader_id and source_account_id are required.", 400)
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", source_id)
+            .eq("trader_id", trader_id)
+            .limit(1).execute().data or []
+        )
+        if not rows:
+            return _np_fail("Exact recovery source account was not found for this trader.", 404)
+
+        source = rows[0]
+        status = str(
+            source.get("account_status") or source.get("status") or ""
+        ).strip().lower()
+
+        if not status.startswith("archived_reset"):
+            return _np_fail(
+                "Staff recovery can only be approved for an archived reset source. "
+                "This account is not in archived_reset status.",
+                409,
+            )
+
+        stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+        if stage not in {"phase1", "phase2", "funded"}:
+            return _np_fail("Recovery source stage could not be verified.", 409)
+
+        size = clean(source.get("account_size") or source.get("start_balance") or 0)
+        if not size:
+            return _np_fail("Recovery source account size could not be verified.", 409)
+
+        consumed, child = _np_staff_recovery_child_exists_v53(source)
+        if consumed:
+            child_login = str((child or {}).get("mt5_login") or "").strip()
+            return _np_fail(
+                "Recovery approval blocked: this exact source has already been consumed"
+                + (f" by MT5 {child_login}." if child_login else " or its successor could not be safely ruled out."),
+                409,
+            )
+
+        # Idempotent if already approved and still unconsumed.
+        blob = _np_kill_blob(source)
+        if "[np_entitlement:admin_recovery]" in blob:
+            ent = _np_reset_entitlement_for_source(
+                source, get_trader_by_id(trader_id) or {}
+            )
+            if ent.get("eligible"):
+                return _np_ok({
+                    "success": True,
+                    "idempotent": True,
+                    "source_account_id": source_id,
+                    "mt5_login": source.get("mt5_login"),
+                    "account_size": size,
+                    "stage": stage,
+                    "entitlement": ent,
+                }, "Staff recovery was already approved for this exact source.")
+
+        now = now_iso()
+        marker = (
+            f"[NP_ENTITLEMENT:admin_recovery] "
+            f"[NP_RECOVERY_APPROVED:{now}] "
+            f"reason={note}"
+        )
+        updated_reason = (
+            str(source.get("archive_reason") or "").strip()
+            + " | "
+            + marker
+        ).strip(" |")
+
+        result = (
+            supabase.table("trader_accounts").update({
+                "archive_reason": updated_reason,
+                "monitoring_enabled": False,
+                "updated_at": now,
+            })
+            .eq("id", source_id)
+            .eq("trader_id", trader_id)
+            .execute().data or []
+        )
+        if not result:
+            return _np_fail("Staff recovery approval did not persist. No assignment was authorised.", 500)
+
+        refreshed = result[0]
+        ent = _np_reset_entitlement_for_source(
+            refreshed, get_trader_by_id(trader_id) or {}
+        )
+        if not ent.get("eligible") or str(ent.get("reason") or "") != "admin_recovery":
+            return _np_fail(
+                "Staff recovery marker was saved but entitlement verification still failed. "
+                "No MT5 was released.",
+                500,
+            )
+
+        try:
+            _audit_safe(
+                "recovery",
+                "staff_recovery_approved",
+                (
+                    f"source_account={source_id}; mt5={source.get('mt5_login')}; "
+                    f"stage={stage}; size={size}; reason={note}"
+                ),
+                admin,
+                source_id,
+            )
+        except Exception:
+            pass
+
+        return _np_ok({
+            "success": True,
+            "source_account_id": source_id,
+            "mt5_login": source.get("mt5_login"),
+            "account_size": size,
+            "stage": stage,
+            "entitlement": ent,
+        }, "Staff recovery approved. One fresh same-stage MT5 may now be assigned.")
+
+    except Exception as exc:
+        print("V53 STAFF RECOVERY APPROVAL ERROR:", exc)
+        return _np_fail("Staff recovery approval failed safely: " + str(exc), 500)
+
+
+@app.route("/admin/staff_recovery_v53/health", methods=["GET", "OPTIONS"])
+def admin_staff_recovery_v53_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_STAFF_RECOVERY_RELEASE_V53,
+        "breach_alone_creates_recovery": False,
+        "explicit_admin_approval_required": True,
+        "one_successor_only": True,
+        "same_stage_same_size": True,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_STAFF_RECOVERY_RELEASE_V53
+
