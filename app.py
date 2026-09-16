@@ -36326,3 +36326,162 @@ def admin_progression_v51_health():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PROGRESSION_RELEASE_V51
 
+
+
+# ============================================================================
+# NAIRAPIPS V52 — STAFF-ERROR RECOVERY / RESET ASSIGNMENT ROUTE FIX
+# 16 SEP 2026
+#
+# Business case:
+# A staff mistake may lead a trader to breach an MT5 that should have been recalled.
+# Once a real breach/trade occurred, Recall is no longer the right operation.
+# The correct repair is an explicit ADMIN RECOVERY:
+#   breached source -> archived_reset_* + [NP_ENTITLEMENT:admin_recovery]
+#   -> ONE fresh same-stage MT5
+#   -> old breached MT5 remains immutable history.
+#
+# This patch does NOT create entitlement from breach alone.
+# It only allows an already-verified archived reset/recovery entitlement to reach
+# the existing reset-assignment engine without being misclassified as pass
+# progression by Journey Authority.
+# ============================================================================
+
+NAIRAPIPS_RECOVERY_ASSIGN_RELEASE_V52 = "V52_STAFF_RECOVERY_ASSIGNMENT_2026_09_16"
+
+_np_assign_phase_mt5_v52_current = app.view_functions.get("assign_phase_mt5")
+
+def _np_assign_phase_mt5_v52():
+    if request.method == "OPTIONS":
+        try:
+            return _np_assign_phase_mt5_v52_current()
+        except Exception as exc:
+            return _np_fail(str(exc), 500)
+
+    d = request.get_json(silent=True) or {}
+    raw_source = str(
+        d.get("completed_account_id")
+        or d.get("source_account_id")
+        or d.get("trader_account_id")
+        or d.get("passed_account_id")
+        or ""
+    ).strip()
+
+    source_id = raw_source
+    for prefix in ("waiting:", "reset-waiting:", "recall-waiting:"):
+        if source_id.startswith(prefix):
+            if prefix == "waiting:":
+                parts = source_id.split(":")
+                source_id = str(parts[1] if len(parts) > 1 else "").strip()
+            else:
+                source_id = source_id.split(":", 1)[1].strip()
+            break
+
+    try:
+        source = None
+        if source_id:
+            rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", source_id).limit(1).execute().data or []
+            )
+            source = rows[0] if rows else None
+
+        # RESET / PAYOUT RENEWAL / ADMIN RECOVERY:
+        # Use reset-specific authority, not pass-progression Journey Authority.
+        if source:
+            status = str(
+                source.get("account_status") or source.get("status") or ""
+            ).strip().lower()
+
+            if status.startswith("archived_reset"):
+                trader = get_trader_by_id(source.get("trader_id")) or {}
+                entitlement = _np_reset_entitlement_for_source(source, trader)
+
+                if not entitlement.get("eligible"):
+                    return _np_fail(
+                        "Replacement assignment blocked: this exact archived reset "
+                        "source has no verified unconsumed entitlement.",
+                        409,
+                    )
+
+                requested_stage = _normalize_lifecycle_stage(
+                    d.get("phase") or d.get("target_stage") or d.get("stage") or ""
+                )
+                source_stage = _normalize_lifecycle_stage(
+                    source.get("stage") or source.get("phase")
+                )
+                entitled_stage = _normalize_lifecycle_stage(
+                    entitlement.get("target_stage") or source_stage
+                )
+
+                if requested_stage != source_stage or requested_stage != entitled_stage:
+                    return _np_fail(
+                        f"Recovery assignment must stay in {source_stage}. "
+                        f"Requested {requested_stage or 'unknown'} is not allowed.",
+                        409,
+                    )
+
+                # This is the already-existing production reset router. It calls the
+                # base assignment engine, then consumes this exact entitlement once.
+                try:
+                    response = _np_assign_phase_mt5_router_20260907()
+                except ValueError as exc:
+                    return _np_fail(str(exc), 409)
+                except Exception as exc:
+                    print("V52 RESET/RECOVERY ASSIGNMENT ERROR:", exc)
+                    return _np_fail(
+                        "Recovery assignment failed safely: " + str(exc),
+                        500,
+                    )
+
+                # Best-effort authority refresh only AFTER successful assignment.
+                try:
+                    code = getattr(response, "status_code", 200)
+                    if code < 400:
+                        pid = str(
+                            source.get("purchase_id")
+                            or source.get("challenge_purchase_id")
+                            or ""
+                        ).strip()
+                        tid = str(source.get("trader_id") or "").strip()
+                        if pid and tid:
+                            _np_ja_journey_authority(tid, pid)
+                except Exception as exc:
+                    print("V52 POST-RECOVERY AUTHORITY REFRESH:", exc)
+
+                return response
+
+        # Normal pass progression and other routes keep all existing V51 safety.
+        try:
+            return _np_assign_phase_mt5_v52_current()
+        except ValueError as exc:
+            return _np_fail(str(exc), 409)
+        except Exception as exc:
+            print("V52 ASSIGN PHASE JSON SAFETY:", exc)
+            return _np_fail("Assignment failed safely: " + str(exc), 500)
+
+    except Exception as exc:
+        print("V52 ASSIGNMENT PRECHECK ERROR:", exc)
+        return _np_fail("Assignment precheck failed safely: " + str(exc), 500)
+
+if _np_assign_phase_mt5_v52_current:
+    app.view_functions["assign_phase_mt5"] = _np_assign_phase_mt5_v52
+
+
+@app.route("/admin/recovery_assignment_v52/health", methods=["GET", "OPTIONS"])
+def admin_recovery_assignment_v52_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_RECOVERY_ASSIGN_RELEASE_V52,
+        "recall_rule": "unused mistaken assignment only",
+        "staff_error_after_real_breach": "explicit admin recovery -> one fresh same-stage MT5",
+        "breach_alone_creates_entitlement": False,
+        "html_bad_json_errors": False,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RECOVERY_ASSIGN_RELEASE_V52
+
