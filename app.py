@@ -11042,32 +11042,48 @@ def reject_payout():
         if not pid: return bad("Missing payout id")
         payout = get_payout_by_id(pid)
         if not payout: return bad("Payout not found",404)
-        if payout_status(payout) != "pending":
-            return bad("Only pending payouts can be rejected",409)
-        note = d.get("admin_note","")
-        result = supabase.table("payouts").update({"status":"rejected","rejected_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+        if payout_status(payout) != "pending": return bad("Only pending payouts can be rejected",409)
+        if not d.get("preview_confirmed"): return bad("Compliance notice must be previewed and confirmed in Admin before rejection.",400)
+        reasons=[str(x).strip() for x in (d.get("rejection_reasons") or []) if str(x).strip()]
+        evidence=str(d.get("rejection_evidence") or d.get("admin_note") or "").strip()
+        trades=d.get("rejection_trades") or []
+        final_message=str(d.get("rejection_message") or "").strip()
+        if not reasons: return bad("At least one compliance reason is required",400)
+        if not evidence: return bad("Compliance evidence/review note is required",400)
+        if not final_message: return bad("Final preview message is required",400)
+        # Freeze the exact evidence reviewed by Admin into the payout audit note.
+        trade_summary=[]
+        for t in trades[:50]:
+            trade_summary.append(f"{t.get('ticket') or '—'} {t.get('symbol') or '—'} {t.get('side') or '—'} {t.get('volume') or 0} lot | {t.get('opened_at') or '—'} -> {t.get('closed_at') or '—'} | {t.get('duration') or '—'} | P/L {t.get('profit') or 0}")
+        frozen_note="Reasons: "+"; ".join(reasons)+" | Review: "+evidence
+        if trade_summary: frozen_note += " | Trades: " + " || ".join(trade_summary)
+        rejected_at=now_iso()
+        result = supabase.table("payouts").update({"status":"rejected","rejected_at":rejected_at,"admin_note":frozen_note}).eq("id",pid).eq("status","pending").execute().data or []
+        if not result: return bad("Payout changed state before rejection. Refresh Payouts and review again.",409)
         trader_row = _resolve_trader_for_money_action(payout)
         account = _get_exact_trader_account(payout.get("trader_account_id"))
         if trader_row and account:
-            _release_funded_payout_trade_lock(
-                trader_row, account,
-                reason=f"Payout {pid} rejected by Admin. Same funded account reopened.",
-            )
-
-        send_email_safe(
-            payout.get("email"),
-            "NairaPips payout rejected",
-            f"""Hello {payout.get("trader_name") or "Trader"},
-
-Your payout request was rejected after review.
-
-Amount: {email_money(payout.get("amount"))}
-Reason / Admin Note: {note or "Please contact support for details."}
-
-NairaPips Team"""
-        )
-
-        return ok(result, "Payout rejected")
+            _release_funded_payout_trade_lock(trader_row, account, reason=f"Payout {pid} rejected by Admin. Same funded account reopened.")
+        rejection_subject = "Payout Compliance Decision – Trading Rule Violation"
+        email_sent = bool(send_email_safe(payout.get("email"), rejection_subject, final_message))
+        dashboard_saved=False
+        trader_id=str(payout.get("trader_id") or (trader_row or {}).get("id") or "").strip()
+        target_email=str(payout.get("email") or (trader_row or {}).get("email") or "").strip().lower()
+        target_name=str(payout.get("trader_name") or (trader_row or {}).get("name") or "Trader").strip()
+        target_phone=str((trader_row or {}).get("phone") or "").strip()
+        account_reference=str((trader_row or {}).get("account_reference") or "").strip()
+        dashboard_row={"title":rejection_subject,"message":final_message,"type":"private_offer","status":"active","show_on_landing":False,"show_on_dashboard":True,"created_by":"NairaPips Compliance","created_at":rejected_at,"target_trader_id":trader_id or None,"target_email":target_email or None,"target_name":target_name or None,"target_phone":target_phone or None,"target_account_reference":account_reference or None,"subject":rejection_subject,"offer_code":"","expires_at":None,"cta_label":"","cta_url":"","priority":"high","require_ack":True,"delivery_dashboard":True,"delivery_email":False,"delivery_whatsapp":False,"read_at":None,"message_only":True,"audience_segment":"single","audience_label":"Compliance Decision","notice_type":"payout_compliance"}
+        try:
+            supabase.table("announcements").insert(dashboard_row).execute(); dashboard_saved=True
+        except Exception as schema_error:
+            print("PAYOUT REJECTION MESSAGE CENTRE SCHEMA FALLBACK:", schema_error)
+            meta={"private_offer":True,"message_only":True,"audience_segment":"single","audience_label":"Compliance Decision","notice_type":"payout_compliance","target_trader_id":trader_id,"target_email":target_email,"target_name":target_name,"target_phone":target_phone,"target_account_reference":account_reference,"subject":rejection_subject,"offer_code":"","expires_at":"","cta_label":"","cta_url":"","priority":"high","require_ack":True,"delivery_dashboard":True,"show_on_dashboard":True,"delivery_email":False,"delivery_whatsapp":False,"created_by":"NairaPips Compliance"}
+            try:
+                supabase.table("announcements").insert({"title":rejection_subject,"message":final_message,"type":"private_offer","status":"active","show_on_landing":False,"show_on_dashboard":False,"created_by":_np_offer_meta_pack(meta),"created_at":rejected_at}).execute(); dashboard_saved=True
+            except Exception as fallback_error: print("PAYOUT REJECTION MESSAGE CENTRE ERROR:", fallback_error)
+        _audit_safe("payouts","payout_rejected",f"Payout {pid} rejected after preview; email_sent={email_sent}; dashboard_saved={dashboard_saved}; {frozen_note[:1500]}",_admin_from_payload(d),pid)
+        np_invalidate_admin_bootstrap("payouts")
+        return ok({"payout":result,"email_sent":email_sent,"dashboard_message_saved":dashboard_saved},"Payout rejected; exact preview notice delivered")
     except Exception as e: return bad(e)
 
 @app.route("/mark_payout_paid", methods=["POST"])
@@ -32620,6 +32636,38 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PAYOUT_RENEWAL_STALE_CLAIM_RECOVERY_V33_20
 # - Pre-12-Sep journeys remain manual-only.
 # ============================================================================
 
+# ============================================================================
+# NAIRAPIPS V49 — EVENT-DATE PAYOUT AUTHORITY — 15 SEP 2026
+#
+# A journey may have a legacy origin while a NEW immutable financial event is
+# live automation. Historical events remain read-only; an exact PAID payout on
+# or after the clean cutover may create exactly one Funded renewal entitlement.
+# This changes payout-renewal authority only. PASS, Second Life and reset laws
+# remain untouched.
+# ============================================================================
+
+NAIRAPIPS_PAYOUT_EVENT_RELEASE_V49 = "V49_EVENT_DATE_PAYOUT_AUTHORITY_2026_09_15"
+_NP_PAYOUT_EVENT_AUTOMATION_CUTOVER_V49 = _NP_CLEAN_CUTOVER
+
+def _np_exact_paid_payout_event_is_live_v49(payout):
+    payout = payout or {}
+    if payout_status(payout) != "paid":
+        return False
+    dt = _np_parse_dt_safe(
+        payout.get("paid_at")
+        or payout.get("updated_at")
+        or payout.get("created_at")
+    )
+    return bool(dt and dt >= _NP_PAYOUT_EVENT_AUTOMATION_CUTOVER_V49)
+
+def _np_payout_event_automation_allowed_v49(payout, purchase):
+    # New purchases keep their existing automation authority. Legacy-origin
+    # journeys gain authority ONLY from a new exact PAID payout event.
+    return bool(
+        _np_automation_generation_purchase(purchase)
+        or _np_exact_paid_payout_event_is_live_v49(payout)
+    )
+
 def _np_exact_payout_funded_due_v34(payout_id):
     payout_id = str(payout_id or "").strip()
     if not payout_id:
@@ -32706,10 +32754,10 @@ def _np_exact_payout_funded_due_v34(payout_id):
             "source_purchase_id": source_purchase_id,
         }
 
-    if not _np_automation_generation_purchase(purchase):
+    if not _np_payout_event_automation_allowed_v49(payout, purchase):
         return {
             "ok": True, "due": False, "manual_only": True,
-            "reason": "pre_cutover_manual_only",
+            "reason": "pre_cutover_event_manual_only",
             "payout_id": payout_id, "purchase_id": purchase_id,
             "source_account_id": source_id,
         }
@@ -35904,3 +35952,154 @@ app.view_functions["admin_assignable_mt5_v46"] = _np_admin_assignable_mt5_v48
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MT5_HISTORY_RELEASE_V48
 
+# ============================================================================
+# NAIRAPIPS V49 — JOURNEY PRESENTATION BRIDGE FOR LIVE PAYOUT EVENTS
+#
+# Preserve the origin of old journeys, but never label a verified post-cutover
+# payout obligation as "automation disabled". The canonical V34/V35/V37 exact
+# payout engine remains the only component that can release an MT5.
+# ============================================================================
+
+_np_all_journeys_preserved_v49_core = _np_all_journeys_preserved_v5
+
+def _np_all_journeys_preserved_v5(trader_id):
+    bundle = _np_all_journeys_preserved_v49_core(trader_id)
+    allowed_ids = {
+        str(x or "").strip()
+        for x in (bundle.get("identity_trader_ids") or [])
+        if str(x or "").strip()
+    }
+    if str(trader_id or "").strip():
+        allowed_ids.add(str(trader_id).strip())
+
+    for journey in bundle.get("journeys") or []:
+        mode = str(journey.get("control_mode") or "").strip()
+        if mode not in {"", "LEGACY_READ_ONLY", "CLEAN_MIGRATION_PAYOUT_RENEWAL"}:
+            continue
+
+        payouts = [
+            p for p in (journey.get("payouts") or [])
+            if _np_exact_paid_payout_event_is_live_v49(p)
+            and str((p or {}).get("id") or "").strip()
+        ]
+        payouts.sort(
+            key=lambda p: _dt_score(
+                (p or {}).get("paid_at")
+                or (p or {}).get("updated_at")
+                or (p or {}).get("created_at")
+            ),
+            reverse=True,
+        )
+
+        for payout in payouts:
+            payout_id = str(payout.get("id") or "").strip()
+            try:
+                truth = _np_exact_payout_funded_due_v34(payout_id) or {}
+            except Exception as exc:
+                print("V49 JOURNEY PAYOUT AUTHORITY CHECK ERROR:", payout_id, exc)
+                continue
+
+            if not truth.get("ok"):
+                continue
+            owner_tid = str(truth.get("trader_id") or "").strip()
+            if owner_tid and allowed_ids and owner_tid not in allowed_ids:
+                continue
+
+            if truth.get("fulfilled"):
+                # Already consumed: leave the historical origin untouched. The
+                # ledger/accounts still show the replacement and no MT5 is owed.
+                continue
+
+            if not truth.get("due"):
+                continue
+
+            source_id = str(truth.get("source_account_id") or "").strip()
+            source_mt5 = str(truth.get("source_mt5") or "").strip()
+            purchase_id = str(truth.get("purchase_id") or journey.get("journey_id") or "").strip()
+            paid_at = payout.get("paid_at") or payout.get("updated_at") or payout.get("created_at")
+            ent_key = f"payout:{payout_id}:renewal"
+
+            journey["trader_id"] = owner_tid or journey.get("trader_id")
+            journey["control_mode"] = "CLEAN_MIGRATION_PAYOUT_RENEWAL"
+            journey["state"] = "WAITING_MT5"
+            journey["closed"] = False
+            journey["blocked"] = False
+            journey["accountability_status"] = "RECONCILED"
+            journey["next_action"] = "ASSIGN_MT5"
+            journey["outstanding_entitlement"] = {
+                "entitlement_key": ent_key,
+                "entitlement_type": "payout_renewal",
+                "source_event_type": "payout_paid",
+                "source_account_id": source_id,
+                "source_mt5": source_mt5,
+                "evidence_id": payout_id,
+                "payout_id": payout_id,
+                "target_stage": "funded",
+                "status": "AVAILABLE",
+                "reason": "POST-CUTOVER PAYOUT PAID → FRESH FUNDED MT5 REQUIRED",
+                "trader_id": owner_tid,
+            }
+            journey["migration_bridge"] = {
+                "type": "PAYOUT_RENEWAL",
+                "authority": "EXACT_POST_CUTOVER_PAID_PAYOUT",
+                "payout_id": payout_id,
+                "source_account_id": source_id,
+                "source_mt5": source_mt5,
+                "target_stage": "funded",
+                "status": "AVAILABLE",
+                "paid_at": paid_at,
+            }
+
+            ledger = list(journey.get("ledger") or [])
+            if not any(
+                str((ev or {}).get("type") or "").upper() == "ENTITLEMENT_CREATED"
+                and str((ev or {}).get("entitlement_key") or "") == ent_key
+                for ev in ledger
+            ):
+                ledger.append({
+                    "type": "ENTITLEMENT_CREATED",
+                    "at": paid_at,
+                    "journey_id": purchase_id,
+                    "purchase_id": purchase_id,
+                    "source_account_id": source_id,
+                    "mt5_login": source_mt5,
+                    "stage": "funded",
+                    "evidence_id": payout_id,
+                    "entitlement_key": ent_key,
+                    "detail": "POST-CUTOVER PAYOUT PAID → FRESH FUNDED MT5 ENTITLEMENT AVAILABLE",
+                })
+            ledger = [ev for ev in ledger if (ev or {}).get("at")]
+            ledger.sort(key=lambda ev: _dt_score((ev or {}).get("at")))
+            journey["ledger"] = ledger
+
+            accountability = dict(journey.get("accountability") or {})
+            accountability["outstanding_entitlement"] = 1
+            accountability["balance"] = 1
+            accountability["status"] = "RECONCILED"
+            journey["accountability"] = accountability
+            break
+
+    return bundle
+
+
+@app.route("/admin/payout_event_v49/health", methods=["GET", "OPTIONS"])
+def admin_payout_event_v49_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_PAYOUT_EVENT_RELEASE_V49,
+        "historical_origin_stays_read_only": True,
+        "post_cutover_paid_payout_is_live_authority": True,
+        "payout_event_cutover": _NP_PAYOUT_EVENT_AUTOMATION_CUTOVER_V49.isoformat(),
+        "first_assignment_untouched": True,
+        "pass_to_funded_untouched": True,
+        "second_life_untouched": True,
+        "paid_reset_untouched": True,
+        "fresh_mt5_history_guard_v48_preserved": True,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_EVENT_RELEASE_V49
