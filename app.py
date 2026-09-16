@@ -36658,7 +36658,15 @@ def admin_approve_staff_recovery_v53():
         if not result:
             return _np_fail("Staff recovery approval did not persist. No assignment was authorised.", 500)
 
-        refreshed = result[0]
+        # Re-read the exact full row. Supabase update responses can be projection-
+        # dependent; entitlement verification must never rely on a partial returned row.
+        verify_rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", source_id)
+            .eq("trader_id", trader_id)
+            .limit(1).execute().data or []
+        )
+        refreshed = verify_rows[0] if verify_rows else result[0]
         ent = _np_reset_entitlement_for_source(
             refreshed, get_trader_by_id(trader_id) or {}
         )
@@ -36714,4 +36722,94 @@ def admin_staff_recovery_v53_health():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_STAFF_RECOVERY_RELEASE_V53
+
+
+
+# ============================================================================
+# NAIRAPIPS V54 — FINAL ADMIN-RECOVERY ENTITLEMENT AUTHORITY
+# 16 SEP 2026
+#
+# ROOT CAUSE
+# ----------
+# app.py contains several historical redefinitions of
+# _np_reset_entitlement_for_source(). The explicit V53 staff-recovery route
+# correctly persisted [NP_ENTITLEMENT:admin_recovery], but the final kill-switch
+# resolver could still fall through older compatibility layers and return
+# ineligible. Result: "entitlement verification failed; no MT5 released."
+#
+# V54 is intentionally LAST:
+#   * consumed/replaced source still blocks forever;
+#   * exact archived_reset source + explicit admin_recovery marker is eligible;
+#   * breach/archive by itself remains ineligible;
+#   * every other reset/payout/Second-Life rule delegates unchanged.
+# ============================================================================
+
+NAIRAPIPS_ADMIN_RECOVERY_RELEASE_V54 = "V54_FINAL_ADMIN_RECOVERY_ENTITLEMENT_2026_09_16"
+
+_np_reset_entitlement_for_source_v54_core = _np_reset_entitlement_for_source
+
+def _np_reset_entitlement_for_source(source, trader=None):
+    source = source or {}
+    trader = trader or {}
+
+    # Permanent kill switches always win.
+    if source.get("reset_consumed_at") or source.get("reset_replacement_account_id"):
+        return {
+            "eligible": False,
+            "reason": "reset_already_consumed",
+            "label": "RESET ALREADY CONSUMED",
+        }
+
+    blob = _np_kill_blob(source)
+    if (
+        "np_consumed:paid_reset:" in blob
+        or "reset_consumed replacement_account_id=" in blob
+        or "np_consumed:admin_recovery:" in blob
+    ):
+        return {
+            "eligible": False,
+            "reason": "reset_already_consumed",
+            "label": "RESET ALREADY CONSUMED",
+        }
+
+    status = str(
+        source.get("account_status") or source.get("status") or ""
+    ).strip().lower()
+    stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+
+    # Explicit staff-recovery authority. This is NEVER inferred from breach.
+    if (
+        status.startswith("archived_reset")
+        and stage in {"phase1", "phase2", "funded"}
+        and "[np_entitlement:admin_recovery]" in blob
+    ):
+        return {
+            "eligible": True,
+            "reason": "admin_recovery",
+            "label": "ADMIN RECOVERY APPROVED",
+            "target_stage": stage,
+            "evidence_id": str(source.get("id") or ""),
+        }
+
+    # Everything else keeps the existing production authority.
+    return _np_reset_entitlement_for_source_v54_core(source, trader)
+
+
+@app.route("/admin/admin_recovery_v54/health", methods=["GET", "OPTIONS"])
+def admin_admin_recovery_v54_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_ADMIN_RECOVERY_RELEASE_V54,
+        "explicit_marker": "[NP_ENTITLEMENT:admin_recovery]",
+        "breach_alone_creates_entitlement": False,
+        "consumed_source_reopens": False,
+        "assignment_stage": "same as exact archived reset source",
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_ADMIN_RECOVERY_RELEASE_V54
 
