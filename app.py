@@ -36813,3 +36813,459 @@ def admin_admin_recovery_v54_health():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_ADMIN_RECOVERY_RELEASE_V54
 
+
+
+# ============================================================================
+# NAIRAPIPS V55 — AUTOMATION GUIDE JOURNEY DECISION AUTHORITY
+# 17 SEP 2026
+#
+# MASTER BUSINESS LAW
+# -------------------
+# 1) Phase 1 / 2-Lives
+#    Life 1 breach -> ONE free Second Life / fresh Phase 1.
+#    Life 2 breach -> JOURNEY CLOSED -> buy a new Challenge.
+#
+# 2) PASS
+#    Current 1-Phase pass -> Funded.
+#    Legacy 2-Phase remains Phase1 -> Phase2 -> Funded.
+#
+# 3) FUNDED BREACH
+#    First Funded breach -> ONE paid Funded Reset.
+#    Payment proof + Admin approval -> fresh Funded MT5.
+#    Breach of the Funded-reset replacement -> JOURNEY CLOSED -> new Challenge.
+#
+# 4) PAYOUT
+#    PAID payout -> fresh Funded MT5; payout renewal is independent of Funded Reset.
+#
+# 5) CONTROL CLASS
+#    Root purchase before 12 Sep 2026 -> protected MANUAL control.
+#    Root purchase on/after 12 Sep 2026 -> CLEAN AUTOMATION + retry.
+#    The business outcome is the same; only who fires the action differs.
+#
+# This endpoint is READ-ONLY. Existing production mutation endpoints remain the
+# only authority that may approve payment, activate Second Life, or release MT5.
+# ============================================================================
+
+NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V55 = "V55_AUTOMATION_GUIDE_JOURNEY_DECISION_2026_09_17"
+
+
+def _np_v55_account_time(a):
+    return _dt_score(
+        (a or {}).get("assigned_at")
+        or (a or {}).get("started_at")
+        or (a or {}).get("created_at")
+        or (a or {}).get("updated_at")
+    )
+
+
+def _np_v55_is_real_account(a):
+    a = a or {}
+    login = str(a.get("mt5_login") or "").strip()
+    if not login:
+        return False
+    status = str(a.get("account_status") or a.get("status") or "").strip().lower()
+    return not any(x in status for x in (
+        "waiting_mt5", "pending_assignment", "awaiting_mt5"
+    ))
+
+
+def _np_v55_legal_accounts(rows):
+    out = []
+    for a in rows or []:
+        try:
+            if _np_ja_is_recalled(a) and not _np_ja_account_has_trades(a):
+                # Unused recalled mistake does not consume progression.
+                continue
+        except Exception:
+            pass
+        out.append(a)
+    out.sort(key=_np_v55_account_time)
+    return out
+
+
+def _np_v55_same_journey_accounts(trader_id, purchase_id):
+    rows = (
+        supabase.table("trader_accounts").select("*")
+        .eq("trader_id", trader_id)
+        .limit(1000).execute().data or []
+    )
+    pid = str(purchase_id or "").strip()
+    out = [
+        a for a in rows
+        if str(a.get("purchase_id") or a.get("challenge_purchase_id") or "").strip() == pid
+    ]
+    return _np_v55_legal_accounts(out)
+
+
+def _np_v55_paid_payouts(trader_id, account_ids):
+    if not account_ids:
+        return []
+    ids = {str(x or "").strip() for x in account_ids if str(x or "").strip()}
+    rows = (
+        supabase.table("payouts").select("*")
+        .eq("trader_id", trader_id)
+        .order("created_at", desc=False)
+        .limit(2000).execute().data or []
+    )
+    return [
+        p for p in rows
+        if str(p.get("trader_account_id") or p.get("account_id") or "").strip() in ids
+        and (
+            str(p.get("status") or "").strip().lower() == "paid"
+            or bool(p.get("paid_at"))
+        )
+    ]
+
+
+def _np_v55_decision(purchase_id):
+    pid = str(purchase_id or "").strip()
+    if not pid:
+        raise ValueError("purchase_id is required")
+
+    rows = (
+        supabase.table("challenge_purchases").select("*")
+        .eq("id", pid).limit(1).execute().data or []
+    )
+    if not rows:
+        raise ValueError("purchase not found")
+
+    purchase = rows[0]
+    if (
+        str(purchase.get("purchase_type") or "challenge").strip().lower() == "reset"
+        or "[NP_RESET_REQUEST:" in str(purchase.get("admin_note") or "")
+    ):
+        raise ValueError("reset-payment child record is not an independent journey")
+
+    trader_id = str(purchase.get("trader_id") or "").strip()
+    if not trader_id:
+        raise ValueError("purchase trader_id is missing")
+
+    trader = get_trader_by_id(trader_id) or {}
+    accounts = _np_v55_same_journey_accounts(trader_id, pid)
+    clean_root = bool(_np_automation_generation_purchase(purchase))
+    mode = "CLEAN_AUTOMATION" if clean_root else "LEGACY_MANUAL"
+
+    base = {
+        "success": True,
+        "release": NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V55,
+        "purchase_id": pid,
+        "trader_id": trader_id,
+        "automation_mode": mode,
+        "automatic_assignment_allowed": clean_root,
+        "root_purchase_created_at": purchase.get("created_at"),
+        "source_account_id": None,
+        "source_mt5": None,
+        "target_stage": None,
+        "payment_required": False,
+        "closed": False,
+        "safe_to_assign_now": False,
+        "account_size": clean(purchase.get("account_size") or 0),
+        "price": 0,
+        "accounts_count": len(accounts),
+    }
+
+    if not accounts:
+        pst = str(
+            purchase.get("payment_status") or purchase.get("status") or ""
+        ).strip().lower()
+        if _np_ja_purchase_approved(purchase):
+            return {
+                **base,
+                "code": "FIRST_MT5_DUE",
+                "state": "WAITING_MT5",
+                "title": "FIRST PHASE 1 MT5 REQUIRED",
+                "message": (
+                    "Purchase is approved and this journey has no delivered MT5. "
+                    + ("Clean automation should assign and retry automatically."
+                       if clean_root else
+                       "Legacy journey requires protected manual assignment.")
+                ),
+                "target_stage": "phase1",
+                "safe_to_assign_now": True,
+            }
+        return {
+            **base,
+            "code": "PURCHASE_PAYMENT_REVIEW",
+            "state": "WAITING_PAYMENT",
+            "title": "PURCHASE PAYMENT REVIEW",
+            "message": f"Purchase status is {pst or 'pending'}. No MT5 is due until approval.",
+        }
+
+    latest = accounts[-1]
+    latest_id = str(latest.get("id") or "").strip()
+    latest_mt5 = str(latest.get("mt5_login") or "").strip()
+    latest_stage = _normalize_lifecycle_stage(latest.get("stage") or latest.get("phase"))
+    size = clean(
+        latest.get("account_size")
+        or latest.get("start_balance")
+        or purchase.get("account_size")
+        or 0
+    )
+    base.update({
+        "source_account_id": latest_id,
+        "source_mt5": latest_mt5,
+        "target_stage": latest_stage,
+        "account_size": size,
+        "latest_account_status": latest.get("account_status") or latest.get("status"),
+        "latest_stage": latest_stage,
+    })
+
+    # -----------------------------------------------------------------------
+    # BREACH: use the existing single reset-policy authority.
+    # -----------------------------------------------------------------------
+    if _np_reset_account_is_breached(latest):
+        policy = _np_reset_policy(latest, trader) or {}
+        kind = str(policy.get("kind") or "").strip().lower()
+        reason = str(policy.get("reason") or "").strip()
+        title = str(policy.get("title") or "").strip()
+        subtitle = str(policy.get("subtitle") or "").strip()
+        target_stage = _normalize_lifecycle_stage(policy.get("stage") or latest_stage)
+        common = {
+            **base,
+            "reset_policy": policy,
+            "target_stage": target_stage,
+            "price": clean(policy.get("price") or 0),
+            "source_account_id": str(policy.get("source_account_id") or latest_id),
+            "source_mt5": str(policy.get("source_mt5_login") or latest_mt5),
+        }
+
+        if kind == "free_second_life":
+            return {
+                **common,
+                "code": "SECOND_LIFE_AVAILABLE",
+                "state": "SECOND_LIFE_AVAILABLE",
+                "title": title or "FREE SECOND LIFE AVAILABLE",
+                "message": subtitle or "Life 1 breached. One fresh Phase 1 Second Life remains.",
+                "target_stage": "phase1",
+                "safe_to_assign_now": False,  # activation endpoint must run first
+                "payment_required": False,
+            }
+
+        if kind in {"paid_funded", "paid_challenge"}:
+            return {
+                **common,
+                "code": "RESET_PAYMENT_REQUIRED",
+                "state": "WAITING_RESET_PAYMENT",
+                "title": title or (
+                    "FUNDED RESET PAYMENT REQUIRED"
+                    if target_stage == "funded" else
+                    f"{target_stage.upper()} RESET PAYMENT REQUIRED"
+                ),
+                "message": subtitle or "Reset payment is required before a fresh MT5 can be issued.",
+                "payment_required": True,
+                "safe_to_assign_now": False,
+            }
+
+        if kind == "payment_pending":
+            return {
+                **common,
+                "code": "RESET_PAYMENT_UNDER_REVIEW",
+                "state": "WAITING_RESET_PAYMENT_REVIEW",
+                "title": title or "RESET PAYMENT UNDER REVIEW",
+                "message": subtitle or "Payment proof exists and requires Admin approval.",
+                "payment_required": True,
+                "safe_to_assign_now": False,
+            }
+
+        if kind == "waiting":
+            return {
+                **common,
+                "code": "RESET_MT5_DUE",
+                "state": "WAITING_MT5",
+                "title": title or "RESET APPROVED · FRESH MT5 REQUIRED",
+                "message": subtitle or "Reset payment is approved. Assign one fresh MT5 at the same stage.",
+                "payment_required": False,
+                "safe_to_assign_now": True,
+            }
+
+        if kind == "terminal":
+            second_enabled = _second_life_bool(purchase.get("second_life_enabled"))
+            second_used = _second_life_bool(purchase.get("second_life_used"))
+            if latest_stage in {"phase1", "phase2"} and second_enabled and second_used:
+                final_title = "2 LIVES EXHAUSTED · BUY A NEW CHALLENGE"
+                final_message = (
+                    "Life 2 breached. The included free Challenge reset / Second Life "
+                    "has already been used. No Life 3 and no further Challenge reset are permitted."
+                )
+            elif latest_stage == "funded":
+                final_title = "FUNDED JOURNEY COMPLETE · BUY A NEW CHALLENGE"
+                final_message = subtitle or (
+                    "The one Funded breach reset for this journey has already been used. "
+                    "This Funded account breached, so the journey is closed."
+                )
+            else:
+                final_title = title or "JOURNEY COMPLETE · BUY A NEW CHALLENGE"
+                final_message = subtitle or "No further reset is permitted on this journey."
+            return {
+                **common,
+                "code": "JOURNEY_CLOSED_NEW_CHALLENGE",
+                "state": "CLOSED",
+                "title": final_title,
+                "message": final_message,
+                "closed": True,
+                "payment_required": False,
+                "safe_to_assign_now": False,
+            }
+
+        return {
+            **common,
+            "code": "BREACH_REVIEW_REQUIRED",
+            "state": "REVIEW",
+            "title": title or "BREACH REQUIRES REVIEW",
+            "message": subtitle or reason or "The reset outcome could not be verified safely.",
+            "safe_to_assign_now": False,
+        }
+
+    # -----------------------------------------------------------------------
+    # PASS: exact next stage, preserving legacy 2-Phase rules where applicable.
+    # -----------------------------------------------------------------------
+    if _np_ja_is_passed(latest):
+        plan = _safe_plan_for_purchase(purchase) or {}
+        target = _next_stage_for_lifecycle(
+            latest_stage, latest, purchase, plan, trader
+        )
+        target = _normalize_lifecycle_stage(target)
+        later = [
+            a for a in accounts
+            if str(a.get("id") or "") != latest_id
+            and _np_v55_account_time(a) >= _np_v55_account_time(latest)
+            and _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == target
+            and _np_v55_is_real_account(a)
+        ]
+        if later:
+            child = later[-1]
+            return {
+                **base,
+                "code": "PROGRESSION_COMPLETED",
+                "state": "ACTIVE",
+                "title": f"{latest_stage.upper()} PASS PROGRESSION COMPLETED",
+                "message": f"MT5 {child.get('mt5_login')} is the delivered {target.upper()} successor.",
+                "target_stage": target,
+                "safe_to_assign_now": False,
+                "replacement_account_id": child.get("id"),
+                "replacement_mt5": child.get("mt5_login"),
+            }
+        return {
+            **base,
+            "code": "PROGRESSION_DUE",
+            "state": "WAITING_MT5",
+            "title": f"{target.upper()} MT5 REQUIRED",
+            "message": (
+                f"{latest_stage.upper()} passed. One {target.upper()} MT5 is owed. "
+                + ("Clean automation should fire/retry automatically."
+                   if clean_root else
+                   "Legacy journey requires protected manual assignment.")
+            ),
+            "target_stage": target,
+            "safe_to_assign_now": True,
+        }
+
+    # -----------------------------------------------------------------------
+    # PAID PAYOUT: renewal is independent from the one Funded breach reset.
+    # -----------------------------------------------------------------------
+    account_ids = [str(a.get("id") or "") for a in accounts if a.get("id")]
+    paid_payouts = _np_v55_paid_payouts(trader_id, account_ids)
+    if paid_payouts:
+        paid_payouts.sort(
+            key=lambda p: _dt_score(
+                p.get("paid_at") or p.get("updated_at") or p.get("created_at")
+            )
+        )
+        p = paid_payouts[-1]
+        source_id = str(p.get("trader_account_id") or p.get("account_id") or "").strip()
+        source = next((a for a in accounts if str(a.get("id") or "") == source_id), None)
+        if source and _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) == "funded":
+            successors = [
+                a for a in accounts
+                if str(a.get("id") or "") != source_id
+                and _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == "funded"
+                and _np_v55_account_time(a) > _np_v55_account_time(source)
+                and _np_v55_is_real_account(a)
+            ]
+            if not successors:
+                return {
+                    **base,
+                    "code": "PAYOUT_RENEWAL_DUE",
+                    "state": "WAITING_MT5",
+                    "title": "PAYOUT PAID · FRESH FUNDED MT5 REQUIRED",
+                    "message": (
+                        "Payout renewal is repeatable and does not consume the one Funded breach reset. "
+                        + ("Clean automation should fire/retry automatically."
+                           if clean_root else
+                           "Legacy journey requires protected manual fresh Funded assignment.")
+                    ),
+                    "source_account_id": source_id,
+                    "source_mt5": source.get("mt5_login"),
+                    "target_stage": "funded",
+                    "payout_id": p.get("id"),
+                    "safe_to_assign_now": True,
+                }
+
+    # -----------------------------------------------------------------------
+    # Active / neutral state.
+    # -----------------------------------------------------------------------
+    if _np_ja_is_active(latest):
+        return {
+            **base,
+            "code": "ACTIVE",
+            "state": "ACTIVE",
+            "title": f"{latest_stage.upper()} ACTIVE",
+            "message": f"MT5 {latest_mt5 or '—'} is the current live account. No assignment is due.",
+            "safe_to_assign_now": False,
+        }
+
+    return {
+        **base,
+        "code": "NO_OPEN_ACTION",
+        "state": "IDLE",
+        "title": "NO OPEN LIFECYCLE ACTION",
+        "message": "No unresolved automation-guide action was found for this exact journey.",
+        "safe_to_assign_now": False,
+    }
+
+
+@app.route("/admin/automation_guide_decision_v55", methods=["GET", "OPTIONS"])
+def admin_automation_guide_decision_v55():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    pid = str(request.args.get("purchase_id") or "").strip()
+    if not pid:
+        return _np_fail("purchase_id is required", 400)
+    try:
+        return _np_ok({
+            "success": True,
+            "decision": _np_v55_decision(pid),
+            "generated_at": now_iso(),
+        })
+    except ValueError as exc:
+        return _np_fail(str(exc), 409)
+    except Exception as exc:
+        print("V55 AUTOMATION GUIDE DECISION ERROR:", exc)
+        return _np_fail("Automation Guide decision failed safely: " + str(exc), 500)
+
+
+@app.route("/admin/automation_guide_v55/health", methods=["GET", "OPTIONS"])
+def admin_automation_guide_v55_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V55,
+        "life1_breach": "Second Life once",
+        "life2_breach": "journey closed -> new challenge",
+        "funded_first_breach": "paid Funded reset once",
+        "funded_reset_child_breach": "journey closed -> new challenge",
+        "payout_paid": "fresh Funded renewal; does not consume Funded reset",
+        "legacy_control": "protected manual",
+        "clean_control": "automatic + retry",
+        "mutation_free": True,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V55
+
