@@ -11035,6 +11035,110 @@ NairaPips Team"""
         return ok(result, "Payout approved")
     except Exception as e: return bad(e)
 
+
+@app.route("/admin/reopen_payout_review", methods=["POST", "OPTIONS"])
+def admin_reopen_payout_review():
+    """Return an APPROVED-but-unpaid payout to PENDING compliance review.
+
+    This exists specifically as a safe recovery path for an accidental approval.
+    It does NOT pay, reject, renew, reset, or release the funded account.
+    The exact funded account remains profit_protected while Admin reviews it.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    d = request.get_json(silent=True) or {}
+    pid = str(d.get("id") or "").strip()
+    reason = str(d.get("reason") or d.get("admin_note") or "Returned to compliance review by Admin.").strip()
+    if not pid:
+        return _np_fail("Missing payout id", 400)
+
+    try:
+        payout = get_payout_by_id(pid)
+        if not payout:
+            return _np_fail("Payout not found", 404)
+
+        current = payout_status(payout)
+        if current != "approved":
+            return _np_fail(
+                f"Only an APPROVED unpaid payout can be returned to review. Current status: {current or 'unknown'}.",
+                409,
+            )
+        if payout.get("paid_at"):
+            return _np_fail("This payout is already paid and cannot be returned to review.", 409)
+
+        account_id = str(payout.get("trader_account_id") or "").strip()
+        trader_id = str(payout.get("trader_id") or "").strip()
+
+        previous_note = str(payout.get("admin_note") or "").strip()
+        review_note = f"RETURNED TO REVIEW: {reason}"
+        if previous_note:
+            review_note += f" | Previous approval note: {previous_note}"
+
+        updated = (
+            _staff_db().table("payouts")
+            .update({
+                "status": "pending",
+                "approved_at": None,
+                "admin_note": review_note,
+            })
+            .eq("id", pid)
+            .eq("status", "approved")
+            .execute().data
+            or []
+        )
+        if not updated:
+            return _np_fail(
+                "Payout changed state before it could be returned to review. Refresh Payouts and try again.",
+                409,
+            )
+
+        # Preserve the payout trading lock while the request is back under review.
+        if account_id:
+            try:
+                q = (
+                    _staff_db().table("trader_accounts")
+                    .update({
+                        "account_status": "profit_protected",
+                        "monitoring_enabled": True,
+                        "updated_at": now_iso(),
+                    })
+                    .eq("id", account_id)
+                )
+                if trader_id:
+                    q = q.eq("trader_id", trader_id)
+                q.execute()
+            except Exception as lock_error:
+                print("REOPEN PAYOUT REVIEW LOCK UPDATE:", lock_error)
+
+        _audit_safe(
+            "payouts",
+            "payout_returned_to_review",
+            f"Payout {pid} returned from APPROVED to PENDING review. Reason: {reason[:1000]}",
+            admin,
+            pid,
+        )
+        try:
+            np_invalidate_admin_bootstrap("payouts")
+        except Exception:
+            pass
+
+        return _np_ok({
+            "success": True,
+            "payout": updated[0] if updated else None,
+            "status": "pending",
+            "trader_account_id": account_id or None,
+            "funded_lock_preserved": True,
+        }, "Payout returned to compliance review")
+    except Exception as exc:
+        print("REOPEN PAYOUT REVIEW ERROR:", exc)
+        return _np_fail("Could not return payout to review: " + str(exc), 500)
+
+
 @app.route("/reject_payout", methods=["POST"])
 def reject_payout():
     try:
@@ -11065,25 +11169,136 @@ def reject_payout():
         if trader_row and account:
             _release_funded_payout_trade_lock(trader_row, account, reason=f"Payout {pid} rejected by Admin. Same funded account reopened.")
         rejection_subject = "Payout Compliance Decision – Trading Rule Violation"
-        email_sent = bool(send_email_safe(payout.get("email"), rejection_subject, final_message))
+
+        # Trader gets the exact notice Admin previewed.
+        email_sent = bool(send_email_safe(
+            payout.get("email"),
+            rejection_subject,
+            final_message
+        ))
+
+        # Admin/owner receives a separate operational copy.
+        admin_copy_body = (
+            "NAIRAPIPS PAYOUT REJECTION — ADMIN COPY\n\n"
+            f"Trader: {payout.get('trader_name') or (trader_row or {}).get('name') or 'Trader'}\n"
+            f"Trader Email: {payout.get('email') or (trader_row or {}).get('email') or '—'}\n"
+            f"Payout ID: {pid}\n"
+            f"MT5: {payout.get('mt5_login') or '—'}\n"
+            f"Amount: {payout.get('amount') or 0}\n"
+            f"Reasons: {'; '.join(reasons)}\n"
+            f"Review Evidence: {evidence}\n\n"
+            "EXACT NOTICE SENT TO TRADER\n"
+            "--------------------------------\n"
+            f"{final_message}"
+        )
+        admin_copy_sent = bool(send_admin_alert(
+            "ADMIN COPY — " + rejection_subject,
+            admin_copy_body
+        ))
+
+        # Dashboard compliance notice belongs in Announcements, not Offers.
         dashboard_saved=False
         trader_id=str(payout.get("trader_id") or (trader_row or {}).get("id") or "").strip()
         target_email=str(payout.get("email") or (trader_row or {}).get("email") or "").strip().lower()
         target_name=str(payout.get("trader_name") or (trader_row or {}).get("name") or "Trader").strip()
         target_phone=str((trader_row or {}).get("phone") or "").strip()
         account_reference=str((trader_row or {}).get("account_reference") or "").strip()
-        dashboard_row={"title":rejection_subject,"message":final_message,"type":"private_offer","status":"active","show_on_landing":False,"show_on_dashboard":True,"created_by":"NairaPips Compliance","created_at":rejected_at,"target_trader_id":trader_id or None,"target_email":target_email or None,"target_name":target_name or None,"target_phone":target_phone or None,"target_account_reference":account_reference or None,"subject":rejection_subject,"offer_code":"","expires_at":None,"cta_label":"","cta_url":"","priority":"high","require_ack":True,"delivery_dashboard":True,"delivery_email":False,"delivery_whatsapp":False,"read_at":None,"message_only":True,"audience_segment":"single","audience_label":"Compliance Decision","notice_type":"payout_compliance"}
+
+        dashboard_row={
+            "title":rejection_subject,
+            "message":final_message,
+            "type":"announcement",
+            "status":"active",
+            "show_on_landing":False,
+            "show_on_dashboard":True,
+            "created_by":"NairaPips Compliance",
+            "created_at":rejected_at,
+            "target_trader_id":trader_id or None,
+            "target_email":target_email or None,
+            "target_name":target_name or None,
+            "target_phone":target_phone or None,
+            "target_account_reference":account_reference or None,
+            "subject":rejection_subject,
+            "offer_code":"",
+            "expires_at":None,
+            "cta_label":"",
+            "cta_url":"",
+            "priority":"urgent",
+            "require_ack":True,
+            "delivery_dashboard":True,
+            "delivery_email":False,
+            "delivery_whatsapp":False,
+            "read_at":None,
+            "message_only":True,
+            "audience_segment":"single",
+            "audience_label":"Compliance Decision",
+            "notice_type":"payout_compliance"
+        }
         try:
-            supabase.table("announcements").insert(dashboard_row).execute(); dashboard_saved=True
+            supabase.table("announcements").insert(dashboard_row).execute()
+            dashboard_saved=True
         except Exception as schema_error:
-            print("PAYOUT REJECTION MESSAGE CENTRE SCHEMA FALLBACK:", schema_error)
-            meta={"private_offer":True,"message_only":True,"audience_segment":"single","audience_label":"Compliance Decision","notice_type":"payout_compliance","target_trader_id":trader_id,"target_email":target_email,"target_name":target_name,"target_phone":target_phone,"target_account_reference":account_reference,"subject":rejection_subject,"offer_code":"","expires_at":"","cta_label":"","cta_url":"","priority":"high","require_ack":True,"delivery_dashboard":True,"show_on_dashboard":True,"delivery_email":False,"delivery_whatsapp":False,"created_by":"NairaPips Compliance"}
+            print("PAYOUT REJECTION ANNOUNCEMENT SCHEMA FALLBACK:", schema_error)
+            meta={
+                "private_offer":False,
+                "message_only":True,
+                "audience_segment":"single",
+                "audience_label":"Compliance Decision",
+                "notice_type":"payout_compliance",
+                "target_trader_id":trader_id,
+                "target_email":target_email,
+                "target_name":target_name,
+                "target_phone":target_phone,
+                "target_account_reference":account_reference,
+                "subject":rejection_subject,
+                "offer_code":"",
+                "expires_at":"",
+                "cta_label":"",
+                "cta_url":"",
+                "priority":"urgent",
+                "require_ack":True,
+                "delivery_dashboard":True,
+                "show_on_dashboard":True,
+                "delivery_email":False,
+                "delivery_whatsapp":False,
+                "created_by":"NairaPips Compliance"
+            }
             try:
-                supabase.table("announcements").insert({"title":rejection_subject,"message":final_message,"type":"private_offer","status":"active","show_on_landing":False,"show_on_dashboard":False,"created_by":_np_offer_meta_pack(meta),"created_at":rejected_at}).execute(); dashboard_saved=True
-            except Exception as fallback_error: print("PAYOUT REJECTION MESSAGE CENTRE ERROR:", fallback_error)
-        _audit_safe("payouts","payout_rejected",f"Payout {pid} rejected after preview; email_sent={email_sent}; dashboard_saved={dashboard_saved}; {frozen_note[:1500]}",_admin_from_payload(d),pid)
+                supabase.table("announcements").insert({
+                    "title":rejection_subject,
+                    "message":final_message,
+                    "type":"announcement",
+                    "status":"active",
+                    "show_on_landing":False,
+                    "show_on_dashboard":False,
+                    "created_by":_np_offer_meta_pack(meta),
+                    "created_at":rejected_at
+                }).execute()
+                dashboard_saved=True
+            except Exception as fallback_error:
+                print("PAYOUT REJECTION ANNOUNCEMENT ERROR:", fallback_error)
+
+        _audit_safe(
+            "payouts",
+            "payout_rejected",
+            (
+                f"Payout {pid} rejected after preview; "
+                f"trader_email_sent={email_sent}; "
+                f"admin_copy_sent={admin_copy_sent}; "
+                f"dashboard_announcement_saved={dashboard_saved}; "
+                f"{frozen_note[:1500]}"
+            ),
+            _admin_from_payload(d),
+            pid
+        )
         np_invalidate_admin_bootstrap("payouts")
-        return ok({"payout":result,"email_sent":email_sent,"dashboard_message_saved":dashboard_saved},"Payout rejected; exact preview notice delivered")
+        return ok({
+            "payout":result,
+            "email_sent":email_sent,
+            "admin_copy_sent":admin_copy_sent,
+            "dashboard_message_saved":dashboard_saved,
+            "dashboard_destination":"announcements"
+        },"Payout rejected; exact preview notice delivered")
     except Exception as e: return bad(e)
 
 @app.route("/mark_payout_paid", methods=["POST"])
@@ -37269,3 +37484,7 @@ def admin_automation_guide_v55_health():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V55
 
+
+# NAIRAPIPS_BACKEND_RELEASE: V56_PAYOUT_REVIEW_SAFETY_2026_09_17
+
+# NAIRAPIPS_BACKEND_RELEASE: V57_PAYOUT_REJECTION_DELIVERY_RESTORED_2026_09_17
