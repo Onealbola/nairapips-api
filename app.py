@@ -10432,6 +10432,14 @@ def payouts():
         elif email:
             q = q.eq("email", email)
         rows = q.order("created_at", desc=True).limit(limit).execute().data or []
+
+        # Old rejected payouts may still contain historical verbose compliance
+        # notes. They are no longer part of the Admin work surface.
+        for _row in rows:
+            if str((_row or {}).get("status") or "").strip().lower() == "rejected":
+                _row["admin_note"] = ""
+                _row["note"] = ""
+
         if trader_id:
             rows = [_trader_safe_payout_row(r) for r in rows]
         return jsonify(rows)
@@ -11139,6 +11147,62 @@ def admin_reopen_payout_review():
         return _np_fail("Could not return payout to review: " + str(exc), 500)
 
 
+
+
+@app.route("/admin/cleanup_rejected_payout_notes", methods=["POST", "OPTIONS"])
+def admin_cleanup_rejected_payout_notes():
+    """Remove old rejection/admin-note text from payout rows.
+
+    Full compliance evidence is now delivered by email and trader Announcement,
+    so rejected payout rows stay operationally clean.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    try:
+        rows = (
+            supabase.table("payouts")
+            .select("id,status,admin_note")
+            .eq("status", "rejected")
+            .limit(5000)
+            .execute().data or []
+        )
+        cleaned = 0
+        for row in rows:
+            if str(row.get("admin_note") or "").strip():
+                try:
+                    upd = (
+                        supabase.table("payouts")
+                        .update({"admin_note": ""})
+                        .eq("id", row.get("id"))
+                        .eq("status", "rejected")
+                        .execute().data or []
+                    )
+                    if upd:
+                        cleaned += 1
+                except Exception as row_error:
+                    print("PAYOUT NOTE CLEANUP ROW ERROR:", row.get("id"), row_error)
+
+        _audit_safe(
+            "payouts",
+            "cleanup_rejected_payout_notes",
+            f"Removed stored admin_note text from {cleaned} rejected payout row(s).",
+            admin,
+        )
+        np_invalidate_admin_bootstrap("payouts")
+        return _np_ok({
+            "success": True,
+            "cleaned": cleaned,
+            "scanned": len(rows),
+        }, "Rejected payout admin notes removed")
+    except Exception as exc:
+        print("PAYOUT NOTE CLEANUP ERROR:", exc)
+        return _np_fail("Could not clean rejected payout notes: " + str(exc), 500)
+
 @app.route("/reject_payout", methods=["POST"])
 def reject_payout():
     try:
@@ -11155,14 +11219,21 @@ def reject_payout():
         if not reasons: return bad("At least one compliance reason is required",400)
         if not evidence: return bad("Compliance evidence/review note is required",400)
         if not final_message: return bad("Final preview message is required",400)
-        # Freeze the exact evidence reviewed by Admin into the payout audit note.
+        # Keep evidence for the outgoing compliance notices only.
+        # NairaPips does NOT store the long compliance message in payouts.admin_note;
+        # Admin receives the full copy by email and the trader receives the same
+        # notice by email + Dashboard Announcements.
         trade_summary=[]
         for t in trades[:50]:
             trade_summary.append(f"{t.get('ticket') or '—'} {t.get('symbol') or '—'} {t.get('side') or '—'} {t.get('volume') or 0} lot | {t.get('opened_at') or '—'} -> {t.get('closed_at') or '—'} | {t.get('duration') or '—'} | P/L {t.get('profit') or 0}")
         frozen_note="Reasons: "+"; ".join(reasons)+" | Review: "+evidence
         if trade_summary: frozen_note += " | Trades: " + " || ".join(trade_summary)
         rejected_at=now_iso()
-        result = supabase.table("payouts").update({"status":"rejected","rejected_at":rejected_at,"admin_note":frozen_note}).eq("id",pid).eq("status","pending").execute().data or []
+        result = supabase.table("payouts").update({
+            "status":"rejected",
+            "rejected_at":rejected_at,
+            "admin_note":""
+        }).eq("id",pid).eq("status","pending").execute().data or []
         if not result: return bad("Payout changed state before rejection. Refresh Payouts and review again.",409)
         trader_row = _resolve_trader_for_money_action(payout)
         account = _get_exact_trader_account(payout.get("trader_account_id"))
@@ -11286,7 +11357,7 @@ def reject_payout():
                 f"trader_email_sent={email_sent}; "
                 f"admin_copy_sent={admin_copy_sent}; "
                 f"dashboard_announcement_saved={dashboard_saved}; "
-                f"{frozen_note[:1500]}"
+                f"reasons={'; '.join(reasons)}"
             ),
             _admin_from_payload(d),
             pid
@@ -37488,3 +37559,5 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V55
 # NAIRAPIPS_BACKEND_RELEASE: V56_PAYOUT_REVIEW_SAFETY_2026_09_17
 
 # NAIRAPIPS_BACKEND_RELEASE: V57_PAYOUT_REJECTION_DELIVERY_RESTORED_2026_09_17
+
+# NAIRAPIPS_BACKEND_RELEASE: V58_REMOVE_PAYOUT_ADMIN_NOTES_2026_09_17
