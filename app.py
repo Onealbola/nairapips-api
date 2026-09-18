@@ -41624,3 +41624,261 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PREVIOUS_RESET_RELEASE_V69
 
 
 NAIRAPIPS_BOOTSTRAP_PREVIOUS_RESET_RELEASE_V70 = "V70_BOOTSTRAP_PREVIOUS_RESET_AUTHORITY_2026_09_18"
+
+
+
+# ============================================================================
+# NAIRAPIPS V71 — PAID RESET PROOF + APPROVAL FIREWALL
+# 18 SEP 2026
+#
+# PRODUCTION INCIDENT RESPONSE
+# ----------------------------
+# A paid reset must never auto-assign from a generic "approved/paid/completed"
+# state alone.
+#
+# Before ANY paid-reset automation may issue an MT5, ALL of these must be true:
+#   1) exact reset child order exists;
+#   2) real payment_proof_url exists on that exact order;
+#   3) payment_status == approved;
+#   4) status is the dedicated reset workflow state:
+#        approved_reset_waiting_mt5 OR reset_assigning;
+#   5) approved_at exists;
+#   6) order contains exact NP_RESET_REQUEST source/parent/stage marker;
+#   7) order contains exact order-specific NP_ENTITLEMENT marker;
+#   8) source account contains the same order-specific entitlement marker;
+#   9) source is actually breached and stage matches;
+#  10) source/order/trader/parent identities all agree.
+#
+# This is the final low-level firewall under the retry worker. It does NOT change
+# Phase1->Funded, Second Life, or payout-renewal automation.
+# ============================================================================
+
+NAIRAPIPS_PAID_RESET_FIREWALL_RELEASE_V71 = "V71_PAID_RESET_PROOF_APPROVAL_FIREWALL_2026_09_18"
+
+
+def _np_v71_nonempty_proof(value):
+    v = str(value or "").strip()
+    if not v:
+        return False
+    if v.lower() in {"none", "null", "n/a", "na", "-", "pending"}:
+        return False
+    return len(v) >= 8
+
+
+def _np_v71_paid_reset_order_firewall(order):
+    order = order or {}
+    oid = str(order.get("id") or "").strip()
+    tid = str(order.get("trader_id") or "").strip()
+    if not oid or not tid:
+        return False, "missing_order_or_trader_id", {}
+
+    refs = _np_reset_order_refs_v43(order)
+    if not refs:
+        return False, "missing_exact_reset_request_marker", {}
+
+    sid = str(refs.get("source_account_id") or "").strip()
+    pid = str(refs.get("parent_purchase_id") or "").strip()
+    stage = str(refs.get("stage") or "").strip().lower()
+    if not sid or not pid or stage not in {"phase1", "phase2", "funded"}:
+        return False, "invalid_exact_reset_identity", refs
+
+    # Hard payment evidence: receipt/proof must exist on the reset child order.
+    proof = (
+        order.get("payment_proof_url")
+        or order.get("proof_url")
+        or order.get("file_url")
+        or order.get("receipt_url")
+    )
+    if not _np_v71_nonempty_proof(proof):
+        return False, "payment_proof_missing", refs
+
+    # Generic approved/paid/completed states are NOT enough for automation.
+    payment_status = str(order.get("payment_status") or "").strip().lower()
+    status = str(order.get("status") or "").strip().lower()
+    if payment_status != "approved":
+        return False, f"payment_status_not_explicitly_approved:{payment_status or 'missing'}", refs
+    if status not in {"approved_reset_waiting_mt5", "reset_assigning"}:
+        return False, f"not_dedicated_reset_approval_state:{status or 'missing'}", refs
+
+    if not str(order.get("approved_at") or "").strip():
+        return False, "approved_at_missing", refs
+
+    note = str(order.get("admin_note") or "")
+    request_marker = f"[NP_RESET_REQUEST:{sid}:{pid}:{stage}]"
+    if request_marker.lower() not in note.lower():
+        return False, "exact_request_marker_missing_from_order", refs
+
+    expected_kind = "funded_reset_paid" if stage == "funded" else "challenge_reset_paid"
+    entitlement_marker = f"[NP_ENTITLEMENT:{expected_kind}:{oid}]"
+    if entitlement_marker.lower() not in note.lower():
+        return False, "order_specific_entitlement_marker_missing", refs
+
+    source_rows = (
+        supabase.table("trader_accounts").select("*")
+        .eq("id", sid).eq("trader_id", tid)
+        .limit(1).execute().data or []
+    )
+    if not source_rows:
+        return False, "exact_source_missing", refs
+    source = source_rows[0]
+
+    if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != stage:
+        return False, "source_stage_mismatch", refs
+
+    if not _np_reset_account_is_breached(source):
+        return False, "source_not_proven_breached", refs
+
+    source_pid = str(
+        source.get("purchase_id")
+        or source.get("challenge_purchase_id")
+        or ""
+    ).strip()
+    if source_pid and source_pid != pid:
+        return False, "source_parent_purchase_mismatch", refs
+
+    parent_rows = (
+        supabase.table("challenge_purchases").select("*")
+        .eq("id", pid).eq("trader_id", tid)
+        .limit(1).execute().data or []
+    )
+    if not parent_rows:
+        return False, "exact_parent_purchase_missing", refs
+
+    source_blob = _np_kill_blob(source)
+    if entitlement_marker.lower() not in source_blob:
+        return False, "source_order_specific_entitlement_marker_missing", refs
+
+    # Existing exact verifier must ALSO pass.
+    if not _np_verify_exact_paid_reset_order(source, get_trader_by_id(tid) or {}, oid, expected_kind):
+        return False, "production_exact_order_verifier_failed", refs
+
+    return True, "verified", {
+        **refs,
+        "order_id": oid,
+        "trader_id": tid,
+        "expected_kind": expected_kind,
+        "proof_present": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# FINAL PAID-RESET AUTOFIRE FIREWALL
+# ---------------------------------------------------------------------------
+
+_np_auto_fulfill_exact_reset_v71_core = _np_auto_fulfill_exact_reset_v43
+
+def _np_auto_fulfill_exact_reset_v43(order):
+    ok_fire, reason, identity = _np_v71_paid_reset_order_firewall(order)
+    if not ok_fire:
+        oid = str((order or {}).get("id") or "").strip()
+        try:
+            _audit_safe(
+                "automation",
+                "v71_paid_reset_autofire_blocked",
+                (
+                    f"order={oid}; reason={reason}; "
+                    f"source={identity.get('source_account_id') or ''}; "
+                    f"parent={identity.get('parent_purchase_id') or ''}; "
+                    f"stage={identity.get('stage') or ''}"
+                ),
+                {"name":"paid_reset_firewall_v71","username":"paid_reset_firewall_v71","role":"system"},
+                oid,
+            )
+        except Exception:
+            pass
+        return {"status":"blocked","reason":f"V71_FIREWALL:{reason}"}
+
+    return _np_auto_fulfill_exact_reset_v71_core(order)
+
+
+# ---------------------------------------------------------------------------
+# LOW-LEVEL AUTOMATED RESET ASSIGNMENT FIREWALL
+#
+# If a system actor attempts a RESET assignment directly, bypassing the V43
+# worker, it must still present exact order= and source= identity and pass V71.
+# This leaves pass->Funded and payout-renewal untouched.
+# ---------------------------------------------------------------------------
+
+_np_assign_mt5_to_trader_v71_core = _assign_mt5_to_trader
+
+def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="MT5 assigned"):
+    actor = staff or {}
+    role = str(actor.get("role") or "").strip().lower()
+    username = str(actor.get("username") or actor.get("name") or "").strip().lower()
+    note_text = str(note or "")
+    note_lower = note_text.lower()
+
+    automated_reset = (
+        role == "system"
+        and "reset" in note_lower
+        and "payout renewal" not in note_lower
+        and "payout_id=" not in note_lower
+        and "phase pass" not in note_lower
+        and "pass -> funded" not in note_lower
+        and "pass→funded" not in note_lower
+    )
+
+    if automated_reset:
+        order_match = re.search(r"\border=([A-Za-z0-9._:-]+)", note_text, re.I)
+        source_match = re.search(r"\bsource=([A-Za-z0-9._:-]+)", note_text, re.I)
+        if not order_match or not source_match:
+            raise RuntimeError(
+                "V71 PAID RESET FIREWALL: automated reset assignment missing exact order/source identity"
+            )
+
+        oid = str(order_match.group(1) or "").strip()
+        sid = str(source_match.group(1) or "").strip()
+
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("id", oid).limit(1).execute().data or []
+        )
+        if not rows:
+            raise RuntimeError(
+                "V71 PAID RESET FIREWALL: exact reset order not found"
+            )
+
+        ok_fire, reason, identity = _np_v71_paid_reset_order_firewall(rows[0])
+        if not ok_fire:
+            raise RuntimeError(
+                "V71 PAID RESET FIREWALL BLOCKED ASSIGNMENT: " + str(reason)
+            )
+        if str(identity.get("source_account_id") or "") != sid:
+            raise RuntimeError(
+                "V71 PAID RESET FIREWALL: assignment source does not match approved reset order"
+            )
+
+    return _np_assign_mt5_to_trader_v71_core(
+        trader, mt5, stage, purchase, staff, note
+    )
+
+
+@app.route("/admin/reset_integrity_v71/status", methods=["GET", "OPTIONS"])
+def admin_reset_integrity_v71_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_PAID_RESET_FIREWALL_RELEASE_V71,
+        "paid_reset_autofire_requires_payment_proof": True,
+        "paid_reset_autofire_requires_payment_status_approved": True,
+        "paid_reset_autofire_requires_dedicated_status": [
+            "approved_reset_waiting_mt5",
+            "reset_assigning",
+        ],
+        "paid_reset_autofire_requires_approved_at": True,
+        "paid_reset_autofire_requires_exact_order_marker": True,
+        "paid_reset_autofire_requires_exact_source_marker": True,
+        "paid_reset_autofire_requires_breached_source": True,
+        "generic_approved_purchase_cannot_autofire_paid_reset": True,
+        "phase_pass_to_funded_unchanged": True,
+        "second_life_unchanged": True,
+        "payout_renewal_unchanged": True,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAID_RESET_FIREWALL_RELEASE_V71
+
