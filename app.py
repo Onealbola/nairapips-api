@@ -7609,6 +7609,335 @@ def trader_bootstrap():
                         account
                     )
 
+
+        # --------------------------------------------------------------------
+        # V70 PREVIOUS-ACCOUNT RESET AUTHORITY — BOOTSTRAP NATIVE
+        #
+        # Calculated INSIDE /trader_bootstrap, the route already used by every
+        # trader dashboard. READ ONLY: this section does not insert/update/delete
+        # any database row. Payment and assignment remain separate endpoints.
+        # --------------------------------------------------------------------
+        previous_reset_actions = []
+
+        def _v70_truthy(value):
+            if value is True or value == 1:
+                return True
+            return str(value or "").strip().lower() in {
+                "1", "true", "yes", "on", "used"
+            }
+
+        def _v70_stage(row):
+            raw = str(
+                (row or {}).get("stage")
+                or (row or {}).get("phase")
+                or ""
+            ).strip().lower().replace(" ", "").replace("_", "")
+            if raw in {"funded", "live", "fundedlive"}:
+                return "funded"
+            if raw in {"phase1", "phaseone", "1"}:
+                return "phase1"
+            if raw in {"phase2", "phasetwo", "2"}:
+                return "phase2"
+            return raw
+
+        def _v70_blob(row):
+            row = row or {}
+            return " ".join(str(row.get(k) or "") for k in (
+                "account_status", "status", "risk_zone", "display_risk_zone",
+                "archive_reason", "reset_reason", "breach_reason", "admin_note",
+                "message", "lifecycle_state", "challenge_state", "reset_kind"
+            )).lower()
+
+        def _v70_breached(row):
+            row = row or {}
+            blob = _v70_blob(row)
+            if "breach" in blob:
+                return True
+            if str(row.get("risk_zone") or "").strip().lower() == "breached":
+                return True
+            if row.get("breached_at") or row.get("breach_at"):
+                return True
+            try:
+                dd = float(
+                    row.get("dd_used_percent")
+                    or row.get("max_drawdown_used")
+                    or 0
+                )
+                if dd >= 100:
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def _v70_time(row):
+            row = row or {}
+            return _dt_score(
+                row.get("breached_at")
+                or row.get("breach_at")
+                or row.get("assigned_at")
+                or row.get("started_at")
+                or row.get("archived_at")
+                or row.get("updated_at")
+                or row.get("created_at")
+            )
+
+        def _v70_money(row):
+            row = row or {}
+            for key in (
+                "funded_reset_fee", "reset_fee", "reset_price", "reset_amount",
+                "final_fee", "amount_due", "amount_paid", "payment_amount",
+                "plan_fee", "challenge_fee", "challenge_price", "fee", "price",
+                "original_fee", "paid_amount", "amount"
+            ):
+                try:
+                    raw = str(row.get(key) or "").replace(",", "").replace("₦", "").strip()
+                    amount = float(raw or 0)
+                except Exception:
+                    amount = 0
+                if amount > 0:
+                    return amount
+            return 0.0
+
+        root_purchase_by_id = {
+            str(p.get("id") or "").strip(): p
+            for p in purchases
+            if str(p.get("id") or "").strip()
+            and "[NP_RESET_REQUEST:" not in str(p.get("admin_note") or "")
+        }
+
+        funded_by_purchase = {}
+        for raw_account in account_rows:
+            if _v70_stage(raw_account) != "funded":
+                continue
+            pid = str(
+                raw_account.get("purchase_id")
+                or raw_account.get("challenge_purchase_id")
+                or ""
+            ).strip()
+            if not pid or pid not in root_purchase_by_id:
+                continue
+            funded_by_purchase.setdefault(pid, []).append(raw_account)
+
+        for pid, funded_rows in funded_by_purchase.items():
+            breached_rows = [a for a in funded_rows if _v70_breached(a)]
+            if not breached_rows:
+                continue
+
+            breached_rows.sort(key=_v70_time, reverse=True)
+            source = breached_rows[0]
+            source_id = str(source.get("id") or "").strip()
+            if not source_id:
+                continue
+
+            source_time = _v70_time(source)
+            root_purchase = root_purchase_by_id.get(pid) or {}
+
+            # A later genuine Funded MT5 on the exact purchase means this older
+            # breach is already superseded/history.
+            later_funded = False
+            for child in funded_rows:
+                if str(child.get("id") or "").strip() == source_id:
+                    continue
+                if not str(child.get("mt5_login") or "").strip():
+                    continue
+                child_blob = _v70_blob(child)
+                if (
+                    "wrong_assignment_recalled" in child_blob
+                    or "recalled_wrong_assignment" in child_blob
+                    or "wrong assignment recalled" in child_blob
+                ):
+                    continue
+                if _v70_time(child) > source_time:
+                    later_funded = True
+                    break
+            if later_funded:
+                continue
+
+            account_size = clean(
+                source.get("account_size")
+                or source.get("start_balance")
+                or root_purchase.get("account_size")
+                or 0
+            )
+            mt5_login = str(source.get("mt5_login") or "").strip()
+
+            # Fail closed on an existing journey-level Funded-reset-used lock.
+            if _v70_truthy(root_purchase.get("funded_reset_used")):
+                previous_reset_actions.append({
+                    "account_id": source_id,
+                    "source_account_id": source_id,
+                    "mt5_login": mt5_login,
+                    "source_mt5_login": mt5_login,
+                    "stage": "funded",
+                    "account_size": account_size,
+                    "purchase_id": pid,
+                    "kind": "terminal",
+                    "code": "RESET_CLOSED",
+                    "eligible": False,
+                    "title": "Funded Reset Already Used",
+                    "message": "This purchase journey already carries a Funded-reset-used lock.",
+                    "price": 0,
+                    "authority": "TRADER_BOOTSTRAP_V70",
+                })
+                continue
+
+            # Exact historical reset-consumption evidence.
+            consumed = False
+            for reset_source in funded_rows:
+                b = _v70_blob(reset_source)
+                marker = (
+                    "np_entitlement:funded_reset_paid" in b
+                    or "np_funded_breach_reset_consumed" in b
+                    or "funded_reset_paid" in b
+                    or "funded reset paid" in b
+                    or str(reset_source.get("reset_kind") or "").strip().lower()
+                        == "funded_reset_paid"
+                )
+                if not marker:
+                    continue
+                reset_time = _v70_time(reset_source)
+                for child in funded_rows:
+                    if str(child.get("id") or "").strip() == str(reset_source.get("id") or "").strip():
+                        continue
+                    if not str(child.get("mt5_login") or "").strip():
+                        continue
+                    if _v70_time(child) > reset_time:
+                        consumed = True
+                        break
+                if consumed:
+                    break
+
+            if consumed:
+                previous_reset_actions.append({
+                    "account_id": source_id,
+                    "source_account_id": source_id,
+                    "mt5_login": mt5_login,
+                    "source_mt5_login": mt5_login,
+                    "stage": "funded",
+                    "account_size": account_size,
+                    "purchase_id": pid,
+                    "kind": "terminal",
+                    "code": "RESET_CLOSED",
+                    "eligible": False,
+                    "title": "Funded Journey Complete",
+                    "message": "The one Funded Reset already produced its replacement MT5.",
+                    "price": 0,
+                    "authority": "TRADER_BOOTSTRAP_V70",
+                })
+                continue
+
+            # Existing exact reset payment child for this breached account.
+            order = None
+            needle = ("[NP_RESET_REQUEST:" + source_id + ":").lower()
+            matching_orders = [
+                p for p in purchases
+                if needle in str(p.get("admin_note") or "").lower()
+            ]
+            matching_orders.sort(
+                key=lambda p: _dt_score(p.get("updated_at") or p.get("created_at")),
+                reverse=True,
+            )
+            if matching_orders:
+                order = matching_orders[0]
+
+            price = _v70_money(root_purchase)
+
+            if order:
+                state = str(
+                    order.get("payment_status")
+                    or order.get("status")
+                    or ""
+                ).strip().lower()
+                order_price = _v70_money(order) or price
+
+                if state in {
+                    "approved", "paid", "completed", "assigned",
+                    "approved_reset_waiting_mt5", "reset_assigning"
+                }:
+                    previous_reset_actions.append({
+                        "account_id": source_id,
+                        "source_account_id": source_id,
+                        "mt5_login": mt5_login,
+                        "source_mt5_login": mt5_login,
+                        "stage": "funded",
+                        "account_size": account_size,
+                        "purchase_id": pid,
+                        "reset_order_id": order.get("id"),
+                        "kind": "waiting",
+                        "code": "PAYMENT_APPROVED_WAITING_MT5",
+                        "eligible": True,
+                        "title": "Funded Reset Approved",
+                        "message": "Your exact reset payment is approved. One fresh Funded MT5 is due.",
+                        "price": order_price,
+                        "authority": "TRADER_BOOTSTRAP_V70",
+                    })
+                    continue
+
+                if state not in {
+                    "rejected", "cancelled", "canceled", "failed", "expired"
+                }:
+                    previous_reset_actions.append({
+                        "account_id": source_id,
+                        "source_account_id": source_id,
+                        "mt5_login": mt5_login,
+                        "source_mt5_login": mt5_login,
+                        "stage": "funded",
+                        "account_size": account_size,
+                        "purchase_id": pid,
+                        "reset_order_id": order.get("id"),
+                        "kind": "payment_pending",
+                        "code": "PAYMENT_UNDER_REVIEW",
+                        "eligible": True,
+                        "title": "Funded Reset Payment Under Review",
+                        "message": "Payment receipt submitted. Admin approval is required before a fresh Funded MT5 can be issued.",
+                        "price": order_price,
+                        "authority": "TRADER_BOOTSTRAP_V70",
+                    })
+                    continue
+
+            # No payment child yet. Only show paid-reset action when a real
+            # non-zero amount can be proven from the exact root purchase.
+            if price > 0:
+                previous_reset_actions.append({
+                    "account_id": source_id,
+                    "source_account_id": source_id,
+                    "mt5_login": mt5_login,
+                    "source_mt5_login": mt5_login,
+                    "stage": "funded",
+                    "account_size": account_size,
+                    "purchase_id": pid,
+                    "kind": "paid_funded",
+                    "code": "PAYMENT_REQUIRED",
+                    "eligible": True,
+                    "title": "One Funded Reset Available",
+                    "message": "This exact previous Funded MT5 breached and still has its one paid Funded Reset. Upload payment receipt for Admin approval.",
+                    "price": price,
+                    "authority": "TRADER_BOOTSTRAP_V70",
+                })
+
+        _v70_priority = {
+            "PAYMENT_UNDER_REVIEW": 500,
+            "PAYMENT_REQUIRED": 450,
+            "PAYMENT_APPROVED_WAITING_MT5": 400,
+            "REVIEW_REQUIRED": 200,
+            "RESET_CLOSED": 100,
+        }
+        previous_reset_actions.sort(
+            key=lambda item: (
+                _v70_priority.get(str(item.get("code") or ""), 0),
+                _v70_time(
+                    next(
+                        (
+                            a for a in account_rows
+                            if str(a.get("id") or "") == str(item.get("account_id") or "")
+                        ),
+                        {},
+                    )
+                ),
+            ),
+            reverse=True,
+        )
+
         payload = {
             "success": True,
             "source": "trader_bootstrap_critical_fast",
@@ -7622,6 +7951,8 @@ def trader_bootstrap():
             "active_purchase": _trader_safe_purchase_row(purchase) if purchase else None,
             "lifecycle_authority": lifecycle_authority,
             "pending_replacements": [_trader_safe_account_row(r) for r in pending_replacements],
+            "previous_reset_actions": previous_reset_actions,
+            "previous_reset_release": "V70_BOOTSTRAP_PREVIOUS_RESET_AUTHORITY_2026_09_18",
             "latest_trades": [],
             "latest_monitoring": None,
             "payout_eligibility": {
@@ -41291,3 +41622,5 @@ def admin_automation_v69_status():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PREVIOUS_RESET_RELEASE_V69
 
+
+NAIRAPIPS_BOOTSTRAP_PREVIOUS_RESET_RELEASE_V70 = "V70_BOOTSTRAP_PREVIOUS_RESET_AUTHORITY_2026_09_18"
