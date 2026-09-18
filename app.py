@@ -524,7 +524,7 @@ TERMINAL_ACCOUNT_STATUSES = {
     "locked", "disabled", "profit_protected",
 }
 ACCOUNT_STAGES = {"phase1", "phase2", "funded"}
-DEFAULT_CHALLENGE_JOURNEY = ("phase1", "phase2", "funded")
+DEFAULT_CHALLENGE_JOURNEY = ("phase1", "funded")
 ONE_PHASE_CHALLENGE_JOURNEY = ("phase1", "funded")
 
 
@@ -2960,6 +2960,82 @@ def _np_auto_post_payout_renewal(payout):
         print('ZERO COST PAYOUT RENEWAL AUTO SKIPPED:', exc)
         return None
 
+
+def _np_update_trader_current_pointer_v59(trader_id, account, stage):
+    """Persist current_account_id while tolerating absent OPTIONAL mirror columns."""
+    trader_id = str(trader_id or "").strip()
+    account = account or {}
+    if not trader_id or not str(account.get("id") or "").strip():
+        raise RuntimeError("current-account pointer update requires trader and account ids")
+
+    payload = {
+        "current_account_id": account.get("id"),
+        "trader_account_id": account.get("id"),  # optional historical mirror
+        "challenge_state": _active_state_for_stage(stage),
+        "phase": stage,
+        "status": "funded" if stage == "funded" else "active",
+        "mt5_login": account.get("mt5_login"),
+        "mt5_server": account.get("mt5_server"),
+        "mt5_master_password": account.get("mt5_master_password"),
+        "mt5_password": account.get("mt5_master_password"),
+        "master_password": account.get("mt5_master_password"),
+        "mt5_investor_password": account.get("mt5_investor_password"),
+        "investor_password": account.get("mt5_investor_password"),
+        "account_size": account.get("account_size"),
+        "monitoring_enabled": True,
+        "mt5_account_active": True,
+        "mt5_access_disabled": False,
+        "lifecycle_updated_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+
+    required = {"current_account_id"}
+    removed = []
+    last_error = None
+
+    for _attempt in range(12):
+        try:
+            rows = (
+                supabase.table("traders")
+                .update(payload)
+                .eq("id", trader_id)
+                .execute().data or []
+            )
+            if not rows:
+                raise RuntimeError("fresh MT5 assigned but current_account_id pointer was not persisted")
+            row = rows[0]
+            if (
+                "current_account_id" in row
+                and str(row.get("current_account_id") or "") != str(account.get("id") or "")
+            ):
+                raise RuntimeError("current_account_id verification mismatch after assignment")
+            return row, removed
+        except Exception as exc:
+            last_error = exc
+            msg = str(exc)
+            match = re.search(
+                r"Could not find the ['\\\"]([^'\\\"]+)['\\\"] column of ['\\\"]traders['\\\"] in the schema cache",
+                msg,
+                re.I,
+            )
+            if not match:
+                raise
+            missing = str(match.group(1) or "").strip()
+            if not missing or missing in required or missing not in payload:
+                raise
+            payload.pop(missing, None)
+            removed.append(missing)
+            print(
+                "V59 TRADER POINTER OPTIONAL COLUMN SKIPPED:",
+                {"column": missing, "trader_id": trader_id, "mt5": account.get("mt5_login")},
+                flush=True,
+            )
+
+    raise RuntimeError(
+        f"current-account pointer update exhausted compatibility retries: {last_error}"
+    )
+
+
 def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="MT5 assigned"):
     stage = str(stage or "").lower()
     if stage not in ACCOUNT_STAGES:
@@ -3070,40 +3146,24 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         staff,
         f"assign_{stage}_mt5"
     )
-    # CURRENT ACCOUNT POINTER SAFETY — 2026-09-11
-    # Any successful fresh assignment (manual or automation) must immediately become
-    # the trader's current/display account.  This prevents a reset successor from
-    # existing only in MT5 Vault while the dashboard keeps an older lifecycle row.
-    # Fail closed if the pointer cannot be persisted: the new MT5 is locked again so
-    # we never leave a tradable account hidden from the trader.
+    # CURRENT ACCOUNT POINTER SAFETY — V59
+    # current_account_id is mandatory. Historical mirror fields such as
+    # traders.trader_account_id are optional and may not exist in every schema.
     try:
-        pointer_rows = (supabase.table("traders").update({
-            "current_account_id": account.get("id"),
-            "trader_account_id": account.get("id"),
-            "challenge_state": _active_state_for_stage(stage),
-            "phase": stage,
-            "status": "funded" if stage == "funded" else "active",
-            "mt5_login": account.get("mt5_login"),
-            "mt5_server": account.get("mt5_server"),
-            "mt5_master_password": account.get("mt5_master_password"),
-            "mt5_password": account.get("mt5_master_password"),
-            "master_password": account.get("mt5_master_password"),
-            "mt5_investor_password": account.get("mt5_investor_password"),
-            "investor_password": account.get("mt5_investor_password"),
-            "account_size": account.get("account_size"),
-            "monitoring_enabled": True,
-            "mt5_account_active": True,
-            "mt5_access_disabled": False,
-            "lifecycle_updated_at": now_iso(),
-            "updated_at": now_iso(),
-        }).eq("id", trader.get("id")).execute().data or [])
-        if not pointer_rows:
-            raise RuntimeError("fresh MT5 assigned but current_account_id pointer was not persisted")
-        trader_row = pointer_rows[0]
+        trader_row, _pointer_optional_columns = _np_update_trader_current_pointer_v59(
+            trader.get("id"), account, stage
+        )
         _invalidate_trader_bootstrap_cache(trader.get("id"))
-        _audit_safe("lifecycle", "current_account_promoted",
-                    f"Fresh {stage} MT5 {account.get('mt5_login')} promoted to current dashboard account",
-                    staff or {"name":"system","username":"system","role":"system"}, account.get("id"))
+        _audit_safe(
+            "lifecycle",
+            "current_account_promoted",
+            (
+                f"Fresh {stage} MT5 {account.get('mt5_login')} promoted to current dashboard account; "
+                f"optional_columns_skipped={_pointer_optional_columns}"
+            ),
+            staff or {"name":"system","username":"system","role":"system"},
+            account.get("id"),
+        )
     except Exception as _pointer_err:
         try:
             supabase.table("trader_accounts").update({
@@ -9164,7 +9224,15 @@ def approve_purchase():
             m=mres.data[0]
         else:
             m=_np_pick_fresh_mt5(p.get("account_size") or 0, "phase1")
-            if not m: return bad("No fresh MT5 (7 days or less) is AUTO READY for this account size",409)
+            if not m:
+                waiting=_np_mark_purchase_approved_waiting_v60(
+                    p, d, "No matching fresh Phase 1 MT5 available at approval time"
+                )
+                return ok({
+                    "purchase": waiting,
+                    "waiting_for_mt5": True,
+                    "target_stage": "phase1",
+                }, "Payment approved. Waiting for the correct fresh Phase 1 MT5; automation will retry.")
         if auto_mode:
             auto_ok,auto_reason=_np_mt5_auto_eligible(m,p.get("account_size") or 0,"phase1")
             if not auto_ok:
@@ -9178,11 +9246,14 @@ def approve_purchase():
                 )
                 m=_np_pick_fresh_mt5(p.get("account_size") or 0,"phase1")
                 if not m:
-                    return bad(
-                        "No genuinely fresh MT5 is currently available for this account size. "
-                        "The purchase remains pending and automation will retry when fresh inventory is available.",
-                        409
+                    waiting=_np_mark_purchase_approved_waiting_v60(
+                        p, d, "Approved purchase waiting for genuinely fresh Phase 1 MT5"
                     )
+                    return ok({
+                        "purchase": waiting,
+                        "waiting_for_mt5": True,
+                        "target_stage": "phase1",
+                    }, "Payment approved. Waiting for the correct fresh Phase 1 MT5; automation will retry.")
         try:
             _np_assert_mt5_pool_matches_stage(m, "phase1")
         except ValueError as exc:
@@ -34820,9 +34891,10 @@ def _np_auto_fulfill_exact_reset_v43(order):
         return {"status":"blocked","reason":"source_or_parent_missing"}
     source, parent = sr[0], pr[0]
 
-    # Original root date decides automation class.
-    if not _np_is_clean_root_v43(parent):
-        return {"status":"legacy_manual","reason":"legacy_root_purchase_manual_only"}
+    # V60: the payment approval itself is an exact human-controlled entitlement.
+    # Once approved, assignment/retry may fulfil it regardless of root purchase date.
+    # This does NOT infer a reset from an old breach; _np_verify_exact_paid_reset_order
+    # below remains mandatory.
 
     if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != stage:
         return {"status":"blocked","reason":"source_stage_mismatch"}
@@ -35003,8 +35075,12 @@ def _np_approve_reset_purchase_payment(p, admin_payload=None):
             if refs:
                 prows = supabase.table("challenge_purchases").select("*").eq("id",refs["parent_purchase_id"]).limit(1).execute().data or []
                 parent = prows[0] if prows else {}
-            if refs and _np_is_clean_root_v43(parent):
-                threading.Thread(target=lambda: _np_auto_fulfill_exact_reset_v43(order), name=f"nairapips-reset-{oid[:8]}", daemon=True).start()
+            if refs:
+                threading.Thread(
+                    target=lambda: _np_auto_fulfill_exact_reset_v43(order),
+                    name=f"nairapips-reset-{oid[:8]}",
+                    daemon=True
+                ).start()
     except Exception as exc:
         print("V43 RESET APPROVAL AUTOFIRE DEFERRED:", exc)
     return resp
@@ -37561,3 +37637,893 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V55
 # NAIRAPIPS_BACKEND_RELEASE: V57_PAYOUT_REJECTION_DELIVERY_RESTORED_2026_09_17
 
 # NAIRAPIPS_BACKEND_RELEASE: V58_REMOVE_PAYOUT_ADMIN_NOTES_2026_09_17
+
+
+
+# ============================================================================
+# NAIRAPIPS V59 — ACTIVATED SECOND-LIFE AUTOFIRE + RETRY
+# 17 SEP 2026
+#
+# Restores the narrow V9 rule that V43's blanket root-date firewall later
+# overrode:
+#
+#   exact Life-1 breach
+#   + Second Life ALREADY ACTIVATED
+#   + waiting for MT5
+#   + no Life-2 successor yet
+#   -> fresh same-size Phase-1 MT5 automatically
+#   -> retry until a correct MT5 becomes available
+#
+# This does NOT turn raw legacy breaches into automatic entitlements and does
+# NOT create Life 3.
+# ============================================================================
+
+NAIRAPIPS_SECOND_LIFE_AUTOFIRE_RELEASE_V59 = "V59_SECOND_LIFE_AUTOFIRE_AND_POINTER_FIX_2026_09_17"
+
+
+def _np_v59_second_life_waiting_authority(purchase, trader_id):
+    p = purchase or {}
+    tid = str(trader_id or p.get("trader_id") or "").strip()
+    pid = str(p.get("id") or "").strip()
+    if not tid or not pid:
+        return {"eligible": False, "reason": "missing_identity"}
+
+    if not _second_life_bool(p.get("second_life_used")):
+        return {"eligible": False, "reason": "second_life_not_activated"}
+
+    status = str(p.get("second_life_status") or "").strip().lower()
+    if status not in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+        return {"eligible": False, "reason": "not_waiting_for_life2_mt5"}
+
+    sl = _second_life_status_payload(p, tid) or {}
+    if not sl.get("enabled"):
+        return {"eligible": False, "reason": "second_life_not_entitled"}
+
+    bridge = _np_second_life_cutover_bridge_v9(p, tid)
+    if not bridge:
+        return {"eligible": False, "reason": "exact_second_life_bridge_not_proven"}
+    if bridge.get("consumed"):
+        return {
+            "eligible": False,
+            "reason": "second_life_already_has_successor",
+            "bridge": bridge,
+        }
+    if not bridge.get("eligible"):
+        return {
+            "eligible": False,
+            "reason": "second_life_bridge_ineligible",
+            "bridge": bridge,
+        }
+
+    return {
+        "eligible": True,
+        "reason": "activated_second_life_waiting_mt5",
+        "bridge": bridge,
+        "source_account": bridge.get("source_account"),
+        "source_account_id": bridge.get("source_account_id"),
+        "source_mt5": bridge.get("source_mt5"),
+        "target_stage": "phase1",
+    }
+
+
+# Final wrapper: ordinary legacy progressions remain manual. ONLY the exact
+# already-activated Second-Life waiting entitlement bypasses the root-date gate.
+_np_auto_assign_waiting_stage_v59_core = _np_auto_assign_waiting_stage
+
+def _np_auto_assign_waiting_stage(
+    trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"
+):
+    p = purchase or {}
+    target = _normalize_lifecycle_stage(stage)
+    why = str(reason or "").strip().lower()
+    trader_id = str((trader or {}).get("id") or p.get("trader_id") or "").strip()
+
+    if target == "phase1" and why == "second_life":
+        authority = _np_v59_second_life_waiting_authority(p, trader_id)
+        if authority.get("eligible"):
+            source = source_account or authority.get("source_account")
+            try:
+                # Protected pre-cutoff core still enforces size/pool/single-use guards.
+                return _np_cutover_auto_assign_v6_core(
+                    trader, "phase1", p, source, "second_life"
+                )
+            except Exception as exc:
+                print(
+                    "V59 ACTIVATED SECOND-LIFE AUTO ASSIGN FAILED:",
+                    {
+                        "purchase": p.get("id"),
+                        "trader": trader_id,
+                        "source_mt5": authority.get("source_mt5"),
+                        "error": str(exc),
+                    },
+                    flush=True,
+                )
+                return None
+
+    return _np_auto_assign_waiting_stage_v59_core(
+        trader, stage, p, source_account, reason
+    )
+
+
+def _np_v59_recover_second_life_assignment_sync_error(purchase, trader_id, actor=None):
+    """Recover one exact untraded MT5 stranded by the old pointer-schema error."""
+    p = purchase or {}
+    tid = str(trader_id or "").strip()
+    pid = str(p.get("id") or "").strip()
+    if not tid or not pid:
+        return None
+
+    if not _second_life_bool(p.get("second_life_used")):
+        return None
+    if str(p.get("second_life_status") or "").strip().lower() not in {
+        "life2_waiting_mt5", "waiting_mt5", "activated"
+    }:
+        return None
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", tid)
+            .eq("purchase_id", pid)
+            .eq("stage", "phase1")
+            .order("created_at", desc=False)
+            .limit(500).execute().data or []
+        )
+    except Exception as exc:
+        print("V59 SYNC-ERROR RECOVERY ACCOUNT LOAD FAILED:", exc)
+        return None
+
+    active = [
+        a for a in rows
+        if str(a.get("account_status") or "").strip().lower()
+        in {"assigned_active", "active", "current_active", "phase1_active", "live"}
+        and str(a.get("mt5_login") or "").strip()
+    ]
+    if active:
+        return {"account": active[-1], "already_fulfilled": True}
+
+    breached = []
+    for a in rows:
+        try:
+            if _np_account_has_breach_evidence(a):
+                breached.append(a)
+        except Exception:
+            pass
+    if not breached:
+        return None
+
+    source = breached[-1]
+    source_time = _np_ja_account_time(source)
+
+    candidates = [
+        a for a in rows
+        if str(a.get("account_status") or "").strip().lower() == "assignment_sync_error"
+        and str(a.get("mt5_login") or "").strip()
+        and _np_ja_account_time(a) >= source_time
+    ]
+    if len(candidates) != 1:
+        if len(candidates) > 1:
+            print(
+                "V59 SYNC-ERROR RECOVERY AMBIGUOUS:",
+                {
+                    "purchase": pid,
+                    "trader": tid,
+                    "candidate_ids": [c.get("id") for c in candidates],
+                },
+                flush=True,
+            )
+        return None
+
+    candidate = candidates[0]
+    candidate_id = str(candidate.get("id") or "").strip()
+
+    # Never revive an account that somehow received a trade.
+    try:
+        trades = (
+            supabase.table("trader_trades").select("id")
+            .eq("trader_account_id", candidate_id)
+            .limit(1).execute().data or []
+        )
+        if trades:
+            return None
+    except Exception as exc:
+        print("V59 SYNC-ERROR RECOVERY TRADE VERIFY FAILED:", exc)
+        return None
+
+    pool_id = str(candidate.get("mt5_pool_id") or "").strip()
+    if not pool_id:
+        return None
+
+    try:
+        pool_rows = (
+            supabase.table("mt5_pool").select("*")
+            .eq("id", pool_id).limit(1).execute().data or []
+        )
+    except Exception as exc:
+        print("V59 SYNC-ERROR RECOVERY POOL LOAD FAILED:", exc)
+        return None
+    if not pool_rows:
+        return None
+
+    pool = pool_rows[0]
+    if str(pool.get("mt5_login") or "").strip() != str(candidate.get("mt5_login") or "").strip():
+        return None
+    pool_owner = str(
+        pool.get("assigned_trader_id") or pool.get("trader_id") or ""
+    ).strip()
+    if pool_owner and pool_owner != tid:
+        return None
+    if str(pool.get("status") or "").strip().lower() not in {
+        "assigned_sync_error", "assigned"
+    }:
+        return None
+
+    try:
+        trader_row, skipped = _np_update_trader_current_pointer_v59(
+            tid, candidate, "phase1"
+        )
+        now = now_iso()
+
+        arows = (
+            supabase.table("trader_accounts").update({
+                "account_status": "assigned_active",
+                "monitoring_enabled": True,
+                "updated_at": now,
+            })
+            .eq("id", candidate_id)
+            .eq("trader_id", tid)
+            .execute().data or []
+        )
+        recovered_account = (
+            arows[0] if arows
+            else dict(candidate, account_status="assigned_active", monitoring_enabled=True)
+        )
+
+        supabase.table("mt5_pool").update({
+            "status": "assigned",
+            "assigned_trader_id": tid,
+            "trader_account_id": candidate_id,
+            "updated_at": now,
+            "admin_note": (
+                "V59 recovered verified assignment after dashboard pointer schema "
+                "compatibility failure."
+            ),
+        }).eq("id", pool_id).execute()
+
+        supabase.table("challenge_purchases").update({
+            "second_life_used": True,
+            "life_number": 2,
+            "second_life_status": "life2_active",
+            "lifecycle_state": "phase1_active",
+            "trader_account_id": candidate_id,
+            "assigned_mt5_id": pool_id,
+            "mt5_login": candidate.get("mt5_login"),
+            "mt5_server": candidate.get("mt5_server"),
+            "updated_at": now,
+        }).eq("id", pid).eq("trader_id", tid).execute()
+
+        try:
+            _np_append_purchase_marker(
+                pid,
+                tid,
+                (
+                    f"[NP_CONSUMED:SECOND_LIFE:{pid}] "
+                    f"replacement_account_id={candidate_id} "
+                    f"replacement_mt5={candidate.get('mt5_login')}"
+                ),
+            )
+        except Exception:
+            pass
+
+        _invalidate_trader_bootstrap_cache(tid)
+
+        # Original assignment stopped before credentials email. Send now.
+        try:
+            trader = get_trader_by_id(tid) or {}
+            email = str(trader.get("email") or "").strip()
+            if email:
+                send_email_safe(
+                    email,
+                    "NairaPips — Your PHASE 1 Second Life MT5 credentials",
+                    (
+                        f"Hello {trader.get('name') or 'Trader'},\n\n"
+                        "Your NairaPips Second Life Phase 1 account is now active.\n\n"
+                        f"MT5 Login: {candidate.get('mt5_login') or '—'}\n"
+                        f"Server: {candidate.get('mt5_server') or '—'}\n"
+                        f"Master Password: {candidate.get('mt5_master_password') or '—'}\n"
+                        f"Investor Password: {candidate.get('mt5_investor_password') or '—'}\n"
+                        f"Account Size: {candidate.get('account_size') or '—'}\n\n"
+                        "This is your one Second Life Phase 1 account for this journey.\n\n"
+                        "NairaPips"
+                    ),
+                )
+        except Exception as mail_exc:
+            print("V59 SECOND-LIFE RECOVERY EMAIL ERROR:", mail_exc)
+
+        _audit_safe(
+            "automation",
+            "v59_second_life_sync_error_recovered",
+            (
+                f"purchase={pid}; source_mt5={source.get('mt5_login')}; "
+                f"recovered_mt5={candidate.get('mt5_login')}; "
+                f"optional_pointer_columns_skipped={skipped}"
+            ),
+            actor or {
+                "name": "automation_retry",
+                "username": "automation_retry",
+                "role": "system",
+            },
+            candidate_id,
+        )
+
+        return {
+            "account": recovered_account,
+            "trader": trader_row,
+            "recovered_sync_error": True,
+        }
+    except Exception as exc:
+        print("V59 SECOND-LIFE SYNC-ERROR RECOVERY FAILED:", exc, flush=True)
+        return None
+
+
+def _np_retry_waiting_second_lives_v19(limit=250):
+    """Retry every exact ALREADY-ACTIVATED Second-Life waiting entitlement."""
+    summary = {
+        "checked": 0,
+        "assigned": 0,
+        "recovered_sync_error": 0,
+        "waiting_inventory": 0,
+        "already_fulfilled": 0,
+        "ineligible": 0,
+        "errors": 0,
+    }
+
+    try:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .in_(
+                "second_life_status",
+                ["life2_waiting_mt5", "waiting_mt5", "activated"],
+            )
+            .eq("second_life_used", True)
+            .order("updated_at", desc=False)
+            .limit(limit).execute().data or []
+        )
+    except Exception as exc:
+        print("V59 SECOND LIFE RETRY LOAD FAILED:", exc)
+        summary["errors"] += 1
+        return summary
+
+    actor = {
+        "name": "automation_retry_v59",
+        "username": "automation_retry_v59",
+        "role": "system",
+    }
+
+    for purchase in rows:
+        try:
+            trader_id = str(purchase.get("trader_id") or "").strip()
+            if not trader_id:
+                summary["errors"] += 1
+                continue
+
+            summary["checked"] += 1
+
+            recovered = _np_v59_recover_second_life_assignment_sync_error(
+                purchase, trader_id, actor
+            )
+            if recovered:
+                if recovered.get("recovered_sync_error"):
+                    summary["recovered_sync_error"] += 1
+                    summary["assigned"] += 1
+                else:
+                    summary["already_fulfilled"] += 1
+                continue
+
+            authority = _np_v59_second_life_waiting_authority(
+                purchase, trader_id
+            )
+            if not authority.get("eligible"):
+                if authority.get("reason") == "second_life_already_has_successor":
+                    summary["already_fulfilled"] += 1
+                else:
+                    summary["ineligible"] += 1
+                continue
+
+            result = _np_retry_waiting_second_life_assignment(
+                purchase, trader_id, actor
+            )
+            if result:
+                if result.get("already_fulfilled") or result.get("already_active"):
+                    summary["already_fulfilled"] += 1
+                else:
+                    summary["assigned"] += 1
+            else:
+                # Correct MT5 unavailable or transient failure: entitlement stays alive.
+                summary["waiting_inventory"] += 1
+
+        except Exception as exc:
+            summary["errors"] += 1
+            print("V59 SECOND LIFE RETRY ERROR:", exc, flush=True)
+
+    return summary
+
+
+@app.route("/admin/automation_v59/status", methods=["GET", "OPTIONS"])
+def admin_automation_v59_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_SECOND_LIFE_AUTOFIRE_RELEASE_V59,
+        "rule": (
+            "ACTIVATED SECOND LIFE WAITING FOR MT5 -> "
+            "AUTO ASSIGN SAME-SIZE PHASE1 + RETRY"
+        ),
+        "root_date_blocks_activated_second_life_assignment": False,
+        "raw_legacy_breach_auto_activation": False,
+        "life3_allowed": False,
+        "no_mt5_behavior": "WAIT_AND_RETRY",
+        "pointer_required": "traders.current_account_id",
+        "optional_pointer_mirror": "traders.trader_account_id",
+        "worker_interval_seconds": globals().get(
+            "_NP_LIFECYCLE_WORKER_INTERVAL_V40", 30
+        ),
+        "last_lifecycle_summary": globals().get(
+            "_NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40", {}
+        ),
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_SECOND_LIFE_AUTOFIRE_RELEASE_V59
+
+
+
+# ============================================================================
+# NAIRAPIPS V60 — MASTER AUTOMATION CONSTITUTION
+# 17 SEP 2026
+#
+# AUTHORITATIVE BUSINESS RULES
+# ----------------------------
+# * There is NO normal Phase 2 progression.
+# * Standard / legacy: Phase 1 PASS -> Funded.
+# * Standard / legacy Phase 1 BREACH -> paid same-stage Phase 1 reset.
+# * 2-Lives Life 1 BREACH -> one free same-stage Phase 1 Life 2.
+# * 2-Lives Life 2 BREACH -> journey closed; no Life 3.
+# * Life 1 or Life 2 Phase 1 PASS -> Funded.
+# * PAID payout -> one fresh Funded renewal; repeatable per unique payout ID.
+# * Payout renewal never consumes Funded Reset.
+# * First Funded breach -> one paid Funded Reset after payment/Admin approval.
+# * Later Funded breach after that reset is consumed -> journey closed.
+# * Operational/Admin recovery stays at the SAME stage and is not progression.
+# * No correct MT5 / transient failure -> WAIT + RETRY.
+# * One exact event -> one entitlement -> one correct-stage MT5 -> consumed.
+#
+# HISTORICAL SAFETY
+# -----------------
+# Old Phase 2 rows are retained as history only. V60 never creates a new Phase 2
+# progression. A historical Phase 2 PASS may move to Funded; a historical Phase 2
+# breach is review-only so production does not manufacture another obsolete stage.
+#
+# CUT-OFF SAFETY
+# --------------
+# Raw historical pass/breach discovery remains protected by the existing clean-root
+# rules. But once a human/payment gate has created an exact approved entitlement
+# (approved purchase waiting for first MT5, approved paid reset, activated Second
+# Life), fulfilment/retry may complete that exact obligation.
+# ============================================================================
+
+NAIRAPIPS_AUTOMATION_CONSTITUTION_RELEASE_V60 = "V60_MASTER_AUTOMATION_CONSTITUTION_2026_09_17"
+
+# New journeys are always Phase 1 -> Funded.
+DEFAULT_CHALLENGE_JOURNEY = ("phase1", "funded")
+ONE_PHASE_CHALLENGE_JOURNEY = ("phase1", "funded")
+
+_np_journey_from_text_v60_core = _journey_from_text
+
+def _journey_from_text(*values):
+    """Normalize all current NairaPips challenge routes to Phase 1 -> Funded.
+
+    Historical Phase 2 metadata is not allowed to create a new Phase 2 entitlement.
+    """
+    raw = _np_journey_from_text_v60_core(*values)
+    if not raw:
+        return None
+
+    stages = tuple(_normalize_lifecycle_stage(x, "") for x in raw)
+    stages = tuple(x for x in stages if x in ACCOUNT_STAGES)
+    if not stages:
+        return None
+
+    # A historical row that itself starts at Phase 2 may still be interpreted for
+    # display/reconciliation, but its next stage is Funded.
+    if stages[0] == "phase2":
+        return ("phase2", "funded")
+
+    if "phase1" in stages:
+        return ("phase1", "funded")
+
+    return stages
+
+
+def _journey_source_value(*values):
+    journey = _journey_from_text(*values)
+    if journey:
+        return list(journey)
+    return ["phase1", "funded"]
+
+
+def _journey_for_lifecycle(account=None, purchase=None, plan=None, trader=None):
+    """Current business authority: Phase 1 -> Funded; Phase 2 is historical only."""
+    account = account or {}
+    purchase = purchase or {}
+    plan = plan or {}
+
+    # Historical exact Phase 2 account may finish to Funded, but no Phase 1 account
+    # may be routed INTO Phase 2.
+    exact_stage = _normalize_lifecycle_stage(
+        account.get("stage") or account.get("phase") or "",
+        ""
+    )
+    if exact_stage == "phase2":
+        return ("phase2", "funded")
+
+    return ("phase1", "funded")
+
+
+def _next_stage_for_lifecycle(stage, account=None, purchase=None, plan=None, trader=None):
+    stage = _normalize_lifecycle_stage(stage)
+    if stage == "phase1":
+        return "funded"
+    if stage == "phase2":  # historical artifact only
+        return "funded"
+    return None
+
+
+def _np_mark_purchase_approved_waiting_v60(purchase, admin_payload=None, reason="Waiting for Phase 1 MT5"):
+    """Persist Admin-approved first-account entitlement when inventory is absent."""
+    p = purchase or {}
+    pid = str(p.get("id") or "").strip()
+    if not pid:
+        raise ValueError("purchase id is required")
+
+    now = now_iso()
+    marker = f"[NP_ENTITLEMENT:FIRST_PHASE1:{pid}]"
+    old_note = str(p.get("admin_note") or "").strip()
+    note = old_note
+    if marker.lower() not in old_note.lower():
+        note = (old_note + " | " + marker + " " + str(reason or "")).strip(" |")
+
+    rows = (
+        supabase.table("challenge_purchases").update({
+            "payment_status": "approved",
+            "status": "approved_waiting_mt5",
+            "lifecycle_state": "phase1_waiting_mt5",
+            "approved_at": p.get("approved_at") or now,
+            "updated_at": now,
+            "admin_note": note,
+        })
+        .eq("id", pid)
+        .execute().data or []
+    )
+    if not rows:
+        raise RuntimeError("Payment approval could not be persisted in WAITING FOR MT5 state")
+
+    try:
+        _audit_safe(
+            "challenge_purchases",
+            "approved_waiting_mt5",
+            f"Purchase {pid} approved; Phase 1 entitlement waiting for correct MT5",
+            _admin_from_payload(admin_payload or {}),
+            pid,
+        )
+    except Exception:
+        pass
+
+    return rows[0]
+
+
+def _np_retry_approved_first_phase1_v60(limit=250):
+    """Fulfil exact Admin-approved first-Phase1 obligations; never guess payment."""
+    summary = {
+        "checked": 0,
+        "assigned": 0,
+        "already_fulfilled": 0,
+        "waiting_inventory": 0,
+        "blocked": 0,
+        "errors": 0,
+    }
+
+    try:
+        purchases = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("payment_status", "approved")
+            .eq("status", "approved_waiting_mt5")
+            .order("updated_at", desc=False)
+            .limit(max(1, min(int(limit or 250), 1000)))
+            .execute().data or []
+        )
+    except Exception as exc:
+        summary["errors"] = 1
+        summary["error"] = str(exc)
+        return summary
+
+    actor = {
+        "name": "automation_constitution_v60",
+        "username": "automation_constitution_v60",
+        "role": "system",
+    }
+
+    for purchase in purchases:
+        summary["checked"] += 1
+        try:
+            pid = str(purchase.get("id") or "").strip()
+            tid = str(purchase.get("trader_id") or "").strip()
+            marker = f"[np_entitlement:first_phase1:{pid}]".lower()
+            if not pid or not tid or marker not in str(purchase.get("admin_note") or "").lower():
+                summary["blocked"] += 1
+                continue
+
+            # Exact replay guard: ANY existing real account for this purchase means
+            # first-account entitlement is already fulfilled.
+            existing = (
+                supabase.table("trader_accounts").select("*")
+                .eq("trader_id", tid)
+                .eq("purchase_id", pid)
+                .limit(10).execute().data or []
+            )
+            existing_real = [
+                a for a in existing
+                if str(a.get("mt5_login") or "").strip()
+                and str(a.get("account_status") or a.get("status") or "").lower()
+                not in {"assignment_sync_error"}
+            ]
+            if existing_real:
+                summary["already_fulfilled"] += 1
+                continue
+
+            trader = get_trader_by_id(tid)
+            if not trader:
+                summary["blocked"] += 1
+                continue
+
+            size = clean(purchase.get("account_size") or 0)
+            if not size:
+                summary["blocked"] += 1
+                continue
+
+            mt5 = _np_pick_fresh_mt5(size, "phase1")
+            if not mt5:
+                summary["waiting_inventory"] += 1
+                continue
+
+            account, _ = _assign_mt5_to_trader(
+                trader,
+                mt5,
+                "phase1",
+                purchase,
+                actor,
+                f"V60 APPROVED PURCHASE AUTO-FULFIL · purchase={pid}",
+            )
+            if account:
+                summary["assigned"] += 1
+        except Exception as exc:
+            summary["errors"] += 1
+            print("V60 FIRST PHASE1 RETRY ERROR:", exc, flush=True)
+
+    return summary
+
+
+# Historical Phase 2 can never be a new normal progression target.
+_np_assign_phase_mt5_v60_core = app.view_functions.get("assign_phase_mt5")
+
+def _np_assign_phase_mt5_v60():
+    if request.method == "OPTIONS":
+        return _np_assign_phase_mt5_v60_core()
+
+    d = request.get_json(silent=True) or {}
+    requested = _normalize_lifecycle_stage(
+        d.get("phase") or d.get("target_stage") or d.get("stage") or ""
+    )
+
+    if requested == "phase2":
+        source_id = str(
+            d.get("completed_account_id")
+            or d.get("source_account_id")
+            or d.get("trader_account_id")
+            or ""
+        ).strip()
+        source = None
+        if source_id:
+            for prefix in ("waiting:", "reset-waiting:", "recall-waiting:"):
+                if source_id.startswith(prefix):
+                    source_id = source_id.split(":", 1)[1]
+                    if ":" in source_id and prefix == "waiting:":
+                        source_id = source_id.split(":", 1)[0]
+                    break
+            rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", source_id).limit(1).execute().data or []
+            )
+            source = rows[0] if rows else None
+
+        source_stage = _normalize_lifecycle_stage(
+            (source or {}).get("stage") or (source or {}).get("phase") or ""
+        )
+        source_status = str(
+            (source or {}).get("account_status") or (source or {}).get("status") or ""
+        ).lower()
+
+        # Preserve only a forensic same-stage operational replacement for a
+        # historical Phase2 source. Never Phase1 -> Phase2 progression.
+        historical_same_stage_recovery = (
+            source_stage == "phase2"
+            and (
+                source_status.startswith("archived_reset")
+                or "recalled" in source_status
+                or "[np_entitlement:admin_recovery]" in _np_kill_blob(source)
+            )
+        )
+        if not historical_same_stage_recovery:
+            return _np_fail(
+                "Phase 2 progression is retired. NairaPips progression is Phase 1 -> Funded. "
+                "Refresh this journey and assign the exact Funded entitlement instead.",
+                409,
+            )
+
+    return _np_assign_phase_mt5_v60_core()
+
+if _np_assign_phase_mt5_v60_core:
+    app.view_functions["assign_phase_mt5"] = _np_assign_phase_mt5_v60
+
+
+# V60 reset policy wrapper: current standard/legacy Phase1 reset and Funded reset
+# remain paid; 2-Lives retains its one free Second Life. Historical Phase2 breach
+# is never auto-created/reset into more obsolete Phase2 inventory.
+_np_reset_policy_v60_core = _np_reset_policy
+
+def _np_reset_policy(account, trader=None):
+    account = account or {}
+    stage = _normalize_lifecycle_stage(account.get("stage") or account.get("phase"))
+
+    if stage == "phase2" and _np_reset_account_is_breached(account):
+        return {
+            "eligible": False,
+            "kind": "review",
+            "reason": "historical_phase2_requires_reconciliation",
+            "title": "Historical Phase 2 — Manual Reconciliation Required",
+            "subtitle": (
+                "NairaPips no longer progresses through Phase 2. This historical "
+                "Phase 2 breach must be reconciled without creating a new Phase 2 journey."
+            ),
+            "stage": "phase2",
+            "account_size": clean(account.get("account_size") or account.get("start_balance") or 0),
+            "source_account_id": account.get("id"),
+            "source_mt5_login": account.get("mt5_login"),
+        }
+
+    return _np_reset_policy_v60_core(account, trader)
+
+
+# Consolidated lifecycle cycle. Existing payout and paid-reset daemons remain
+# separate to avoid double-processing; this cycle owns first Phase1, pass->Funded
+# and activated Second Life retry.
+_np_run_verified_lifecycle_cycle_v60_core = _np_run_verified_lifecycle_cycle_v40
+
+def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
+    global _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40
+
+    if "_np_interactive_priority_active_v47" in globals():
+        try:
+            if _np_interactive_priority_active_v47():
+                summary = {
+                    "release": NAIRAPIPS_AUTOMATION_CONSTITUTION_RELEASE_V60,
+                    "trigger": trigger,
+                    "started_at": now_iso(),
+                    "finished_at": now_iso(),
+                    "deferred_for_admin_read": True,
+                    "first_phase1": {},
+                    "phase_pass_to_funded": {},
+                    "second_life": {},
+                    "errors": 0,
+                }
+                _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40 = summary
+                return summary
+        except Exception:
+            pass
+
+    summary = {
+        "release": NAIRAPIPS_AUTOMATION_CONSTITUTION_RELEASE_V60,
+        "trigger": trigger,
+        "started_at": now_iso(),
+        "first_phase1": {},
+        "phase_pass_to_funded": {},
+        "second_life": {},
+        "errors": 0,
+    }
+
+    try:
+        summary["first_phase1"] = _np_retry_approved_first_phase1_v60(limit=100)
+    except Exception as exc:
+        summary["errors"] += 1
+        summary["first_phase1"] = {"errors": 1, "error": str(exc)}
+
+    try:
+        summary["phase_pass_to_funded"] = _np_retry_clean_pass_funded_v19(limit=100)
+    except Exception as exc:
+        summary["errors"] += 1
+        summary["phase_pass_to_funded"] = {"errors": 1, "error": str(exc)}
+
+    try:
+        summary["second_life"] = _np_retry_waiting_second_lives_v19(limit=100)
+    except Exception as exc:
+        summary["errors"] += 1
+        summary["second_life"] = {"errors": 1, "error": str(exc)}
+
+    summary["finished_at"] = now_iso()
+    _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40 = summary
+    return summary
+
+
+def _np_v60_rule_matrix():
+    return {
+        "new_purchase": "PAYMENT APPROVED -> PHASE1 -> ACTIVE; no MT5 = WAIT+RETRY",
+        "standard_phase1_pass": "PHASE1 PASS -> FUNDED",
+        "standard_phase1_breach": "PAID PHASE1 RESET -> SAME STAGE",
+        "two_lives_life1_breach": "ONE FREE SECOND LIFE -> FRESH PHASE1",
+        "two_lives_life2_breach": "JOURNEY CLOSED; NO LIFE3",
+        "second_life_pass": "PHASE1 PASS -> FUNDED",
+        "payout_paid": "ONE PAYOUT ID -> ONE FRESH FUNDED RENEWAL",
+        "payout_vs_reset": "PAYOUT RENEWAL DOES NOT CONSUME FUNDED RESET",
+        "first_funded_breach": "PAID FUNDED RESET -> SAME STAGE",
+        "later_funded_breach_after_reset": "JOURNEY CLOSED",
+        "legacy_progression": "PHASE1 -> FUNDED; NO PHASE2",
+        "legacy_phase1_breach": "PAID PHASE1 RESET -> SAME STAGE",
+        "legacy_funded_breach": "PAID FUNDED RESET -> SAME STAGE",
+        "operational_replacement": "SAME STAGE; NEVER PROGRESSION",
+        "no_inventory": "WAIT+RETRY; ENTITLEMENT REMAINS ALIVE",
+        "technical_failure": "WAIT+RETRY; ATTEMPT DOES NOT CONSUME",
+        "replay_guard": "ONE EXACT EVENT -> ONE ENTITLEMENT -> ONE MT5 -> DEAD",
+    }
+
+
+@app.route("/admin/automation_v60/status", methods=["GET", "OPTIONS"])
+def admin_automation_v60_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_AUTOMATION_CONSTITUTION_RELEASE_V60,
+        "rules": _np_v60_rule_matrix(),
+        "new_phase2_progression_allowed": False,
+        "historical_phase2_rows_deleted": False,
+        "raw_historical_events_auto_replayed": False,
+        "approved_payment_entitlements_auto_fulfil": True,
+        "workers": {
+            "first_phase1": "V60 lifecycle worker",
+            "phase1_pass_to_funded": "V60/V44 exact pass retry",
+            "second_life": "V59/V60 exact activated entitlement retry",
+            "paid_reset": "V43/V44 exact approved payment retry, V60 legacy-safe fulfilment",
+            "payout_renewal": "V33 exact PAID payout worker",
+        },
+        "last_lifecycle_summary": globals().get("_NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40", {}),
+        "last_reset_summary": globals().get("_NP_RESET_AUTOFIRE_LAST_V43", {}),
+        "last_payout_summary": (
+            globals().get("_NP_PAYOUT_RENEWAL_LAST_SUMMARY_V33")
+            or globals().get("_NP_PAYOUT_RENEWAL_LAST_SUMMARY_V31")
+            or {}
+        ),
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_CONSTITUTION_RELEASE_V60
+
