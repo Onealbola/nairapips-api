@@ -40487,3 +40487,196 @@ def admin_automation_v64_status():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_PRICE_RELEASE_V64
 
+
+
+# ============================================================================
+# NAIRAPIPS V65 — TRADER EXACT RESET PRIORITY
+# 18 SEP 2026
+#
+# Multiple independent journeys may coexist. An older Second-Life opportunity
+# must not hide a newer breached Funded account that now requires the one paid
+# Funded Reset workflow.
+#
+# /trader_reset_opportunities returns:
+#   opportunity   = latest exact unresolved recovery event (primary)
+#   opportunities = all unresolved independent opportunities
+#
+# Visibility only: V63/V64 remain payment/lineage/replay authority.
+# ============================================================================
+
+NAIRAPIPS_TRADER_RESET_PRIORITY_RELEASE_V65 = "V65_TRADER_EXACT_RESET_PRIORITY_2026_09_18"
+
+def _np_v65_opportunity_event_time(opportunity, by_id):
+    op = opportunity or {}
+    source = by_id.get(str(op.get("source_account_id") or "").strip()) or {}
+    return _dt_score(
+        source.get("breached_at") or source.get("breach_at")
+        or source.get("reset_at") or source.get("archived_at")
+        or source.get("updated_at") or source.get("created_at")
+        or op.get("updated_at") or op.get("created_at")
+    )
+
+def _np_v65_normalize_reset_opportunity(policy):
+    p = policy or {}
+    if not p:
+        return None
+    return {
+        "eligible": bool(p.get("eligible")),
+        "kind": p.get("kind"),
+        "reason": p.get("reason"),
+        "title": p.get("title"),
+        "subtitle": p.get("subtitle"),
+        "stage": p.get("stage"),
+        "account_size": clean(p.get("account_size") or 0),
+        "source_account_id": p.get("source_account_id"),
+        "source_mt5_login": p.get("source_mt5_login"),
+        "purchase_id": p.get("purchase_id"),
+        "reset_order_id": p.get("reset_order_id"),
+        "plan_id": p.get("plan_id"),
+        "plan_name": p.get("plan_name"),
+        "price": clean(p.get("price") or 0),
+        "authority": p.get("authority") or "RESET_POLICY",
+    }
+
+def _np_v65_opportunity_priority(op):
+    kind = str((op or {}).get("kind") or "").strip().lower()
+    return {
+        "waiting": 100,
+        "payment_pending": 95,
+        "paid_funded": 90,
+        "paid_challenge": 85,
+        "free_second_life": 80,
+        "terminal": 30,
+        "review": 20,
+    }.get(kind, 10)
+
+_NP_V65_PREVIOUS_TRADER_RESET_VIEW = app.view_functions.get("trader_reset_opportunities")
+
+def _np_v65_trader_reset_opportunities():
+    base_result = _NP_V65_PREVIOUS_TRADER_RESET_VIEW()
+    try:
+        response = app.make_response(base_result)
+        base_data = response.get_json(silent=True) or {}
+        base_op = base_data.get("opportunity")
+        if base_op is None and isinstance(base_data.get("data"), dict):
+            base_op = base_data["data"].get("opportunity")
+
+        if request.method == "OPTIONS":
+            return response
+
+        requested = str(request.args.get("trader_id") or "").strip()
+        authed_id, auth_error = _authenticated_trader_id_for_request(requested)
+        if auth_error or not authed_id:
+            return response
+
+        trader = get_trader_by_id(authed_id) or {}
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", authed_id)
+            .order("updated_at", desc=True)
+            .limit(1000).execute().data or []
+        )
+        by_id = {
+            str(a.get("id") or "").strip(): a
+            for a in rows if str(a.get("id") or "").strip()
+        }
+
+        candidates = []
+        keys = set()
+
+        def add(op):
+            if not op or not str(op.get("kind") or "").strip():
+                return
+            key = (
+                str(op.get("kind") or "").strip().lower(),
+                str(op.get("source_account_id") or "").strip(),
+                str(op.get("purchase_id") or "").strip(),
+                str(op.get("reset_order_id") or "").strip(),
+            )
+            if key in keys:
+                return
+            keys.add(key)
+            item = dict(op)
+            item["_event_score"] = _np_v65_opportunity_event_time(item, by_id)
+            item["_priority"] = _np_v65_opportunity_priority(item)
+            candidates.append(item)
+
+        # Keep old reconciled route result (Second Life / payout compatibility).
+        add(base_op)
+
+        breached = [a for a in rows if _np_reset_account_is_breached(a)]
+        breached.sort(
+            key=lambda a: _dt_score(
+                a.get("breached_at") or a.get("breach_at")
+                or a.get("updated_at") or a.get("created_at")
+            ),
+            reverse=True,
+        )
+
+        for source in breached:
+            try:
+                if _np_reset_source_already_replaced(source, rows):
+                    continue
+            except Exception:
+                pass
+
+            stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+            policy = (
+                _np_v62_direct_funded_reset_policy(source, trader)
+                if stage == "funded"
+                else _np_reset_policy(source, trader)
+            )
+            kind = str((policy or {}).get("kind") or "").strip().lower()
+            if kind not in {
+                "paid_funded","paid_challenge","payment_pending",
+                "waiting","terminal","review"
+            }:
+                continue
+            add(_np_v65_normalize_reset_opportunity(policy))
+
+        candidates.sort(
+            key=lambda x: (
+                float(x.get("_event_score") or 0),
+                int(x.get("_priority") or 0),
+            ),
+            reverse=True,
+        )
+
+        public = [
+            {k:v for k,v in item.items() if not k.startswith("_")}
+            for item in candidates
+        ]
+        primary = public[0] if public else None
+
+        return _np_ok({
+            "success": True,
+            "opportunity": primary,
+            "opportunities": public,
+            "release": NAIRAPIPS_TRADER_RESET_PRIORITY_RELEASE_V65,
+            "selection_rule": "LATEST_EXACT_UNRESOLVED_EVENT_FIRST",
+        })
+    except Exception as exc:
+        print("V65 TRADER RESET PRIORITY WRAPPER SKIPPED:", exc, flush=True)
+        return base_result
+
+if _NP_V65_PREVIOUS_TRADER_RESET_VIEW:
+    app.view_functions["trader_reset_opportunities"] = _np_v65_trader_reset_opportunities
+
+@app.route("/admin/automation_v65/status", methods=["GET", "OPTIONS"])
+def admin_automation_v65_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_TRADER_RESET_PRIORITY_RELEASE_V65,
+        "trader_reset_endpoint_returns_all": True,
+        "primary_rule": "LATEST EXACT UNRESOLVED EVENT",
+        "older_independent_opportunity_discarded": False,
+        "funded_reset_payment_lock": "V63/V64",
+        "reset_replay_lock": "V63",
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_TRADER_RESET_PRIORITY_RELEASE_V65
