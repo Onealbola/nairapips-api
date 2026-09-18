@@ -40292,3 +40292,198 @@ def admin_reset_integrity_v63_status():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_SAFETY_RELEASE_V63
 
+
+
+# ============================================================================
+# NAIRAPIPS V64 — RESET PRICE AUTHORITY COMPLETION
+# 18 SEP 2026
+#
+# The Cockpit safe-lock in Admin V60 is working correctly: it refuses to assign
+# when the backend returns only a review/unresolved state. The remaining gap was
+# the backend price resolver. Purchase/Admin pages already recognise price fields
+# such as amount_paid / payment_amount / plan_fee, but the reset authority did not.
+#
+# Result:
+# exact breached Funded account + unused Funded Reset + exact root purchase
+# -> RESET_PAYMENT_REQUIRED, with a real paid amount
+#
+# No free reset is created. If no non-zero price can be proven, V63/V62 still
+# fails closed for review.
+# ============================================================================
+
+NAIRAPIPS_RESET_PRICE_RELEASE_V64 = "V64_RESET_PRICE_AUTHORITY_COMPLETION_2026_09_18"
+
+
+def _np_v64_positive_money(row, keys):
+    row = row or {}
+    for key in keys:
+        try:
+            value = clean(row.get(key))
+        except Exception:
+            value = 0
+        if value and value > 0:
+            return float(value), key
+    return 0.0, ""
+
+
+def _np_v61_reset_price(account, purchase):
+    """Final reset-price authority used by V61/V62/V63 Funded-reset decisions.
+
+    Priority:
+    1) explicit reset-price fields on current matching plan
+    2) standard fee/price fields on current plan
+    3) exact root purchase transaction amount
+
+    The last fallback is safe because this business model uses the paid challenge
+    amount as the reset amount when no separate reset fee is stored. It never
+    returns zero as an eligible paid reset.
+    """
+    account = account or {}
+    purchase = purchase or {}
+
+    plan = {}
+    try:
+        plan = _np_reset_current_plan_for(account, purchase) or {}
+    except Exception:
+        plan = {}
+
+    # Prefer an explicitly stored reset fee if production plans contain one.
+    price, key = _np_v64_positive_money(
+        plan,
+        (
+            "funded_reset_fee",
+            "reset_fee",
+            "reset_price",
+            "reset_amount",
+            "replacement_fee",
+        ),
+    )
+    if price > 0:
+        return price, plan, f"current_plan_{key}"
+
+    # Normal plan/challenge fee fields.
+    price, key = _np_v64_positive_money(
+        plan,
+        (
+            "fee",
+            "price",
+            "challenge_fee",
+            "plan_fee",
+            "amount",
+            "final_fee",
+            "amount_due",
+        ),
+    )
+    if price > 0:
+        return price, plan, f"current_plan_{key}"
+
+    # Exact root purchase transaction. These are the same fields used by the
+    # production Admin purchase screen, including amount_paid/payment_amount.
+    price, key = _np_v64_positive_money(
+        purchase,
+        (
+            "reset_fee",
+            "funded_reset_fee",
+            "final_fee",
+            "amount_due",
+            "amount_paid",
+            "payment_amount",
+            "plan_fee",
+            "challenge_fee",
+            "challenge_price",
+            "fee",
+            "price",
+            "original_fee",
+            "paid_amount",
+            "amount",
+        ),
+    )
+    if price > 0:
+        return price, purchase, f"root_purchase_{key}"
+
+    return 0.0, plan or purchase or {}, "unresolved"
+
+
+@app.route("/admin/automation_v64/reset_price_diagnostic", methods=["GET", "OPTIONS"])
+def admin_automation_v64_reset_price_diagnostic():
+    """Read-only diagnostic for one exact breached account."""
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    account_id = str(request.args.get("account_id") or "").strip()
+    if not account_id:
+        return _np_fail("account_id is required", 400)
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", account_id).limit(1).execute().data or []
+        )
+        if not rows:
+            return _np_fail("account not found", 404)
+
+        account = rows[0]
+        purchase = _np_reset_purchase_for_account(account) or {}
+        price, price_row, source = _np_v61_reset_price(account, purchase)
+        policy = _np_v62_direct_funded_reset_policy(
+            account,
+            get_trader_by_id(str(account.get("trader_id") or "").strip()) or {},
+        )
+
+        return _np_ok({
+            "success": True,
+            "release": NAIRAPIPS_RESET_PRICE_RELEASE_V64,
+            "account_id": account_id,
+            "mt5_login": account.get("mt5_login"),
+            "stage": _normalize_lifecycle_stage(account.get("stage") or account.get("phase")),
+            "breached": bool(_np_reset_account_is_breached(account)),
+            "purchase_id": purchase.get("id"),
+            "purchase_plan": purchase.get("plan_name") or purchase.get("selected_plan"),
+            "resolved_price": price,
+            "price_source": source,
+            "policy_kind": policy.get("kind"),
+            "policy_reason": policy.get("reason"),
+            "policy_title": policy.get("title"),
+        })
+    except Exception as exc:
+        print("V64 RESET PRICE DIAGNOSTIC ERROR:", exc, flush=True)
+        return _np_fail("Reset price diagnostic failed: " + str(exc), 500)
+
+
+@app.route("/admin/automation_v64/status", methods=["GET", "OPTIONS"])
+def admin_automation_v64_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_RESET_PRICE_RELEASE_V64,
+        "reset_price_fields_supported": [
+            "funded_reset_fee",
+            "reset_fee",
+            "reset_price",
+            "amount_paid",
+            "payment_amount",
+            "plan_fee",
+            "challenge_fee",
+            "challenge_price",
+            "fee",
+            "price",
+            "final_fee",
+            "amount_due",
+            "amount",
+        ],
+        "zero_price_creates_reset": False,
+        "direct_funded_reset_authority": "V62/V63",
+        "anti_replay_lock": "V63",
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_PRICE_RELEASE_V64
+
