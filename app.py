@@ -38527,3 +38527,598 @@ def admin_automation_v60_status():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_CONSTITUTION_RELEASE_V60
 
+
+
+# ============================================================================
+# NAIRAPIPS V61 — FIRST FUNDED BREACH RESET PROGRESSION COMPLETION
+# 18 SEP 2026
+#
+# Exact business law:
+#   Phase 1 -> Funded -> first Funded breach
+#   -> ONE paid Funded Reset opportunity
+#   -> payment proof/Admin approval
+#   -> fresh same-size Funded MT5
+#   -> Funded Reset permanently consumed
+#
+# Payout renewal is independent and does NOT consume this right.
+# Challenge/Second-Life reset usage does NOT consume this right.
+# A later Funded breach AFTER the paid Funded Reset was consumed closes journey.
+#
+# V61 fixes two authority gaps:
+# 1) Some Funded successors inherit the journey through parent-account lineage
+#    even when their direct purchase_id mirror is absent/stale.
+# 2) A missing/inactive challenge_plans row must not make the reset right vanish
+#    when the exact root purchase itself proves the paid challenge price.
+#
+# No free reset is created here. This patch only exposes the PAYMENT REQUIRED
+# state for a first Funded breach and keeps all replay/consumption locks.
+# ============================================================================
+
+NAIRAPIPS_FUNDED_RESET_PROGRESS_RELEASE_V61 = "V61_FUNDED_RESET_PROGRESS_COMPLETION_2026_09_18"
+
+
+def _np_v61_parent_account_id(account):
+    a = account or {}
+    return str(
+        a.get("previous_account_id")
+        or a.get("previous_trader_account_id")
+        or a.get("replaces_trader_account_id")
+        or a.get("source_account_id")
+        or a.get("reset_trader_account_id")
+        or a.get("parent_account_id")
+        or ""
+    ).strip()
+
+
+_np_reset_purchase_for_account_v61_core = _np_reset_purchase_for_account
+
+def _np_reset_purchase_for_account(account):
+    """Resolve the exact root purchase through account lineage, not trader identity."""
+    a = account or {}
+
+    # Normal/direct path first.
+    try:
+        direct = _np_reset_purchase_for_account_v61_core(a)
+        if direct:
+            return direct
+    except Exception:
+        pass
+
+    trader_id = str(a.get("trader_id") or "").strip()
+    if not trader_id:
+        return None
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", trader_id)
+            .limit(1000).execute().data or []
+        )
+    except Exception:
+        return None
+
+    by_id = {
+        str(r.get("id") or "").strip(): r
+        for r in rows
+        if str(r.get("id") or "").strip()
+    }
+
+    cur = a
+    seen = set()
+    purchase_id = ""
+
+    for _ in range(30):
+        pid = str(
+            cur.get("purchase_id")
+            or cur.get("challenge_purchase_id")
+            or ""
+        ).strip()
+        if pid:
+            purchase_id = pid
+            break
+
+        cid = str(cur.get("id") or "").strip()
+        if not cid or cid in seen:
+            break
+        seen.add(cid)
+
+        parent_id = _np_v61_parent_account_id(cur)
+        if not parent_id:
+            break
+        parent = by_id.get(parent_id)
+        if not parent:
+            break
+        cur = parent
+
+    if not purchase_id:
+        return None
+
+    try:
+        prows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("id", purchase_id)
+            .eq("trader_id", trader_id)
+            .limit(1).execute().data or []
+        )
+        return prows[0] if prows else None
+    except Exception:
+        return None
+
+
+def _np_v61_reset_price(account, purchase):
+    """Resolve paid reset price without turning an unresolved price into a free reset."""
+    account = account or {}
+    purchase = purchase or {}
+
+    # Preferred authority: current matching challenge plan.
+    try:
+        plan = _np_reset_current_plan_for(account, purchase) or {}
+        price = _np_reset_price(plan)
+        if price > 0:
+            return float(price), plan, "current_plan"
+    except Exception:
+        plan = {}
+
+    # Safe fallback: exact root purchase price. This remains a PAID reset.
+    for key in (
+        "final_fee", "amount_due", "fee", "price",
+        "challenge_fee", "original_fee", "amount"
+    ):
+        try:
+            value = clean(purchase.get(key))
+        except Exception:
+            value = 0
+        if value and value > 0:
+            return float(value), purchase, f"root_purchase_{key}"
+
+    return 0.0, plan or {}, "unresolved"
+
+
+_np_reset_policy_v61_core = _np_reset_policy
+
+def _np_reset_policy(account, trader=None):
+    """V61 final reset authority.
+
+    The generic V60 authority remains primary. We only repair the exact first
+    Funded-breach case when lineage/price mirrors prevented it from being surfaced.
+    """
+    a = account or {}
+    policy = _np_reset_policy_v61_core(a, trader) or {}
+
+    if not a or not _np_reset_account_is_breached(a):
+        return policy
+
+    stage = _normalize_lifecycle_stage(a.get("stage") or a.get("phase"))
+    if stage != "funded":
+        return policy
+
+    # If the existing authority already knows the exact outcome, keep it.
+    kind = str(policy.get("kind") or "").strip().lower()
+    if kind in {
+        "paid_funded", "payment_pending", "waiting", "terminal"
+    }:
+        return policy
+
+    source_id = str(a.get("id") or "").strip()
+    purchase = _np_reset_purchase_for_account(a) or {}
+    purchase_id = str(purchase.get("id") or "").strip()
+    size = clean(
+        a.get("account_size")
+        or a.get("start_balance")
+        or purchase.get("account_size")
+        or 0
+    )
+
+    # Existing reset-payment proof always wins before creating another request.
+    open_order = _np_reset_open_order(source_id)
+    if open_order:
+        st = str(
+            open_order.get("payment_status")
+            or open_order.get("status")
+            or ""
+        ).strip().lower()
+        if st in {"approved", "paid", "completed", "assigned"}:
+            return {
+                "eligible": True,
+                "kind": "waiting",
+                "reason": "reset_payment_approved",
+                "title": "Funded Reset Approved — Fresh Funded MT5 Pending",
+                "subtitle": (
+                    "Your Funded reset payment is approved. Do not pay again. "
+                    "NairaPips will assign one fresh Funded MT5 at the same size."
+                ),
+                "stage": "funded",
+                "account_size": size,
+                "source_account_id": source_id,
+                "source_mt5_login": a.get("mt5_login"),
+                "purchase_id": purchase_id or None,
+                "reset_order_id": open_order.get("id"),
+                "price": clean(
+                    open_order.get("fee")
+                    or open_order.get("amount_due")
+                    or 0
+                ),
+                "authority": "V61_EXACT_FUNDED_RESET",
+            }
+        return {
+            "eligible": True,
+            "kind": "payment_pending",
+            "reason": "reset_payment_under_review",
+            "title": "Funded Reset Payment Under Review",
+            "subtitle": (
+                "Your Funded reset payment proof has been submitted. "
+                "Admin approval is required before the fresh Funded MT5 is issued."
+            ),
+            "stage": "funded",
+            "account_size": size,
+            "source_account_id": source_id,
+            "source_mt5_login": a.get("mt5_login"),
+            "purchase_id": purchase_id or None,
+            "reset_order_id": open_order.get("id"),
+            "price": clean(
+                open_order.get("fee")
+                or open_order.get("amount_due")
+                or 0
+            ),
+            "authority": "V61_EXACT_FUNDED_RESET",
+        }
+
+    # Exact terminal guards. Challenge reset / Second Life use is intentionally
+    # NOT checked here; those rights are independent from Funded Reset.
+    if _np_funded_reset_child_already_used(a):
+        return {
+            "eligible": False,
+            "kind": "terminal",
+            "reason": "funded_reset_replacement_breached_journey_complete",
+            "title": "Funded Journey Complete",
+            "subtitle": (
+                "This Funded account came from the one paid Funded Reset already "
+                "used on this journey. It has now breached, so the journey is closed."
+            ),
+            "stage": "funded",
+            "account_size": size,
+            "source_account_id": source_id,
+            "source_mt5_login": a.get("mt5_login"),
+            "purchase_id": purchase_id or None,
+            "price": 0,
+            "authority": "V61_EXACT_FUNDED_RESET",
+        }
+
+    if purchase and _np_reset_bool(purchase.get("funded_reset_used")):
+        return {
+            "eligible": False,
+            "kind": "terminal",
+            "reason": "funded_reset_already_used",
+            "title": "Funded Reset Already Used",
+            "subtitle": (
+                "This journey has already consumed its one paid Funded Reset. "
+                "Start a new Challenge to continue."
+            ),
+            "stage": "funded",
+            "account_size": size,
+            "source_account_id": source_id,
+            "source_mt5_login": a.get("mt5_login"),
+            "purchase_id": purchase_id or None,
+            "price": 0,
+            "authority": "V61_EXACT_FUNDED_RESET",
+        }
+
+    # A first Funded breach MUST surface the paid reset right if we can prove the
+    # exact root journey and a non-zero paid price.
+    if not purchase_id:
+        return {
+            "eligible": False,
+            "kind": "review",
+            "reason": "funded_reset_root_purchase_unresolved",
+            "title": "Funded Reset Journey Link Requires Review",
+            "subtitle": (
+                "The Funded breach is confirmed, but the exact root Challenge could "
+                "not be proven through account lineage. No reset was created."
+            ),
+            "stage": "funded",
+            "account_size": size,
+            "source_account_id": source_id,
+            "source_mt5_login": a.get("mt5_login"),
+            "price": 0,
+            "authority": "V61_EXACT_FUNDED_RESET",
+        }
+
+    price, price_row, price_source = _np_v61_reset_price(a, purchase)
+    if price <= 0:
+        return {
+            "eligible": False,
+            "kind": "review",
+            "reason": "funded_reset_price_unresolved",
+            "title": "Funded Reset Price Requires Review",
+            "subtitle": (
+                "The one Funded Reset right is intact, but the paid reset price "
+                "could not be resolved safely. No free reset was created."
+            ),
+            "stage": "funded",
+            "account_size": size,
+            "source_account_id": source_id,
+            "source_mt5_login": a.get("mt5_login"),
+            "purchase_id": purchase_id,
+            "price": 0,
+            "authority": "V61_EXACT_FUNDED_RESET",
+        }
+
+    return {
+        "eligible": True,
+        "kind": "paid_funded",
+        "reason": "funded_reset_payment_required",
+        "title": "One Funded Reset Available",
+        "subtitle": (
+            "This is the first Funded breach on this journey. One paid Funded Reset "
+            "is available. After payment proof and Admin approval, NairaPips will "
+            "issue one fresh Funded MT5 at the same account size."
+        ),
+        "stage": "funded",
+        "account_size": size,
+        "source_account_id": source_id,
+        "source_mt5_login": a.get("mt5_login"),
+        "purchase_id": purchase_id,
+        "plan_id": (
+            price_row.get("id")
+            if price_source == "current_plan"
+            else purchase.get("plan_id")
+        ),
+        "plan_name": (
+            price_row.get("name")
+            or price_row.get("plan_name")
+            or purchase.get("plan_name")
+            or purchase.get("selected_plan")
+        ),
+        "price": price,
+        "price_source": price_source,
+        "authority": "V61_EXACT_FUNDED_RESET",
+    }
+
+
+def _np_v61_policy_to_guide_decision(policy, account, purchase):
+    policy = policy or {}
+    account = account or {}
+    purchase = purchase or {}
+    kind = str(policy.get("kind") or "").strip().lower()
+    target_stage = _normalize_lifecycle_stage(
+        policy.get("stage") or account.get("stage") or account.get("phase")
+    )
+    common = {
+        "success": True,
+        "release": NAIRAPIPS_FUNDED_RESET_PROGRESS_RELEASE_V61,
+        "purchase_id": str(purchase.get("id") or "").strip() or None,
+        "trader_id": str(account.get("trader_id") or purchase.get("trader_id") or "").strip(),
+        "automation_mode": (
+            "CLEAN_AUTOMATION"
+            if purchase and _np_automation_generation_purchase(purchase)
+            else "LEGACY_MANUAL"
+        ),
+        "automatic_assignment_allowed": False,
+        "source_account_id": str(policy.get("source_account_id") or account.get("id") or "").strip(),
+        "source_mt5": str(policy.get("source_mt5_login") or account.get("mt5_login") or "").strip(),
+        "target_stage": target_stage,
+        "account_size": clean(policy.get("account_size") or account.get("account_size") or 0),
+        "price": clean(policy.get("price") or 0),
+        "payment_required": False,
+        "closed": False,
+        "safe_to_assign_now": False,
+        "reset_policy": policy,
+    }
+
+    if kind == "paid_funded":
+        return {
+            **common,
+            "code": "RESET_PAYMENT_REQUIRED",
+            "state": "WAITING_RESET_PAYMENT",
+            "title": policy.get("title") or "FUNDED RESET PAYMENT REQUIRED",
+            "message": policy.get("subtitle") or "One paid Funded Reset is available.",
+            "payment_required": True,
+        }
+    if kind == "payment_pending":
+        return {
+            **common,
+            "code": "RESET_PAYMENT_UNDER_REVIEW",
+            "state": "WAITING_RESET_PAYMENT_REVIEW",
+            "title": policy.get("title") or "FUNDED RESET PAYMENT UNDER REVIEW",
+            "message": policy.get("subtitle") or "Admin approval is required.",
+            "payment_required": True,
+        }
+    if kind == "waiting":
+        return {
+            **common,
+            "code": "RESET_MT5_DUE",
+            "state": "WAITING_MT5",
+            "title": policy.get("title") or "FRESH FUNDED MT5 REQUIRED",
+            "message": policy.get("subtitle") or "Reset approved; fresh Funded MT5 is due.",
+            "safe_to_assign_now": True,
+        }
+    if kind == "terminal":
+        return {
+            **common,
+            "code": "JOURNEY_CLOSED_NEW_CHALLENGE",
+            "state": "CLOSED",
+            "title": policy.get("title") or "FUNDED JOURNEY COMPLETE",
+            "message": policy.get("subtitle") or "The one Funded Reset was already consumed.",
+            "closed": True,
+        }
+    return {
+        **common,
+        "code": "BREACH_REVIEW_REQUIRED",
+        "state": "REVIEW",
+        "title": policy.get("title") or "FUNDED BREACH REQUIRES REVIEW",
+        "message": policy.get("subtitle") or policy.get("reason") or "Reset authority could not be proven.",
+    }
+
+
+@app.route("/admin/automation_v61/reset_decisions", methods=["GET", "OPTIONS"])
+def admin_automation_v61_reset_decisions():
+    """One lightweight request returns reset authority for every breached latest journey."""
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+
+    try:
+        trader = get_trader_by_id(trader_id) or {}
+        accounts = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", trader_id)
+            .limit(1000).execute().data or []
+        )
+        purchases = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("trader_id", trader_id)
+            .limit(500).execute().data or []
+        )
+
+        by_account = {
+            str(a.get("id") or "").strip(): a
+            for a in accounts if str(a.get("id") or "").strip()
+        }
+        purchase_map = {
+            str(p.get("id") or "").strip(): p
+            for p in purchases
+            if str(p.get("id") or "").strip()
+            and "[NP_RESET_REQUEST:" not in str(p.get("admin_note") or "")
+        }
+
+        def root_pid(a):
+            cur = a or {}
+            seen = set()
+            for _ in range(30):
+                pid = str(
+                    cur.get("purchase_id")
+                    or cur.get("challenge_purchase_id")
+                    or ""
+                ).strip()
+                if pid:
+                    return pid
+                cid = str(cur.get("id") or "").strip()
+                if not cid or cid in seen:
+                    return ""
+                seen.add(cid)
+                parent = by_account.get(_np_v61_parent_account_id(cur))
+                if not parent:
+                    return ""
+                cur = parent
+            return ""
+
+        grouped = {}
+        for a in accounts:
+            pid = root_pid(a)
+            if pid and pid in purchase_map:
+                grouped.setdefault(pid, []).append(a)
+
+        decisions = {}
+        for pid, rows in grouped.items():
+            rows = _np_v55_legal_accounts(rows)
+            if not rows:
+                continue
+            latest = rows[-1]
+            if not _np_reset_account_is_breached(latest):
+                continue
+            policy = _np_reset_policy(latest, trader) or {}
+            decisions[pid] = _np_v61_policy_to_guide_decision(
+                policy, latest, purchase_map.get(pid) or {}
+            )
+
+        return _np_ok({
+            "success": True,
+            "release": NAIRAPIPS_FUNDED_RESET_PROGRESS_RELEASE_V61,
+            "decisions": decisions,
+            "generated_at": now_iso(),
+        })
+    except Exception as exc:
+        print("V61 RESET DECISION BATCH ERROR:", exc, flush=True)
+        return _np_fail("Could not build exact reset decisions: " + str(exc), 500)
+
+
+# Keep the existing Admin URL, but ensure it executes against V61 final policy.
+_np_v61_old_guide_view = app.view_functions.get("admin_automation_guide_decision_v55")
+
+def _np_v61_automation_guide_decision_view():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    pid = str(request.args.get("purchase_id") or "").strip()
+    if not pid:
+        return _np_fail("purchase_id is required", 400)
+
+    try:
+        return _np_ok({
+            "success": True,
+            "decision": _np_v55_decision(pid),
+            "generated_at": now_iso(),
+            "policy_release": NAIRAPIPS_FUNDED_RESET_PROGRESS_RELEASE_V61,
+        })
+    except Exception as exc:
+        # Exact fallback for the breach/reset portion only. Never manufacture a
+        # pass, payout or assignment entitlement on an exception.
+        try:
+            prows = (
+                supabase.table("challenge_purchases").select("*")
+                .eq("id", pid).limit(1).execute().data or []
+            )
+            if prows:
+                purchase = prows[0]
+                tid = str(purchase.get("trader_id") or "").strip()
+                trader = get_trader_by_id(tid) or {}
+                accounts = _np_v55_same_journey_accounts(tid, pid)
+                if accounts:
+                    latest = accounts[-1]
+                    if _np_reset_account_is_breached(latest):
+                        policy = _np_reset_policy(latest, trader) or {}
+                        decision = _np_v61_policy_to_guide_decision(
+                            policy, latest, purchase
+                        )
+                        return _np_ok({
+                            "success": True,
+                            "decision": decision,
+                            "generated_at": now_iso(),
+                            "fallback_used": True,
+                            "policy_release": NAIRAPIPS_FUNDED_RESET_PROGRESS_RELEASE_V61,
+                        })
+        except Exception as fallback_exc:
+            print("V61 GUIDE FALLBACK ERROR:", fallback_exc, flush=True)
+
+        print("V61 AUTOMATION GUIDE DECISION ERROR:", exc, flush=True)
+        return _np_fail(
+            "Automation decision failed safely: " + str(exc),
+            500
+        )
+
+if _np_v61_old_guide_view:
+    app.view_functions["admin_automation_guide_decision_v55"] = _np_v61_automation_guide_decision_view
+
+
+@app.route("/admin/automation_v61/status", methods=["GET", "OPTIONS"])
+def admin_automation_v61_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_FUNDED_RESET_PROGRESS_RELEASE_V61,
+        "first_funded_breach": "ONE PAID FUNDED RESET OPPORTUNITY",
+        "challenge_reset_independent": True,
+        "second_life_independent": True,
+        "payout_renewal_independent": True,
+        "after_reset_consumed_breach": "JOURNEY CLOSED",
+        "reset_fulfilment": "PAYMENT PROOF -> ADMIN APPROVAL -> FRESH FUNDED MT5",
+        "no_inventory": "WAIT_AND_RETRY",
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_FUNDED_RESET_PROGRESS_RELEASE_V61
+
