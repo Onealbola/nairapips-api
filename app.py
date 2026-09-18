@@ -40680,3 +40680,402 @@ def admin_automation_v65_status():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_TRADER_RESET_PRIORITY_RELEASE_V65
+
+
+
+# ============================================================================
+# NAIRAPIPS V66 — FORENSIC RECOVERY AUTHORITY
+# 18 SEP 2026
+#
+# FORENSIC FINDINGS
+# -----------------
+# V65 called the old /trader_reset_opportunities implementation FIRST.
+# That old GET can mutate reset-consumption fields and V65 silently returned that
+# old single opportunity if any later multi-journey scan failed.
+#
+# V66 replaces the trader reset GET with a PURE account-by-account authority:
+# - no mutation on GET
+# - every breached account evaluated independently
+# - exact Funded reset uses V62/V63/V64 authority
+# - Second Life evaluated per exact purchase
+# - one broken row cannot erase another journey's opportunity
+# - all independent opportunities returned
+# - action-required opportunities receive primary attention before passive waiting
+# ============================================================================
+
+NAIRAPIPS_FORENSIC_RECOVERY_RELEASE_V66 = "V66_FORENSIC_RECOVERY_AUTHORITY_2026_09_18"
+
+
+def _np_v66_public_policy(policy):
+    p = policy or {}
+    return {
+        "eligible": bool(p.get("eligible")),
+        "kind": str(p.get("kind") or "").strip().lower(),
+        "reason": p.get("reason"),
+        "title": p.get("title"),
+        "subtitle": p.get("subtitle"),
+        "stage": _normalize_lifecycle_stage(p.get("stage") or ""),
+        "account_size": clean(p.get("account_size") or 0),
+        "source_account_id": p.get("source_account_id"),
+        "source_mt5_login": p.get("source_mt5_login"),
+        "purchase_id": p.get("purchase_id"),
+        "reset_order_id": p.get("reset_order_id"),
+        "plan_id": p.get("plan_id"),
+        "plan_name": p.get("plan_name"),
+        "price": clean(p.get("price") or 0),
+        "authority": p.get("authority") or "RESET_POLICY",
+    }
+
+
+def _np_v66_action_priority(op):
+    kind = str((op or {}).get("kind") or "").strip().lower()
+    return {
+        "payment_pending": 120,
+        "paid_funded": 115,
+        "paid_challenge": 110,
+        "free_second_life": 105,
+        "waiting": 80,
+        "review": 40,
+        "terminal": 30,
+    }.get(kind, 10)
+
+
+def _np_v66_source_event_time(op, account_by_id):
+    op = op or {}
+    source = account_by_id.get(str(op.get("source_account_id") or "").strip()) or {}
+    return _dt_score(
+        op.get("event_at")
+        or source.get("breached_at")
+        or source.get("breach_at")
+        or source.get("archived_at")
+        or source.get("reset_at")
+        or source.get("updated_at")
+        or source.get("created_at")
+    )
+
+
+def _np_v66_find_second_life_source(accounts, purchase_id):
+    pid = str(purchase_id or "").strip()
+    candidates = []
+    for a in accounts or []:
+        if str(a.get("purchase_id") or a.get("challenge_purchase_id") or "").strip() != pid:
+            continue
+        if _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) != "phase1":
+            continue
+        try:
+            breached = bool(_np_account_has_breach_evidence(a))
+        except Exception:
+            breached = _np_reset_account_is_breached(a)
+        if breached:
+            candidates.append(a)
+    candidates.sort(
+        key=lambda a: _dt_score(
+            a.get("breached_at")
+            or a.get("breach_at")
+            or a.get("archived_at")
+            or a.get("updated_at")
+            or a.get("created_at")
+        ),
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _np_v66_build_recovery_bundle(trader_id):
+    tid = str(trader_id or "").strip()
+    trader = get_trader_by_id(tid) or {}
+
+    accounts = (
+        supabase.table("trader_accounts").select("*")
+        .eq("trader_id", tid)
+        .order("updated_at", desc=True)
+        .limit(1000).execute().data or []
+    )
+    purchases = (
+        supabase.table("challenge_purchases").select("*")
+        .eq("trader_id", tid)
+        .order("created_at", desc=True)
+        .limit(1000).execute().data or []
+    )
+
+    account_by_id = {
+        str(a.get("id") or "").strip(): a
+        for a in accounts
+        if str(a.get("id") or "").strip()
+    }
+
+    opportunities = []
+    seen = set()
+    diagnostics = []
+
+    def add(op, event_at=None, authority_source=""):
+        if not op:
+            return
+        item = dict(op)
+        kind = str(item.get("kind") or "").strip().lower()
+        if not kind:
+            return
+        item["kind"] = kind
+        if event_at:
+            item["event_at"] = event_at
+        if authority_source:
+            item["authority_source"] = authority_source
+
+        key = (
+            kind,
+            str(item.get("source_account_id") or "").strip(),
+            str(item.get("purchase_id") or "").strip(),
+            str(item.get("reset_order_id") or "").strip(),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        opportunities.append(item)
+
+    # A) Exact breach/reset authority.
+    breached_accounts = []
+    for account in accounts:
+        try:
+            if _np_reset_account_is_breached(account):
+                breached_accounts.append(account)
+        except Exception as exc:
+            diagnostics.append({
+                "account_id": account.get("id"),
+                "mt5_login": account.get("mt5_login"),
+                "check": "breach_detection",
+                "status": "error",
+                "error": str(exc),
+            })
+
+    breached_accounts.sort(
+        key=lambda a: _dt_score(
+            a.get("breached_at")
+            or a.get("breach_at")
+            or a.get("archived_at")
+            or a.get("updated_at")
+            or a.get("created_at")
+        ),
+        reverse=True,
+    )
+
+    for source_account in breached_accounts:
+        stage = _normalize_lifecycle_stage(
+            source_account.get("stage") or source_account.get("phase")
+        )
+        try:
+            policy = (
+                _np_v62_direct_funded_reset_policy(source_account, trader)
+                if stage == "funded"
+                else _np_reset_policy(source_account, trader)
+            )
+            public = _np_v66_public_policy(policy)
+            kind = public.get("kind")
+
+            diagnostics.append({
+                "account_id": source_account.get("id"),
+                "mt5_login": source_account.get("mt5_login"),
+                "stage": stage,
+                "check": "reset_policy",
+                "status": "ok",
+                "policy_kind": kind,
+                "policy_reason": public.get("reason"),
+                "purchase_id": public.get("purchase_id"),
+                "price": public.get("price"),
+            })
+
+            if kind in {
+                "paid_funded",
+                "paid_challenge",
+                "payment_pending",
+                "waiting",
+                "review",
+                "terminal",
+            }:
+                add(
+                    public,
+                    event_at=(
+                        source_account.get("breached_at")
+                        or source_account.get("breach_at")
+                        or source_account.get("archived_at")
+                        or source_account.get("updated_at")
+                    ),
+                    authority_source="exact_breached_account",
+                )
+        except Exception as exc:
+            diagnostics.append({
+                "account_id": source_account.get("id"),
+                "mt5_login": source_account.get("mt5_login"),
+                "stage": stage,
+                "check": "reset_policy",
+                "status": "error",
+                "error": str(exc),
+            })
+
+    # B) Exact purchase-scoped Second Life.
+    for purchase in purchases:
+        try:
+            status = _second_life_status_payload(purchase, tid) or {}
+            if not status.get("enabled"):
+                continue
+
+            pid = str(purchase.get("id") or "").strip()
+            used = bool(status.get("used"))
+            source_account = _np_v66_find_second_life_source(accounts, pid)
+            size = clean(
+                purchase.get("account_size")
+                or (source_account or {}).get("account_size")
+                or 0
+            )
+
+            raw_status = str(
+                purchase.get("second_life_status")
+                or status.get("source_status")
+                or status.get("status")
+                or ""
+            ).strip().lower()
+
+            if used and raw_status in {
+                "life2_waiting_mt5", "waiting_mt5", "activated"
+            }:
+                unresolved_source = _np_second_life_used_but_unfulfilled(
+                    purchase, tid
+                )
+                if unresolved_source:
+                    add(
+                        {
+                            "eligible": True,
+                            "kind": "waiting",
+                            "reason": "second_life_activated_waiting_mt5",
+                            "title": "Second Life Activated",
+                            "subtitle": (
+                                "Your one free Life 2 is already activated. "
+                                "A fresh Phase 1 MT5 is waiting for assignment."
+                            ),
+                            "stage": "phase1",
+                            "account_size": size,
+                            "source_account_id": unresolved_source.get("id"),
+                            "source_mt5_login": unresolved_source.get("mt5_login"),
+                            "purchase_id": pid,
+                            "price": 0,
+                            "authority": "SECOND_LIFE_EXACT_PURCHASE",
+                        },
+                        event_at=(
+                            purchase.get("second_life_activated_at")
+                            or unresolved_source.get("breached_at")
+                            or unresolved_source.get("breach_at")
+                            or unresolved_source.get("updated_at")
+                        ),
+                        authority_source="second_life_purchase",
+                    )
+                continue
+
+            if (not used) and status.get("eligible_now"):
+                add(
+                    {
+                        "eligible": True,
+                        "kind": "free_second_life",
+                        "reason": "second_life_available",
+                        "title": "Your Second Life Is Ready",
+                        "subtitle": (
+                            "Life 1 breached on this 2-Lives journey. "
+                            "Activate the one included Life 2 Phase 1 account."
+                        ),
+                        "stage": "phase1",
+                        "account_size": size,
+                        "source_account_id": (
+                            status.get("breached_account_id")
+                            or (source_account or {}).get("id")
+                        ),
+                        "source_mt5_login": (source_account or {}).get("mt5_login"),
+                        "purchase_id": pid,
+                        "price": 0,
+                        "authority": "SECOND_LIFE_EXACT_PURCHASE",
+                    },
+                    event_at=(
+                        status.get("breached_at")
+                        or (source_account or {}).get("breached_at")
+                        or (source_account or {}).get("breach_at")
+                    ),
+                    authority_source="second_life_purchase",
+                )
+        except Exception as exc:
+            diagnostics.append({
+                "purchase_id": purchase.get("id"),
+                "check": "second_life",
+                "status": "error",
+                "error": str(exc),
+            })
+
+    opportunities.sort(
+        key=lambda op: (
+            _np_v66_action_priority(op),
+            _np_v66_source_event_time(op, account_by_id),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "success": True,
+        "opportunity": opportunities[0] if opportunities else None,
+        "opportunities": opportunities,
+        "release": NAIRAPIPS_FORENSIC_RECOVERY_RELEASE_V66,
+        "selection_rule": "ACTION_PRIORITY_THEN_EXACT_EVENT_TIME",
+        "diagnostics": diagnostics,
+        "counts": {
+            "accounts": len(accounts),
+            "breached_accounts": len(breached_accounts),
+            "purchases": len(purchases),
+            "opportunities": len(opportunities),
+        },
+    }
+
+
+def _np_v66_trader_reset_opportunities():
+    if request.method == "OPTIONS":
+        return _np_ok({
+            "success": True,
+            "opportunity": None,
+            "opportunities": [],
+            "release": NAIRAPIPS_FORENSIC_RECOVERY_RELEASE_V66,
+        })
+
+    requested = str(request.args.get("trader_id") or "").strip()
+    authed_id, auth_error = _authenticated_trader_id_for_request(requested)
+    if auth_error:
+        return _np_fail(auth_error, 401)
+
+    try:
+        return _np_ok(_np_v66_build_recovery_bundle(authed_id))
+    except Exception as exc:
+        print("V66 TRADER RECOVERY AUTHORITY ERROR:", exc, flush=True)
+        return _np_fail(
+            "Recovery authority could not be loaded safely: " + str(exc),
+            500,
+        )
+
+
+# Keep URL compatibility, replace only implementation.
+app.view_functions["trader_reset_opportunities"] = _np_v66_trader_reset_opportunities
+
+
+@app.route("/admin/automation_v66/recovery_diagnostic", methods=["GET", "OPTIONS"])
+def admin_automation_v66_recovery_diagnostic():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+
+    try:
+        return _np_ok(_np_v66_build_recovery_bundle(trader_id))
+    except Exception as exc:
+        return _np_fail(str(exc), 500)
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_FORENSIC_RECOVERY_RELEASE_V66
+
