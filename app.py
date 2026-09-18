@@ -21228,11 +21228,6 @@ if _NP_PREVIOUS_TRADER_RESET_OPPORTUNITIES_VIEW:
     app.view_functions["trader_reset_opportunities"] = _np_final_trader_reset_opportunities_20260911
 
 
-if __name__ == "__main__":
-    port=int(os.environ.get("PORT",10000))
-    app.run(host="0.0.0.0", port=port)
-
-
 # ============================================================
 # NAIRAPIPS GLOBAL PHASE PASS HANDOFF REPAIR
 # Purpose: if MT5 engine detects phase1_passed/phase2_passed but an older
@@ -41078,4 +41073,80 @@ def admin_automation_v66_recovery_diagnostic():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_FORENSIC_RECOVERY_RELEASE_V66
+
+
+
+# ============================================================================
+# NAIRAPIPS V67 — STARTUP ORDER FORENSIC FIX
+# 18 SEP 2026
+#
+# All route registrations and endpoint overrides MUST execute before app.run().
+# This makes `python app.py` and `gunicorn app:app` load the same application.
+# ============================================================================
+
+NAIRAPIPS_RUNTIME_BOOT_RELEASE_V67 = "V67_STARTUP_ORDER_FORENSIC_FIX_2026_09_18"
+
+
+def _np_v67_runtime_integrity_snapshot():
+    critical = {
+        "trader_reset_opportunities": "_np_v66_trader_reset_opportunities",
+        "admin_automation_v62_funded_reset_decision": "admin_automation_v62_funded_reset_decision",
+        "admin_automation_v66_recovery_diagnostic": "admin_automation_v66_recovery_diagnostic",
+        "reject_payout": "reject_payout",
+    }
+
+    bindings = {}
+    all_ok = True
+    for endpoint, expected in critical.items():
+        fn = app.view_functions.get(endpoint)
+        actual = getattr(fn, "__name__", None) if fn else None
+        ok = bool(actual == expected)
+        bindings[endpoint] = {
+            "expected": expected,
+            "actual": actual,
+            "ok": ok,
+        }
+        all_ok = all_ok and ok
+
+    return {
+        "success": True,
+        "release": NAIRAPIPS_RUNTIME_BOOT_RELEASE_V67,
+        "all_critical_bindings_ok": all_ok,
+        "bindings": bindings,
+        "route_count": len(app.url_map._rules),
+        "recovery_release": globals().get(
+            "NAIRAPIPS_FORENSIC_RECOVERY_RELEASE_V66", ""
+        ),
+        "reset_safety_release": globals().get(
+            "NAIRAPIPS_RESET_SAFETY_RELEASE_V63", ""
+        ),
+        "reset_price_release": globals().get(
+            "NAIRAPIPS_RESET_PRICE_RELEASE_V64", ""
+        ),
+    }
+
+
+@app.route("/health/runtime_v67", methods=["GET"])
+def health_runtime_v67():
+    # Intentionally contains no trader, account, credential or payment data.
+    return jsonify(_np_v67_runtime_integrity_snapshot())
+
+
+try:
+    _np_v67_boot = _np_v67_runtime_integrity_snapshot()
+    print(
+        "NAIRAPIPS V67 RUNTIME INTEGRITY:",
+        json.dumps(_np_v67_boot, default=str),
+        flush=True,
+    )
+except Exception as _np_v67_boot_exc:
+    print("NAIRAPIPS V67 RUNTIME INTEGRITY CHECK ERROR:", _np_v67_boot_exc, flush=True)
+
+
+# IMPORTANT: this is deliberately the LAST executable block in app.py.
+# All routes, workers, compatibility layers and endpoint overrides above have
+# now been registered before the server starts.
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
