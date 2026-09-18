@@ -41079,3 +41079,215 @@ def admin_automation_v66_recovery_diagnostic():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_FORENSIC_RECOVERY_RELEASE_V66
 
+
+
+# ============================================================================
+# NAIRAPIPS V69 — PREVIOUS ACCOUNT RESET WORKFLOW
+# 18 SEP 2026
+#
+# UX / BUSINESS CONTRACT
+# ----------------------
+# A breached MT5 is a PREVIOUS account, not a current trading account.
+# If that exact breached account has a paid reset right:
+#
+# PREVIOUS/BREACHED ACCOUNT
+# -> trader clicks RESET THIS ACCOUNT
+# -> uploads payment receipt
+# -> /create_reset_purchase stores exact payment proof as PENDING
+# -> Admin reviews/approves the exact reset payment
+# -> one fresh same-stage MT5 becomes due
+# -> exact entitlement is consumed after replacement assignment
+#
+# This endpoint is READ ONLY. It never creates, approves or consumes a reset.
+# The existing V63/V64 payment, lineage and anti-replay locks remain authority.
+# ============================================================================
+
+NAIRAPIPS_PREVIOUS_RESET_RELEASE_V69 = "V69_PREVIOUS_ACCOUNT_RESET_WORKFLOW_2026_09_18"
+
+
+def _np_v69_previous_reset_action(account, trader):
+    a = account or {}
+    stage = _normalize_lifecycle_stage(a.get("stage") or a.get("phase"))
+
+    # Exact Funded policy is strongest for Funded sources.
+    if stage == "funded":
+        policy = _np_v62_direct_funded_reset_policy(a, trader or {})
+    else:
+        policy = _np_reset_policy(a, trader or {})
+
+    p = policy or {}
+    kind = str(p.get("kind") or "").strip().lower()
+
+    # This endpoint is only for the PAID reset workflow on historical accounts.
+    # Free Second Life remains a separate journey opportunity.
+    if kind not in {
+        "paid_funded",
+        "paid_challenge",
+        "payment_pending",
+        "waiting",
+        "terminal",
+        "review",
+    }:
+        return None
+
+    code = {
+        "paid_funded": "PAYMENT_REQUIRED",
+        "paid_challenge": "PAYMENT_REQUIRED",
+        "payment_pending": "PAYMENT_UNDER_REVIEW",
+        "waiting": "PAYMENT_APPROVED_WAITING_MT5",
+        "terminal": "RESET_CLOSED",
+        "review": "REVIEW_REQUIRED",
+    }.get(kind, "REVIEW_REQUIRED")
+
+    return {
+        "account_id": str(a.get("id") or "").strip(),
+        "trader_id": str(a.get("trader_id") or "").strip(),
+        "mt5_login": str(a.get("mt5_login") or "").strip(),
+        "stage": stage,
+        "account_size": clean(
+            p.get("account_size")
+            or a.get("account_size")
+            or a.get("start_balance")
+            or 0
+        ),
+        "purchase_id": str(
+            p.get("purchase_id")
+            or (_np_reset_purchase_for_account(a) or {}).get("id")
+            or ""
+        ).strip() or None,
+        "kind": kind,
+        "code": code,
+        "eligible": bool(p.get("eligible")),
+        "title": p.get("title"),
+        "message": p.get("subtitle") or p.get("message"),
+        "price": clean(p.get("price") or 0),
+        "reset_order_id": p.get("reset_order_id"),
+        "source_account_id": str(p.get("source_account_id") or a.get("id") or "").strip(),
+        "source_mt5_login": str(p.get("source_mt5_login") or a.get("mt5_login") or "").strip(),
+        "authority": p.get("authority") or "V69_EXACT_PREVIOUS_ACCOUNT",
+        "breached_at": a.get("breached_at") or a.get("breach_at"),
+        "account_status": a.get("account_status") or a.get("status"),
+    }
+
+
+@app.route("/trader_previous_reset_actions", methods=["GET", "OPTIONS"])
+def trader_previous_reset_actions():
+    if request.method == "OPTIONS":
+        return _np_ok({
+            "success": True,
+            "actions": [],
+            "release": NAIRAPIPS_PREVIOUS_RESET_RELEASE_V69,
+        })
+
+    requested = str(request.args.get("trader_id") or "").strip()
+    authed_id, auth_error = _authenticated_trader_id_for_request(requested)
+    if auth_error:
+        return _np_fail(auth_error, 401)
+
+    try:
+        trader = get_trader_by_id(authed_id) or {}
+        accounts = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", authed_id)
+            .order("updated_at", desc=True)
+            .limit(1000).execute().data or []
+        )
+
+        actions = []
+        diagnostics = []
+
+        for account in accounts:
+            try:
+                if not _np_reset_account_is_breached(account):
+                    continue
+
+                action = _np_v69_previous_reset_action(account, trader)
+                if not action:
+                    continue
+
+                actions.append(action)
+                diagnostics.append({
+                    "account_id": account.get("id"),
+                    "mt5_login": account.get("mt5_login"),
+                    "stage": _normalize_lifecycle_stage(
+                        account.get("stage") or account.get("phase")
+                    ),
+                    "code": action.get("code"),
+                    "kind": action.get("kind"),
+                })
+            except Exception as exc:
+                # One bad old row must not hide a valid reset action on another account.
+                diagnostics.append({
+                    "account_id": account.get("id"),
+                    "mt5_login": account.get("mt5_login"),
+                    "status": "error",
+                    "error": str(exc),
+                })
+
+        # Actionable first, newest breach next.
+        priority = {
+            "PAYMENT_UNDER_REVIEW": 500,
+            "PAYMENT_REQUIRED": 450,
+            "PAYMENT_APPROVED_WAITING_MT5": 400,
+            "REVIEW_REQUIRED": 200,
+            "RESET_CLOSED": 100,
+        }
+
+        def _sort_key(item):
+            source = next(
+                (
+                    a for a in accounts
+                    if str(a.get("id") or "") == str(item.get("account_id") or "")
+                ),
+                {},
+            )
+            return (
+                priority.get(str(item.get("code") or ""), 0),
+                _dt_score(
+                    source.get("breached_at")
+                    or source.get("breach_at")
+                    or source.get("updated_at")
+                    or source.get("created_at")
+                ),
+            )
+
+        actions.sort(key=_sort_key, reverse=True)
+
+        return _np_ok({
+            "success": True,
+            "actions": actions,
+            "release": NAIRAPIPS_PREVIOUS_RESET_RELEASE_V69,
+            "workflow": (
+                "BREACHED_PREVIOUS_ACCOUNT -> PAYMENT_PROOF -> "
+                "ADMIN_APPROVAL -> FRESH_SAME_STAGE_MT5"
+            ),
+            "diagnostics": diagnostics,
+        })
+    except Exception as exc:
+        print("V69 PREVIOUS RESET ACTIONS ERROR:", exc, flush=True)
+        return _np_fail(
+            "Previous-account reset actions could not be loaded safely: " + str(exc),
+            500,
+        )
+
+
+@app.route("/admin/automation_v69/status", methods=["GET", "OPTIONS"])
+def admin_automation_v69_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_PREVIOUS_RESET_RELEASE_V69,
+        "breached_account_location": "PREVIOUS_HISTORY",
+        "trader_receipt_endpoint": "/create_reset_purchase",
+        "admin_approval_required": True,
+        "direct_free_replacement": False,
+        "replay_protection": "V63",
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PREVIOUS_RESET_RELEASE_V69
+
