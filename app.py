@@ -15432,7 +15432,7 @@ def _aff_base_url():
 
 def _aff_link_for_code(code):
     code = _aff_code(code)
-    return f"{_aff_base_url()}/?ref={code}" if code else _aff_base_url()
+    return f"{_aff_base_url()}/dashboard/?mode=register&ref={code}" if code else f"{_aff_base_url()}/dashboard/?mode=register"
 
 def _aff_repair_partner_link(partner):
     """Return and persist the canonical public referral URL for older partner rows."""
