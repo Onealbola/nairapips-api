@@ -42205,3 +42205,448 @@ def admin_reset_integrity_v72_status():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_FULFILLED_RELEASE_V72
+
+
+
+# ============================================================================
+# NAIRAPIPS V73 — DIRECT RESET RECEIPT PIPELINE
+# 19 SEP 2026
+#
+# Why:
+# The old Trader reset UI performed TWO requests:
+#   browser -> /upload_payment_proof -> Supabase Storage
+#   browser -> /create_reset_purchase
+#
+# The Storage SDK call can sit long enough for the browser's 30s abort timer to
+# fire. That produced "Receipt upload timed out" even though the reset logic was
+# otherwise valid.
+#
+# V73 makes reset receipt submission one server transaction:
+#   exact reset validation
+#   -> bounded direct Supabase Storage HTTP upload
+#   -> exact PENDING reset order creation
+#
+# IMPORTANT:
+# - no payment approval here
+# - no MT5 assignment here
+# - Admin approval remains mandatory
+# - V71/V72 reset/duplicate protections remain authoritative
+# ============================================================================
+
+NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V73 = "V73_DIRECT_RESET_RECEIPT_PIPELINE_2026_09_19"
+
+
+def _np_v73_storage_upload_reset_proof(raw_file, ext, content_type, trader_id, source_id):
+    if not raw_file:
+        raise RuntimeError("Payment receipt is empty")
+
+    base = str(SUPABASE_URL or "").rstrip("/")
+    key = str(SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY or "").strip()
+    if not base or not key:
+        raise RuntimeError("Payment storage service is not configured")
+
+    digest = hashlib.sha256(raw_file).hexdigest()[:24]
+    safe_trader = secure_filename(str(trader_id or "")) or "trader"
+    safe_source = secure_filename(str(source_id or "")) or "source"
+    path = f"reset-payments/{safe_trader}/{safe_source}/{digest}.{ext}"
+    encoded_path = urllib.parse.quote(path, safe="/")
+
+    url = f"{base}/storage/v1/object/payment-proofs/{encoded_path}"
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": content_type or "application/octet-stream",
+        "x-upsert": "true",
+    }
+
+    last_error = None
+    response = None
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                data=raw_file,
+                timeout=(4, 18),
+            )
+            if response.status_code < 500:
+                break
+            last_error = f"Storage temporary error {response.status_code}: {response.text[:180]}"
+        except requests.exceptions.Timeout:
+            last_error = "Storage upload timed out"
+        except Exception as exc:
+            last_error = str(exc)
+        if attempt == 0:
+            time.sleep(0.6)
+
+    if response is None:
+        raise RuntimeError(last_error or "Receipt storage did not respond")
+
+    # x-upsert makes an exact-file retry idempotent.
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Receipt storage rejected the upload ({response.status_code}): "
+            f"{response.text[:220]}"
+        )
+
+    public_url = (
+        f"{base}/storage/v1/object/public/payment-proofs/{encoded_path}"
+    )
+    return {
+        "url": public_url,
+        "path": path,
+        "sha256": hashlib.sha256(raw_file).hexdigest(),
+    }
+
+
+def _np_v73_reset_submission_status_payload(trader_id, source_id):
+    source_id = str(source_id or "").strip()
+    trader_id = str(trader_id or "").strip()
+    if not source_id or not trader_id:
+        return {"found": False}
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", source_id).eq("trader_id", trader_id)
+            .limit(1).execute().data or []
+        )
+    except Exception:
+        rows = []
+
+    if not rows:
+        return {"found": False}
+
+    source = rows[0]
+    child = None
+    try:
+        child = _np_v72_exact_reset_successor(source)
+    except Exception:
+        child = None
+
+    if child:
+        return {
+            "found": True,
+            "code": "RESET_FULFILLED",
+            "source_account_id": source_id,
+            "replacement_mt5": child.get("mt5_login"),
+        }
+
+    order = _np_reset_open_order(source_id)
+    if not order:
+        return {
+            "found": False,
+            "source_account_id": source_id,
+        }
+
+    status = str(
+        order.get("payment_status") or order.get("status") or ""
+    ).strip().lower()
+
+    if status == "approved" or str(order.get("status") or "").strip().lower() in {
+        "approved_reset_waiting_mt5", "reset_assigning"
+    }:
+        code = "PAYMENT_APPROVED_WAITING_MT5"
+    else:
+        code = "PAYMENT_UNDER_REVIEW"
+
+    return {
+        "found": True,
+        "code": code,
+        "source_account_id": source_id,
+        "reset_order_id": order.get("id"),
+        "payment_status": order.get("payment_status"),
+        "status": order.get("status"),
+        "payment_proof_url": order.get("payment_proof_url"),
+    }
+
+
+@app.route("/reset_payment_status_v73", methods=["GET", "OPTIONS"])
+def reset_payment_status_v73():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    requested = str(request.args.get("trader_id") or "").strip()
+    source_id = str(
+        request.args.get("source_account_id")
+        or request.args.get("trader_account_id")
+        or ""
+    ).strip()
+
+    authed_id, auth_error = _authenticated_trader_id_for_request(requested)
+    if auth_error:
+        return _np_fail(auth_error, 401)
+
+    if not source_id:
+        return _np_fail("source_account_id is required", 400)
+
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V73,
+        **_np_v73_reset_submission_status_payload(authed_id, source_id),
+    })
+
+
+@app.route("/submit_reset_payment_proof_v73", methods=["POST", "OPTIONS"])
+def submit_reset_payment_proof_v73():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    try:
+        requested = str(request.form.get("trader_id") or "").strip()
+        source_id = str(
+            request.form.get("source_account_id")
+            or request.form.get("trader_account_id")
+            or ""
+        ).strip()
+
+        authed_id, auth_error = _authenticated_trader_id_for_request(requested)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+
+        if not source_id:
+            return _np_fail("Exact breached trader_account_id is required", 400)
+
+        # Exact account first.
+        source_rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", source_id).eq("trader_id", authed_id)
+            .limit(1).execute().data or []
+        )
+        if not source_rows:
+            return _np_fail("Breached account was not found for this trader", 404)
+
+        source = source_rows[0]
+
+        # V72 duplicate/fulfilled protection before accepting any receipt.
+        child = _np_v72_exact_reset_successor(source)
+        if child:
+            return _np_fail(
+                f"Reset already fulfilled by MT5 "
+                f"{child.get('mt5_login') or 'a replacement account'}. "
+                f"Do not pay again.",
+                409,
+            )
+
+        if (
+            source.get("reset_consumed_at")
+            or source.get("reset_replacement_account_id")
+            or "np_consumed:paid_reset:" in _np_kill_blob(source)
+        ):
+            return _np_fail(
+                "This exact reset entitlement is already consumed. "
+                "A second reset payment cannot be opened.",
+                409,
+            )
+
+        trader = get_trader_by_id(authed_id) or {}
+        policy = _np_reset_policy(source, trader)
+
+        # If the exact order already exists, retry is a SUCCESS state, not an
+        # invitation to upload/pay again.
+        existing_order = _np_reset_open_order(source_id)
+        if existing_order:
+            return _np_ok({
+                "success": True,
+                "already_submitted": True,
+                "message": "Reset receipt is already on file. Do not pay again.",
+                "purchase": existing_order,
+                "opportunity": _np_reset_policy(source, trader),
+                "status": _np_v73_reset_submission_status_payload(
+                    authed_id, source_id
+                ),
+                "release": NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V73,
+            })
+
+        if (
+            policy.get("kind") not in {"paid_challenge", "paid_funded"}
+            or not policy.get("eligible")
+        ):
+            return _np_fail(
+                policy.get("subtitle")
+                or policy.get("title")
+                or "This account is not eligible for a paid reset",
+                409,
+            )
+
+        price = clean(policy.get("price") or 0)
+        if price <= 0:
+            return _np_fail(
+                "Current reset price could not be resolved. "
+                "Payment request was not created.",
+                409,
+            )
+
+        parent_purchase = _np_reset_purchase_for_account(source) or {}
+        parent_id = str(parent_purchase.get("id") or "").strip()
+        if not parent_id:
+            return _np_fail(
+                "Reset requires an exact challenge journey/purchase reference",
+                409,
+            )
+
+        # File validation.
+        f = request.files.get("file")
+        if not f or not f.filename:
+            return _np_fail("Upload your payment receipt first", 400)
+
+        safe_name = secure_filename(f.filename)
+        ext = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
+        if ext not in {"jpg", "jpeg", "png", "webp", "pdf"}:
+            return _np_fail(
+                "Receipt must be JPG, PNG, WEBP or PDF",
+                400,
+            )
+
+        raw_file = f.read()
+        if not raw_file:
+            return _np_fail("Uploaded receipt is empty", 400)
+        if len(raw_file) > 10 * 1024 * 1024:
+            return _np_fail(
+                "Receipt is too large. Maximum size is 10MB.",
+                400,
+            )
+
+        # Bounded direct storage upload — no unbounded Supabase SDK wait.
+        stored = _np_v73_storage_upload_reset_proof(
+            raw_file=raw_file,
+            ext=ext,
+            content_type=f.content_type or "application/octet-stream",
+            trader_id=authed_id,
+            source_id=source_id,
+        )
+        proof_url = str(stored.get("url") or "").strip()
+        if not proof_url:
+            return _np_fail(
+                "Receipt upload completed but no file URL was produced",
+                500,
+            )
+
+        # Re-check open order AFTER upload in case another tab submitted at the
+        # same time. This closes the race before database insert.
+        existing_order = _np_reset_open_order(source_id)
+        if existing_order:
+            return _np_ok({
+                "success": True,
+                "already_submitted": True,
+                "message": "Reset receipt is already on file. Do not pay again.",
+                "purchase": existing_order,
+                "status": _np_v73_reset_submission_status_payload(
+                    authed_id, source_id
+                ),
+                "release": NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V73,
+            })
+
+        plan = _np_reset_current_plan_for(source, parent_purchase) or {}
+        now = now_iso()
+        stage = _np_reset_stage(source)
+        marker = f"[NP_RESET_REQUEST:{source_id}:{parent_id}:{stage}]"
+        mt5 = str(source.get("mt5_login") or "").strip() or "—"
+
+        row = {
+            "trader_id": authed_id,
+            "trader_name": trader.get("name") or trader.get("full_name") or "",
+            "email": trader.get("email") or parent_purchase.get("email") or "",
+            "phone": trader.get("phone") or parent_purchase.get("phone") or "",
+            "plan_id": plan.get("id") or parent_purchase.get("plan_id"),
+            "plan_name": f"{stage.upper()} RESET · " + (
+                plan.get("name")
+                or plan.get("plan_name")
+                or parent_purchase.get("plan_name")
+                or "RESET"
+            ),
+            "account_size": clean(
+                source.get("account_size")
+                or source.get("start_balance")
+                or parent_purchase.get("account_size")
+                or 0
+            ),
+            "fee": price,
+            "original_fee": price,
+            "final_fee": price,
+            "amount_due": price,
+            "payment_proof_url": proof_url,
+            "payment_status": "pending",
+            "status": "reset_payment_proof_submitted",
+            "admin_note": (
+                f"RESET PAYMENT PROOF · {stage.upper()} · source MT5 {mt5} · "
+                f"{marker} · Use Admin Trader Card → Confirm Reset Paid. "
+                f"DO NOT APPROVE AS NEW PURCHASE."
+            ),
+            "challenge_journey": parent_purchase.get("challenge_journey"),
+            "journey_source": "reset_payment_proof_exact_account",
+            "created_at": now,
+            "purchase_month": month(),
+            "purchase_year": year(),
+        }
+
+        created = (
+            supabase.table("challenge_purchases")
+            .insert(row).execute().data or []
+        )
+        if not created:
+            return _np_fail(
+                "Receipt was stored, but the reset payment record could not be created. "
+                "Please contact NairaPips support and do not pay again.",
+                500,
+            )
+
+        # Notifications are best-effort and must never roll back a valid payment proof.
+        try:
+            send_admin_alert(
+                "NairaPips reset payment proof submitted",
+                f"Trader: {trader.get('name') or trader.get('email')}\n"
+                f"Stage: {stage.upper()}\nOld MT5: {mt5}\n"
+                f"Account Size: {email_money(row['account_size'])}\n"
+                f"Amount: {email_money(price)}\n"
+                f"Action: Open Admin Trader Card and confirm this exact reset payment."
+            )
+            send_email_safe(
+                trader.get("email"),
+                "NairaPips reset payment received — awaiting confirmation",
+                f"Hello {trader.get('name') or 'Trader'},\n\n"
+                f"We received your reset payment proof.\n\n"
+                f"Stage: {stage.upper()}\nPrevious MT5: {mt5}\n"
+                f"Reset Amount: {email_money(price)}\n"
+                f"Status: Awaiting NairaPips confirmation\n\n"
+                f"Do not make a second payment for this reset.\n\nNairaPips Team"
+            )
+        except Exception:
+            pass
+
+        try:
+            np_invalidate_admin_bootstrap("purchases")
+            np_invalidate_admin_bootstrap("traders")
+        except Exception:
+            pass
+
+        return _np_ok({
+            "success": True,
+            "message": "Receipt submitted successfully. Payment is under review.",
+            "purchase": created[0],
+            "payment_proof_url": proof_url,
+            "status": {
+                "found": True,
+                "code": "PAYMENT_UNDER_REVIEW",
+                "source_account_id": source_id,
+                "reset_order_id": created[0].get("id"),
+            },
+            "release": NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V73,
+        })
+
+    except requests.exceptions.Timeout:
+        return _np_fail(
+            "Receipt storage is temporarily slow. No MT5 has been issued. "
+            "Please retry once; duplicate reset requests are blocked automatically.",
+            504,
+        )
+    except Exception as exc:
+        print("V73 RESET RECEIPT SUBMISSION ERROR:", repr(exc), flush=True)
+        return _np_fail(
+            "Reset receipt submission failed: " + str(exc),
+            500,
+        )
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V73
+
