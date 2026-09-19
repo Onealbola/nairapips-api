@@ -15432,7 +15432,7 @@ def _aff_base_url():
 
 def _aff_link_for_code(code):
     code = _aff_code(code)
-    return f"{_aff_base_url()}/?ref={code}" if code else _aff_base_url()
+    return f"{_aff_base_url()}/dashboard/?mode=register&ref={code}" if code else f"{_aff_base_url()}/dashboard/?mode=register"
 
 def _aff_repair_partner_link(partner):
     """Return and persist the canonical public referral URL for older partner rows."""
@@ -16489,7 +16489,12 @@ def affiliate_payout_quote():
 
 @app.route("/trader_referral_activity", methods=["GET", "POST", "OPTIONS"])
 def trader_referral_activity():
-    """Show referral registrations separately from commission earnings."""
+    """Fast referral activity read.
+
+    Important: this route is intentionally read-light. It does NOT run the expensive
+    historical commission reconciliation sweep. Commission reconciliation remains on
+    the payout/approval paths where it belongs.
+    """
     if request.method == "OPTIONS":
         return _np_ok({})
     try:
@@ -16511,20 +16516,123 @@ def trader_referral_activity():
         if not owner_email and owner_phone and owner_phone != _aff_norm_phone(trader.get("phone")):
             return bad("This referral code does not belong to this trader", 403)
 
-        _affiliate_reconcile_commissions_for_code(code)
         records = {}
+        repair_status = {"attempted": False, "result": "not_needed"}
+
+        # Exact historical recovery requested by the owner on 2026-09-19.
+        # Scope is deliberately locked to one email + one referral code.
+        # It never runs globally and never runs before unrelated requests.
+        if code == "ADERETIFOLASADEANIKE":
+            repair_status = {"attempted": True, "result": "not_found"}
+            try:
+                historical_rows = (supabase.table("traders").select("*")
+                                   .eq("email", "bolaji273@gmail.com").limit(10).execute().data or [])
+                if not historical_rows:
+                    try:
+                        historical_rows = (supabase.table("traders").select("*")
+                                           .eq("canonical_email", "bolaji273@gmail.com")
+                                           .limit(10).execute().data or [])
+                    except Exception:
+                        historical_rows = []
+                if historical_rows:
+                    try:
+                        historical = sorted(historical_rows, key=_row_score, reverse=True)[0]
+                    except Exception:
+                        historical = historical_rows[0]
+
+                    prior = ""
+                    try:
+                        prior = _np_referral_code_from_trader(historical) or ""
+                    except Exception:
+                        prior = ""
+
+                    if prior and _aff_code(prior) != code:
+                        repair_status = {"attempted": True, "result": "different_existing_referral", "existing_code": _aff_code(prior)}
+                    else:
+                        if _aff_code(prior) != code and historical.get("id"):
+                            marker = f"ref={code}"
+                            def _append_ref(value):
+                                value = str(value or "").strip()
+                                if re.search(r"(?:^|[|;&\\s])ref=[A-Za-z0-9_-]{1,40}(?:$|[|;&\\s])", value, re.I):
+                                    return value
+                                return f"{value}|{marker}" if value else marker
+
+                            old_registration_source = str(historical.get("registration_source") or "").strip()
+                            old_source = str(historical.get("source") or "").strip()
+                            old_payment_note = str(historical.get("payment_note") or "").strip()
+                            variants = [
+                                {
+                                    "registration_source": _append_ref(old_registration_source or "historical_referral_recovery"),
+                                    "source": _append_ref(old_source or "historical_referral_recovery"),
+                                    "payment_note": _append_ref(old_payment_note),
+                                    "updated_at": now_iso(),
+                                },
+                                {
+                                    "source": _append_ref(old_source or "historical_referral_recovery"),
+                                    "payment_note": _append_ref(old_payment_note),
+                                    "updated_at": now_iso(),
+                                },
+                                {
+                                    "payment_note": _append_ref(old_payment_note),
+                                    "updated_at": now_iso(),
+                                },
+                            ]
+                            updated = []
+                            last_error = None
+                            for patch in variants:
+                                try:
+                                    updated = (supabase.table("traders").update(patch)
+                                               .eq("id", historical.get("id")).execute().data or [])
+                                    if updated:
+                                        historical = updated[0]
+                                        break
+                                except Exception as exc:
+                                    last_error = exc
+                            repair_status = {
+                                "attempted": True,
+                                "result": "recovered" if updated else "update_failed",
+                            }
+                            if last_error and not updated:
+                                repair_status["error"] = str(last_error)[:250]
+                        else:
+                            repair_status = {"attempted": True, "result": "already_correct"}
+
+                        # Make the historical registration visible in this same response
+                        # once ownership is verified, even if the database update has not
+                        # propagated through a subsequent query yet.
+                        key = str(historical.get("id") or historical.get("email") or "").strip().lower()
+                        if key:
+                            email = str(historical.get("email") or "").strip().lower()
+                            masked = (email[:2] + "***" + email[email.find("@"):] if "@" in email else "Registered trader")
+                            records[key] = {
+                                "trader_id": historical.get("id"),
+                                "name": str(historical.get("name") or "Referred trader")[:80],
+                                "email": masked,
+                                "registered_at": historical.get("created_at"),
+                                "purchase_count": 0,
+                                "latest_purchase_status": "registered",
+                                "commission_status": "not_earned_yet",
+                                "commission_amount": 0,
+                            }
+            except Exception as exc:
+                repair_status = {"attempted": True, "result": "error", "error": str(exc)[:250]}
 
         # Registration evidence captured from the referral URL.
+        # Keep these lookups bounded and independent. No nested historical sweep here.
         referred = []
+        seen_referred = set()
         for column in ("registration_source", "source", "payment_note", "admin_note"):
             try:
-                # select('*') is deliberate: requesting optional columns by
-                # name caused every lookup to fail when one column was absent.
                 rows = (supabase.table("traders").select("*")
-                        .ilike(column, f"%ref={code}%").limit(500).execute().data or [])
-                referred.extend(rows)
+                        .ilike(column, f"%ref={code}%").limit(200).execute().data or [])
+                for row in rows:
+                    rid = str(row.get("id") or row.get("email") or "").strip().lower()
+                    if rid and rid not in seen_referred:
+                        seen_referred.add(rid)
+                        referred.append(row)
             except Exception as exc:
                 print(f"REFERRAL ACTIVITY REGISTRATION LOOKUP SKIP {column}:", exc)
+
         for row in referred:
             key = str(row.get("id") or row.get("email") or "").strip().lower()
             if not key:
@@ -16536,19 +16644,19 @@ def trader_referral_activity():
                 "name": str(row.get("name") or "Referred trader")[:80],
                 "email": masked,
                 "registered_at": row.get("created_at"),
-                "purchase_count": 0,
-                "latest_purchase_status": "registered",
-                "commission_status": "not_earned_yet",
-                "commission_amount": 0,
+                "purchase_count": int(records.get(key, {}).get("purchase_count") or 0),
+                "latest_purchase_status": records.get(key, {}).get("latest_purchase_status") or "registered",
+                "commission_status": records.get(key, {}).get("commission_status") or "not_earned_yet",
+                "commission_amount": clean(records.get(key, {}).get("commission_amount") or 0),
             }
 
-        # Purchase evidence also counts even when an old registration row lacks ref metadata.
+        # Purchase evidence. These are direct equality lookups only; no repair sweep.
         purchases = []
         seen_purchase_ids = set()
         for column in ("affiliate_code", "referral_code", "partner_code", "promo_code"):
             try:
                 rows = (supabase.table("challenge_purchases").select("*").eq(column, code)
-                        .order("created_at", desc=True).limit(500).execute().data or [])
+                        .order("created_at", desc=True).limit(200).execute().data or [])
                 for row in rows:
                     pid = str(row.get("id") or "")
                     if pid and pid not in seen_purchase_ids:
@@ -16560,7 +16668,7 @@ def trader_referral_activity():
         commissions = {}
         try:
             for row in (supabase.table("affiliate_commissions").select("*").eq("partner_code", code)
-                        .order("created_at", desc=True).limit(500).execute().data or []):
+                        .order("created_at", desc=True).limit(200).execute().data or []):
                 commissions[str(row.get("purchase_id") or "")] = row
         except Exception as exc:
             print("REFERRAL ACTIVITY COMMISSION LOOKUP SKIP:", exc)
@@ -16596,9 +16704,12 @@ def trader_referral_activity():
             "buyer_count": sum(1 for x in activity if int(x.get("purchase_count") or 0) > 0),
             "purchase_count": len(purchases),
             "referrals": activity[:100],
+            "repair_status": repair_status,
+            "fast_activity_path": True,
         }, "Referral activity ready")
     except Exception as e:
         return bad(e, 500)
+
 
 @app.route("/request_affiliate_payout", methods=["POST", "OPTIONS"])
 def request_affiliate_payout():
@@ -42920,153 +43031,3 @@ def submit_reset_payment_proof_v73():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V73
-
-# ============================================================
-# NAIRAPIPS TARGETED HISTORICAL REFERRAL RECOVERY — 2026-09-19
-# Scope: ONLY bolaji273@gmail.com -> ADERETIFOLASADEANIKE
-# Safety: does not touch MT5, Second-Life, lifecycle, reset, payout,
-# challenge status, balances, credentials, or automation workers.
-# Idempotent: once the referral is present, it performs no further write.
-# ============================================================
-NAIRAPIPS_REFERRAL_RECOVERY_RELEASE_20260919 = "BOLAJI273_ADERETIFOLASADEANIKE_REFERRAL_ONLY"
-_NP_REFERRAL_RECOVERY_STATE_20260919 = {"done": False, "attempts": 0, "result": "pending"}
-
-
-def _np_recover_bolaji273_referral_20260919():
-    state = _NP_REFERRAL_RECOVERY_STATE_20260919
-    if state.get("done"):
-        return state
-    # Avoid a bad dependency causing work on every request forever.
-    if int(state.get("attempts") or 0) >= 10:
-        return state
-    state["attempts"] = int(state.get("attempts") or 0) + 1
-
-    target_email = "bolaji273@gmail.com"
-    target_code = "ADERETIFOLASADEANIKE"
-    marker = f"ref={target_code}"
-
-    try:
-        rows = (
-            supabase.table("traders")
-            .select("*")
-            .eq("email", target_email)
-            .limit(10)
-            .execute().data or []
-        )
-        if not rows:
-            # Also try canonical_email where available.
-            try:
-                rows = (
-                    supabase.table("traders")
-                    .select("*")
-                    .eq("canonical_email", target_email)
-                    .limit(10)
-                    .execute().data or []
-                )
-            except Exception:
-                rows = []
-        if not rows:
-            state["result"] = "trader_not_found"
-            return state
-
-        # Choose the same strongest row-selection rule already used by production.
-        try:
-            trader = sorted(rows, key=_row_score, reverse=True)[0]
-        except Exception:
-            trader = rows[0]
-
-        trader_id = trader.get("id")
-        if not trader_id:
-            state["result"] = "trader_missing_id"
-            return state
-
-        prior_code = ""
-        try:
-            prior_code = _np_referral_code_from_trader(trader) or ""
-        except Exception:
-            prior_code = ""
-
-        # Never overwrite another established referrer automatically.
-        if prior_code and str(prior_code).upper() != target_code:
-            state["done"] = True
-            state["result"] = f"existing_different_referral:{prior_code}"
-            print("REFERRAL RECOVERY 20260919 SKIPPED: existing referral", target_email, prior_code, flush=True)
-            return state
-
-        if str(prior_code).upper() == target_code:
-            state["done"] = True
-            state["result"] = "already_correct"
-            return state
-
-        old_registration_source = str(trader.get("registration_source") or "").strip()
-        old_source = str(trader.get("source") or "").strip()
-        old_payment_note = str(trader.get("payment_note") or "").strip()
-
-        def _append_marker(value):
-            value = str(value or "").strip()
-            if re.search(r"(?:^|[|;&\s])ref=[A-Za-z0-9_-]{1,40}(?:$|[|;&\s])", value, re.I):
-                return value
-            return f"{value}|{marker}" if value else marker
-
-        full_patch = {
-            "registration_source": _append_marker(old_registration_source or "historical_referral_recovery"),
-            "source": _append_marker(old_source or "historical_referral_recovery"),
-            "payment_note": _append_marker(old_payment_note),
-            "updated_at": now_iso(),
-        }
-
-        # Production schemas differ. Try richest patch first, then safe fallbacks.
-        variants = [
-            full_patch,
-            {k: v for k, v in full_patch.items() if k != "registration_source"},
-            {"payment_note": _append_marker(old_payment_note), "updated_at": now_iso()},
-        ]
-        updated = []
-        last_error = None
-        for patch in variants:
-            try:
-                updated = (
-                    supabase.table("traders")
-                    .update(patch)
-                    .eq("id", trader_id)
-                    .execute().data or []
-                )
-                if updated:
-                    break
-            except Exception as exc:
-                last_error = exc
-
-        if not updated:
-            state["result"] = "update_failed:" + (str(last_error) if last_error else "unknown")
-            return state
-
-        state["done"] = True
-        state["result"] = "recovered"
-        state["trader_id"] = str(trader_id)
-        print("REFERRAL RECOVERY 20260919 OK:", target_email, "->", target_code, flush=True)
-        return state
-    except Exception as exc:
-        state["result"] = "error:" + str(exc)
-        print("REFERRAL RECOVERY 20260919 ERROR:", repr(exc), flush=True)
-        return state
-
-
-@app.before_request
-def _np_referral_recovery_heartbeat_20260919():
-    # One tiny idempotent historical repair; after success this becomes a no-op.
-    try:
-        _np_recover_bolaji273_referral_20260919()
-    except Exception:
-        pass
-    return None
-
-
-@app.get("/admin/referral_recovery_20260919/status")
-def _np_referral_recovery_status_20260919():
-    return _np_ok({
-        "success": True,
-        "release": NAIRAPIPS_REFERRAL_RECOVERY_RELEASE_20260919,
-        "email": "bolaji273@gmail.com",
-        "referral_code": "ADERETIFOLASADEANIKE",
-        "state": dict(_NP_REFERRAL_RECOVERY_STATE_20260919),
-    })
