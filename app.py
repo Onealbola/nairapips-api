@@ -41882,3 +41882,326 @@ def admin_reset_integrity_v71_status():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAID_RESET_FIREWALL_RELEASE_V71
 
+
+
+# ============================================================================
+# NAIRAPIPS V72 — RESET FULFILLED RECONCILIATION + DUPLICATE ASSIGNMENT LOCK
+# 19 SEP 2026
+#
+# INCIDENT / FORENSIC RESULT
+# --------------------------
+# An approved reset child order could remain discoverable after its replacement
+# MT5 had already been assigned. The V62 direct Funded policy checked that order
+# before checking whether the reset had already produced its successor, so the
+# Cockpit could incorrectly display RESET_MT5_DUE after fulfilment.
+#
+# V72 establishes the final invariant:
+#
+#   EXACT RESET SOURCE + GENUINE SUCCESSOR EXISTS
+#       => RESET_FULFILLED_ACTIVE
+#       => NO payment can be submitted again
+#       => NO manual reset assignment can be fired again
+#       => NO automation owes another MT5
+#
+# This does not alter:
+#   Phase1 pass -> Funded
+#   Second Life
+#   Payout-paid Funded renewal
+# ============================================================================
+
+NAIRAPIPS_RESET_FULFILLED_RELEASE_V72 = "V72_RESET_FULFILLED_RECONCILIATION_LOCK_2026_09_19"
+
+
+def _np_v72_exact_reset_successor(source):
+    """Return exact genuine successor for an already-fulfilled reset source."""
+    source = source or {}
+    try:
+        child = _np_v63_source_replacement(source)
+        if child and str(child.get("mt5_login") or "").strip():
+            return child
+    except Exception:
+        pass
+
+    rid = str(source.get("reset_replacement_account_id") or "").strip()
+    tid = str(source.get("trader_id") or "").strip()
+    if rid and tid:
+        try:
+            rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", rid).eq("trader_id", tid)
+                .limit(1).execute().data or []
+            )
+            if rows and str(rows[0].get("mt5_login") or "").strip():
+                return rows[0]
+        except Exception:
+            pass
+
+    return None
+
+
+def _np_v72_source_is_paid_reset_context(source):
+    source = source or {}
+    blob = _np_kill_blob(source)
+    return bool(
+        source.get("reset_order_id")
+        or source.get("reset_consumed_at")
+        or source.get("reset_replacement_account_id")
+        or "[np_entitlement:funded_reset_paid:" in blob
+        or "[np_entitlement:challenge_reset_paid:" in blob
+        or "np_consumed:paid_reset:" in blob
+        or "np_funded_breach_reset_consumed" in blob
+        or "funded_reset_paid" in blob
+        or "challenge_reset_paid" in blob
+    )
+
+
+# ---------------------------------------------------------------------------
+# A) FINAL FUNDED RESET POLICY
+# Successor existence outranks stale approved reset orders.
+# ---------------------------------------------------------------------------
+
+_np_v62_direct_funded_reset_policy_v72_core = _np_v62_direct_funded_reset_policy
+
+def _np_v62_direct_funded_reset_policy(account, trader=None):
+    a = account or {}
+    trader = trader or {}
+
+    if (
+        a
+        and _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == "funded"
+        and _np_reset_account_is_breached(a)
+    ):
+        child = _np_v72_exact_reset_successor(a)
+        if child:
+            purchase = _np_reset_purchase_for_account(a) or {}
+            size = clean(
+                a.get("account_size")
+                or a.get("start_balance")
+                or child.get("account_size")
+                or purchase.get("account_size")
+                or 0
+            )
+            return {
+                "eligible": False,
+                "kind": "fulfilled",
+                "reason": "funded_reset_successor_exists",
+                "title": "Funded Reset Fulfilled",
+                "subtitle": (
+                    f"The one paid Funded Reset has already been fulfilled by MT5 "
+                    f"{child.get('mt5_login')}. No further MT5 is due from this reset."
+                ),
+                "stage": "funded",
+                "account_size": size,
+                "source_account_id": str(a.get("id") or "").strip(),
+                "source_mt5_login": a.get("mt5_login"),
+                "purchase_id": str(purchase.get("id") or "").strip() or None,
+                "replacement_account_id": child.get("id"),
+                "replacement_mt5_login": child.get("mt5_login"),
+                "price": 0,
+                "closed": False,
+                "safe_to_assign_now": False,
+                "authority": "V72_RESET_FULFILLED",
+            }
+
+    return _np_v62_direct_funded_reset_policy_v72_core(a, trader)
+
+
+# ---------------------------------------------------------------------------
+# B) GUIDE MAPPER
+# FULFILLED is ACTIVE/RECONCILED, not CLOSED and not MT5-DUE.
+# ---------------------------------------------------------------------------
+
+_np_v61_policy_to_guide_decision_v72_core = _np_v61_policy_to_guide_decision
+
+def _np_v61_policy_to_guide_decision(policy, account, purchase):
+    p = policy or {}
+    if str(p.get("kind") or "").strip().lower() == "fulfilled":
+        account = account or {}
+        purchase = purchase or {}
+        replacement_mt5 = str(p.get("replacement_mt5_login") or "").strip()
+        replacement_id = str(p.get("replacement_account_id") or "").strip()
+        return {
+            "success": True,
+            "release": NAIRAPIPS_RESET_FULFILLED_RELEASE_V72,
+            "purchase_id": str(purchase.get("id") or p.get("purchase_id") or "").strip() or None,
+            "trader_id": str(account.get("trader_id") or purchase.get("trader_id") or "").strip(),
+            "automation_mode": (
+                "CLEAN_AUTOMATION"
+                if purchase and _np_automation_generation_purchase(purchase)
+                else "LEGACY_MANUAL"
+            ),
+            "automatic_assignment_allowed": False,
+            "source_account_id": str(p.get("source_account_id") or account.get("id") or "").strip(),
+            "source_mt5": str(p.get("source_mt5_login") or account.get("mt5_login") or "").strip(),
+            "target_stage": "funded",
+            "account_size": clean(p.get("account_size") or account.get("account_size") or 0),
+            "price": 0,
+            "payment_required": False,
+            "closed": False,
+            "safe_to_assign_now": False,
+            "code": "RESET_FULFILLED_ACTIVE",
+            "state": "ACTIVE",
+            "title": "FUNDED RESET FULFILLED",
+            "message": (
+                f"Fresh Funded MT5 {replacement_mt5 or 'has been assigned'} already "
+                f"fulfilled the one paid Funded Reset. No MT5 is outstanding."
+            ),
+            "replacement_account_id": replacement_id or None,
+            "replacement_mt5": replacement_mt5 or None,
+            "reset_policy": p,
+        }
+
+    return _np_v61_policy_to_guide_decision_v72_core(policy, account, purchase)
+
+
+# ---------------------------------------------------------------------------
+# C) TRADER PAYMENT-SUBMISSION FIREWALL
+# Even if an old/stale frontend renders a reset button, the server refuses a
+# second payment request once the exact reset has a successor.
+# ---------------------------------------------------------------------------
+
+_np_create_reset_purchase_v72_core = app.view_functions.get("create_reset_purchase")
+
+def _np_create_reset_purchase_v72():
+    if request.method == "OPTIONS":
+        return _np_create_reset_purchase_v72_core()
+
+    d = request.get_json(silent=True) or {}
+    requested = str(d.get("trader_id") or "").strip()
+    authed_id, auth_error = _authenticated_trader_id_for_request(requested)
+    if auth_error:
+        return _np_fail(auth_error, 401)
+
+    source_id = str(
+        d.get("trader_account_id")
+        or d.get("source_account_id")
+        or ""
+    ).strip()
+
+    if source_id:
+        try:
+            rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", source_id).eq("trader_id", authed_id)
+                .limit(1).execute().data or []
+            )
+            if rows:
+                source = rows[0]
+                child = _np_v72_exact_reset_successor(source)
+                if child:
+                    return _np_fail(
+                        f"Reset already fulfilled by MT5 "
+                        f"{child.get('mt5_login') or 'a replacement account'}. "
+                        f"Do not pay again.",
+                        409,
+                    )
+                if (
+                    source.get("reset_consumed_at")
+                    or source.get("reset_replacement_account_id")
+                    or "np_consumed:paid_reset:" in _np_kill_blob(source)
+                ):
+                    return _np_fail(
+                        "This exact reset entitlement is already consumed. "
+                        "A second reset payment cannot be opened.",
+                        409,
+                    )
+        except Exception as exc:
+            return _np_fail(
+                "Reset safety check could not be completed: " + str(exc),
+                500,
+            )
+
+    return _np_create_reset_purchase_v72_core()
+
+
+if _np_create_reset_purchase_v72_core:
+    app.view_functions["create_reset_purchase"] = _np_create_reset_purchase_v72
+
+
+# ---------------------------------------------------------------------------
+# D) MANUAL/STAFF ASSIGNMENT FIREWALL
+# Status naming is no longer trusted. If the exact reset source already produced
+# its successor, any repeat assignment request is rejected before core assignment.
+# ---------------------------------------------------------------------------
+
+_np_assign_phase_v72_core = app.view_functions.get("assign_phase_mt5")
+
+def _np_assign_phase_v72():
+    if request.method == "OPTIONS":
+        return _np_assign_phase_v72_core()
+
+    d = request.get_json(silent=True) or {}
+    tid = str(d.get("trader_id") or d.get("id") or "").strip()
+    raw_source = str(
+        d.get("completed_account_id")
+        or d.get("source_account_id")
+        or d.get("trader_account_id")
+        or ""
+    ).strip()
+
+    for prefix in ("waiting:", "reset-waiting:", "recall-waiting:"):
+        if raw_source.startswith(prefix):
+            raw_source = raw_source.split(":", 1)[1]
+            if prefix == "waiting:" and ":" in raw_source:
+                raw_source = raw_source.split(":", 1)[0]
+            break
+
+    if tid and raw_source:
+        try:
+            rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", raw_source).eq("trader_id", tid)
+                .limit(1).execute().data or []
+            )
+            if rows:
+                source = rows[0]
+                if _np_v72_source_is_paid_reset_context(source):
+                    child = _np_v72_exact_reset_successor(source)
+                    if child:
+                        return _np_fail(
+                            f"Duplicate reset assignment blocked: source MT5 "
+                            f"{source.get('mt5_login') or '—'} already produced "
+                            f"replacement MT5 {child.get('mt5_login') or '—'}.",
+                            409,
+                        )
+        except Exception as exc:
+            return _np_fail(
+                "Reset replay safety check failed closed: " + str(exc),
+                500,
+            )
+
+    return _np_assign_phase_v72_core()
+
+
+if _np_assign_phase_v72_core:
+    app.view_functions["assign_phase_mt5"] = _np_assign_phase_v72
+
+
+# ---------------------------------------------------------------------------
+# E) READ-ONLY integrity endpoint
+# ---------------------------------------------------------------------------
+
+@app.route("/admin/reset_integrity_v72/status", methods=["GET", "OPTIONS"])
+def admin_reset_integrity_v72_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_RESET_FULFILLED_RELEASE_V72,
+        "successor_exists_overrides_stale_approved_order": True,
+        "fulfilled_reset_code": "RESET_FULFILLED_ACTIVE",
+        "fulfilled_reset_is_closed": False,
+        "fulfilled_reset_owes_mt5": False,
+        "second_payment_after_successor": "BLOCKED",
+        "second_manual_assignment_after_successor": "BLOCKED",
+        "automatic_duplicate_assignment": "BLOCKED_BY_EXISTING_CHILD_IDEMPOTENCY",
+        "phase_pass_to_funded_unchanged": True,
+        "second_life_unchanged": True,
+        "payout_renewal_unchanged": True,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_FULFILLED_RELEASE_V72
