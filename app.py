@@ -43013,14 +43013,39 @@ def referral_v3_summary():
         except Exception as exc:
             print("REFERRAL V3 REGISTRATION LOOKUP SKIP:", exc, flush=True)
 
-        # Recover the owner's known historical test registration without fabricating a row:
-        # it is shown only when that email really exists in the traders table.
+        # Recover the owner's known historical test registration using the same
+        # identity resolver as production login (canonical_email/email/phone/etc).
+        # If the trader exists and has no conflicting prior referrer, persist the
+        # missing marker so future activity reads do not need this recovery path.
         if code == "ADERETIFOLASADEANIKE" and not any(str(x.get("email") or "").lower() == "bolaji273@gmail.com" for x in referred):
             try:
-                hist = (supabase.table("traders").select("id,name,email,created_at,payment_note")
-                        .eq("email", "bolaji273@gmail.com").limit(1).execute().data or [])
-                if hist:
-                    referred.append(hist[0])
+                hist_row = _latest_trader_for_lookup("bolaji273@gmail.com")
+                if hist_row:
+                    prior_code = _np_referral_code_from_trader(hist_row)
+                    if not prior_code or prior_code == code:
+                        if not prior_code and hist_row.get("id"):
+                            old_note = str(hist_row.get("payment_note") or "").strip()
+                            new_note = (old_note + (" | " if old_note else "") + f"ref={code}").strip()
+                            try:
+                                patched = (supabase.table("traders").update({
+                                    "payment_note": new_note,
+                                    "updated_at": now_iso(),
+                                }).eq("id", hist_row.get("id")).execute().data or [])
+                                if patched:
+                                    hist_row = patched[0]
+                            except Exception as patch_exc:
+                                print("REFERRAL V3 HISTORICAL MARKER PATCH SKIP:", patch_exc, flush=True)
+                        referred.append({
+                            "id": hist_row.get("id"),
+                            "name": hist_row.get("name"),
+                            "email": hist_row.get("email") or hist_row.get("canonical_email") or "bolaji273@gmail.com",
+                            "created_at": hist_row.get("created_at"),
+                            "payment_note": hist_row.get("payment_note"),
+                        })
+                    else:
+                        print("REFERRAL V3 HISTORICAL CONFLICT: bolaji273@gmail.com already belongs to", prior_code, flush=True)
+                else:
+                    print("REFERRAL V3 HISTORICAL NOT FOUND: bolaji273@gmail.com", flush=True)
             except Exception as exc:
                 print("REFERRAL V3 HISTORICAL LOOKUP SKIP:", exc, flush=True)
 
@@ -43086,3 +43111,433 @@ def referral_v3_summary():
     except Exception as exc:
         print("REFERRAL V3 SUMMARY ERROR:", repr(exc), flush=True)
         return bad(str(exc), 500)
+
+# ============================================================================
+# NAIRAPIPS REFERRAL V4 — DURABLE REGISTRATION ATTRIBUTION 2026-09-19
+# PURPOSE
+# -------
+# Make referral attribution first-touch, redundant, and server-enforced so a
+# successful registration arriving with a referral code is not silently lost.
+# This patch is isolated from MT5, lifecycle, Second-Life, reset and payout
+# automation. It strengthens only registration attribution + referral activity.
+# ============================================================================
+NAIRAPIPS_REFERRAL_V4_RELEASE = "REFERRAL_V4_DURABLE_ATTRIBUTION_2026_09_19"
+
+
+def _np_ref_v4_code_from_payload(payload):
+    payload = payload or {}
+    return _aff_code(
+        payload.get("referred_by_code")
+        or payload.get("referral_code")
+        or payload.get("affiliate_code")
+        or payload.get("partner_code")
+        or payload.get("ref_code")
+        or payload.get("ref")
+        or payload.get("code")
+    )
+
+
+def _np_ref_v4_append_marker(value, code):
+    text = str(value or "").strip()
+    code = _aff_code(code)
+    if not code:
+        return text
+    if re.search(r"(?:^|[|;&\s])ref=" + re.escape(code) + r"(?:$|[|;&\s])", text, re.I):
+        return text
+    return (text + (" | " if text else "") + f"ref={code}").strip()
+
+
+def _np_ref_v4_find_trader(trader_id="", email="", phone=""):
+    trader_id = str(trader_id or "").strip()
+    email = str(email or "").strip().lower()
+    phone = str(phone or "").strip()
+    if trader_id:
+        try:
+            rows = supabase.table("traders").select("*").eq("id", trader_id).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+        except Exception as exc:
+            print("REFERRAL V4 TRADER ID LOOKUP SKIP:", exc, flush=True)
+    if email:
+        try:
+            row = _latest_trader_for_lookup(email)
+            if row:
+                return row
+        except Exception as exc:
+            print("REFERRAL V4 EMAIL LOOKUP SKIP:", exc, flush=True)
+    if phone:
+        try:
+            row = _latest_trader_for_lookup(phone)
+            if row:
+                return row
+        except Exception as exc:
+            print("REFERRAL V4 PHONE LOOKUP SKIP:", exc, flush=True)
+    return None
+
+
+def _np_ref_v4_persist_attribution(trader_id="", email="", phone="", code="", capture_source="registration"):
+    """Persist immutable first-touch referral attribution redundantly.
+
+    `payment_note` is the guaranteed legacy-compatible carrier. We also try
+    registration_source/source when those columns exist. A pre-existing different
+    referral code is never overwritten.
+    """
+    code = _aff_code(code)
+    if not code:
+        return {"captured": False, "reason": "no_code"}
+
+    trader = _np_ref_v4_find_trader(trader_id, email, phone)
+    if not trader:
+        return {"captured": False, "reason": "trader_not_found", "code": code}
+
+    prior = _np_referral_code_from_trader(trader)
+    if prior and prior != code:
+        return {
+            "captured": False,
+            "reason": "first_touch_preserved",
+            "code": prior,
+            "incoming_code": code,
+            "trader_id": trader.get("id"),
+        }
+
+    tid = trader.get("id")
+    if not tid:
+        return {"captured": False, "reason": "missing_trader_id", "code": code}
+
+    # Primary durable carrier. This column exists in the production trader schema
+    # and is already used by registration/referral reads.
+    payment_note = _np_ref_v4_append_marker(trader.get("payment_note"), code)
+    last_error = None
+    patched_any = False
+    try:
+        patched = (supabase.table("traders").update({
+            "payment_note": payment_note,
+            "updated_at": now_iso(),
+        }).eq("id", tid).execute().data or [])
+        if patched:
+            trader = patched[0]
+            patched_any = True
+    except Exception as exc:
+        last_error = exc
+        print("REFERRAL V4 PAYMENT_NOTE CAPTURE ERROR:", exc, flush=True)
+
+    # Redundant carriers. Each is independent so an older schema cannot break the
+    # primary capture above.
+    for field in ("registration_source", "source"):
+        try:
+            current = str(trader.get(field) or "").strip()
+            new_value = _np_ref_v4_append_marker(current or capture_source, code)
+            if new_value != current:
+                rows = (supabase.table("traders").update({field: new_value, "updated_at": now_iso()})
+                        .eq("id", tid).execute().data or [])
+                if rows:
+                    trader = rows[0]
+                    patched_any = True
+        except Exception as exc:
+            # Optional on older schemas; never undo the primary payment_note capture.
+            print(f"REFERRAL V4 OPTIONAL {field} CAPTURE SKIP:", exc, flush=True)
+
+    # Audit backup: useful if a future UI field is changed or a legacy row is repaired.
+    try:
+        _audit_safe(
+            "traders",
+            "referral_attribution_captured",
+            f"Referral attribution captured: trader={tid} code={code} source={capture_source}",
+            {"name": "referral_v4", "username": "referral_v4", "role": "system"},
+            tid,
+        )
+    except Exception as exc:
+        print("REFERRAL V4 AUDIT SKIP:", exc, flush=True)
+
+    # Verify from the row again. If payment_note succeeded, this should resolve.
+    try:
+        verified_rows = supabase.table("traders").select("*").eq("id", tid).limit(1).execute().data or []
+        verified = verified_rows[0] if verified_rows else trader
+        resolved = _np_referral_code_from_trader(verified)
+        if resolved == code:
+            return {"captured": True, "code": code, "trader_id": tid, "source": capture_source}
+        if resolved and resolved != code:
+            return {"captured": False, "reason": "first_touch_preserved", "code": resolved, "incoming_code": code, "trader_id": tid}
+    except Exception as exc:
+        last_error = last_error or exc
+
+    return {
+        "captured": bool(patched_any),
+        "code": code,
+        "trader_id": tid,
+        "reason": "capture_unverified" if patched_any else "capture_failed",
+        "error": str(last_error) if last_error else "",
+    }
+
+
+# Wrap the existing production registration endpoint instead of rewriting it.
+# The original registration logic remains authoritative; V4 only verifies and
+# persists the referral after any successful registration/completion response.
+_np_register_trader_v4_core = app.view_functions.get("register_trader")
+
+
+def register_trader_v4_durable_referral():
+    if _np_register_trader_v4_core is None:
+        return bad("Registration authority unavailable", 500)
+    if request.method == "OPTIONS":
+        return _np_register_trader_v4_core()
+
+    incoming = request.get_json(silent=True) or {}
+    incoming_code = _np_ref_v4_code_from_payload(incoming)
+    response = _np_register_trader_v4_core()
+
+    if not incoming_code:
+        return response
+
+    try:
+        response_obj = response[0] if isinstance(response, tuple) else response
+        payload = response_obj.get_json(silent=True) if hasattr(response_obj, "get_json") else None
+        if not isinstance(payload, dict) or not payload.get("success"):
+            return response
+        data = payload.get("data") or {}
+        if not isinstance(data, dict):
+            data = {}
+        trader_id = data.get("id") or data.get("trader_id") or incoming.get("trader_id")
+        result = _np_ref_v4_persist_attribution(
+            trader_id=trader_id,
+            email=data.get("email") or incoming.get("email"),
+            phone=data.get("phone") or incoming.get("phone"),
+            code=incoming_code,
+            capture_source="register_trader",
+        )
+        print("REFERRAL V4 REGISTRATION CAPTURE:", result, flush=True)
+    except Exception as exc:
+        # Registration itself already succeeded. Never corrupt or roll back the
+        # trader account because the auxiliary verification/audit failed.
+        print("REFERRAL V4 POST-REGISTER CAPTURE ERROR:", repr(exc), flush=True)
+    return response
+
+
+if _np_register_trader_v4_core is not None:
+    app.view_functions["register_trader"] = register_trader_v4_durable_referral
+
+
+def _np_ref_v4_owner_authorized(trader_id, code):
+    rows = supabase.table("traders").select("id,email,phone").eq("id", trader_id).limit(1).execute().data or []
+    partner = _aff_get_partner_by_code(code) or _aff_get_code(code)
+    if not rows or not partner:
+        return False, "Referral account not found"
+    trader = rows[0]
+    owner_email = _aff_norm_email(partner.get("email") or partner.get("owner_email"))
+    owner_phone = _aff_norm_phone(partner.get("phone") or partner.get("owner_phone"))
+    if owner_email and owner_email != _aff_norm_email(trader.get("email")):
+        return False, "This referral code does not belong to this trader"
+    if not owner_email and owner_phone and owner_phone != _aff_norm_phone(trader.get("phone")):
+        return False, "This referral code does not belong to this trader"
+    return True, ""
+
+
+def _np_ref_v4_collect_historical(code):
+    """Collect any historical trader row that already contains this referral code.
+
+    Fast path uses payment_note. A limited legacy scan then checks every field via
+    the existing referral parser and normalizes discovered rows back into
+    payment_note so they become fast-path records from then on.
+    """
+    code = _aff_code(code)
+    by_id = {}
+
+    # Fast durable path used by every V4 registration going forward.
+    try:
+        rows = (supabase.table("traders").select("*")
+                .ilike("payment_note", f"%ref={code}%")
+                .order("created_at", desc=True).limit(2000).execute().data or [])
+        for row in rows:
+            key = str(row.get("id") or row.get("email") or "").strip().lower()
+            if key:
+                by_id[key] = row
+    except Exception as exc:
+        print("REFERRAL V4 FAST ACTIVITY LOOKUP SKIP:", exc, flush=True)
+
+    # Legacy normalization scan. NairaPips currently has a modest trader table;
+    # paging avoids one giant response and lets all old referral carriers be found.
+    # Once normalized, future activity reads hit payment_note directly.
+    start = 0
+    page_size = 500
+    max_legacy_scan = 5000
+    while start < max_legacy_scan:
+        try:
+            q = (supabase.table("traders").select("*")
+                 .order("created_at", desc=True).range(start, start + page_size - 1))
+            rows = q.execute().data or []
+        except Exception as exc:
+            print("REFERRAL V4 LEGACY PAGE LOOKUP STOP:", exc, flush=True)
+            break
+        if not rows:
+            break
+        for row in rows:
+            try:
+                if _np_referral_code_from_trader(row) != code:
+                    continue
+                key = str(row.get("id") or row.get("email") or "").strip().lower()
+                if key:
+                    by_id[key] = row
+                if "ref=" + code not in str(row.get("payment_note") or "").upper():
+                    _np_ref_v4_persist_attribution(
+                        trader_id=row.get("id"),
+                        email=row.get("email") or row.get("canonical_email"),
+                        phone=row.get("phone") or row.get("canonical_phone"),
+                        code=code,
+                        capture_source="legacy_referral_normalization",
+                    )
+            except Exception as exc:
+                print("REFERRAL V4 LEGACY ROW NORMALIZE SKIP:", exc, flush=True)
+        if len(rows) < page_size:
+            break
+        start += page_size
+
+    return list(by_id.values())
+
+
+def _np_ref_v4_recover_known_user_confirmed_history(code):
+    """Recover only user-confirmed historical mappings from this repair session."""
+    known = {
+        "ADERETIFOLASADEANIKE": ["bolaji273@gmail.com"],
+    }
+    recovered = []
+    for email in known.get(_aff_code(code), []):
+        # Query both canonical and legacy email columns so duplicate/older trader
+        # rows do not cause the historical referral to disappear.
+        candidates = []
+        for field in ("canonical_email", "email"):
+            try:
+                rows = (supabase.table("traders").select("*")
+                        .eq(field, str(email).strip().lower()).limit(20).execute().data or [])
+                candidates.extend(rows)
+            except Exception as exc:
+                print(f"REFERRAL V4 KNOWN HISTORY {field} LOOKUP SKIP:", exc, flush=True)
+        seen = set()
+        for row in candidates:
+            tid = str(row.get("id") or "")
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            prior = _np_referral_code_from_trader(row)
+            if prior and prior != _aff_code(code):
+                print("REFERRAL V4 KNOWN HISTORY CONFLICT:", email, prior, flush=True)
+                continue
+            result = _np_ref_v4_persist_attribution(
+                trader_id=tid,
+                email=email,
+                phone=row.get("phone"),
+                code=code,
+                capture_source="user_confirmed_historical_recovery",
+            )
+            if result.get("captured") or result.get("code") == _aff_code(code):
+                refreshed = _np_ref_v4_find_trader(tid, email, row.get("phone")) or row
+                recovered.append(refreshed)
+    return recovered
+
+
+def referral_v4_summary():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        trader_id = str(request.args.get("trader_id") or "").strip()
+        code = _aff_code(request.args.get("code"))
+        if not trader_id or not code:
+            return bad("Trader ID and referral code are required", 400)
+        authed_id, auth_error = _authenticated_trader_id_for_request(trader_id)
+        if auth_error:
+            return bad(auth_error, 401)
+        ok_owner, owner_error = _np_ref_v4_owner_authorized(authed_id, code)
+        if not ok_owner:
+            return bad(owner_error, 403)
+
+        referred_rows = _np_ref_v4_collect_historical(code)
+        recovered_rows = _np_ref_v4_recover_known_user_confirmed_history(code)
+
+        referred_map = {}
+        for row in referred_rows + recovered_rows:
+            key = str(row.get("id") or row.get("email") or row.get("canonical_email") or "").strip().lower()
+            if key:
+                referred_map[key] = row
+
+        # Purchase/commission visibility is read-only here. No commission repair,
+        # lifecycle sweep, MT5 work, payout work, or automation worker is triggered.
+        purchases = []
+        seen_purchase_ids = set()
+        for field in ("affiliate_code", "referral_code", "partner_code", "promo_code"):
+            try:
+                rows = (supabase.table("challenge_purchases").select("*")
+                        .eq(field, code).order("created_at", desc=True).limit(1000).execute().data or [])
+                for row in rows:
+                    pid = str(row.get("id") or "")
+                    if pid and pid not in seen_purchase_ids:
+                        seen_purchase_ids.add(pid)
+                        purchases.append(row)
+            except Exception as exc:
+                print(f"REFERRAL V4 PURCHASE {field} LOOKUP SKIP:", exc, flush=True)
+
+        commissions = {}
+        try:
+            rows = (supabase.table("affiliate_commissions").select("*")
+                    .eq("partner_code", code).limit(1000).execute().data or [])
+            commissions = {str(x.get("purchase_id") or ""): x for x in rows}
+        except Exception as exc:
+            print("REFERRAL V4 COMMISSION LOOKUP SKIP:", exc, flush=True)
+
+        records = {}
+        for row in referred_map.values():
+            key = str(row.get("id") or row.get("email") or row.get("canonical_email") or "").strip().lower()
+            if not key:
+                continue
+            email = str(row.get("email") or row.get("canonical_email") or "").strip().lower()
+            masked = email[:2] + "***" + email[email.find("@"):] if "@" in email else "Registered trader"
+            records[key] = {
+                "trader_id": row.get("id"),
+                "name": str(row.get("name") or "Referred trader")[:80],
+                "email": masked,
+                "registered_at": row.get("created_at"),
+                "purchase_count": 0,
+                "latest_purchase_status": "registered",
+                "commission_status": "Not earned yet",
+            }
+
+        for purchase in purchases:
+            key = str(purchase.get("trader_id") or purchase.get("email") or purchase.get("id") or "").strip().lower()
+            if not key:
+                continue
+            email = str(purchase.get("email") or "").strip().lower()
+            item = records.get(key) or {
+                "trader_id": purchase.get("trader_id"),
+                "name": str(purchase.get("trader_name") or "Referred buyer")[:80],
+                "email": email[:2] + "***" + email[email.find("@"):] if "@" in email else "Referred buyer",
+                "registered_at": purchase.get("created_at"),
+                "purchase_count": 0,
+                "latest_purchase_status": "registered",
+                "commission_status": "Not earned yet",
+            }
+            item["purchase_count"] = int(item.get("purchase_count") or 0) + 1
+            item["latest_purchase_status"] = str(purchase.get("payment_status") or purchase.get("status") or "pending").lower()
+            commission = commissions.get(str(purchase.get("id") or "")) or {}
+            if commission:
+                item["commission_status"] = str(commission.get("status") or "pending")
+            records[key] = item
+
+        activity = sorted(records.values(), key=lambda x: str(x.get("registered_at") or ""), reverse=True)
+        return ok({
+            "release": NAIRAPIPS_REFERRAL_V4_RELEASE,
+            "code": code,
+            "registered_count": len(activity),
+            "buyer_count": sum(1 for x in activity if int(x.get("purchase_count") or 0) > 0),
+            "purchase_count": len(purchases),
+            "referrals": activity[:1000],
+            "capture_policy": "first_touch_durable",
+        }, "Referral summary ready")
+    except Exception as exc:
+        print("REFERRAL V4 SUMMARY ERROR:", repr(exc), flush=True)
+        return bad(str(exc), 500)
+
+
+# Keep the existing /referral_v3/summary URL used by referral.html, but replace
+# only its view function with the stronger V4 collector. No frontend change is
+# required for this release.
+if "referral_v3_summary" in app.view_functions:
+    app.view_functions["referral_v3_summary"] = referral_v4_summary
+
