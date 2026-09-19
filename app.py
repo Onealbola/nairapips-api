@@ -15432,7 +15432,7 @@ def _aff_base_url():
 
 def _aff_link_for_code(code):
     code = _aff_code(code)
-    return f"{_aff_base_url()}/dashboard/?mode=register&ref={code}" if code else f"{_aff_base_url()}/dashboard/?mode=register"
+    return f"{_aff_base_url()}/?ref={code}" if code else _aff_base_url()
 
 def _aff_repair_partner_link(partner):
     """Return and persist the canonical public referral URL for older partner rows."""
@@ -42920,3 +42920,153 @@ def submit_reset_payment_proof_v73():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V73
+
+# ============================================================
+# NAIRAPIPS TARGETED HISTORICAL REFERRAL RECOVERY — 2026-09-19
+# Scope: ONLY bolaji273@gmail.com -> ADERETIFOLASADEANIKE
+# Safety: does not touch MT5, Second-Life, lifecycle, reset, payout,
+# challenge status, balances, credentials, or automation workers.
+# Idempotent: once the referral is present, it performs no further write.
+# ============================================================
+NAIRAPIPS_REFERRAL_RECOVERY_RELEASE_20260919 = "BOLAJI273_ADERETIFOLASADEANIKE_REFERRAL_ONLY"
+_NP_REFERRAL_RECOVERY_STATE_20260919 = {"done": False, "attempts": 0, "result": "pending"}
+
+
+def _np_recover_bolaji273_referral_20260919():
+    state = _NP_REFERRAL_RECOVERY_STATE_20260919
+    if state.get("done"):
+        return state
+    # Avoid a bad dependency causing work on every request forever.
+    if int(state.get("attempts") or 0) >= 10:
+        return state
+    state["attempts"] = int(state.get("attempts") or 0) + 1
+
+    target_email = "bolaji273@gmail.com"
+    target_code = "ADERETIFOLASADEANIKE"
+    marker = f"ref={target_code}"
+
+    try:
+        rows = (
+            supabase.table("traders")
+            .select("*")
+            .eq("email", target_email)
+            .limit(10)
+            .execute().data or []
+        )
+        if not rows:
+            # Also try canonical_email where available.
+            try:
+                rows = (
+                    supabase.table("traders")
+                    .select("*")
+                    .eq("canonical_email", target_email)
+                    .limit(10)
+                    .execute().data or []
+                )
+            except Exception:
+                rows = []
+        if not rows:
+            state["result"] = "trader_not_found"
+            return state
+
+        # Choose the same strongest row-selection rule already used by production.
+        try:
+            trader = sorted(rows, key=_row_score, reverse=True)[0]
+        except Exception:
+            trader = rows[0]
+
+        trader_id = trader.get("id")
+        if not trader_id:
+            state["result"] = "trader_missing_id"
+            return state
+
+        prior_code = ""
+        try:
+            prior_code = _np_referral_code_from_trader(trader) or ""
+        except Exception:
+            prior_code = ""
+
+        # Never overwrite another established referrer automatically.
+        if prior_code and str(prior_code).upper() != target_code:
+            state["done"] = True
+            state["result"] = f"existing_different_referral:{prior_code}"
+            print("REFERRAL RECOVERY 20260919 SKIPPED: existing referral", target_email, prior_code, flush=True)
+            return state
+
+        if str(prior_code).upper() == target_code:
+            state["done"] = True
+            state["result"] = "already_correct"
+            return state
+
+        old_registration_source = str(trader.get("registration_source") or "").strip()
+        old_source = str(trader.get("source") or "").strip()
+        old_payment_note = str(trader.get("payment_note") or "").strip()
+
+        def _append_marker(value):
+            value = str(value or "").strip()
+            if re.search(r"(?:^|[|;&\s])ref=[A-Za-z0-9_-]{1,40}(?:$|[|;&\s])", value, re.I):
+                return value
+            return f"{value}|{marker}" if value else marker
+
+        full_patch = {
+            "registration_source": _append_marker(old_registration_source or "historical_referral_recovery"),
+            "source": _append_marker(old_source or "historical_referral_recovery"),
+            "payment_note": _append_marker(old_payment_note),
+            "updated_at": now_iso(),
+        }
+
+        # Production schemas differ. Try richest patch first, then safe fallbacks.
+        variants = [
+            full_patch,
+            {k: v for k, v in full_patch.items() if k != "registration_source"},
+            {"payment_note": _append_marker(old_payment_note), "updated_at": now_iso()},
+        ]
+        updated = []
+        last_error = None
+        for patch in variants:
+            try:
+                updated = (
+                    supabase.table("traders")
+                    .update(patch)
+                    .eq("id", trader_id)
+                    .execute().data or []
+                )
+                if updated:
+                    break
+            except Exception as exc:
+                last_error = exc
+
+        if not updated:
+            state["result"] = "update_failed:" + (str(last_error) if last_error else "unknown")
+            return state
+
+        state["done"] = True
+        state["result"] = "recovered"
+        state["trader_id"] = str(trader_id)
+        print("REFERRAL RECOVERY 20260919 OK:", target_email, "->", target_code, flush=True)
+        return state
+    except Exception as exc:
+        state["result"] = "error:" + str(exc)
+        print("REFERRAL RECOVERY 20260919 ERROR:", repr(exc), flush=True)
+        return state
+
+
+@app.before_request
+def _np_referral_recovery_heartbeat_20260919():
+    # One tiny idempotent historical repair; after success this becomes a no-op.
+    try:
+        _np_recover_bolaji273_referral_20260919()
+    except Exception:
+        pass
+    return None
+
+
+@app.get("/admin/referral_recovery_20260919/status")
+def _np_referral_recovery_status_20260919():
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_REFERRAL_RECOVERY_RELEASE_20260919,
+        "email": "bolaji273@gmail.com",
+        "referral_code": "ADERETIFOLASADEANIKE",
+        "state": dict(_NP_REFERRAL_RECOVERY_STATE_20260919),
+    })
