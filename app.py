@@ -6797,7 +6797,12 @@ def register_trader():
             except Exception as referral_capture_error:
                 print("EXISTING TRADER REGISTRATION REPAIR FAILED:", referral_capture_error)
                 return bad("This account exists but could not be completed. Please contact support.", 500)
-            return ok(existing, "Trader account completed")
+            registration_session = _public_trader_payload(existing)
+            registration_session["auth_token"] = _make_trader_auth_token(existing.get("id"))
+            registration_session["bootstrap_url"] = (
+                f"/trader_bootstrap?trader_id={existing.get('id')}"
+            )
+            return ok(registration_session, "Trader account completed")
 
         # Durable referral attribution: the landing page already sends ref/referral_code,
         # but older registration code discarded it. Preserve it server-side inside the
@@ -6892,7 +6897,12 @@ Phone: {phone or "Not provided"}
 Reference: {trader_row.get("account_reference", "Not generated")}"""
         )
 
-        return ok(trader_row, "Trader registered")
+        registration_session = _public_trader_payload(trader_row)
+        registration_session["auth_token"] = _make_trader_auth_token(trader_row.get("id"))
+        registration_session["bootstrap_url"] = (
+            f"/trader_bootstrap?trader_id={trader_row.get('id')}"
+        )
+        return ok(registration_session, "Trader registered")
     except Exception as e:
         return bad(e)
 
