@@ -42962,11 +42962,16 @@ def _np2_ref_payload_code(data):
     )
 
 
-def _np2_ref_code_for_trader_id(trader_id):
+def _np2_ref_code_for_trader_id(trader_id, trader_name=""):
+    """Human-readable fallback only. The database is authoritative for uniqueness."""
     import hashlib
     tid = str(trader_id or "").strip()
-    digest = hashlib.md5((tid + ":NAIRAPIPS_REFERRAL_FINAL_20260919").encode("utf-8")).hexdigest()[:20]
-    return ("NP" + digest).upper()
+    first = (str(trader_name or "Trader").strip().split() or ["Trader"])[0]
+    base = re.sub(r"[^A-Za-z0-9]", "", first).upper()[:6]
+    if len(base) < 3:
+        base = "TRADER"
+    seed = int(hashlib.md5((tid + ":NP2_SHORT_20260919").encode("utf-8")).hexdigest()[:4], 16) % 100
+    return f"{base}{seed:02d}"
 
 
 def _np2_ref_ensure_profile(trader):
@@ -42978,9 +42983,22 @@ def _np2_ref_ensure_profile(trader):
     rows = db.table("np2_referral_profiles").select("*").eq("trader_id", tid).limit(1).execute().data or []
     if rows:
         return rows[0]
+    # Let the fresh NP2 database generate the authoritative short human code.
+    # This keeps uniqueness/collision handling in one place.
+    try:
+        db.rpc("np2_ensure_referral_profile", {"p_trader_id": tid}).execute()
+        rows = db.table("np2_referral_profiles").select("*").eq("trader_id", tid).limit(1).execute().data or []
+        if rows:
+            return rows[0]
+    except Exception as exc:
+        print("NP2 SHORT PROFILE ENSURE RPC ERROR:", repr(exc), flush=True)
+
+    # Emergency fallback only if the RPC is temporarily unavailable.
     row = {
         "trader_id": tid,
-        "code": _np2_ref_code_for_trader_id(tid),
+        "code": _np2_ref_code_for_trader_id(
+            tid, trader.get("name") or trader.get("full_name") or "Trader"
+        ),
         "commission_percent": 10,
         "buyer_discount_percent": 0,
         "status": "active",
@@ -43179,3 +43197,73 @@ if _NP2_ORIGINAL_REGISTER_VIEW:
     app.view_functions["register_trader"] = _np2_register_trader_view
 
 NAIRAPIPS_REFERRAL_RELEASE = NP2_REFERRAL_RELEASE
+
+
+# ============================================================================
+# NAIRAPIPS NP2 REFERRAL PAYOUT — ₦5,000 MINIMUM — 19 SEP 2026
+# ============================================================================
+NP2_REFERRAL_MIN_WITHDRAWAL = 5000.0
+
+@app.route("/np2_referral/payout_summary", methods=["GET", "OPTIONS"])
+def np2_referral_payout_summary_route():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    requested = str(request.args.get("trader_id") or "").strip() or None
+    trader, auth_response = _np2_ref_authenticated_trader(requested)
+    if auth_response:
+        return auth_response
+    try:
+        result = _np2_ref_db().rpc(
+            "np2_referral_payout_summary",
+            {"p_trader_id": str(trader.get("id"))}
+        ).execute().data
+        if isinstance(result, list) and result:
+            result = result[0]
+        result = result or {}
+        result["minimum_withdrawal"] = NP2_REFERRAL_MIN_WITHDRAWAL
+        return _np_ok(result)
+    except Exception as exc:
+        print("NP2 REFERRAL PAYOUT SUMMARY ERROR:", repr(exc), flush=True)
+        return _np_fail("Referral withdrawal summary could not load: " + str(exc), 503)
+
+
+@app.route("/np2_referral/payout_request", methods=["POST", "OPTIONS"])
+def np2_referral_payout_request_route():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    data = request.get_json(silent=True) or {}
+    requested = str(data.get("trader_id") or "").strip() or None
+    trader, auth_response = _np2_ref_authenticated_trader(requested)
+    if auth_response:
+        return auth_response
+
+    amount = clean(data.get("amount"))
+    if amount < NP2_REFERRAL_MIN_WITHDRAWAL:
+        return _np_fail("Minimum referral withdrawal is ₦5,000", 400)
+
+    try:
+        result = _np2_ref_db().rpc(
+            "np2_request_referral_payout",
+            {
+                "p_trader_id": str(trader.get("id")),
+                "p_amount": amount,
+                "p_payment_method": str(data.get("payment_method") or "Bank Transfer"),
+                "p_bank_name": str(data.get("bank_name") or ""),
+                "p_account_number": str(data.get("account_number") or ""),
+                "p_account_name": str(data.get("account_name") or ""),
+            }
+        ).execute().data
+        if isinstance(result, list) and result:
+            result = result[0]
+        return _np_ok(result or {"success": True, "status": "pending"})
+    except Exception as exc:
+        message = str(exc)
+        print("NP2 REFERRAL PAYOUT REQUEST ERROR:", repr(exc), flush=True)
+        low = message.lower()
+        if "minimum referral withdrawal" in low:
+            return _np_fail("Minimum referral withdrawal is ₦5,000", 400)
+        if "under review" in low:
+            return _np_fail("You already have a referral withdrawal under review", 409)
+        if "exceeds available" in low:
+            return _np_fail("Requested amount exceeds your available referral commission", 400)
+        return _np_fail("Referral withdrawal request failed: " + message, 500)
