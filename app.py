@@ -6733,7 +6733,7 @@ def register_trader():
         password = str(d.get("password") or "")
         confirm_password = str(d.get("confirm_password") or d.get("password_confirm") or "")
 
-        # FRESH REFERRAL V1: one canonical referral code, validated only against
+        # FRESH REFERRAL V2: one canonical referral code, validated only against
         # the new np_referral_profiles table. No legacy affiliate tables are used.
         np_referral_code = _np_ref_v1_clean_code(
             d.get("np_referral_code") or d.get("ref") or d.get("ref_code") or
@@ -6802,7 +6802,7 @@ def register_trader():
             registration_session["fresh_referral_captured"] = bool(np_referral_code or existing_fresh_code)
             return ok(registration_session, "Trader account completed")
 
-        # Fresh Referral V1 stores referral attribution only in the new canonical
+        # Fresh Referral V2 stores referral attribution only in the new canonical
         # np_referral_code field and new referral tables. Legacy source/payment-note
         # referral parsing is intentionally not used by the new system.
         _base_registration_source = str(d.get("source") or "public_register").strip() or "public_register"
@@ -42964,7 +42964,7 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V7
 
 
 # ============================================================================
-# NAIRAPIPS FRESH REFERRAL SYSTEM V1 — 19 SEP 2026
+# NAIRAPIPS FRESH REFERRAL SYSTEM V2 — 19 SEP 2026
 # ============================================================================
 # This subsystem is intentionally independent of the legacy affiliate/referral
 # tables and routes. Source of truth:
@@ -42976,7 +42976,7 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V7
 # Registration capture is also enforced by a PostgreSQL trigger installed by
 # NAIRAPIPS_FRESH_REFERRAL_SCHEMA_V1.sql.
 # ============================================================================
-NP_FRESH_REFERRAL_RELEASE = "FRESH_REFERRAL_V1_2026_09_19"
+NP_FRESH_REFERRAL_RELEASE = "FRESH_REFERRAL_V2_2026_09_19"
 NP_FRESH_REFERRAL_PUBLIC_BASE = "https://nairapips.com/dashboard/?mode=register&ref="
 
 
@@ -43006,26 +43006,18 @@ def _np_ref_v1_profile_by_id(profile_id):
 
 
 def _np_ref_v1_make_code(trader):
+    """Return the Fresh Referral V2 permanent code for one trader.
+
+    The code is derived only from the immutable trader id, never from the old
+    affiliate/referral system, trader name, email, payment notes or legacy
+    referral fields. Existing traders are pre-provisioned by the V2 SQL.
+    """
     t = trader or {}
-    base = _np_ref_v1_clean_code(t.get("name") or t.get("full_name") or "")
-    if len(base) < 5:
-        base = _np_ref_v1_clean_code(str(t.get("email") or "").split("@", 1)[0])
-    if len(base) < 5:
-        base = "TRADER" + _np_ref_v1_clean_code(str(t.get("id") or ""))[-8:]
-    base = base[:32] or "TRADER"
-    db = _np_ref_v1_db()
-    candidate = base
-    for attempt in range(20):
-        rows = db.table("np_referral_profiles").select("id,trader_id").eq("code", candidate).limit(1).execute().data or []
-        if not rows:
-            return candidate
-        if str(rows[0].get("trader_id") or "") == str(t.get("id") or ""):
-            return candidate
-        suffix = _np_ref_v1_clean_code(str(t.get("id") or ""))[-6:] or secrets.token_hex(3).upper()
-        candidate = (base[:33] + suffix)[:40]
-        if attempt:
-            candidate = (base[:30] + secrets.token_hex(4).upper())[:40]
-    return (base[:28] + secrets.token_hex(6).upper())[:40]
+    tid = str(t.get("id") or "").strip()
+    if not tid:
+        raise ValueError("Trader id is required")
+    digest = hashlib.sha256((tid + ":NAIRAPIPS_FRESH_REFERRAL_V2").encode("utf-8")).hexdigest().upper()
+    return ("NP" + digest[:18])[:20]
 
 
 def _np_ref_v1_ensure_profile_for_trader(trader):
@@ -43035,9 +43027,22 @@ def _np_ref_v1_ensure_profile_for_trader(trader):
         raise ValueError("Trader id is required")
     db = _np_ref_v1_db()
     rows = db.table("np_referral_profiles").select("*").eq("trader_id", tid).limit(1).execute().data or []
-    if rows:
-        return rows[0]
     code = _np_ref_v1_make_code(t)
+    if rows:
+        current = rows[0]
+        # V2 normalizes any early test/name-based code to the permanent NP code.
+        # No legacy affiliate lookup is involved.
+        if _np_ref_v1_clean_code(current.get("code")) != code:
+            changed = (db.table("np_referral_profiles").update({
+                "code": code, "status": "active", "updated_at": now_iso()
+            }).eq("id", current.get("id")).execute().data or [])
+            if changed:
+                current = changed[0]
+            try:
+                db.table("np_referral_registrations").update({"referral_code": code}).eq("profile_id", current.get("id")).execute()
+            except Exception:
+                pass
+        return current
     row = {
         "trader_id": tid,
         "code": code,
