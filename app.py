@@ -16430,6 +16430,117 @@ def affiliate_payout_quote():
     except Exception as e:
         return bad(e, 500)
 
+@app.route("/trader_referral_activity", methods=["GET", "POST", "OPTIONS"])
+def trader_referral_activity():
+    """Show referral registrations separately from commission earnings."""
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    try:
+        d = dict(request.args) if request.method == "GET" else (request.get_json(silent=True) or {})
+        code = _aff_code(d.get("partner_code") or d.get("code") or d.get("affiliate_code"))
+        trader_id = str(d.get("trader_id") or "").strip()
+        if not code or not trader_id:
+            return bad("Referral code and trader ID are required", 400)
+
+        trader_rows = supabase.table("traders").select("id,email,phone").eq("id", trader_id).limit(1).execute().data or []
+        partner = _aff_get_partner_by_code(code) or _aff_get_code(code)
+        if not trader_rows or not partner:
+            return bad("Referral account not found", 404)
+        trader = trader_rows[0]
+        owner_email = _aff_norm_email(partner.get("email") or partner.get("owner_email"))
+        owner_phone = _aff_norm_phone(partner.get("phone") or partner.get("owner_phone"))
+        if owner_email and owner_email != _aff_norm_email(trader.get("email")):
+            return bad("This referral code does not belong to this trader", 403)
+        if not owner_email and owner_phone and owner_phone != _aff_norm_phone(trader.get("phone")):
+            return bad("This referral code does not belong to this trader", 403)
+
+        _affiliate_reconcile_commissions_for_code(code)
+        records = {}
+
+        # Registration evidence captured from the referral URL.
+        referred = []
+        for column in ("registration_source", "source"):
+            try:
+                rows = (supabase.table("traders").select("id,name,email,created_at,registration_source,source")
+                        .ilike(column, f"%ref={code}%").limit(500).execute().data or [])
+                referred.extend(rows)
+            except Exception as exc:
+                print(f"REFERRAL ACTIVITY REGISTRATION LOOKUP SKIP {column}:", exc)
+        for row in referred:
+            key = str(row.get("id") or row.get("email") or "").strip().lower()
+            if not key:
+                continue
+            email = str(row.get("email") or "").strip().lower()
+            masked = (email[:2] + "***" + email[email.find("@"):] if "@" in email else "Registered trader")
+            records[key] = {
+                "trader_id": row.get("id"),
+                "name": str(row.get("name") or "Referred trader")[:80],
+                "email": masked,
+                "registered_at": row.get("created_at"),
+                "purchase_count": 0,
+                "latest_purchase_status": "registered",
+                "commission_status": "not_earned_yet",
+                "commission_amount": 0,
+            }
+
+        # Purchase evidence also counts even when an old registration row lacks ref metadata.
+        purchases = []
+        seen_purchase_ids = set()
+        for column in ("affiliate_code", "referral_code", "partner_code", "promo_code"):
+            try:
+                rows = (supabase.table("challenge_purchases").select("*").eq(column, code)
+                        .order("created_at", desc=True).limit(500).execute().data or [])
+                for row in rows:
+                    pid = str(row.get("id") or "")
+                    if pid and pid not in seen_purchase_ids:
+                        seen_purchase_ids.add(pid)
+                        purchases.append(row)
+            except Exception as exc:
+                print(f"REFERRAL ACTIVITY PURCHASE LOOKUP SKIP {column}:", exc)
+
+        commissions = {}
+        try:
+            for row in (supabase.table("affiliate_commissions").select("*").eq("partner_code", code)
+                        .order("created_at", desc=True).limit(500).execute().data or []):
+                commissions[str(row.get("purchase_id") or "")] = row
+        except Exception as exc:
+            print("REFERRAL ACTIVITY COMMISSION LOOKUP SKIP:", exc)
+
+        for purchase in purchases:
+            key = str(purchase.get("trader_id") or purchase.get("email") or purchase.get("id") or "").strip().lower()
+            if not key:
+                continue
+            email = str(purchase.get("email") or "").strip().lower()
+            masked = (email[:2] + "***" + email[email.find("@"):] if "@" in email else "Referred buyer")
+            item = records.get(key) or {
+                "trader_id": purchase.get("trader_id"),
+                "name": str(purchase.get("trader_name") or "Referred buyer")[:80],
+                "email": masked,
+                "registered_at": purchase.get("created_at"),
+                "purchase_count": 0,
+                "latest_purchase_status": "registered",
+                "commission_status": "not_earned_yet",
+                "commission_amount": 0,
+            }
+            item["purchase_count"] = int(item.get("purchase_count") or 0) + 1
+            item["latest_purchase_status"] = str(purchase.get("payment_status") or purchase.get("status") or "pending").lower()
+            commission = commissions.get(str(purchase.get("id") or "")) or {}
+            if commission:
+                item["commission_status"] = str(commission.get("status") or "pending").lower()
+                item["commission_amount"] = clean(item.get("commission_amount")) + clean(commission.get("commission_amount"))
+            records[key] = item
+
+        activity = sorted(records.values(), key=lambda x: str(x.get("registered_at") or ""), reverse=True)
+        return ok({
+            "code": code,
+            "registered_count": len(activity),
+            "buyer_count": sum(1 for x in activity if int(x.get("purchase_count") or 0) > 0),
+            "purchase_count": len(purchases),
+            "referrals": activity[:100],
+        }, "Referral activity ready")
+    except Exception as e:
+        return bad(e, 500)
+
 @app.route("/request_affiliate_payout", methods=["POST", "OPTIONS"])
 def request_affiliate_payout():
     if request.method == "OPTIONS":
