@@ -15432,7 +15432,7 @@ def _aff_base_url():
 
 def _aff_link_for_code(code):
     code = _aff_code(code)
-    return f"{_aff_base_url()}/dashboard/?mode=register&ref={code}" if code else _aff_base_url()
+    return f"{_aff_base_url()}/?ref={code}" if code else _aff_base_url()
 
 def _aff_repair_partner_link(partner):
     """Return and persist the canonical public referral URL for older partner rows."""
@@ -42921,75 +42921,56 @@ def submit_reset_payment_proof_v73():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V73
 
+# ============================================================================
+# NAIRAPIPS REFERRAL V3 — ISOLATED / NON-BLOCKING 2026-09-19
+# Fresh referral page authority. This does not alter MT5, lifecycle, Second-Life,
+# payouts, resets, or any automation worker.
+# ============================================================================
+NAIRAPIPS_REFERRAL_V3_RELEASE = "REFERRAL_V3_ISOLATED_NONBLOCKING_2026_09_19"
 
-# ============================================================
-# NAIRAPIPS REFERRAL V2 — ISOLATED / FAST / NO DASHBOARD BOOT WORK
-# 2026-09-19
-# Purpose:
-# - Referral APIs run only when the standalone referral page is opened.
-# - No commission reconciliation sweep in profile/activity reads.
-# - New registration attribution uses the durable traders.payment_note ref marker.
-# - Existing payout/MT5/reset/lifecycle/Second-Life logic is untouched.
-# ============================================================
-NAIRAPIPS_REFERRAL_V2_RELEASE = "REFERRAL_V2_ISOLATED_FAST_2026_09_19"
+def _np_ref_v3_code(value):
+    return _aff_code(value)
 
+def _np_ref_v3_link(code):
+    code = _np_ref_v3_code(code)
+    return "https://nairapips.com/dashboard/?mode=register&ref=" + urllib.parse.quote(code) if code else "https://nairapips.com/dashboard/"
 
-def _np_ref_v2_payload():
-    if request.method == "GET":
-        return dict(request.args)
-    return request.get_json(silent=True) or {}
-
-
-def _np_ref_v2_canonical_link(code):
-    code = _aff_code(code)
-    if not code:
-        return "https://nairapips.com/dashboard/"
-    return "https://nairapips.com/dashboard/?mode=register&ref=" + urllib.parse.quote(code)
-
-
-@app.route("/trader_referral_profile_v2", methods=["GET", "POST", "OPTIONS"])
-def trader_referral_profile_v2():
+@app.route("/referral_v3/ensure", methods=["POST", "OPTIONS"])
+def referral_v3_ensure():
     if request.method == "OPTIONS":
         return _np_ok({})
     try:
-        d = _np_ref_v2_payload()
-        trader_id = str(d.get("trader_id") or d.get("id") or "").strip()
-        email = str(d.get("email") or "").strip().lower()
-
-        rows = []
-        if trader_id:
-            rows = (supabase.table("traders").select("*")
-                    .eq("id", trader_id).limit(1).execute().data or [])
-        if not rows and email:
-            rows = (supabase.table("traders").select("*")
-                    .eq("email", email).limit(1).execute().data or [])
+        d = request.get_json(silent=True) or {}
+        trader_id = str(d.get("trader_id") or "").strip()
+        authed_id, auth_error = _authenticated_trader_id_for_request(trader_id)
+        if auth_error:
+            return bad(auth_error, 401)
+        rows = (supabase.table("traders").select("id,name,email,phone,account_reference")
+                .eq("id", authed_id).limit(1).execute().data or [])
         if not rows:
             return bad("Trader not found", 404)
-
         trader = rows[0]
-        name = trader.get("name") or trader.get("full_name") or trader.get("email") or "Trader"
-        email = str(trader.get("email") or email or "").strip().lower()
-        phone = str(trader.get("phone") or trader.get("whatsapp") or "").strip()
-        rates = _affiliate_default_rates()
-
+        email = str(trader.get("email") or "").strip().lower()
         existing = []
         if email:
             existing = (supabase.table("affiliate_partners").select("*")
                         .eq("email", email).limit(1).execute().data or [])
-
+        rates = _affiliate_default_rates()
         if existing:
             partner = existing[0]
         else:
-            preferred = trader.get("referral_code") or trader.get("affiliate_code") or trader.get("account_reference") or name
-            code = _aff_unique_partner_code(preferred)
+            requested = _np_ref_v3_code(d.get("code"))
+            if not requested:
+                requested = _aff_code_from_identity(trader.get("name"), email, trader.get("phone"))
+            code = _aff_unique_partner_code(requested)
             row = {
-                "name": name,
+                "name": trader.get("name") or email or "NairaPips Trader",
                 "email": email,
-                "phone": phone,
+                "phone": trader.get("phone") or "",
                 "company": "NairaPips Trader",
                 "partner_type": "trader_referral",
                 "code": code,
-                "affiliate_link": _np_ref_v2_canonical_link(code),
+                "affiliate_link": _np_ref_v3_link(code),
                 "commission_percent": rates["commission_percent"],
                 "discount_percent": rates["discount_percent"],
                 "status": "active",
@@ -42998,113 +42979,65 @@ def trader_referral_profile_v2():
             }
             created = supabase.table("affiliate_partners").insert(row).execute().data or [row]
             partner = created[0] if created else row
-
-        code = _aff_code(partner.get("code"))
+        code = _np_ref_v3_code(partner.get("code"))
         return ok({
-            "release": NAIRAPIPS_REFERRAL_V2_RELEASE,
-            "partner": partner,
+            "release": NAIRAPIPS_REFERRAL_V3_RELEASE,
             "code": code,
-            "affiliate_link": _np_ref_v2_canonical_link(code),
+            "affiliate_link": _np_ref_v3_link(code),
             "commission_percent": partner.get("commission_percent") if partner.get("commission_percent") is not None else rates["commission_percent"],
             "discount_percent": partner.get("discount_percent") if partner.get("discount_percent") is not None else rates["discount_percent"],
         }, "Referral profile ready")
     except Exception as exc:
-        print("REFERRAL V2 PROFILE ERROR:", repr(exc), flush=True)
+        print("REFERRAL V3 ENSURE ERROR:", repr(exc), flush=True)
         return bad(str(exc), 500)
 
-
-@app.route("/trader_referral_activity_v2", methods=["GET", "OPTIONS"])
-def trader_referral_activity_v2():
+@app.route("/referral_v3/summary", methods=["GET", "OPTIONS"])
+def referral_v3_summary():
     if request.method == "OPTIONS":
         return _np_ok({})
     try:
-        d = dict(request.args)
-        code = _aff_code(d.get("code") or d.get("partner_code") or d.get("affiliate_code"))
-        trader_id = str(d.get("trader_id") or "").strip()
-        if not code or not trader_id:
-            return bad("Referral code and trader ID are required", 400)
+        trader_id = str(request.args.get("trader_id") or "").strip()
+        code = _np_ref_v3_code(request.args.get("code"))
+        if not trader_id or not code:
+            return bad("Trader ID and referral code are required", 400)
+        authed_id, auth_error = _authenticated_trader_id_for_request(trader_id)
+        if auth_error:
+            return bad(auth_error, 401)
 
-        trader_rows = (supabase.table("traders").select("id,email,phone")
-                       .eq("id", trader_id).limit(1).execute().data or [])
-        if not trader_rows:
-            return bad("Trader not found", 404)
-        trader = trader_rows[0]
-
-        partner = _aff_get_partner_by_code(code) or _aff_get_code(code)
-        if partner:
-            owner_email = _aff_norm_email(partner.get("email") or partner.get("owner_email"))
-            owner_phone = _aff_norm_phone(partner.get("phone") or partner.get("owner_phone"))
-            if owner_email and owner_email != _aff_norm_email(trader.get("email")):
-                return bad("This referral code does not belong to this trader", 403)
-            if not owner_email and owner_phone and owner_phone != _aff_norm_phone(trader.get("phone")):
-                return bad("This referral code does not belong to this trader", 403)
-
-        # One exact historical repair requested by the owner. It is scoped only to
-        # this referral page call and never runs during dashboard/login/MT5 traffic.
-        legacy_extra = []
-        if code == "ADERETIFOLASADEANIKE":
-            try:
-                hist = (supabase.table("traders").select("*")
-                        .eq("email", "bolaji273@gmail.com").limit(1).execute().data or [])
-                if hist:
-                    row = hist[0]
-                    marker = "ref=ADERETIFOLASADEANIKE"
-                    note = str(row.get("payment_note") or "").strip()
-                    if marker.lower() not in note.lower():
-                        patched_note = (note + (" | " if note else "") + marker)[:1000]
-                        try:
-                            updated = (supabase.table("traders").update({"payment_note": patched_note, "updated_at": now_iso()})
-                                       .eq("id", row.get("id")).execute().data or [])
-                            if updated:
-                                row = updated[0]
-                        except Exception as repair_exc:
-                            print("REFERRAL V2 LEGACY NOTE REPAIR SKIP:", repair_exc, flush=True)
-                    legacy_extra.append(row)
-            except Exception as legacy_exc:
-                print("REFERRAL V2 LEGACY LOOKUP SKIP:", legacy_exc, flush=True)
-
-        # Fresh V2 authority: registration attribution is read from the single
-        # durable payment_note marker written by /register_trader.
+        # Registration lookup only. No affiliate reconciliation and no lifecycle work.
         referred = []
         try:
             referred = (supabase.table("traders").select("id,name,email,created_at,payment_note")
                         .ilike("payment_note", f"%ref={code}%")
                         .order("created_at", desc=True).limit(100).execute().data or [])
-        except Exception as primary_exc:
-            print("REFERRAL V2 PAYMENT_NOTE LOOKUP SKIP:", primary_exc, flush=True)
-            # One fallback only for older schema rows; no four-column sweep.
-            try:
-                referred = (supabase.table("traders").select("id,name,email,created_at,registration_source")
-                            .ilike("registration_source", f"%ref={code}%")
-                            .order("created_at", desc=True).limit(100).execute().data or [])
-            except Exception as fallback_exc:
-                print("REFERRAL V2 REGISTRATION_SOURCE LOOKUP SKIP:", fallback_exc, flush=True)
-                referred = []
+        except Exception as exc:
+            print("REFERRAL V3 REGISTRATION LOOKUP SKIP:", exc, flush=True)
 
-        by_id = {}
-        for row in list(referred) + legacy_extra:
-            key = str(row.get("id") or row.get("email") or "").strip().lower()
-            if key:
-                by_id[key] = row
-        referred = list(by_id.values())
+        # Recover the owner's known historical test registration without fabricating a row:
+        # it is shown only when that email really exists in the traders table.
+        if code == "ADERETIFOLASADEANIKE" and not any(str(x.get("email") or "").lower() == "bolaji273@gmail.com" for x in referred):
+            try:
+                hist = (supabase.table("traders").select("id,name,email,created_at,payment_note")
+                        .eq("email", "bolaji273@gmail.com").limit(1).execute().data or [])
+                if hist:
+                    referred.append(hist[0])
+            except Exception as exc:
+                print("REFERRAL V3 HISTORICAL LOOKUP SKIP:", exc, flush=True)
 
         purchases = []
         try:
-            purchases = (supabase.table("challenge_purchases").select("*")
-                         .eq("affiliate_code", code)
-                         .order("created_at", desc=True).limit(100).execute().data or [])
-        except Exception as purchase_exc:
-            print("REFERRAL V2 PURCHASE LOOKUP SKIP:", purchase_exc, flush=True)
+            purchases = (supabase.table("challenge_purchases").select("id,trader_id,trader_name,email,created_at,payment_status,status,affiliate_code")
+                         .eq("affiliate_code", code).order("created_at", desc=True).limit(100).execute().data or [])
+        except Exception as exc:
+            print("REFERRAL V3 PURCHASE LOOKUP SKIP:", exc, flush=True)
 
         commissions = {}
         try:
-            commission_rows = (supabase.table("affiliate_commissions").select("*")
-                               .eq("partner_code", code)
-                               .order("created_at", desc=True).limit(100).execute().data or [])
-            for row in commission_rows:
-                commissions[str(row.get("purchase_id") or "")] = row
-        except Exception as commission_exc:
-            print("REFERRAL V2 COMMISSION LOOKUP SKIP:", commission_exc, flush=True)
+            commission_rows = (supabase.table("affiliate_commissions").select("purchase_id,status,commission_amount")
+                               .eq("partner_code", code).limit(100).execute().data or [])
+            commissions = {str(x.get("purchase_id") or ""): x for x in commission_rows}
+        except Exception as exc:
+            print("REFERRAL V3 COMMISSION LOOKUP SKIP:", exc, flush=True)
 
         records = {}
         for row in referred:
@@ -43112,7 +43045,7 @@ def trader_referral_activity_v2():
             if not key:
                 continue
             email = str(row.get("email") or "").strip().lower()
-            masked = (email[:2] + "***" + email[email.find("@"):] if "@" in email else "Registered trader")
+            masked = email[:2] + "***" + email[email.find("@"):] if "@" in email else "Registered trader"
             records[key] = {
                 "trader_id": row.get("id"),
                 "name": str(row.get("name") or "Referred trader")[:80],
@@ -43120,82 +43053,36 @@ def trader_referral_activity_v2():
                 "registered_at": row.get("created_at"),
                 "purchase_count": 0,
                 "latest_purchase_status": "registered",
-                "commission_status": "not_earned_yet",
-                "commission_amount": 0,
+                "commission_status": "Not earned yet",
             }
-
         for purchase in purchases:
             key = str(purchase.get("trader_id") or purchase.get("email") or purchase.get("id") or "").strip().lower()
-            if not key:
-                continue
             email = str(purchase.get("email") or "").strip().lower()
             item = records.get(key) or {
                 "trader_id": purchase.get("trader_id"),
                 "name": str(purchase.get("trader_name") or "Referred buyer")[:80],
-                "email": (email[:2] + "***" + email[email.find("@"):] if "@" in email else "Referred buyer"),
+                "email": email[:2] + "***" + email[email.find("@"):] if "@" in email else "Referred buyer",
                 "registered_at": purchase.get("created_at"),
                 "purchase_count": 0,
                 "latest_purchase_status": "registered",
-                "commission_status": "not_earned_yet",
-                "commission_amount": 0,
+                "commission_status": "Not earned yet",
             }
             item["purchase_count"] = int(item.get("purchase_count") or 0) + 1
             item["latest_purchase_status"] = str(purchase.get("payment_status") or purchase.get("status") or "pending").lower()
             commission = commissions.get(str(purchase.get("id") or "")) or {}
             if commission:
-                item["commission_status"] = str(commission.get("status") or "pending").lower()
-                item["commission_amount"] = clean(item.get("commission_amount")) + clean(commission.get("commission_amount"))
+                item["commission_status"] = str(commission.get("status") or "pending")
             records[key] = item
 
         activity = sorted(records.values(), key=lambda x: str(x.get("registered_at") or ""), reverse=True)
         return ok({
-            "release": NAIRAPIPS_REFERRAL_V2_RELEASE,
+            "release": NAIRAPIPS_REFERRAL_V3_RELEASE,
             "code": code,
             "registered_count": len(activity),
             "buyer_count": sum(1 for x in activity if int(x.get("purchase_count") or 0) > 0),
             "purchase_count": len(purchases),
             "referrals": activity,
-        }, "Referral activity ready")
+        }, "Referral summary ready")
     except Exception as exc:
-        print("REFERRAL V2 ACTIVITY ERROR:", repr(exc), flush=True)
-        return bad(str(exc), 500)
-
-
-@app.route("/affiliate_payout_quote_v2", methods=["GET", "OPTIONS"])
-def affiliate_payout_quote_v2():
-    if request.method == "OPTIONS":
-        return _np_ok({})
-    try:
-        code = _aff_code(request.args.get("code") or request.args.get("partner_code"))
-        if not code:
-            return bad("Referral code is required", 400)
-        rows = []
-        try:
-            rows = (supabase.table("affiliate_commissions").select("*")
-                    .eq("partner_code", code).order("created_at", desc=True).limit(500).execute().data or [])
-        except Exception as exc:
-            print("REFERRAL V2 PAYOUT QUOTE COMMISSION SKIP:", exc, flush=True)
-        approved = [r for r in rows if str(r.get("status") or "").strip().lower() == "approved"]
-        pending = [r for r in rows if str(r.get("status") or "pending").strip().lower() == "pending"]
-        paid = [r for r in rows if str(r.get("status") or "").strip().lower() == "paid"]
-        open_request = None
-        try:
-            reqs = (supabase.table("affiliate_payout_requests").select("*")
-                    .eq("partner_code", code).in_("status", ["pending", "approved", "processing"])
-                    .order("created_at", desc=True).limit(1).execute().data or [])
-            open_request = reqs[0] if reqs else None
-        except Exception as exc:
-            print("REFERRAL V2 PAYOUT REQUEST LOOKUP SKIP:", exc, flush=True)
-        return ok({
-            "release": NAIRAPIPS_REFERRAL_V2_RELEASE,
-            "approved_available": round(sum(clean(r.get("commission_amount")) for r in approved), 2),
-            "pending_review": round(sum(clean(r.get("commission_amount")) for r in pending), 2),
-            "paid_total": round(sum(clean(r.get("commission_amount")) for r in paid), 2),
-            "approved_count": len(approved),
-            "pending_count": len(pending),
-            "paid_count": len(paid),
-            "open_payout_request": open_request,
-        }, "Referral payout summary ready")
-    except Exception as exc:
-        print("REFERRAL V2 PAYOUT QUOTE ERROR:", repr(exc), flush=True)
+        print("REFERRAL V3 SUMMARY ERROR:", repr(exc), flush=True)
         return bad(str(exc), 500)
