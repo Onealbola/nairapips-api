@@ -6689,15 +6689,28 @@ def admin_reset_trader_password():
         return bad(e, 500)
 
 def _safe_insert_trader(row):
-    try:
-        return supabase.table("traders").insert(row).execute().data
-    except Exception as e:
-        # Keep `source`: it is the backward-compatible, durable home for the
-        # signup referral. Only remove newer tracking columns on old schemas.
-        optional = ["user_agent", "ip_address", "registration_source", "registration_user_agent", "registration_ip"]
-        safe_row = {k: v for k, v in row.items() if k not in optional}
-        print("REGISTRATION OPTIONAL TRACKING SKIPPED:", str(e))
-        return supabase.table("traders").insert(safe_row).execute().data
+    # Production has used several generations of the traders schema. Try the
+    # richest row first, then remove only columns absent from older schemas.
+    # payment_note remains the final durable referral carrier.
+    variants = [
+        row,
+        {k: v for k, v in row.items() if k not in {
+            "user_agent", "ip_address", "registration_source",
+            "registration_user_agent", "registration_ip"
+        }},
+        {k: v for k, v in row.items() if k not in {
+            "user_agent", "ip_address", "registration_source", "source",
+            "registration_user_agent", "registration_ip"
+        }},
+    ]
+    last_error = None
+    for candidate in variants:
+        try:
+            return supabase.table("traders").insert(candidate).execute().data
+        except Exception as exc:
+            last_error = exc
+            print("REGISTRATION SCHEMA FALLBACK:", str(exc))
+    raise last_error
 
 @app.route("/register_trader", methods=["POST", "OPTIONS"])
 def register_trader():
@@ -6748,35 +6761,43 @@ def register_trader():
                     d.get("affiliate_code") or d.get("ref_code") or d.get("ref")
                 )
                 prior_ref = _np_referral_code_from_trader(existing)
+                old_source = str(existing.get("registration_source") or existing.get("source") or "public_register").strip()
+                patched_source = f"{old_source}|ref={incoming_ref}" if incoming_ref and not prior_ref else old_source
+                credential_patch = {
+                    "password_hash": _hash_trader_password(password),
+                    "password_set_at": now_iso(),
+                    "password_reset_required": False,
+                    "email_verified": True,
+                    "email_verified_at": now_iso(),
+                    "updated_at": now_iso(),
+                }
+                patch_variants = []
                 if incoming_ref and not prior_ref:
-                    old_source = str(existing.get("registration_source") or existing.get("source") or "public_register").strip()
-                    patched_source = f"{old_source}|ref={incoming_ref}"
-                    # Prefer the newer column, but old production schemas may
-                    # only have `source`. Never lose attribution on that fallback.
+                    patch_variants.extend([
+                        dict(credential_patch, registration_source=patched_source, source=patched_source,
+                             payment_note=f"ref={incoming_ref}"),
+                        dict(credential_patch, source=patched_source, payment_note=f"ref={incoming_ref}"),
+                        dict(credential_patch, payment_note=f"ref={incoming_ref}"),
+                    ])
+                patch_variants.append(credential_patch)
+                patched = []
+                last_patch_error = None
+                for patch in patch_variants:
                     try:
-                        patched = (supabase.table("traders").update({
-                            "registration_source": patched_source,
-                            "source": patched_source,
-                            "updated_at": now_iso(),
-                        }).eq("id", existing.get("id")).execute().data or [])
-                    except Exception:
-                        try:
-                            patched = (supabase.table("traders").update({
-                                "source": patched_source,
-                                "updated_at": now_iso(),
-                            }).eq("id", existing.get("id")).execute().data or [])
-                        except Exception:
-                            # Oldest production schema: payment_note is known to
-                            # exist even when both source columns do not.
-                            patched = (supabase.table("traders").update({
-                                "payment_note": patched_source,
-                                "updated_at": now_iso(),
-                            }).eq("id", existing.get("id")).execute().data or [])
-                    if patched:
-                        existing = patched[0]
+                        patched = (supabase.table("traders").update(patch)
+                                   .eq("id", existing.get("id")).execute().data or [])
+                        break
+                    except Exception as exc:
+                        last_patch_error = exc
+                if not patched and last_patch_error:
+                    raise last_patch_error
+                if patched:
+                    existing = patched[0]
+                _consume_email_verification(email)
             except Exception as referral_capture_error:
-                print("EXISTING TRADER REFERRAL CAPTURE SKIPPED:", referral_capture_error)
-            return ok(existing, "Trader already exists")
+                print("EXISTING TRADER REGISTRATION REPAIR FAILED:", referral_capture_error)
+                return bad("This account exists but could not be completed. Please contact support.", 500)
+            return ok(existing, "Trader account completed")
 
         # Durable referral attribution: the landing page already sends ref/referral_code,
         # but older registration code discarded it. Preserve it server-side inside the
