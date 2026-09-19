@@ -15829,6 +15829,27 @@ def _np_referral_code_from_trader(trader):
     return ""
 
 
+
+def _np2_referral_reward_already_used(trader_id):
+    """True once this referred trader has generated their one NP2 referral reward."""
+    tid = str(trader_id or "").strip()
+    if not tid:
+        return False
+    try:
+        rows = (
+            supabase.table("np2_referral_commissions")
+            .select("id,status")
+            .eq("referred_trader_id", tid)
+            .limit(20)
+            .execute().data or []
+        )
+        return any(str(r.get("status") or "").strip().lower() in {"approved", "paid"} for r in rows)
+    except Exception as exc:
+        # Checkout must not fail because the informational one-time check had an issue.
+        print("NP2 ONE-TIME REFERRAL CHECK ERROR:", repr(exc), flush=True)
+        return False
+
+
 def _affiliate_quote_details(d, base_fee):
     """Return production-safe quote details for promo / affiliate / partner codes.
     Discount reduces customer price. Commission is calculated on the final paid fee.
@@ -15871,6 +15892,26 @@ def _affiliate_quote_details(d, base_fee):
     referral_ok, referral_reason = _affiliate_abuse_check(d or {}, source)
     if not referral_ok:
         result.update({"valid": False, "message": referral_reason})
+        return result
+
+    campaign_type = str(source.get("code_type") or source.get("partner_type") or "affiliate").strip().lower() or "affiliate"
+    if campaign_type in {"np2_checkout_bridge", "np2_checkout_alias"} and _np2_referral_reward_already_used((d or {}).get("trader_id")):
+        # The trader may still buy another challenge. The referral reward itself is consumed.
+        # Return a normal-price valid quote with no code attached to this later purchase.
+        result.update({
+            "valid": True,
+            "code": "",
+            "message": "Referral reward already used on this trader's first approved purchase. This purchase continues at the normal price with no additional referral commission.",
+            "discount_percent": 0,
+            "discount_amount": 0,
+            "final_fee": base_fee,
+            "fee": base_fee,
+            "commission_percent": 0,
+            "commission_amount": 0,
+            "affiliate_owner": source.get("owner_name") or source.get("name") or source.get("partner_name") or "",
+            "campaign_type": campaign_type,
+            "source": None,
+        })
         return result
 
     discount_pct = max(0, min(100, clean(source.get("discount_percent"))))
@@ -43101,7 +43142,16 @@ def np2_referral_activity():
         purchases_by_registration = {}
         for p in purchases:
             purchases_by_registration.setdefault(str(p.get("registration_id") or ""), []).append(p)
-        commission_by_purchase = {str(c.get("purchase_id") or ""): c for c in commissions}
+
+        # One-time reward: show the single live commission for the referred trader,
+        # even when their latest purchase is a later non-rewarded purchase.
+        commission_by_registration = {}
+        for c in commissions:
+            if str(c.get("status") or "").lower() not in {"approved", "paid"}:
+                continue
+            rid = str(c.get("registration_id") or "")
+            if rid and rid not in commission_by_registration:
+                commission_by_registration[rid] = c
 
         rows = []
         buyers = 0
@@ -43111,7 +43161,7 @@ def np2_referral_activity():
             if linked:
                 buyers += 1
             latest = linked[0] if linked else None
-            commission = commission_by_purchase.get(str((latest or {}).get("purchase_id") or ""), {}) if latest else {}
+            commission = commission_by_registration.get(reg_id, {})
             email = str(reg.get("referred_email") or reg.get("normalized_email") or "")
             masked = email
             if "@" in email:
@@ -43141,6 +43191,7 @@ def np2_referral_activity():
             "purchase_count": len(purchases),
             "approved_commission": round(sum(clean(c.get("commission_amount")) for c in approved), 2),
             "paid_commission": round(sum(clean(c.get("commission_amount")) for c in paid), 2),
+            "reward_rule": "one_time_first_approved_purchase",
             "referrals": rows,
         })
     except Exception as exc:
