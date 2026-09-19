@@ -6692,7 +6692,9 @@ def _safe_insert_trader(row):
     try:
         return supabase.table("traders").insert(row).execute().data
     except Exception as e:
-        optional = ["source", "user_agent", "ip_address", "registration_source", "registration_user_agent", "registration_ip"]
+        # Keep `source`: it is the backward-compatible, durable home for the
+        # signup referral. Only remove newer tracking columns on old schemas.
+        optional = ["user_agent", "ip_address", "registration_source", "registration_user_agent", "registration_ip"]
         safe_row = {k: v for k, v in row.items() if k not in optional}
         print("REGISTRATION OPTIONAL TRACKING SKIPPED:", str(e))
         return supabase.table("traders").insert(safe_row).execute().data
@@ -6749,10 +6751,19 @@ def register_trader():
                 if incoming_ref and not prior_ref:
                     old_source = str(existing.get("registration_source") or existing.get("source") or "public_register").strip()
                     patched_source = f"{old_source}|ref={incoming_ref}"
-                    patched = (supabase.table("traders").update({
-                        "registration_source": patched_source,
-                        "updated_at": now_iso(),
-                    }).eq("id", existing.get("id")).execute().data or [])
+                    # Prefer the newer column, but old production schemas may
+                    # only have `source`. Never lose attribution on that fallback.
+                    try:
+                        patched = (supabase.table("traders").update({
+                            "registration_source": patched_source,
+                            "source": patched_source,
+                            "updated_at": now_iso(),
+                        }).eq("id", existing.get("id")).execute().data or [])
+                    except Exception:
+                        patched = (supabase.table("traders").update({
+                            "source": patched_source,
+                            "updated_at": now_iso(),
+                        }).eq("id", existing.get("id")).execute().data or [])
                     if patched:
                         existing = patched[0]
             except Exception as referral_capture_error:
@@ -6810,7 +6821,9 @@ def register_trader():
             "funded_at": None,
             "last_login_at": None,
             "trading_days_left": d.get("trading_days_left", 0),
-            "source": _base_registration_source,
+            # Save the referral in the legacy field too. `_safe_insert_trader`
+            # can discard registration_source for older database schemas.
+            "source": _durable_registration_source,
             "registration_source": _durable_registration_source,
             "user_agent": user_agent[:250],
             "registration_user_agent": user_agent[:250],
