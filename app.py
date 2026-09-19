@@ -6737,6 +6737,26 @@ def register_trader():
 
         existing = _find_existing_trader(email, phone)
         if existing:
+            # A returning trader may arrive through a genuine referral before
+            # making their first purchase. Preserve it only when the account has
+            # no earlier attribution; never overwrite a prior referrer.
+            try:
+                incoming_ref = _aff_code(
+                    d.get("referred_by_code") or d.get("referral_code") or
+                    d.get("affiliate_code") or d.get("ref_code") or d.get("ref")
+                )
+                prior_ref = _np_referral_code_from_trader(existing)
+                if incoming_ref and not prior_ref:
+                    old_source = str(existing.get("registration_source") or existing.get("source") or "public_register").strip()
+                    patched_source = f"{old_source}|ref={incoming_ref}"
+                    patched = (supabase.table("traders").update({
+                        "registration_source": patched_source,
+                        "updated_at": now_iso(),
+                    }).eq("id", existing.get("id")).execute().data or [])
+                    if patched:
+                        existing = patched[0]
+            except Exception as referral_capture_error:
+                print("EXISTING TRADER REFERRAL CAPTURE SKIPPED:", referral_capture_error)
             return ok(existing, "Trader already exists")
 
         # Durable referral attribution: the landing page already sends ref/referral_code,
@@ -15360,6 +15380,25 @@ def _aff_link_for_code(code):
     code = _aff_code(code)
     return f"{_aff_base_url()}/?ref={code}" if code else _aff_base_url()
 
+def _aff_repair_partner_link(partner):
+    """Return and persist the canonical public referral URL for older partner rows."""
+    row = partner or {}
+    code = _aff_code(row.get("code") or row.get("partner_code") or row.get("affiliate_code"))
+    canonical = _aff_link_for_code(code)
+    if code and str(row.get("affiliate_link") or "").strip() != canonical:
+        try:
+            updated = (supabase.table("affiliate_partners").update({
+                "affiliate_link": canonical,
+                "updated_at": now_iso(),
+            }).eq("id", row.get("id")).execute().data or [])
+            if updated:
+                row = updated[0]
+        except Exception as exc:
+            print("AFFILIATE LINK REPAIR SKIPPED:", exc)
+    row = dict(row)
+    row["affiliate_link"] = canonical
+    return row
+
 def _aff_code_from_identity(name="", email="", phone=""):
     seed = re.sub(r"[^A-Z0-9]", "", str(name or "").upper())
     if not seed:
@@ -15950,6 +15989,55 @@ def _affiliate_reconcile_commissions_for_code(code):
                     candidates.append(row)
         except Exception as exc:
             print(f"AFFILIATE RECONCILE LOOKUP SKIP {column}:", exc)
+
+    # Recover older purchases whose buyer registration preserved the exact
+    # referrer but whose checkout failed to copy it into the purchase row.
+    source = _aff_get_code(code) or _aff_get_partner_by_code(code)
+    try:
+        referred_traders = (supabase.table("traders").select("id,registration_source,source")
+                            .ilike("registration_source", f"%ref={code}%")
+                            .limit(500).execute().data or [])
+    except Exception as exc:
+        print("AFFILIATE HISTORICAL TRADER LOOKUP SKIP:", exc)
+        referred_traders = []
+    for referred_trader in referred_traders:
+        trader_id = referred_trader.get("id")
+        if not trader_id:
+            continue
+        try:
+            purchases = (supabase.table("challenge_purchases").select("*")
+                         .eq("trader_id", trader_id).order("created_at", desc=True)
+                         .limit(100).execute().data or [])
+        except Exception as exc:
+            print("AFFILIATE HISTORICAL PURCHASE LOOKUP SKIP:", exc)
+            continue
+        for purchase in purchases:
+            pid = str(purchase.get("id") or "")
+            if not pid or pid in seen:
+                continue
+            existing_code = _aff_code(purchase.get("affiliate_code") or purchase.get("referral_code") or purchase.get("partner_code") or purchase.get("promo_code"))
+            if existing_code and existing_code != code:
+                continue
+            if not existing_code and source:
+                pct = clean(source.get("commission_percent"))
+                amount = round(clean(purchase.get("fee")) * pct / 100, 2)
+                repair = {
+                    "affiliate_code": code, "referral_code": code,
+                    "partner_code": code, "promo_code": code,
+                    "affiliate_owner": source.get("owner_name") or source.get("name") or "",
+                    "commission_percent": pct, "commission_amount": amount,
+                    "affiliate_status": "valid", "updated_at": now_iso(),
+                }
+                try:
+                    fixed = (supabase.table("challenge_purchases").update(repair)
+                             .eq("id", pid).execute().data or [])
+                    if fixed:
+                        purchase = fixed[0]
+                except Exception as exc:
+                    print("AFFILIATE HISTORICAL PURCHASE REPAIR SKIP:", exc)
+                    continue
+            seen.add(pid)
+            candidates.append(purchase)
     created = 0
     for row in candidates:
         payment_status = str(row.get("payment_status") or "").strip().lower()
@@ -16082,12 +16170,19 @@ def trader_affiliate_profile():
                         partner = updated[0]
                 except Exception as sync_error:
                     print("TRADER REFERRAL RATE SYNC SKIPPED:", sync_error)
+        partner = _aff_repair_partner_link(partner)
+        try:
+            reconciliation = _affiliate_reconcile_commissions_for_code(partner.get("code"))
+        except Exception as reconcile_error:
+            print("TRADER REFERRAL RECONCILIATION SKIPPED:", reconcile_error)
+            reconciliation = {"checked": 0, "created": 0}
         return ok({
             "partner": partner,
             "code": partner.get("code"),
-            "affiliate_link": partner.get("affiliate_link") or _aff_link_for_code(partner.get("code")),
+            "affiliate_link": _aff_link_for_code(partner.get("code")),
             "commission_percent": partner.get("commission_percent") if partner.get("commission_percent") is not None else rates["commission_percent"],
             "discount_percent": partner.get("discount_percent") if partner.get("discount_percent") is not None else rates["discount_percent"],
+            "reconciliation": reconciliation,
         }, "Trader referral profile ready")
     except Exception as e:
         return bad(e, 500)
@@ -38545,6 +38640,12 @@ def _np_mark_purchase_approved_waiting_v60(purchase, admin_payload=None, reason=
     if not rows:
         raise RuntimeError("Payment approval could not be persisted in WAITING FOR MT5 state")
 
+    # Referral earnings depend on approved payment, not MT5 inventory.
+    try:
+        _affiliate_create_commission_from_purchase(rows[0], admin_payload or {})
+    except Exception as referral_error:
+        print("WAITING PURCHASE REFERRAL COMMISSION REPAIR SKIPPED:", referral_error)
+
     try:
         _audit_safe(
             "challenge_purchases",
@@ -42649,4 +42750,3 @@ def submit_reset_payment_proof_v73():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V73
-
