@@ -6760,10 +6760,18 @@ def register_trader():
                             "updated_at": now_iso(),
                         }).eq("id", existing.get("id")).execute().data or [])
                     except Exception:
-                        patched = (supabase.table("traders").update({
-                            "source": patched_source,
-                            "updated_at": now_iso(),
-                        }).eq("id", existing.get("id")).execute().data or [])
+                        try:
+                            patched = (supabase.table("traders").update({
+                                "source": patched_source,
+                                "updated_at": now_iso(),
+                            }).eq("id", existing.get("id")).execute().data or [])
+                        except Exception:
+                            # Oldest production schema: payment_note is known to
+                            # exist even when both source columns do not.
+                            patched = (supabase.table("traders").update({
+                                "payment_note": patched_source,
+                                "updated_at": now_iso(),
+                            }).eq("id", existing.get("id")).execute().data or [])
                     if patched:
                         existing = patched[0]
             except Exception as referral_capture_error:
@@ -6812,7 +6820,9 @@ def register_trader():
             "phone_verified": False,
             "payment_proof_url": "",
             "selected_plan": "",
-            "payment_note": "",
+            # Schema-compatible referral fallback. This makes attribution
+            # visible even on deployments without source/registration_source.
+            "payment_note": (f"ref={_signup_referral_code}" if _signup_referral_code else ""),
             "approved_by": "",
             "admin_note": "",
             "account_reference": d.get("account_reference") or ref(),
@@ -15780,9 +15790,12 @@ def _np_referral_code_from_trader(trader):
         value = _aff_code(row.get(key))
         if value:
             return value
-    source = str(row.get("registration_source") or row.get("source") or "")
-    m = re.search(r"(?:^|[|;&\s])ref=([A-Za-z0-9_-]{1,40})(?:$|[|;&\s])", source, re.I)
-    return _aff_code(m.group(1)) if m else ""
+    for source_key in ("registration_source", "source", "payment_note", "admin_note"):
+        source = str(row.get(source_key) or "")
+        m = re.search(r"(?:^|[|;&\s])ref=([A-Za-z0-9_-]{1,40})(?:$|[|;&\s])", source, re.I)
+        if m:
+            return _aff_code(m.group(1))
+    return ""
 
 
 def _affiliate_quote_details(d, base_fee):
@@ -16472,9 +16485,11 @@ def trader_referral_activity():
 
         # Registration evidence captured from the referral URL.
         referred = []
-        for column in ("registration_source", "source"):
+        for column in ("registration_source", "source", "payment_note", "admin_note"):
             try:
-                rows = (supabase.table("traders").select("id,name,email,created_at,registration_source,source")
+                # select('*') is deliberate: requesting optional columns by
+                # name caused every lookup to fail when one column was absent.
+                rows = (supabase.table("traders").select("*")
                         .ilike(column, f"%ref={code}%").limit(500).execute().data or [])
                 referred.extend(rows)
             except Exception as exc:
