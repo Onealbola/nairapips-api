@@ -43320,371 +43320,728 @@ def np2_referral_payout_request_route():
         return _np_fail("Referral withdrawal request failed: " + message, 500)
 
 
+
 # ============================================================================
-# NAIRAPIPS V75 — AUTOMATION SAFETY LAYER / PRODUCTION PROTECTION SHELL
-# 20 SEP 2026
+# NAIRAPIPS V74 — AUTOMATION WORKER STABILIZATION / SECOND-LIFE TERMINAL GUARD
+# 19 SEP 2026
 #
 # PURPOSE
 # -------
-# Protect the now-stable lifecycle automation WITHOUT rewriting its business law.
-# This layer wraps the FINAL Flask view functions after every existing production
-# patch has loaded, so healthy behaviour remains exactly the same.
+# Preserve the V60 business constitution exactly while removing a production
+# execution fault exposed by Render logs:
 #
-# SAFETY CONTROLS
-# ---------------
-# 1) GLOBAL + MODULE ENV KILL SWITCHES (default ON; no behaviour change).
-# 2) SAME-ACTION CONCURRENCY LOCK: repeated clicks/workers in this process cannot
-#    run the same entitlement mutation at the same instant.
-# 3) CIRCUIT BREAKER: repeated 5xx failures fail closed instead of creating a
-#    retry storm against MT5/Supabase.
-# 4) FINANCIAL SEPARATION: disabling payout-renewal automation does NOT prevent a
-#    payout from being marked PAID; only the renewal MT5 hook is bypassed.
-# 5) READ-ONLY ADMIN HEALTH ENDPOINT exposes route/switch/circuit integrity.
-# 6) AUDIT ON BLOCKS/ERRORS. Successful business events continue to use their
-#    existing production audit paths, avoiding duplicate database pressure.
+#   stale purchase row says Life2 waiting/activated
+#   + Life2 has in fact already existed / breached
+#   -> old V9 bridge selected the LATEST breached Phase1 account as the source
+#   -> it could look like another outstanding Second Life
+#   -> final Journey Authority correctly blocked it as CLOSED
+#   -> background workers retried the same dead obligation repeatedly
 #
-# IMPORTANT
-# ---------
-# This is a protection shell, not a new lifecycle engine. Existing V55/V61/V72+
-# entitlement, lineage, consumed-source and duplicate guards remain authoritative.
+# V74 fixes EXECUTION / RETRY SUPERVISION only.
+#
+# Business law is unchanged:
+#   Phase1 PASS -> FUNDED
+#   Life1 breach -> exactly one free Second Life
+#   Life2 breach -> CLOSED / no Life3
+#   first Funded breach -> one PAID Funded reset after proof/Admin approval
+#   breach after Funded-reset replacement -> CLOSED
+#   PAID payout -> fresh Funded renewal, independent of Funded reset
+#   one event -> one entitlement -> one MT5 -> consumed
 # ============================================================================
 
-NAIRAPIPS_AUTOMATION_SAFETY_RELEASE_V75 = "V75_AUTOMATION_SAFETY_LAYER_2026_09_20"
+NAIRAPIPS_AUTOMATION_STABILITY_RELEASE_V74 = "V74_AUTOMATION_WORKER_STABILIZATION_2026_09_19"
 
-import threading as _np_v75_threading
-import functools as _np_v75_functools
-import hashlib as _np_v75_hashlib
-
-_NP_V75_RULESET_TEXT = (
-    "PHASE1_2LIVES:LIFE1_BREACH=>ONE_SECOND_LIFE;"
-    "LIFE2_BREACH=>CLOSED_NEW_CHALLENGE;"
-    "PASS:CURRENT_PHASE1=>FUNDED;LEGACY_PHASE1=>PHASE2=>FUNDED;"
-    "FUNDED_BREACH:FIRST=>ONE_PAID_FUNDED_RESET;"
-    "RESET_REPLACEMENT_BREACH=>CLOSED_NEW_CHALLENGE;"
-    "PAYOUT:PAID=>FRESH_FUNDED_INDEPENDENT_OF_FUNDED_RESET;"
-    "ONE_ENTITLEMENT=>ONE_MT5;UNKNOWN=>FAIL_CLOSED"
-)
-NP_AUTOMATION_RULESET_VERSION = "1.0-FROZEN-2026-09-20"
-NP_AUTOMATION_RULESET_SHA256 = _np_v75_hashlib.sha256(
-    _NP_V75_RULESET_TEXT.encode("utf-8")
-).hexdigest()
+_NP_V74_SECOND_LIFE_QUARANTINE = {}
+_NP_V74_SECOND_LIFE_QUARANTINE_SECONDS = 6 * 60 * 60
+_NP_V74_LAST_HEAVY_SCAN = {}
+_NP_V74_LAST_SECOND_LIFE_SUMMARY = {}
 
 
-def _np_v75_env_bool(name, default=True):
-    raw = os.getenv(name)
-    if raw is None:
-        return bool(default)
-    return str(raw).strip().lower() not in {"0", "false", "off", "no", "disabled", "pause", "paused"}
+def _np_v74_account_time(a):
+    return _dt_score(
+        (a or {}).get("assigned_at")
+        or (a or {}).get("started_at")
+        or (a or {}).get("created_at")
+        or (a or {}).get("breached_at")
+        or (a or {}).get("breach_at")
+        or (a or {}).get("archived_at")
+        or (a or {}).get("updated_at")
+    )
 
 
-_NP_V75_MODULE_ENV = {
-    "pass_funded": "NP_AUTOMATION_PASS_FUNDED_ENABLED",
-    "reconcile": "NP_AUTOMATION_RECONCILE_ENABLED",
-    "second_life": "NP_AUTOMATION_SECOND_LIFE_ENABLED",
-    "funded_reset": "NP_AUTOMATION_FUNDED_RESET_ENABLED",
-    "payout_renewal": "NP_AUTOMATION_PAYOUT_RENEWAL_ENABLED",
-    "assignment": "NP_AUTOMATION_ASSIGNMENT_ENABLED",
-}
+def _np_v74_exact_phase1_rows(purchase, trader_id):
+    """Load only exact Phase1 lineage; dual-column compatibility, no trader-wide inference."""
+    p = purchase or {}
+    pid = str(p.get("id") or "").strip()
+    tid = str(trader_id or p.get("trader_id") or "").strip()
+    if not pid or not tid:
+        return []
 
-
-def _np_v75_module_enabled(module):
-    if not _np_v75_env_bool("NP_AUTOMATION_ENABLED", True):
-        return False
-    env_name = _NP_V75_MODULE_ENV.get(str(module or ""))
-    return _np_v75_env_bool(env_name, True) if env_name else True
-
-
-# Per-process locks are intentionally an EXTRA guard. Existing database lineage /
-# consumed-entitlement guards remain the cross-worker authority.
-_NP_V75_LOCKS = {}
-_NP_V75_LOCKS_GUARD = _np_v75_threading.Lock()
-
-# Circuit breaker: 3 server failures inside 5 minutes pauses the affected module
-# in this worker for 10 minutes. 4xx business refusals do not trip the circuit.
-_NP_V75_CIRCUIT = {}
-_NP_V75_FAILURE_WINDOW_SECONDS = 300
-_NP_V75_FAILURE_LIMIT = 3
-_NP_V75_CIRCUIT_OPEN_SECONDS = 600
-
-
-def _np_v75_now_ts():
-    return time.time()
-
-
-def _np_v75_circuit_state(module):
-    module = str(module or "unknown")
-    now = _np_v75_now_ts()
-    state = _NP_V75_CIRCUIT.setdefault(module, {"failures": [], "open_until": 0.0, "last_error": ""})
-    state["failures"] = [x for x in state.get("failures", []) if now - float(x) <= _NP_V75_FAILURE_WINDOW_SECONDS]
-    if float(state.get("open_until") or 0) <= now:
-        state["open_until"] = 0.0
-    return state
-
-
-def _np_v75_record_server_failure(module, detail=""):
-    state = _np_v75_circuit_state(module)
-    now = _np_v75_now_ts()
-    state["failures"].append(now)
-    state["last_error"] = str(detail or "")[:500]
-    if len(state["failures"]) >= _NP_V75_FAILURE_LIMIT and not state.get("open_until"):
-        state["open_until"] = now + _NP_V75_CIRCUIT_OPEN_SECONDS
-        _audit_safe(
-            "automation_safety",
-            "circuit_opened",
-            f"module={module}; failures={len(state['failures'])}; detail={state['last_error']}",
-            {"name": "V75 safety", "username": "system", "role": "system"},
-            str(module),
-        )
-    return state
-
-
-def _np_v75_response_status(response):
-    try:
-        if isinstance(response, tuple) and len(response) > 1:
-            return int(response[1])
-        return int(getattr(response, "status_code", 200) or 200)
-    except Exception:
-        return 200
-
-
-def _np_v75_request_payload():
-    data = {}
-    try:
-        j = request.get_json(silent=True)
-        if isinstance(j, dict):
-            data.update(j)
-    except Exception:
-        pass
-    try:
-        for src in (request.form, request.args):
-            for k in src.keys():
-                if k not in data:
-                    data[k] = src.get(k)
-    except Exception:
-        pass
-    return data
-
-
-def _np_v75_action_key(module):
-    d = _np_v75_request_payload()
-    values = []
-    for key in (
-        "purchase_id", "challenge_purchase_id", "payout_id", "id",
-        "source_account_id", "trader_account_id", "completed_account_id",
-        "passed_account_id", "trader_id", "mt5_login", "phase", "target_stage",
-    ):
-        v = str(d.get(key) or "").strip()
-        if v:
-            values.append(f"{key}={v}")
-    if not values:
-        # Still serialize identical mutation paths when an old caller supplies no key.
-        values.append("path=" + str(getattr(request, "path", "") or "unknown"))
-    raw = f"{module}|" + "|".join(values)
-    return _np_v75_hashlib.sha256(raw.encode("utf-8")).hexdigest(), raw[:600]
-
-
-def _np_v75_get_lock(key):
-    with _NP_V75_LOCKS_GUARD:
-        lock = _NP_V75_LOCKS.get(key)
-        if lock is None:
-            lock = _np_v75_threading.Lock()
-            _NP_V75_LOCKS[key] = lock
-        return lock
-
-
-def _np_v75_release_lock(key, lock):
-    try:
-        lock.release()
-    finally:
-        with _NP_V75_LOCKS_GUARD:
-            if _NP_V75_LOCKS.get(key) is lock and not lock.locked():
-                _NP_V75_LOCKS.pop(key, None)
-
-
-def _np_v75_wrap_endpoint(endpoint, module):
-    """Wrap a FINAL Flask endpoint without changing its healthy business result."""
-    original = app.view_functions.get(endpoint)
-    if not original or getattr(original, "_np_v75_safety_wrapped", False):
-        return bool(original)
-
-    @_np_v75_functools.wraps(original)
-    def protected(*args, **kwargs):
-        if request.method == "OPTIONS":
-            return original(*args, **kwargs)
-
-        if not _np_v75_module_enabled(module):
-            _audit_safe(
-                "automation_safety", "kill_switch_block",
-                f"module={module}; endpoint={endpoint}; path={request.path}",
-                {"name": "V75 safety", "username": "system", "role": "system"}, endpoint,
-            )
-            return _np_fail(
-                f"{module.replace('_', ' ').title()} automation is safely paused. "
-                "No lifecycle entitlement or MT5 was consumed.",
-                503,
-            )
-
-        circuit = _np_v75_circuit_state(module)
-        if circuit.get("open_until"):
-            wait = max(1, int(float(circuit["open_until"]) - _np_v75_now_ts()))
-            return _np_fail(
-                f"Automation safety circuit is open for {module.replace('_',' ')} after repeated server failures. "
-                f"Retry after approximately {wait} seconds. No new action was started.",
-                503,
-            )
-
-        key, descriptor = _np_v75_action_key(module)
-        lock = _np_v75_get_lock(key)
-        if not lock.acquire(blocking=False):
-            _audit_safe(
-                "automation_safety", "duplicate_inflight_block",
-                f"module={module}; endpoint={endpoint}; {descriptor}",
-                {"name": "V75 safety", "username": "system", "role": "system"}, endpoint,
-            )
-            return _np_fail(
-                "The same automation action is already running. A duplicate request was blocked safely.",
-                409,
-            )
-
+    rows, seen = [], set()
+    for col in ("purchase_id", "challenge_purchase_id"):
         try:
-            try:
-                response = original(*args, **kwargs)
-            except Exception as exc:
-                _np_v75_record_server_failure(module, repr(exc))
-                _audit_safe(
-                    "automation_safety", "protected_exception",
-                    f"module={module}; endpoint={endpoint}; error={repr(exc)[:700]}",
-                    {"name": "V75 safety", "username": "system", "role": "system"}, endpoint,
-                )
-                return _np_fail(
-                    "Automation safety intercepted an internal failure. No duplicate retry was started automatically.",
-                    500,
-                )
+            got = (
+                supabase.table("trader_accounts").select("*")
+                .eq("trader_id", tid).eq(col, pid)
+                .order("created_at", desc=False).limit(250)
+                .execute().data or []
+            )
+        except Exception:
+            got = []
 
-            status = _np_v75_response_status(response)
-            if status >= 500:
-                _np_v75_record_server_failure(module, f"HTTP {status} from {endpoint}")
-            return response
-        finally:
-            _np_v75_release_lock(key, lock)
+        for a in got:
+            if _normalize_lifecycle_stage(
+                a.get("stage") or a.get("phase") or a.get("phase_label")
+            ) != "phase1":
+                continue
+            aid = str(a.get("id") or "").strip()
+            if aid and aid not in seen:
+                seen.add(aid)
+                rows.append(a)
 
-    protected._np_v75_safety_wrapped = True
-    protected._np_v75_original = original
-    app.view_functions[endpoint] = protected
+    rows.sort(key=_np_v74_account_time)
+    return rows
+
+
+def _np_v74_has_breach(a):
+    try:
+        return bool(_np_account_has_breach_evidence(a))
+    except Exception:
+        blob = " ".join(str((a or {}).get(k) or "") for k in (
+            "account_status", "status", "risk_zone", "breach_reason",
+            "archive_reason", "breached_at", "breach_at"
+        )).lower()
+        return "breach" in blob
+
+
+# ---------------------------------------------------------------------------
+# A) CORRECT SECOND-LIFE BRIDGE
+#
+# The source of a Second-Life entitlement is Life1's breach, not the latest
+# breached Phase1 row. ANY later Phase1 MT5 on the exact purchase proves that
+# the one free Second Life was already fulfilled. If that later account later
+# breaches, the journey is terminal; it must never become a Life3 candidate.
+# ---------------------------------------------------------------------------
+
+_np_second_life_cutover_bridge_v9_v74_core = _np_second_life_cutover_bridge_v9
+
+def _np_second_life_cutover_bridge_v9(purchase, trader_id=None):
+    p = purchase or {}
+    tid = str(trader_id or p.get("trader_id") or "").strip()
+    pid = str(p.get("id") or "").strip()
+
+    if not tid or not pid:
+        return None
+    if not _second_life_bool(p.get("second_life_enabled")):
+        # Plan-backed entitlement enrichment stays owned by the shared status
+        # authority. Do not invent the flag here.
+        status_payload = _second_life_status_payload(p, tid) or {}
+        if not status_payload.get("enabled"):
+            return None
+    if not _second_life_bool(p.get("second_life_used")):
+        return None
+
+    sl_status = str(p.get("second_life_status") or "").strip().lower()
+    if sl_status not in {
+        "life2_waiting_mt5", "waiting_mt5", "activated",
+        "life2_active", "active", "fulfilled", "completed"
+    }:
+        return None
+
+    phase1 = _np_v74_exact_phase1_rows(p, tid)
+    if not phase1:
+        return None
+
+    breached = [a for a in phase1 if _np_v74_has_breach(a)]
+    if not breached:
+        return None
+
+    # LIFE 1 is the earliest proven breached Phase1 on this purchase.
+    life1_source = breached[0]
+    life1_time = _np_v74_account_time(life1_source)
+
+    successors = [
+        a for a in phase1
+        if str(a.get("id") or "") != str(life1_source.get("id") or "")
+        and str(a.get("mt5_login") or "").strip()
+        and _np_v74_account_time(a) > life1_time
+    ]
+    successors.sort(key=_np_v74_account_time)
+
+    if successors:
+        life2 = successors[0]
+        return {
+            "eligible": False,
+            "consumed": True,
+            "terminal": bool(_np_v74_has_breach(life2)),
+            "reason": (
+                "life2_breached_journey_closed"
+                if _np_v74_has_breach(life2)
+                else "second_life_already_has_successor"
+            ),
+            "source_account": life1_source,
+            "source_account_id": life1_source.get("id"),
+            "source_mt5": life1_source.get("mt5_login"),
+            "successor": life2,
+            "successor_account_id": life2.get("id"),
+            "successor_mt5": life2.get("mt5_login"),
+            "purchase_id": pid,
+        }
+
+    # Activated but no later Phase1 MT5 exists: this is the one legitimate
+    # outstanding Life2 assignment.
+    if sl_status in {"life2_active", "active", "fulfilled", "completed"}:
+        # Fail closed on an inconsistent "active/fulfilled" flag without the
+        # account row. Do not release another MT5 merely from stale metadata.
+        return {
+            "eligible": False,
+            "consumed": False,
+            "reason": "life2_status_says_fulfilled_but_successor_not_proven",
+            "source_account": life1_source,
+            "source_account_id": life1_source.get("id"),
+            "source_mt5": life1_source.get("mt5_login"),
+            "purchase_id": pid,
+        }
+
+    return {
+        "eligible": True,
+        "consumed": False,
+        "reason": "activated_second_life_waiting_mt5",
+        "purchase_id": pid,
+        "source_account": life1_source,
+        "source_account_id": str(life1_source.get("id") or ""),
+        "source_mt5": life1_source.get("mt5_login"),
+        "target_stage": "phase1",
+        "entitlement_type": "second_life",
+        "activated_at": p.get("second_life_activated_at") or p.get("updated_at"),
+    }
+
+
+# Dashboard/recovery helper must use the same Life1-source law.
+_np_second_life_used_but_unfulfilled_v74_core = _np_second_life_used_but_unfulfilled
+
+def _np_second_life_used_but_unfulfilled(purchase, trader_id):
+    p = purchase or {}
+    tid = str(trader_id or p.get("trader_id") or "").strip()
+
+    if not tid or not str(p.get("id") or "").strip():
+        return None
+    if not _second_life_bool(p.get("second_life_used")):
+        return None
+
+    bridge = _np_second_life_cutover_bridge_v9(p, tid)
+    if not bridge:
+        return None
+    if bridge.get("consumed"):
+        return None
+    if not bridge.get("eligible"):
+        return None
+    return bridge.get("source_account")
+
+
+# ---------------------------------------------------------------------------
+# B) SECOND-LIFE RETRY QUEUE — CLOSED/FULFILLED ROWS DO NOT HAMMER THE DB
+# ---------------------------------------------------------------------------
+
+def _np_v74_quarantined(pid):
+    pid = str(pid or "").strip()
+    if not pid:
+        return False
+    until = float(_NP_V74_SECOND_LIFE_QUARANTINE.get(pid) or 0)
+    if until <= time.time():
+        _NP_V74_SECOND_LIFE_QUARANTINE.pop(pid, None)
+        return False
     return True
 
 
-# Wrap mutation endpoints that can create/consume lifecycle entitlements or MT5s.
-_NP_V75_PROTECTED_ENDPOINTS = {
-    "admin_journey_authority_reconcile_due_v15": "reconcile",
-    "admin_pass_funded_fire_v16": "pass_funded",
-    "admin_second_life_activate": "second_life",
-    "second_life_activate": "second_life",
-    "admin_mark_funded_reset_paid": "funded_reset",
-    "assign_phase_mt5": "assignment",
-    "lifecycle_assign_phase2_mt5": "assignment",
-    "lifecycle_assign_funded_mt5": "assignment",
-    "admin_retry_exact_payout_renewal_v30": "payout_renewal",
-    "admin_fire_exact_payout_renewal_v34": "payout_renewal",
-}
-
-_NP_V75_WRAP_RESULTS = {
-    endpoint: _np_v75_wrap_endpoint(endpoint, module)
-    for endpoint, module in _NP_V75_PROTECTED_ENDPOINTS.items()
-}
-
-
-# Special payout-paid wrapper: financial payment state remains independent from
-# renewal automation. If renewal is paused, mark payout PAID using the pre-renewal
-# production core captured by V34, rather than blocking the financial operation.
-_np_v75_mark_paid_final = app.view_functions.get("mark_paid")
-if _np_v75_mark_paid_final and not getattr(_np_v75_mark_paid_final, "_np_v75_payout_safe", False):
-    @_np_v75_functools.wraps(_np_v75_mark_paid_final)
-    def _np_v75_mark_paid_protected(*args, **kwargs):
-        if request.method == "OPTIONS":
-            return _np_v75_mark_paid_final(*args, **kwargs)
-        if _np_v75_module_enabled("payout_renewal"):
-            return _np_v75_mark_paid_final(*args, **kwargs)
-        core = globals().get("_np_mark_paid_v33_core")
-        if callable(core):
-            _audit_safe(
-                "automation_safety", "payout_renewal_paused_payment_continues",
-                "Payout marked PAID while fresh-Funded renewal automation is paused.",
-                {"name": "V75 safety", "username": "system", "role": "system"},
-                str((_np_v75_request_payload() or {}).get("id") or ""),
-            )
-            return core(*args, **kwargs)
-        return _np_fail(
-            "Payout-renewal automation is paused and the safe payment-only route is unavailable. No change was made.",
-            503,
+def _np_v74_quarantine(pid, seconds=None):
+    pid = str(pid or "").strip()
+    if pid:
+        _NP_V74_SECOND_LIFE_QUARANTINE[pid] = (
+            time.time()
+            + float(seconds or _NP_V74_SECOND_LIFE_QUARANTINE_SECONDS)
         )
-    _np_v75_mark_paid_protected._np_v75_payout_safe = True
-    _np_v75_mark_paid_protected._np_v75_original = _np_v75_mark_paid_final
-    app.view_functions["mark_paid"] = _np_v75_mark_paid_protected
 
 
-@app.route("/admin/automation_safety_v75/status", methods=["GET", "OPTIONS"])
-def admin_automation_safety_v75_status():
+def _np_retry_waiting_second_lives_v19(limit=100):
+    """
+    Exact activated-Life2 retry queue.
+
+    The DB query may still contain stale waiting/activated purchase rows, but
+    exact lineage decides whether the one Second Life is still outstanding.
+    Fulfilled/terminal rows are quarantined in memory and never reach assignment.
+    """
+    global _NP_V74_LAST_SECOND_LIFE_SUMMARY
+
+    process_limit = max(10, min(int(limit or 100), 100))
+    scan_limit = max(100, min(process_limit * 4, 400))
+
+    summary = {
+        "checked": 0,
+        "eligible": 0,
+        "assigned": 0,
+        "waiting_inventory": 0,
+        "already_fulfilled": 0,
+        "terminal_closed": 0,
+        "ineligible": 0,
+        "quarantined_skip": 0,
+        "errors": 0,
+        "scan_limit": scan_limit,
+        "process_limit": process_limit,
+        "release": NAIRAPIPS_AUTOMATION_STABILITY_RELEASE_V74,
+    }
+
+    try:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .in_(
+                "second_life_status",
+                ["life2_waiting_mt5", "waiting_mt5", "activated"],
+            )
+            .eq("second_life_used", True)
+            .order("updated_at", desc=False)
+            .limit(scan_limit).execute().data or []
+        )
+    except Exception as exc:
+        summary["errors"] += 1
+        summary["error"] = "load_failed: " + str(exc)
+        _NP_V74_LAST_SECOND_LIFE_SUMMARY = summary
+        print("V74 SECOND LIFE RETRY LOAD DEFERRED:", exc, flush=True)
+        return summary
+
+    actor = {
+        "name": "automation_retry_v74",
+        "username": "automation_retry_v74",
+        "role": "system",
+    }
+
+    processed = 0
+    for purchase in rows:
+        if processed >= process_limit:
+            break
+
+        pid = str(purchase.get("id") or "").strip()
+        if _np_v74_quarantined(pid):
+            summary["quarantined_skip"] += 1
+            continue
+
+        trader_id = str(purchase.get("trader_id") or "").strip()
+        if not pid or not trader_id:
+            summary["ineligible"] += 1
+            _np_v74_quarantine(pid, 30 * 60)
+            continue
+
+        processed += 1
+        summary["checked"] += 1
+
+        try:
+            # First recover only a proven stranded untraded assignment.
+            recovered = _np_v59_recover_second_life_assignment_sync_error(
+                purchase, trader_id, actor
+            )
+            if recovered:
+                summary["already_fulfilled"] += 1
+                _np_v74_quarantine(pid)
+                continue
+
+            authority = _np_v59_second_life_waiting_authority(
+                purchase, trader_id
+            )
+
+            if not authority.get("eligible"):
+                reason = str(authority.get("reason") or "").strip()
+                bridge = authority.get("bridge") or {}
+
+                if reason == "second_life_already_has_successor":
+                    summary["already_fulfilled"] += 1
+                    if bridge.get("terminal") or bridge.get("reason") == "life2_breached_journey_closed":
+                        summary["terminal_closed"] += 1
+                    _np_v74_quarantine(pid)
+                elif reason in {
+                    "life2_breached_journey_closed",
+                    "not_waiting_for_life2_mt5",
+                }:
+                    summary["terminal_closed"] += 1
+                    _np_v74_quarantine(pid)
+                else:
+                    summary["ineligible"] += 1
+                    # Short quarantine for potentially transient plan/schema reads.
+                    _np_v74_quarantine(pid, 10 * 60)
+                continue
+
+            summary["eligible"] += 1
+            result = _np_retry_waiting_second_life_assignment(
+                purchase, trader_id, actor
+            )
+
+            if result:
+                if result.get("already_fulfilled") or result.get("already_active"):
+                    summary["already_fulfilled"] += 1
+                else:
+                    summary["assigned"] += 1
+                _np_v74_quarantine(pid)
+            else:
+                # No MT5 or transient condition: entitlement remains alive.
+                summary["waiting_inventory"] += 1
+
+        except ValueError as exc:
+            msg = str(exc)
+            if "Journey closed: no valid entitlement remains" in msg:
+                # Business-rule terminal state, not an automation crash.
+                summary["terminal_closed"] += 1
+                _np_v74_quarantine(pid)
+            else:
+                summary["errors"] += 1
+                print("V74 SECOND LIFE RETRY ITEM ERROR:", msg, flush=True)
+        except Exception as exc:
+            summary["errors"] += 1
+            print("V74 SECOND LIFE RETRY ITEM ERROR:", exc, flush=True)
+
+    _NP_V74_LAST_SECOND_LIFE_SUMMARY = summary
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# C) CROSS-GUNICORN PROCESS LOCK FOR HEAVY SAFETY-NET SWEEPS
+#
+# Existing threading.Lock objects are per process. Gunicorn workers therefore
+# can each run the same DB sweep. /tmp flock makes only one worker on this Render
+# instance execute a heavy lifecycle/recovery/reset scan at a time.
+# ---------------------------------------------------------------------------
+
+def _np_v74_try_file_lock(path="/tmp/nairapips_automation_heavy_scan.lock"):
+    handle = None
+    try:
+        import fcntl
+        handle = open(path, "a+")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except Exception:
+        try:
+            if handle:
+                handle.close()
+        except Exception:
+            pass
+        return None
+
+
+def _np_v74_release_file_lock(handle):
+    if not handle:
+        return
+    try:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        handle.close()
+    except Exception:
+        pass
+
+
+_np_run_verified_lifecycle_cycle_v74_core = _np_run_verified_lifecycle_cycle_v40
+
+def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
+    global _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40
+
+    lock = _np_v74_try_file_lock()
+    if not lock:
+        summary = {
+            "release": NAIRAPIPS_AUTOMATION_STABILITY_RELEASE_V74,
+            "trigger": trigger,
+            "started_at": now_iso(),
+            "finished_at": now_iso(),
+            "deferred_cross_process_busy": True,
+            "first_phase1": {},
+            "phase_pass_to_funded": {},
+            "second_life": {},
+            "errors": 0,
+        }
+        _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40 = summary
+        return summary
+
+    try:
+        result = _np_run_verified_lifecycle_cycle_v74_core(trigger)
+        if isinstance(result, dict):
+            result["supervision_release"] = NAIRAPIPS_AUTOMATION_STABILITY_RELEASE_V74
+        _NP_V74_LAST_HEAVY_SCAN["lifecycle"] = now_iso()
+        return result
+    finally:
+        _np_v74_release_file_lock(lock)
+
+
+_np_second_life_breach_recovery_cycle_v74_core = _np_second_life_breach_recovery_cycle_v41
+
+def _np_second_life_breach_recovery_cycle_v41(limit=30):
+    lock = _np_v74_try_file_lock()
+    if not lock:
+        return {
+            "checked": 0,
+            "eligible": 0,
+            "assigned": 0,
+            "activated_waiting": 0,
+            "skipped": 0,
+            "errors": 0,
+            "deferred_cross_process_busy": True,
+            "release": NAIRAPIPS_AUTOMATION_STABILITY_RELEASE_V74,
+            "started_at": now_iso(),
+            "finished_at": now_iso(),
+        }
+
+    try:
+        result = _np_second_life_breach_recovery_cycle_v74_core(
+            limit=min(max(int(limit or 30), 10), 30)
+        )
+        if isinstance(result, dict):
+            result["supervision_release"] = NAIRAPIPS_AUTOMATION_STABILITY_RELEASE_V74
+        _NP_V74_LAST_HEAVY_SCAN["second_life_breach_recovery"] = now_iso()
+        return result
+    finally:
+        _np_v74_release_file_lock(lock)
+
+
+# The V41 worker is only a safety net for a missed Life1 breach event.
+# Event-driven breach handling remains immediate. A 3-minute fallback is enough
+# and materially reduces DB pressure.
+_NP_SECOND_LIFE_RECOVERY_INTERVAL_V41 = max(
+    180, int(globals().get("_NP_SECOND_LIFE_RECOVERY_INTERVAL_V41") or 180)
+)
+
+
+# Paid-reset periodic retry also shares the heavy-scan lock. Direct Admin
+# approval fulfilment is untouched.
+_np_retry_clean_approved_resets_v74_core = _np_retry_clean_approved_resets_v43
+
+def _np_retry_clean_approved_resets_v43(limit=50):
+    lock = _np_v74_try_file_lock()
+    if not lock:
+        return {
+            "scanned": 0,
+            "assigned": 0,
+            "already_fulfilled": 0,
+            "legacy_manual": 0,
+            "waiting_inventory": 0,
+            "busy": 0,
+            "blocked": 0,
+            "errors": 0,
+            "deferred_cross_process_busy": True,
+            "release": NAIRAPIPS_AUTOMATION_STABILITY_RELEASE_V74,
+        }
+
+    try:
+        result = _np_retry_clean_approved_resets_v74_core(
+            limit=min(max(int(limit or 50), 10), 50)
+        )
+        _NP_V74_LAST_HEAVY_SCAN["paid_reset"] = now_iso()
+        return result
+    finally:
+        _np_v74_release_file_lock(lock)
+
+
+# ---------------------------------------------------------------------------
+# D) REMOVE FULL DB SWEEPS FROM HIGH-FREQUENCY REQUEST/ENGINE HEARTBEATS
+#
+# V40 already provides the server-side 90s safety net. Immediate event handlers
+# remain intact. Inventory insertion still calls the exact retry chain directly.
+# Request traffic should not execute the same broad recovery scan per Gunicorn
+# process every 45 seconds.
+# ---------------------------------------------------------------------------
+
+_np_maybe_run_verified_retry_v74_core = _np_maybe_run_verified_retry_v19
+
+def _np_maybe_run_verified_retry_v19(trigger="monitoring_heartbeat"):
+    trigger_text = str(trigger or "")
+    if (
+        trigger_text.startswith("monitoring_heartbeat")
+        or trigger_text.startswith("engine_heartbeat:")
+        or trigger_text.startswith("admin_journey_authority_refresh")
+    ):
+        return {
+            "deferred_to_server_worker": True,
+            "release": NAIRAPIPS_AUTOMATION_STABILITY_RELEASE_V74,
+            "trigger": trigger_text,
+        }
+
+    # Explicit/manual non-heartbeat callers retain the existing protected retry.
+    return _np_maybe_run_verified_retry_v74_core(trigger)
+
+
+# ---------------------------------------------------------------------------
+# E) READ-ONLY OPERATIONS HEALTH
+# ---------------------------------------------------------------------------
+
+@app.route("/admin/automation_v74/status", methods=["GET", "OPTIONS"])
+def admin_automation_v74_status():
     if request.method == "OPTIONS":
         return _np_ok({"success": True})
-    admin, auth_response = _require_admin()
+
+    admin_user, auth_response = _require_admin()
     if auth_response:
         return auth_response
 
-    now = _np_v75_now_ts()
-    switches = {"global": _np_v75_env_bool("NP_AUTOMATION_ENABLED", True)}
-    for module, env_name in _NP_V75_MODULE_ENV.items():
-        switches[module] = _np_v75_module_enabled(module)
-
-    circuits = {}
-    for module in sorted(set(_NP_V75_MODULE_ENV) | set(_NP_V75_CIRCUIT)):
-        state = _np_v75_circuit_state(module)
-        circuits[module] = {
-            "failure_count_window": len(state.get("failures", [])),
-            "open": bool(state.get("open_until")),
-            "seconds_remaining": max(0, int(float(state.get("open_until") or 0) - now)),
-            "last_error": state.get("last_error") or "",
-        }
-
-    routes = {
-        endpoint: {
-            "present": endpoint in app.view_functions,
-            "protected": bool(getattr(app.view_functions.get(endpoint), "_np_v75_safety_wrapped", False)),
-            "module": module,
-        }
-        for endpoint, module in _NP_V75_PROTECTED_ENDPOINTS.items()
-    }
-    routes["mark_paid"] = {
-        "present": "mark_paid" in app.view_functions,
-        "protected": bool(getattr(app.view_functions.get("mark_paid"), "_np_v75_payout_safe", False)),
-        "module": "payout_payment_with_renewal_separation",
+    now_ts = time.time()
+    live_quarantine = {
+        pid: int(max(0, until - now_ts))
+        for pid, until in list(_NP_V74_SECOND_LIFE_QUARANTINE.items())
+        if float(until or 0) > now_ts
     }
 
     return _np_ok({
         "success": True,
-        "release": NAIRAPIPS_AUTOMATION_SAFETY_RELEASE_V75,
-        "ruleset_version": NP_AUTOMATION_RULESET_VERSION,
-        "ruleset_sha256": NP_AUTOMATION_RULESET_SHA256,
-        "global_fail_closed": True,
-        "database_business_guards_remain_authoritative": True,
-        "same_action_concurrency_guard": True,
-        "circuit_breaker": {
-            "failure_limit": _NP_V75_FAILURE_LIMIT,
-            "failure_window_seconds": _NP_V75_FAILURE_WINDOW_SECONDS,
-            "open_seconds": _NP_V75_CIRCUIT_OPEN_SECONDS,
-        },
-        "switches": switches,
-        "circuits": circuits,
-        "routes": routes,
-        "active_inflight_locks_this_worker": len(_NP_V75_LOCKS),
+        "release": NAIRAPIPS_AUTOMATION_STABILITY_RELEASE_V74,
+        "business_rules_changed": False,
+        "phase1_pass_to_funded": "UNCHANGED",
+        "second_life_life1_breach": "ONE LIFE2 ONLY",
+        "second_life_life2_breach": "CLOSED_NO_LIFE3",
+        "funded_first_breach": "PAID_RESET_ONLY",
+        "funded_reset_child_breach": "CLOSED",
+        "payout_paid_renewal": "UNCHANGED_INDEPENDENT",
+        "request_heartbeat_full_db_sweep": "DISABLED",
+        "server_lifecycle_safety_net": "ENABLED",
+        "lifecycle_interval_seconds": globals().get("_NP_LIFECYCLE_WORKER_INTERVAL_V40"),
+        "second_life_breach_safety_interval_seconds": globals().get("_NP_SECOND_LIFE_RECOVERY_INTERVAL_V41"),
+        "cross_process_heavy_scan_lock": "ENABLED_ON_RENDER_LINUX",
+        "quarantined_stale_second_life_rows": len(live_quarantine),
+        "last_second_life_retry_summary": _NP_V74_LAST_SECOND_LIFE_SUMMARY,
+        "last_heavy_scan": _NP_V74_LAST_HEAVY_SCAN,
     })
 
 
-print(
-    "NP V75 AUTOMATION SAFETY LOADED:",
-    NAIRAPIPS_AUTOMATION_SAFETY_RELEASE_V75,
-    "ruleset=", NP_AUTOMATION_RULESET_VERSION,
-    "protected=", sum(1 for x in _NP_V75_WRAP_RESULTS.values() if x),
-    "/", len(_NP_V75_WRAP_RESULTS),
-    flush=True,
-)
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_STABILITY_RELEASE_V74
+
+
+
+# ============================================================================
+# NAIRAPIPS V75 — EXACT-ACCOUNT PAYOUT ELIGIBILITY FIX
+# 20 SEP 2026
+#
+# PRODUCTION ISSUE
+# ----------------
+# Trader dashboard could correctly show:
+#   FUNDED ACTIVE + verified withdrawable profit + NO OPEN PAYOUT
+# while /create_payout still returned:
+#   "Payout blocked for this trader."
+#
+# Root cause:
+# _payout_eligibility() correctly verified the exact selected trader_account,
+# but then also trusted traders.payout_blocked — a trader-level compatibility
+# mirror that is set TRUE by old breach/payout-lock lifecycle events.
+#
+# In a multi-account / renewed-Funded journey that mirror can remain TRUE even
+# after the exact current Funded account is a clean assigned_active account.
+#
+# V75 makes the exact selected trader_account authoritative, as the original
+# multi-account contract already states. Open-payout protection remains enforced
+# per exact account inside /create_payout.
+#
+# This patch does NOT alter:
+# - payout amount / 60-40 split calculations
+# - payout approval / rejection / Mark Paid
+# - payout renewal automation
+# - reset automation
+# - Second Life
+# - Phase1 -> Funded
+# ============================================================================
+
+NAIRAPIPS_PAYOUT_ELIGIBILITY_RELEASE_V75 = "V75_EXACT_ACCOUNT_PAYOUT_ELIGIBILITY_FIX_2026_09_20"
+
+_np_payout_eligibility_v75_previous = _payout_eligibility
+
+def _payout_eligibility(trader, requested_account_id=None):
+    """
+    Exact-account payout authority.
+
+    traders.payout_blocked is a compatibility mirror only and must not veto a
+    different exact active Funded account. The selected trader_account itself
+    proves stage/status/ownership/MT5 availability.
+
+    /create_payout still separately enforces one open payout per exact funded
+    account before inserting a new request.
+    """
+    if not trader:
+        return False, "Trader not found", None
+
+    trader_id = str(trader.get("id") or "").strip()
+    requested_account_id = str(requested_account_id or "").strip()
+    account = None
+
+    if requested_account_id:
+        try:
+            rows = (
+                supabase.table("trader_accounts")
+                .select("*")
+                .eq("id", requested_account_id)
+                .eq("trader_id", trader_id)
+                .limit(1)
+                .execute().data or []
+            )
+            account = rows[0] if rows else None
+        except Exception as exc:
+            print("V75 PAYOUT EXACT ACCOUNT LOOKUP ERROR:", exc, flush=True)
+            account = None
+
+        if not account:
+            return False, "Selected payout account could not be verified for this trader.", None
+    else:
+        # Backward compatibility for older callers. Modern Trader dashboard sends
+        # the exact trader_account_id.
+        account = _get_active_account(trader_id, trader)
+
+    if not account:
+        return False, "Payouts require an active funded MT5 account.", account
+
+    if str(account.get("programme_type") or "").strip().lower() == "traders_league":
+        return False, (
+            "League competition accounts are not eligible for paid payouts. "
+            "Use the League reward system."
+        ), account
+
+    stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
+    status = str(account.get("account_status") or account.get("status") or "").strip().lower()
+
+    if stage != "funded":
+        return False, "The selected payout account is not a funded-stage account.", account
+
+    if status != "assigned_active":
+        # This naturally blocks a payout-pending/profit-protected exact account,
+        # a breached account, archived account, passed challenge, waiting account,
+        # etc. We do not need a trader-wide mirror to do that.
+        return False, "Payouts require the selected funded account to be assigned and active.", account
+
+    if not str(account.get("mt5_login") or "").strip():
+        return False, "Payouts require an active funded MT5 login.", account
+
+    # IMPORTANT:
+    # Do not block this exact active funded account merely because
+    # traders.payout_blocked=True. That field is a compatibility mirror and can
+    # be stale after payout renewal, reset replacement, or an independent account
+    # lifecycle. Exact account + exact open-payout check are authoritative.
+    return True, "Payout eligible", account
+
+
+@app.route("/admin/payout_eligibility_v75/status", methods=["GET", "OPTIONS"])
+def admin_payout_eligibility_v75_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_PAYOUT_ELIGIBILITY_RELEASE_V75,
+        "authority": "EXACT_TRADER_ACCOUNT",
+        "trader_level_payout_blocked_role": "COMPATIBILITY_MIRROR_ONLY",
+        "exact_account_must_be": {
+            "stage": "funded",
+            "account_status": "assigned_active",
+            "mt5_login": "required",
+        },
+        "one_open_payout_per_exact_account": True,
+        "payout_amount_rules_changed": False,
+        "payout_renewal_changed": False,
+        "automation_progression_changed": False,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_ELIGIBILITY_RELEASE_V75
+
