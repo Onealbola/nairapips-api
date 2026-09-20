@@ -43318,3 +43318,373 @@ def np2_referral_payout_request_route():
         if "exceeds available" in low:
             return _np_fail("Requested amount exceeds your available referral commission", 400)
         return _np_fail("Referral withdrawal request failed: " + message, 500)
+
+
+# ============================================================================
+# NAIRAPIPS V75 — AUTOMATION SAFETY LAYER / PRODUCTION PROTECTION SHELL
+# 20 SEP 2026
+#
+# PURPOSE
+# -------
+# Protect the now-stable lifecycle automation WITHOUT rewriting its business law.
+# This layer wraps the FINAL Flask view functions after every existing production
+# patch has loaded, so healthy behaviour remains exactly the same.
+#
+# SAFETY CONTROLS
+# ---------------
+# 1) GLOBAL + MODULE ENV KILL SWITCHES (default ON; no behaviour change).
+# 2) SAME-ACTION CONCURRENCY LOCK: repeated clicks/workers in this process cannot
+#    run the same entitlement mutation at the same instant.
+# 3) CIRCUIT BREAKER: repeated 5xx failures fail closed instead of creating a
+#    retry storm against MT5/Supabase.
+# 4) FINANCIAL SEPARATION: disabling payout-renewal automation does NOT prevent a
+#    payout from being marked PAID; only the renewal MT5 hook is bypassed.
+# 5) READ-ONLY ADMIN HEALTH ENDPOINT exposes route/switch/circuit integrity.
+# 6) AUDIT ON BLOCKS/ERRORS. Successful business events continue to use their
+#    existing production audit paths, avoiding duplicate database pressure.
+#
+# IMPORTANT
+# ---------
+# This is a protection shell, not a new lifecycle engine. Existing V55/V61/V72+
+# entitlement, lineage, consumed-source and duplicate guards remain authoritative.
+# ============================================================================
+
+NAIRAPIPS_AUTOMATION_SAFETY_RELEASE_V75 = "V75_AUTOMATION_SAFETY_LAYER_2026_09_20"
+
+import threading as _np_v75_threading
+import functools as _np_v75_functools
+import hashlib as _np_v75_hashlib
+
+_NP_V75_RULESET_TEXT = (
+    "PHASE1_2LIVES:LIFE1_BREACH=>ONE_SECOND_LIFE;"
+    "LIFE2_BREACH=>CLOSED_NEW_CHALLENGE;"
+    "PASS:CURRENT_PHASE1=>FUNDED;LEGACY_PHASE1=>PHASE2=>FUNDED;"
+    "FUNDED_BREACH:FIRST=>ONE_PAID_FUNDED_RESET;"
+    "RESET_REPLACEMENT_BREACH=>CLOSED_NEW_CHALLENGE;"
+    "PAYOUT:PAID=>FRESH_FUNDED_INDEPENDENT_OF_FUNDED_RESET;"
+    "ONE_ENTITLEMENT=>ONE_MT5;UNKNOWN=>FAIL_CLOSED"
+)
+NP_AUTOMATION_RULESET_VERSION = "1.0-FROZEN-2026-09-20"
+NP_AUTOMATION_RULESET_SHA256 = _np_v75_hashlib.sha256(
+    _NP_V75_RULESET_TEXT.encode("utf-8")
+).hexdigest()
+
+
+def _np_v75_env_bool(name, default=True):
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() not in {"0", "false", "off", "no", "disabled", "pause", "paused"}
+
+
+_NP_V75_MODULE_ENV = {
+    "pass_funded": "NP_AUTOMATION_PASS_FUNDED_ENABLED",
+    "reconcile": "NP_AUTOMATION_RECONCILE_ENABLED",
+    "second_life": "NP_AUTOMATION_SECOND_LIFE_ENABLED",
+    "funded_reset": "NP_AUTOMATION_FUNDED_RESET_ENABLED",
+    "payout_renewal": "NP_AUTOMATION_PAYOUT_RENEWAL_ENABLED",
+    "assignment": "NP_AUTOMATION_ASSIGNMENT_ENABLED",
+}
+
+
+def _np_v75_module_enabled(module):
+    if not _np_v75_env_bool("NP_AUTOMATION_ENABLED", True):
+        return False
+    env_name = _NP_V75_MODULE_ENV.get(str(module or ""))
+    return _np_v75_env_bool(env_name, True) if env_name else True
+
+
+# Per-process locks are intentionally an EXTRA guard. Existing database lineage /
+# consumed-entitlement guards remain the cross-worker authority.
+_NP_V75_LOCKS = {}
+_NP_V75_LOCKS_GUARD = _np_v75_threading.Lock()
+
+# Circuit breaker: 3 server failures inside 5 minutes pauses the affected module
+# in this worker for 10 minutes. 4xx business refusals do not trip the circuit.
+_NP_V75_CIRCUIT = {}
+_NP_V75_FAILURE_WINDOW_SECONDS = 300
+_NP_V75_FAILURE_LIMIT = 3
+_NP_V75_CIRCUIT_OPEN_SECONDS = 600
+
+
+def _np_v75_now_ts():
+    return time.time()
+
+
+def _np_v75_circuit_state(module):
+    module = str(module or "unknown")
+    now = _np_v75_now_ts()
+    state = _NP_V75_CIRCUIT.setdefault(module, {"failures": [], "open_until": 0.0, "last_error": ""})
+    state["failures"] = [x for x in state.get("failures", []) if now - float(x) <= _NP_V75_FAILURE_WINDOW_SECONDS]
+    if float(state.get("open_until") or 0) <= now:
+        state["open_until"] = 0.0
+    return state
+
+
+def _np_v75_record_server_failure(module, detail=""):
+    state = _np_v75_circuit_state(module)
+    now = _np_v75_now_ts()
+    state["failures"].append(now)
+    state["last_error"] = str(detail or "")[:500]
+    if len(state["failures"]) >= _NP_V75_FAILURE_LIMIT and not state.get("open_until"):
+        state["open_until"] = now + _NP_V75_CIRCUIT_OPEN_SECONDS
+        _audit_safe(
+            "automation_safety",
+            "circuit_opened",
+            f"module={module}; failures={len(state['failures'])}; detail={state['last_error']}",
+            {"name": "V75 safety", "username": "system", "role": "system"},
+            str(module),
+        )
+    return state
+
+
+def _np_v75_response_status(response):
+    try:
+        if isinstance(response, tuple) and len(response) > 1:
+            return int(response[1])
+        return int(getattr(response, "status_code", 200) or 200)
+    except Exception:
+        return 200
+
+
+def _np_v75_request_payload():
+    data = {}
+    try:
+        j = request.get_json(silent=True)
+        if isinstance(j, dict):
+            data.update(j)
+    except Exception:
+        pass
+    try:
+        for src in (request.form, request.args):
+            for k in src.keys():
+                if k not in data:
+                    data[k] = src.get(k)
+    except Exception:
+        pass
+    return data
+
+
+def _np_v75_action_key(module):
+    d = _np_v75_request_payload()
+    values = []
+    for key in (
+        "purchase_id", "challenge_purchase_id", "payout_id", "id",
+        "source_account_id", "trader_account_id", "completed_account_id",
+        "passed_account_id", "trader_id", "mt5_login", "phase", "target_stage",
+    ):
+        v = str(d.get(key) or "").strip()
+        if v:
+            values.append(f"{key}={v}")
+    if not values:
+        # Still serialize identical mutation paths when an old caller supplies no key.
+        values.append("path=" + str(getattr(request, "path", "") or "unknown"))
+    raw = f"{module}|" + "|".join(values)
+    return _np_v75_hashlib.sha256(raw.encode("utf-8")).hexdigest(), raw[:600]
+
+
+def _np_v75_get_lock(key):
+    with _NP_V75_LOCKS_GUARD:
+        lock = _NP_V75_LOCKS.get(key)
+        if lock is None:
+            lock = _np_v75_threading.Lock()
+            _NP_V75_LOCKS[key] = lock
+        return lock
+
+
+def _np_v75_release_lock(key, lock):
+    try:
+        lock.release()
+    finally:
+        with _NP_V75_LOCKS_GUARD:
+            if _NP_V75_LOCKS.get(key) is lock and not lock.locked():
+                _NP_V75_LOCKS.pop(key, None)
+
+
+def _np_v75_wrap_endpoint(endpoint, module):
+    """Wrap a FINAL Flask endpoint without changing its healthy business result."""
+    original = app.view_functions.get(endpoint)
+    if not original or getattr(original, "_np_v75_safety_wrapped", False):
+        return bool(original)
+
+    @_np_v75_functools.wraps(original)
+    def protected(*args, **kwargs):
+        if request.method == "OPTIONS":
+            return original(*args, **kwargs)
+
+        if not _np_v75_module_enabled(module):
+            _audit_safe(
+                "automation_safety", "kill_switch_block",
+                f"module={module}; endpoint={endpoint}; path={request.path}",
+                {"name": "V75 safety", "username": "system", "role": "system"}, endpoint,
+            )
+            return _np_fail(
+                f"{module.replace('_', ' ').title()} automation is safely paused. "
+                "No lifecycle entitlement or MT5 was consumed.",
+                503,
+            )
+
+        circuit = _np_v75_circuit_state(module)
+        if circuit.get("open_until"):
+            wait = max(1, int(float(circuit["open_until"]) - _np_v75_now_ts()))
+            return _np_fail(
+                f"Automation safety circuit is open for {module.replace('_',' ')} after repeated server failures. "
+                f"Retry after approximately {wait} seconds. No new action was started.",
+                503,
+            )
+
+        key, descriptor = _np_v75_action_key(module)
+        lock = _np_v75_get_lock(key)
+        if not lock.acquire(blocking=False):
+            _audit_safe(
+                "automation_safety", "duplicate_inflight_block",
+                f"module={module}; endpoint={endpoint}; {descriptor}",
+                {"name": "V75 safety", "username": "system", "role": "system"}, endpoint,
+            )
+            return _np_fail(
+                "The same automation action is already running. A duplicate request was blocked safely.",
+                409,
+            )
+
+        try:
+            try:
+                response = original(*args, **kwargs)
+            except Exception as exc:
+                _np_v75_record_server_failure(module, repr(exc))
+                _audit_safe(
+                    "automation_safety", "protected_exception",
+                    f"module={module}; endpoint={endpoint}; error={repr(exc)[:700]}",
+                    {"name": "V75 safety", "username": "system", "role": "system"}, endpoint,
+                )
+                return _np_fail(
+                    "Automation safety intercepted an internal failure. No duplicate retry was started automatically.",
+                    500,
+                )
+
+            status = _np_v75_response_status(response)
+            if status >= 500:
+                _np_v75_record_server_failure(module, f"HTTP {status} from {endpoint}")
+            return response
+        finally:
+            _np_v75_release_lock(key, lock)
+
+    protected._np_v75_safety_wrapped = True
+    protected._np_v75_original = original
+    app.view_functions[endpoint] = protected
+    return True
+
+
+# Wrap mutation endpoints that can create/consume lifecycle entitlements or MT5s.
+_NP_V75_PROTECTED_ENDPOINTS = {
+    "admin_journey_authority_reconcile_due_v15": "reconcile",
+    "admin_pass_funded_fire_v16": "pass_funded",
+    "admin_second_life_activate": "second_life",
+    "second_life_activate": "second_life",
+    "admin_mark_funded_reset_paid": "funded_reset",
+    "assign_phase_mt5": "assignment",
+    "lifecycle_assign_phase2_mt5": "assignment",
+    "lifecycle_assign_funded_mt5": "assignment",
+    "admin_retry_exact_payout_renewal_v30": "payout_renewal",
+    "admin_fire_exact_payout_renewal_v34": "payout_renewal",
+}
+
+_NP_V75_WRAP_RESULTS = {
+    endpoint: _np_v75_wrap_endpoint(endpoint, module)
+    for endpoint, module in _NP_V75_PROTECTED_ENDPOINTS.items()
+}
+
+
+# Special payout-paid wrapper: financial payment state remains independent from
+# renewal automation. If renewal is paused, mark payout PAID using the pre-renewal
+# production core captured by V34, rather than blocking the financial operation.
+_np_v75_mark_paid_final = app.view_functions.get("mark_paid")
+if _np_v75_mark_paid_final and not getattr(_np_v75_mark_paid_final, "_np_v75_payout_safe", False):
+    @_np_v75_functools.wraps(_np_v75_mark_paid_final)
+    def _np_v75_mark_paid_protected(*args, **kwargs):
+        if request.method == "OPTIONS":
+            return _np_v75_mark_paid_final(*args, **kwargs)
+        if _np_v75_module_enabled("payout_renewal"):
+            return _np_v75_mark_paid_final(*args, **kwargs)
+        core = globals().get("_np_mark_paid_v33_core")
+        if callable(core):
+            _audit_safe(
+                "automation_safety", "payout_renewal_paused_payment_continues",
+                "Payout marked PAID while fresh-Funded renewal automation is paused.",
+                {"name": "V75 safety", "username": "system", "role": "system"},
+                str((_np_v75_request_payload() or {}).get("id") or ""),
+            )
+            return core(*args, **kwargs)
+        return _np_fail(
+            "Payout-renewal automation is paused and the safe payment-only route is unavailable. No change was made.",
+            503,
+        )
+    _np_v75_mark_paid_protected._np_v75_payout_safe = True
+    _np_v75_mark_paid_protected._np_v75_original = _np_v75_mark_paid_final
+    app.view_functions["mark_paid"] = _np_v75_mark_paid_protected
+
+
+@app.route("/admin/automation_safety_v75/status", methods=["GET", "OPTIONS"])
+def admin_automation_safety_v75_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    now = _np_v75_now_ts()
+    switches = {"global": _np_v75_env_bool("NP_AUTOMATION_ENABLED", True)}
+    for module, env_name in _NP_V75_MODULE_ENV.items():
+        switches[module] = _np_v75_module_enabled(module)
+
+    circuits = {}
+    for module in sorted(set(_NP_V75_MODULE_ENV) | set(_NP_V75_CIRCUIT)):
+        state = _np_v75_circuit_state(module)
+        circuits[module] = {
+            "failure_count_window": len(state.get("failures", [])),
+            "open": bool(state.get("open_until")),
+            "seconds_remaining": max(0, int(float(state.get("open_until") or 0) - now)),
+            "last_error": state.get("last_error") or "",
+        }
+
+    routes = {
+        endpoint: {
+            "present": endpoint in app.view_functions,
+            "protected": bool(getattr(app.view_functions.get(endpoint), "_np_v75_safety_wrapped", False)),
+            "module": module,
+        }
+        for endpoint, module in _NP_V75_PROTECTED_ENDPOINTS.items()
+    }
+    routes["mark_paid"] = {
+        "present": "mark_paid" in app.view_functions,
+        "protected": bool(getattr(app.view_functions.get("mark_paid"), "_np_v75_payout_safe", False)),
+        "module": "payout_payment_with_renewal_separation",
+    }
+
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_AUTOMATION_SAFETY_RELEASE_V75,
+        "ruleset_version": NP_AUTOMATION_RULESET_VERSION,
+        "ruleset_sha256": NP_AUTOMATION_RULESET_SHA256,
+        "global_fail_closed": True,
+        "database_business_guards_remain_authoritative": True,
+        "same_action_concurrency_guard": True,
+        "circuit_breaker": {
+            "failure_limit": _NP_V75_FAILURE_LIMIT,
+            "failure_window_seconds": _NP_V75_FAILURE_WINDOW_SECONDS,
+            "open_seconds": _NP_V75_CIRCUIT_OPEN_SECONDS,
+        },
+        "switches": switches,
+        "circuits": circuits,
+        "routes": routes,
+        "active_inflight_locks_this_worker": len(_NP_V75_LOCKS),
+    })
+
+
+print(
+    "NP V75 AUTOMATION SAFETY LOADED:",
+    NAIRAPIPS_AUTOMATION_SAFETY_RELEASE_V75,
+    "ruleset=", NP_AUTOMATION_RULESET_VERSION,
+    "protected=", sum(1 for x in _NP_V75_WRAP_RESULTS.values() if x),
+    "/", len(_NP_V75_WRAP_RESULTS),
+    flush=True,
+)
