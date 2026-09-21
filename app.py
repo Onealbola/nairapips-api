@@ -9284,7 +9284,7 @@ def admin_second_life_activate():
             # fulfil the owed reset directly. No payment or Admin approval is required.
             owed_source = None
             if source_status not in {"life2_waiting_mt5", "waiting_mt5"}:
-                owed_source = _np_second_life_used_but_unfulfilled(p, authed_id)
+                owed_source = _np_second_life_used_but_unfulfilled(p, trader_id)
                 if owed_source:
                     now = now_iso()
                     supabase.table("challenge_purchases").update({
@@ -9292,7 +9292,7 @@ def admin_second_life_activate():
                         "lifecycle_state": "phase1_waiting_mt5",
                         "updated_at": now,
                     }).eq("id", purchase_id).execute()
-                    p = _second_life_purchase_for_trader(purchase_id, authed_id) or p
+                    p = _second_life_purchase_for_trader(purchase_id, trader_id) or p
                     source_status = "life2_waiting_mt5"
             if source_status in {"life2_waiting_mt5", "waiting_mt5"}:
                 actor = {
@@ -42976,7 +42976,7 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V7
 #      the same database transaction as account creation.
 #   4. A post-response finalize call is a second idempotent safety net.
 # ============================================================================
-NP2_REFERRAL_RELEASE = "NP2_REGISTRATION_RESILIENCE_2026_09_20"
+NP2_REFERRAL_RELEASE = "NP2_FINAL_FRESH_REFERRAL_2026_09_19"
 NP2_REFERRAL_REGISTRATION_BASE = "https://nairapips.com/dashboard/?mode=register&ref="
 
 
@@ -43001,63 +43001,6 @@ def _np2_ref_payload_code(data):
         or data.get("ref")
         or data.get("code")
     )
-
-
-
-def _np2_ref_resolve_profile_for_code(code):
-    """Resolve a current short NP2 code or an older NP2 alias.
-
-    Returns (profile, lookup_error). A missing profile with no lookup_error means
-    the code is genuinely invalid/inactive. A lookup_error means the referral
-    database lookup itself was temporarily unavailable and registration should
-    not be destroyed because of that infrastructure problem.
-    """
-    code = _np2_ref_clean_code(code)
-    if not code:
-        return None, None
-
-    db = _np2_ref_db()
-    try:
-        rows = (
-            db.table("np2_referral_profiles")
-            .select("*")
-            .eq("code", code)
-            .eq("status", "active")
-            .limit(1)
-            .execute().data
-            or []
-        )
-        if rows:
-            return rows[0], None
-
-        aliases = (
-            db.table("np2_referral_code_aliases")
-            .select("profile_id,active")
-            .eq("alias_code", code)
-            .eq("active", True)
-            .limit(1)
-            .execute().data
-            or []
-        )
-        if aliases:
-            profile_id = str(aliases[0].get("profile_id") or "").strip()
-            if profile_id:
-                rows = (
-                    db.table("np2_referral_profiles")
-                    .select("*")
-                    .eq("id", profile_id)
-                    .eq("status", "active")
-                    .limit(1)
-                    .execute().data
-                    or []
-                )
-                if rows:
-                    return rows[0], None
-
-        return None, None
-    except Exception as exc:
-        print("NP2 REFERRAL CODE RESOLUTION ERROR:", repr(exc), flush=True)
-        return None, exc
 
 
 def _np2_ref_code_for_trader_id(trader_id, trader_name=""):
@@ -43272,55 +43215,26 @@ def _np2_register_trader_view():
 
     if code:
         if not email:
-            return _np_fail("Email is required before referral registration", 400)
-
-        # Validate current short NP2 codes and old NP2 aliases independently of staging.
-        profile, lookup_error = _np2_ref_resolve_profile_for_code(code)
-
-        if profile is None and lookup_error is None:
-            return _np_fail(
-                "This referral link is invalid or inactive. Please ask the referrer to copy their current referral link.",
-                400,
-            )
-
-        if profile is not None:
-            try:
-                owner_id = str(profile.get("trader_id") or "").strip()
-                owner_rows = (
-                    _np2_ref_db().table("traders")
-                    .select("id,email")
-                    .eq("id", owner_id)
-                    .limit(1).execute().data
-                    or []
-                )
-                owner_email = str((owner_rows[0] if owner_rows else {}).get("email") or "").strip().lower()
-                if owner_email and owner_email == email:
-                    return _np_fail("You cannot register through your own referral link.", 400)
-            except Exception as exc:
-                print("NP2 REFERRAL OWNER CHECK WARNING:", repr(exc), flush=True)
-
+            return _np_fail("Email is required before a referral registration can be secured", 400)
         try:
+            # Crucial guarantee: if first-touch cannot be staged, account creation
+            # does not proceed. This prevents a successful referred registration
+            # from disappearing from the referrer's activity.
             _np2_ref_db().rpc("np2_stage_referral", {
                 "p_code": code,
                 "p_email": email,
             }).execute()
         except Exception as exc:
-            # Referral staging must not take the whole registration service down.
-            # The core registration route below persists ref=CODE into the trader row,
-            # and the NP2 AFTER INSERT/UPDATE capture trigger can recover it directly.
-            print(
-                "NP2 REFERRAL STAGE WARNING — CONTINUING REGISTRATION:",
-                repr(exc),
-                "code=", code,
-                "email=", email,
-                flush=True,
+            print("NP2 REFERRAL STAGE FAILED:", repr(exc), flush=True)
+            return _np_fail(
+                "We could not secure this referral registration yet. Please retry; no trader account was created.",
+                503,
             )
 
-    # Core registration remains authoritative for verification, duplicate identity
-    # protection, password creation and durable referral evidence.
     result = _NP2_ORIGINAL_REGISTER_VIEW()
 
-    # Idempotent safety net. If staging failed, the trader-row trigger is the recovery path.
+    # Idempotent second safety net. New-trader INSERT capture already happens in
+    # the database trigger; this also covers an existing trader completing setup.
     if code and email:
         try:
             _np2_ref_db().rpc("np2_finalize_referral_email", {"p_email": email}).execute()
@@ -44130,4 +44044,942 @@ def admin_payout_eligibility_v75_status():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_ELIGIBILITY_RELEASE_V75
+
+
+
+# ============================================================================
+# NAIRAPIPS V76 — SECOND LIFE SINGLE-TRUTH RECONCILIATION
+# 21 SEP 2026
+#
+# PRODUCTION INCIDENT FIX
+# -----------------------
+# A Second-Life purchase can be marked second_life_used=True at ACTIVATION time,
+# before a fresh Life-2 MT5 has actually been delivered.
+#
+# Older policy code treated used=True as "Life 2 already existed", which could
+# falsely display:
+#     LIFE 2 BREACHED / 2 LIVES EXHAUSTED / BUY NEW CHALLENGE
+# even when the ledger showed only ONE Phase-1 MT5 and SECOND_LIFE_AVAILABLE.
+#
+# A second inconsistency existed for historical purchases whose plan includes
+# Second Life but whose purchase snapshot lacks second_life_enabled=True.
+# The status helper can enrich that from the plan, while Journey Authority used
+# only the raw purchase flag. That mismatch explains why some exact entitled
+# traders auto-assigned and others were blocked by "no valid entitlement".
+#
+# V76 law:
+#   1) Life 1 = earliest genuine breached Phase-1 MT5 in the exact purchase.
+#   2) Life 2 is CONSUMED only when a distinct later Phase-1 MT5 actually exists.
+#   3) Activated/used without a later Phase-1 MT5 = LIFE 2 WAITING MT5, not closed.
+#   4) Only a genuine later Life-2 MT5 that itself breaches closes the journey.
+#   5) Plan-backed Second-Life entitlement is accepted by every authority path.
+#   6) No cross-purchase / same-size guessing.
+#
+# Other automation remains untouched:
+#   Phase1 -> Funded
+#   paid Challenge/Funded reset
+#   payout renewal
+#   payout controls
+#   reset anti-replay
+# ============================================================================
+
+NAIRAPIPS_SECOND_LIFE_SINGLE_TRUTH_RELEASE_V76 = "V76_SECOND_LIFE_SINGLE_TRUTH_2026_09_21"
+
+
+def _np_v76_second_life_truth(purchase, trader_id=None):
+    p = purchase or {}
+    tid = str(trader_id or p.get("trader_id") or "").strip()
+    pid = str(p.get("id") or "").strip()
+
+    if not tid or not pid:
+        return {
+            "enabled": False,
+            "state": "INVALID",
+            "reason": "missing_identity",
+            "purchase_id": pid or None,
+        }
+
+    try:
+        sl = _second_life_status_payload(p, tid) or {}
+    except Exception as exc:
+        return {
+            "enabled": False,
+            "state": "REVIEW",
+            "reason": "second_life_status_unavailable",
+            "error": str(exc),
+            "purchase_id": pid,
+        }
+
+    enabled = bool(sl.get("enabled"))
+    if not enabled:
+        return {
+            "enabled": False,
+            "state": "NOT_INCLUDED",
+            "reason": "second_life_not_included",
+            "purchase_id": pid,
+        }
+
+    # Exact purchase lineage only.
+    phase1 = []
+    try:
+        phase1 = _np_v74_exact_phase1_rows(p, tid)
+    except Exception:
+        phase1 = []
+
+    clean_phase1 = []
+    for a in phase1:
+        try:
+            if _np_account_is_recalled_or_excluded(a):
+                continue
+        except Exception:
+            pass
+        if not str(a.get("mt5_login") or "").strip():
+            continue
+        clean_phase1.append(a)
+
+    clean_phase1.sort(key=_np_v74_account_time)
+
+    breached = [a for a in clean_phase1 if _np_v74_has_breach(a)]
+    if not breached:
+        return {
+            "enabled": True,
+            "state": "NO_LIFE1_BREACH",
+            "reason": "no_phase1_breach",
+            "purchase_id": pid,
+            "used_flag": _second_life_bool(p.get("second_life_used")),
+            "source_status": str(p.get("second_life_status") or "").strip().lower(),
+        }
+
+    # Life 1 is the earliest genuine breached Phase-1 account in this purchase.
+    life1 = breached[0]
+    life1_time = _np_v74_account_time(life1)
+
+    later_phase1 = [
+        a for a in clean_phase1
+        if str(a.get("id") or "") != str(life1.get("id") or "")
+        and _np_v74_account_time(a) > life1_time
+    ]
+    later_phase1.sort(key=_np_v74_account_time)
+
+    # More than one non-recalled Phase-1 successor is not a reason to invent
+    # another entitlement. Fail closed for staff review.
+    if len(later_phase1) > 1:
+        return {
+            "enabled": True,
+            "state": "REVIEW",
+            "reason": "multiple_phase1_successors",
+            "purchase_id": pid,
+            "life1": life1,
+            "life1_account_id": life1.get("id"),
+            "life1_mt5": life1.get("mt5_login"),
+            "successor_account_ids": [a.get("id") for a in later_phase1],
+            "successor_mt5s": [a.get("mt5_login") for a in later_phase1],
+        }
+
+    if later_phase1:
+        life2 = later_phase1[0]
+        status = str(life2.get("account_status") or life2.get("status") or "").strip().lower()
+
+        if status == "assignment_sync_error":
+            return {
+                "enabled": True,
+                "state": "SYNC_RECOVERY",
+                "reason": "life2_assignment_exists_sync_recovery_required",
+                "purchase_id": pid,
+                "life1": life1,
+                "life1_account_id": life1.get("id"),
+                "life1_mt5": life1.get("mt5_login"),
+                "life2": life2,
+                "life2_account_id": life2.get("id"),
+                "life2_mt5": life2.get("mt5_login"),
+                "consumed": True,
+            }
+
+        if _np_v74_has_breach(life2):
+            return {
+                "enabled": True,
+                "state": "TERMINAL",
+                "reason": "life2_breached_journey_closed",
+                "purchase_id": pid,
+                "life1": life1,
+                "life1_account_id": life1.get("id"),
+                "life1_mt5": life1.get("mt5_login"),
+                "life2": life2,
+                "life2_account_id": life2.get("id"),
+                "life2_mt5": life2.get("mt5_login"),
+                "consumed": True,
+            }
+
+        return {
+            "enabled": True,
+            "state": "FULFILLED",
+            "reason": "life2_successor_exists",
+            "purchase_id": pid,
+            "life1": life1,
+            "life1_account_id": life1.get("id"),
+            "life1_mt5": life1.get("mt5_login"),
+            "life2": life2,
+            "life2_account_id": life2.get("id"),
+            "life2_mt5": life2.get("mt5_login"),
+            "life2_passed": bool(_np_ja_is_passed(life2)),
+            "life2_active": bool(_np_ja_is_active(life2)),
+            "consumed": True,
+        }
+
+    used = _second_life_bool(p.get("second_life_used"))
+    raw_status = str(
+        p.get("second_life_status")
+        or sl.get("source_status")
+        or sl.get("status")
+        or ""
+    ).strip().lower()
+
+    activated_statuses = {
+        "life2_waiting_mt5", "waiting_mt5", "activated"
+    }
+
+    if used and raw_status in activated_statuses:
+        return {
+            "enabled": True,
+            "state": "WAITING_MT5",
+            "reason": "second_life_activated_no_successor",
+            "purchase_id": pid,
+            "life1": life1,
+            "life1_account_id": life1.get("id"),
+            "life1_mt5": life1.get("mt5_login"),
+            "used_flag": True,
+            "source_status": raw_status,
+            "activated_at": p.get("second_life_activated_at"),
+            "consumed": False,
+        }
+
+    # If used=True but an old status says active/fulfilled while no distinct
+    # Life-2 MT5 exists, do NOT issue another MT5 automatically. Surface REVIEW.
+    if used:
+        return {
+            "enabled": True,
+            "state": "REVIEW",
+            "reason": "used_flag_without_proven_life2_successor",
+            "purchase_id": pid,
+            "life1": life1,
+            "life1_account_id": life1.get("id"),
+            "life1_mt5": life1.get("mt5_login"),
+            "used_flag": True,
+            "source_status": raw_status,
+            "consumed": False,
+        }
+
+    return {
+        "enabled": True,
+        "state": "AVAILABLE",
+        "reason": "life1_breached_second_life_available",
+        "purchase_id": pid,
+        "life1": life1,
+        "life1_account_id": life1.get("id"),
+        "life1_mt5": life1.get("mt5_login"),
+        "used_flag": False,
+        "source_status": raw_status,
+        "consumed": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# A) RESET POLICY — exact lineage outranks second_life_used boolean.
+# ---------------------------------------------------------------------------
+
+_np_reset_policy_v76_core = _np_reset_policy
+
+def _np_reset_policy(account, trader=None):
+    a = account or {}
+
+    if (
+        a
+        and _np_reset_account_is_breached(a)
+        and _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == "phase1"
+    ):
+        purchase = _np_reset_purchase_for_account(a) or {}
+        tid = str(a.get("trader_id") or (trader or {}).get("id") or "").strip()
+        truth = _np_v76_second_life_truth(purchase, tid)
+
+        if truth.get("enabled"):
+            state = str(truth.get("state") or "").upper()
+            size = clean(
+                a.get("account_size")
+                or a.get("start_balance")
+                or purchase.get("account_size")
+                or 0
+            )
+
+            if state == "AVAILABLE":
+                return {
+                    "eligible": True,
+                    "kind": "free_second_life",
+                    "reason": "second_life_free_reset",
+                    "title": "Free Second Life Available",
+                    "subtitle": (
+                        "Life 1 breached. The one included Second Life has not yet "
+                        "been consumed. Activate it to receive a fresh Phase 1 MT5."
+                    ),
+                    "stage": "phase1",
+                    "account_size": size,
+                    "source_account_id": truth.get("life1_account_id"),
+                    "source_mt5_login": truth.get("life1_mt5"),
+                    "purchase_id": purchase.get("id"),
+                    "price": 0,
+                    "authority": NAIRAPIPS_SECOND_LIFE_SINGLE_TRUTH_RELEASE_V76,
+                }
+
+            if state in {"WAITING_MT5", "SYNC_RECOVERY"}:
+                return {
+                    "eligible": True,
+                    "kind": "second_life_waiting",
+                    "reason": truth.get("reason"),
+                    "title": "Second Life Activated — Fresh Phase 1 MT5 Due",
+                    "subtitle": (
+                        "Life 2 has already been activated, but no completed fresh "
+                        "Phase 1 assignment has been proven yet. The exact entitlement "
+                        "remains alive and the assignment/recovery worker must fulfil it."
+                    ),
+                    "stage": "phase1",
+                    "account_size": size,
+                    "source_account_id": truth.get("life1_account_id"),
+                    "source_mt5_login": truth.get("life1_mt5"),
+                    "purchase_id": purchase.get("id"),
+                    "price": 0,
+                    "authority": NAIRAPIPS_SECOND_LIFE_SINGLE_TRUTH_RELEASE_V76,
+                }
+
+            if state == "TERMINAL":
+                return {
+                    "eligible": False,
+                    "kind": "terminal",
+                    "reason": "life2_breached_journey_closed",
+                    "title": "2 Lives Exhausted — Buy a New Challenge",
+                    "subtitle": (
+                        f"Life 2 MT5 {truth.get('life2_mt5') or '—'} breached. "
+                        "The included Second Life has genuinely been consumed. "
+                        "No Life 3 is permitted."
+                    ),
+                    "stage": "phase1",
+                    "account_size": size,
+                    "source_account_id": truth.get("life2_account_id"),
+                    "source_mt5_login": truth.get("life2_mt5"),
+                    "purchase_id": purchase.get("id"),
+                    "price": 0,
+                    "authority": NAIRAPIPS_SECOND_LIFE_SINGLE_TRUTH_RELEASE_V76,
+                }
+
+            if state == "REVIEW":
+                return {
+                    "eligible": False,
+                    "kind": "review",
+                    "reason": truth.get("reason"),
+                    "title": "Second Life History Requires Review",
+                    "subtitle": (
+                        "The Second-Life flags and exact MT5 lineage do not agree. "
+                        "No new MT5 will be issued until the exact history is reconciled."
+                    ),
+                    "stage": "phase1",
+                    "account_size": size,
+                    "source_account_id": truth.get("life1_account_id") or a.get("id"),
+                    "source_mt5_login": truth.get("life1_mt5") or a.get("mt5_login"),
+                    "purchase_id": purchase.get("id"),
+                    "price": 0,
+                    "authority": NAIRAPIPS_SECOND_LIFE_SINGLE_TRUTH_RELEASE_V76,
+                }
+
+    return _np_reset_policy_v76_core(a, trader)
+
+
+# ---------------------------------------------------------------------------
+# B) JOURNEY AUTHORITY — make the assignment firewall see the SAME truth.
+# ---------------------------------------------------------------------------
+
+_np_ja_journey_authority_v76_core = _np_ja_journey_authority
+
+def _np_ja_journey_authority(trader_id, journey_id):
+    auth = _np_ja_journey_authority_v76_core(trader_id, journey_id)
+    purchase = (auth or {}).get("purchase") or {}
+    if not purchase:
+        return auth
+
+    truth = _np_v76_second_life_truth(purchase, trader_id)
+    if not truth.get("enabled"):
+        return auth
+
+    state = str(truth.get("state") or "").upper()
+    if state not in {
+        "AVAILABLE", "WAITING_MT5", "SYNC_RECOVERY",
+        "FULFILLED", "TERMINAL", "REVIEW"
+    }:
+        return auth
+
+    out = dict(auth or {})
+    out["purchase"] = dict(purchase, second_life_enabled=True)
+    out["second_life_truth_v76"] = {
+        k: v for k, v in truth.items()
+        if k not in {"life1", "life2"}
+    }
+
+    problems = list(out.get("problems") or [])
+
+    # When a valid Life2 successor exists on a plan-backed historical purchase,
+    # old Journey Authority may have produced these two downstream errors only
+    # because the purchase snapshot lacked second_life_enabled=True.
+    if state in {"FULFILLED", "TERMINAL", "SYNC_RECOVERY"}:
+        life1_id = str(truth.get("life1_account_id") or "")
+        life2_id = str(truth.get("life2_account_id") or "")
+        filtered = []
+        for problem in problems:
+            code = str(problem.get("code") or "")
+            sid = str(problem.get("source_account_id") or "")
+            aid = str(problem.get("account_id") or "")
+            if code == "UNAUTHORISED_CONTINUATION_AFTER_BREACH" and sid == life1_id and (not aid or aid == life2_id):
+                continue
+            if code == "ENTITLEMENT_BALANCE_MISMATCH":
+                continue
+            filtered.append(problem)
+        problems = filtered
+        out["problems"] = problems
+        if not problems:
+            out["blocked"] = False
+            out["ok"] = True
+            out["accountability_status"] = "RECONCILED"
+
+    if problems:
+        # Never mask unrelated data conflicts.
+        return out
+
+    ledger = list(out.get("ledger") or [])
+    life1_id = str(truth.get("life1_account_id") or "")
+    life1_mt5 = truth.get("life1_mt5")
+    ent_key = f"breach:{life1_id}:second_life" if life1_id else None
+
+    if state in {"AVAILABLE", "WAITING_MT5", "SYNC_RECOVERY"}:
+        entitlement_type = (
+            "second_life_activation"
+            if state == "AVAILABLE"
+            else "second_life"
+        )
+        reason = (
+            "LIFE 1 BREACHED → ACTIVATE SECOND LIFE"
+            if state == "AVAILABLE"
+            else "SECOND LIFE ACTIVATED → NEW PHASE 1 MT5 REQUIRED"
+        )
+        out["state"] = "WAITING_MT5"
+        out["closed"] = False
+        out["next_action"] = (
+            "ACTIVATE_SECOND_LIFE"
+            if state == "AVAILABLE"
+            else "ASSIGN_MT5"
+        )
+        out["outstanding_entitlement"] = {
+            "entitlement_key": ent_key,
+            "entitlement_type": entitlement_type,
+            "source_event_type": "phase1_breach_second_life",
+            "source_account_id": life1_id,
+            "source_mt5": life1_mt5,
+            "evidence_id": journey_id,
+            "target_stage": "phase1",
+            "status": "AVAILABLE",
+            "reason": reason,
+        }
+        out["accountability_status"] = "RECONCILED"
+        out["blocked"] = False
+        out["ok"] = True
+
+        if not any(
+            str(x.get("type") or "") == "SECOND_LIFE_AVAILABLE"
+            and str(x.get("source_account_id") or "") == life1_id
+            for x in ledger
+        ):
+            ledger.append({
+                "type": "SECOND_LIFE_AVAILABLE",
+                "at": (
+                    truth.get("activated_at")
+                    or (truth.get("life1") or {}).get("breached_at")
+                    or (truth.get("life1") or {}).get("archived_at")
+                    or now_iso()
+                ),
+                "journey_id": journey_id,
+                "purchase_id": journey_id,
+                "source_account_id": life1_id,
+                "mt5_login": life1_mt5,
+                "stage": "phase1",
+                "detail": reason,
+                "entitlement_key": ent_key,
+            })
+            ledger.sort(key=lambda x: _np_ja_score(x.get("at")))
+        out["ledger"] = ledger
+
+        acct = dict(out.get("accountability") or {})
+        delivered = int(acct.get("delivered_mt5") or 0)
+        consumed = int(acct.get("entitlements_consumed") or 0)
+        acct.update({
+            "delivered_mt5": delivered,
+            "entitlements_consumed": consumed,
+            "outstanding_entitlement": 1,
+            "balance": 1,
+            "status": "RECONCILED",
+        })
+        out["accountability"] = acct
+        return out
+
+    if state == "TERMINAL":
+        out["state"] = "CLOSED"
+        out["closed"] = True
+        out["next_action"] = "NONE"
+        out["outstanding_entitlement"] = None
+        out["accountability_status"] = "RECONCILED"
+        out["blocked"] = False
+        out["ok"] = True
+        return out
+
+    if state == "REVIEW":
+        # Exact flags conflict: safe review, never manufacture entitlement.
+        out["state"] = "BLOCKED"
+        out["closed"] = False
+        out["next_action"] = "BLOCKED_RECONCILIATION_REQUIRED"
+        out["outstanding_entitlement"] = None
+        out["blocked"] = True
+        out["ok"] = False
+        out["accountability_status"] = "BLOCKED"
+        out["problems"] = list(out.get("problems") or []) + [{
+            "code": "SECOND_LIFE_LINEAGE_CONFLICT",
+            "message": (
+                "Second-Life flags indicate use/fulfilment but a unique exact "
+                "Life-2 MT5 successor cannot be proven."
+            ),
+        }]
+        return out
+
+    # FULFILLED: actual Life2 exists. Preserve downstream PASS/Funded/Payout
+    # state from core whenever possible; only clear snapshot-caused blocking.
+    if state == "FULFILLED" and not problems:
+        if truth.get("life2_active"):
+            out["state"] = "ACTIVE"
+            out["closed"] = False
+            out["next_action"] = "NONE"
+            out["outstanding_entitlement"] = None
+            out["blocked"] = False
+            out["ok"] = True
+            out["accountability_status"] = "RECONCILED"
+        elif truth.get("life2_passed") and str(out.get("state") or "").upper() == "BLOCKED":
+            life2 = truth.get("life2") or {}
+            out["state"] = "WAITING_MT5"
+            out["closed"] = False
+            out["next_action"] = "ASSIGN_MT5"
+            out["outstanding_entitlement"] = {
+                "entitlement_key": f"pass:{life2.get('id')}:funded",
+                "entitlement_type": "phase_pass",
+                "source_event_type": "pass",
+                "source_account_id": life2.get("id"),
+                "source_mt5": life2.get("mt5_login"),
+                "evidence_id": life2.get("id"),
+                "target_stage": "funded",
+                "status": "AVAILABLE",
+                "reason": "LIFE 2 PHASE 1 PASSED → NEW FUNDED MT5 REQUIRED",
+            }
+            out["blocked"] = False
+            out["ok"] = True
+            out["accountability_status"] = "RECONCILED"
+        return out
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# C) WAITING AUTHORITY + RETRY — plan-backed entitlement and exact lineage.
+# ---------------------------------------------------------------------------
+
+_np_v59_second_life_waiting_authority_v76_core = _np_v59_second_life_waiting_authority
+
+def _np_v59_second_life_waiting_authority(purchase, trader_id):
+    p = purchase or {}
+    truth = _np_v76_second_life_truth(p, trader_id)
+    state = str(truth.get("state") or "").upper()
+
+    if state in {"WAITING_MT5", "SYNC_RECOVERY"}:
+        return {
+            "eligible": True,
+            "reason": truth.get("reason"),
+            "bridge": {
+                "eligible": True,
+                "consumed": False,
+                "source_account": truth.get("life1"),
+                "source_account_id": truth.get("life1_account_id"),
+                "source_mt5": truth.get("life1_mt5"),
+                "purchase_id": truth.get("purchase_id"),
+            },
+            "source_account": truth.get("life1"),
+            "source_account_id": truth.get("life1_account_id"),
+            "source_mt5": truth.get("life1_mt5"),
+            "target_stage": "phase1",
+        }
+
+    if state == "TERMINAL":
+        return {
+            "eligible": False,
+            "reason": "life2_breached_journey_closed",
+            "bridge": {
+                "eligible": False,
+                "consumed": True,
+                "terminal": True,
+                "reason": "life2_breached_journey_closed",
+                "source_account": truth.get("life1"),
+                "source_account_id": truth.get("life1_account_id"),
+                "source_mt5": truth.get("life1_mt5"),
+                "successor": truth.get("life2"),
+                "successor_account_id": truth.get("life2_account_id"),
+                "successor_mt5": truth.get("life2_mt5"),
+                "purchase_id": truth.get("purchase_id"),
+            },
+        }
+
+    if state == "FULFILLED":
+        return {
+            "eligible": False,
+            "reason": "second_life_already_has_successor",
+            "bridge": {
+                "eligible": False,
+                "consumed": True,
+                "terminal": False,
+                "reason": "second_life_already_has_successor",
+                "source_account": truth.get("life1"),
+                "source_account_id": truth.get("life1_account_id"),
+                "source_mt5": truth.get("life1_mt5"),
+                "successor": truth.get("life2"),
+                "successor_account_id": truth.get("life2_account_id"),
+                "successor_mt5": truth.get("life2_mt5"),
+                "purchase_id": truth.get("purchase_id"),
+            },
+        }
+
+    return _np_v59_second_life_waiting_authority_v76_core(p, trader_id)
+
+
+_np_retry_waiting_second_life_assignment_v76_core = _np_retry_waiting_second_life_assignment
+
+def _np_retry_waiting_second_life_assignment(purchase, trader_id, actor=None):
+    p = dict(purchase or {})
+    truth = _np_v76_second_life_truth(p, trader_id)
+    state = str(truth.get("state") or "").upper()
+
+    if state == "FULFILLED":
+        return {
+            "account": truth.get("life2"),
+            "already_active": bool(truth.get("life2_active")),
+            "already_fulfilled": True,
+        }
+
+    if state == "TERMINAL":
+        return None
+
+    if state not in {"WAITING_MT5", "SYNC_RECOVERY"}:
+        return None
+
+    # The original retry helper requires the purchase snapshot flag. The plan
+    # authority may be the only place that flag existed on historical rows.
+    p["second_life_enabled"] = True
+    p["second_life_used"] = True
+    if not str(p.get("second_life_status") or "").strip():
+        p["second_life_status"] = "life2_waiting_mt5"
+
+    return _np_retry_waiting_second_life_assignment_v76_core(
+        p, trader_id, actor
+    )
+
+
+# ---------------------------------------------------------------------------
+# D) EVENT-DRIVEN CLEAN AUTOMATION — remove plan-snapshot lottery.
+# ---------------------------------------------------------------------------
+
+_np_auto_free_phase1_reset_after_breach_v76_core = _np_auto_free_phase1_reset_after_breach
+
+def _np_auto_free_phase1_reset_after_breach(trader, breached_account):
+    trader = trader or {}
+    source = breached_account or {}
+    tid = str(trader.get("id") or source.get("trader_id") or "").strip()
+    pid = str(source.get("purchase_id") or source.get("challenge_purchase_id") or "").strip()
+
+    if (
+        not tid
+        or not pid
+        or _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "phase1"
+    ):
+        return _np_auto_free_phase1_reset_after_breach_v76_core(trader, source)
+
+    try:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("id", pid).eq("trader_id", tid).limit(1).execute().data or []
+        )
+        purchase = rows[0] if rows else {}
+    except Exception:
+        purchase = {}
+
+    if not purchase:
+        return None
+
+    truth = _np_v76_second_life_truth(purchase, tid)
+    state = str(truth.get("state") or "").upper()
+
+    if not truth.get("enabled"):
+        return None
+
+    # Already activated but assignment was missed: retry the SAME entitlement.
+    if state in {"WAITING_MT5", "SYNC_RECOVERY"}:
+        return _np_retry_waiting_second_life_assignment(
+            purchase,
+            tid,
+            {"name":"second_life_v76","username":"second_life_v76","role":"system"},
+        )
+
+    if state in {"FULFILLED", "TERMINAL", "REVIEW"}:
+        return None
+
+    if state != "AVAILABLE":
+        return None
+
+    # Preserve the agreed cutover rule: legacy roots remain protected/manual at
+    # ACTIVATION stage. Clean roots auto-fire. Once activated, the exact waiting
+    # Second Life may be retried through the shared worker regardless of root date.
+    if not _np_automation_generation_purchase(purchase):
+        return None
+
+    # Persist only the stable plan entitlement snapshot, never a life-used flag.
+    if not _second_life_bool(purchase.get("second_life_enabled")):
+        try:
+            updated = (
+                supabase.table("challenge_purchases").update({
+                    "second_life_enabled": True,
+                    "updated_at": now_iso(),
+                }).eq("id", pid).eq("trader_id", tid).execute().data or []
+            )
+            if updated:
+                purchase = updated[0]
+        except Exception as exc:
+            print("V76 SECOND-LIFE SNAPSHOT REPAIR WARNING:", exc, flush=True)
+
+    return _np_auto_free_phase1_reset_after_breach_v76_core(trader, source)
+
+
+# ---------------------------------------------------------------------------
+# E) AUTOMATION GUIDE / COCKPIT — never call Life1 "Life2 breached".
+# ---------------------------------------------------------------------------
+
+_np_v55_decision_v76_core = _np_v55_decision
+
+def _np_v55_decision(purchase_id):
+    pid = str(purchase_id or "").strip()
+    if not pid:
+        return _np_v55_decision_v76_core(purchase_id)
+
+    try:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("id", pid).limit(1).execute().data or []
+        )
+        purchase = rows[0] if rows else {}
+        if purchase:
+            tid = str(purchase.get("trader_id") or "").strip()
+            truth = _np_v76_second_life_truth(purchase, tid)
+            state = str(truth.get("state") or "").upper()
+
+            if truth.get("enabled") and truth.get("life1_account_id"):
+                clean_root = bool(_np_automation_generation_purchase(purchase))
+                mode = "CLEAN_AUTOMATION" if clean_root else "LEGACY_MANUAL"
+                common = {
+                    "success": True,
+                    "release": NAIRAPIPS_SECOND_LIFE_SINGLE_TRUTH_RELEASE_V76,
+                    "purchase_id": pid,
+                    "trader_id": tid,
+                    "automation_mode": mode,
+                    "root_purchase_created_at": purchase.get("created_at"),
+                    "source_account_id": truth.get("life1_account_id"),
+                    "source_mt5": truth.get("life1_mt5"),
+                    "target_stage": "phase1",
+                    "account_size": clean(purchase.get("account_size") or 0),
+                    "price": 0,
+                    "payment_required": False,
+                    "second_life_truth": {
+                        k: v for k, v in truth.items()
+                        if k not in {"life1", "life2"}
+                    },
+                }
+
+                if state == "AVAILABLE":
+                    return {
+                        **common,
+                        "code": "SECOND_LIFE_AVAILABLE",
+                        "state": "SECOND_LIFE_AVAILABLE",
+                        "title": "FREE SECOND LIFE AVAILABLE",
+                        "message": (
+                            "Life 1 breached. The included Second Life is unused. "
+                            + (
+                                "Clean automation should activate and assign automatically."
+                                if clean_root else
+                                "This legacy journey requires protected activation; after activation the exact Life-2 assignment is retry-protected."
+                            )
+                        ),
+                        "automatic_assignment_allowed": clean_root,
+                        "safe_to_assign_now": False,
+                        "closed": False,
+                    }
+
+                if state in {"WAITING_MT5", "SYNC_RECOVERY"}:
+                    return {
+                        **common,
+                        "code": "SECOND_LIFE_MT5_DUE",
+                        "state": "WAITING_MT5",
+                        "title": "SECOND LIFE ACTIVATED · FRESH PHASE 1 MT5 DUE",
+                        "message": (
+                            "The one included Second Life has already been activated. "
+                            "No Life-2 MT5 successor has been completed yet. The same "
+                            "entitlement remains open and the retry worker must fulfil it."
+                        ),
+                        "automatic_assignment_allowed": True,
+                        "safe_to_assign_now": True,
+                        "closed": False,
+                    }
+
+                if state == "TERMINAL":
+                    return {
+                        **common,
+                        "code": "JOURNEY_CLOSED_NEW_CHALLENGE",
+                        "state": "CLOSED",
+                        "title": "2 LIVES EXHAUSTED · BUY A NEW CHALLENGE",
+                        "message": (
+                            f"Life 2 MT5 {truth.get('life2_mt5') or '—'} breached. "
+                            "Both allowed Phase-1 lives have genuinely been used. "
+                            "No Life 3 or further Challenge reset is permitted."
+                        ),
+                        "source_account_id": truth.get("life2_account_id"),
+                        "source_mt5": truth.get("life2_mt5"),
+                        "automatic_assignment_allowed": False,
+                        "safe_to_assign_now": False,
+                        "closed": True,
+                    }
+
+                if state == "REVIEW":
+                    return {
+                        **common,
+                        "code": "BREACH_REVIEW_REQUIRED",
+                        "state": "REVIEW",
+                        "title": "SECOND LIFE HISTORY REQUIRES REVIEW",
+                        "message": (
+                            "Second-Life status flags and exact MT5 lineage do not agree. "
+                            "No MT5 is released until the conflict is reconciled."
+                        ),
+                        "automatic_assignment_allowed": False,
+                        "safe_to_assign_now": False,
+                        "closed": False,
+                    }
+    except Exception as exc:
+        print("V76 GUIDE SECOND-LIFE CHECK WARNING:", exc, flush=True)
+
+    return _np_v55_decision_v76_core(purchase_id)
+
+
+_np_v61_policy_to_guide_decision_v76_core = _np_v61_policy_to_guide_decision
+
+def _np_v61_policy_to_guide_decision(policy, account, purchase):
+    p = policy or {}
+    kind = str(p.get("kind") or "").strip().lower()
+    if kind in {"free_second_life", "second_life_waiting"}:
+        target = _normalize_lifecycle_stage(p.get("stage") or "phase1")
+        base = {
+            "success": True,
+            "release": NAIRAPIPS_SECOND_LIFE_SINGLE_TRUTH_RELEASE_V76,
+            "purchase_id": str((purchase or {}).get("id") or p.get("purchase_id") or "").strip() or None,
+            "trader_id": str((account or {}).get("trader_id") or (purchase or {}).get("trader_id") or "").strip(),
+            "automation_mode": (
+                "CLEAN_AUTOMATION"
+                if purchase and _np_automation_generation_purchase(purchase)
+                else "LEGACY_MANUAL"
+            ),
+            "source_account_id": str(p.get("source_account_id") or (account or {}).get("id") or "").strip(),
+            "source_mt5": str(p.get("source_mt5_login") or (account or {}).get("mt5_login") or "").strip(),
+            "target_stage": target,
+            "account_size": clean(p.get("account_size") or (account or {}).get("account_size") or 0),
+            "price": 0,
+            "payment_required": False,
+            "closed": False,
+        }
+        if kind == "free_second_life":
+            return {
+                **base,
+                "code": "SECOND_LIFE_AVAILABLE",
+                "state": "SECOND_LIFE_AVAILABLE",
+                "title": p.get("title") or "FREE SECOND LIFE AVAILABLE",
+                "message": p.get("subtitle") or "Life 1 breached. One Second Life remains.",
+                "automatic_assignment_allowed": False,
+                "safe_to_assign_now": False,
+            }
+        return {
+            **base,
+            "code": "SECOND_LIFE_MT5_DUE",
+            "state": "WAITING_MT5",
+            "title": p.get("title") or "SECOND LIFE ACTIVATED · PHASE 1 MT5 DUE",
+            "message": p.get("subtitle") or "Activated Second Life is waiting for its fresh Phase 1 MT5.",
+            "automatic_assignment_allowed": True,
+            "safe_to_assign_now": True,
+        }
+
+    return _np_v61_policy_to_guide_decision_v76_core(policy, account, purchase)
+
+
+# ---------------------------------------------------------------------------
+# F) READ-ONLY HEALTH / FORENSIC ENDPOINT
+# ---------------------------------------------------------------------------
+
+@app.route("/admin/second_life_v76/status", methods=["GET", "OPTIONS"])
+def admin_second_life_v76_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    purchase_id = str(request.args.get("purchase_id") or "").strip()
+    trader_id = str(request.args.get("trader_id") or "").strip()
+
+    if purchase_id:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("id", purchase_id).limit(1).execute().data or []
+        )
+        if not rows:
+            return _np_fail("purchase not found", 404)
+        purchase = rows[0]
+        tid = trader_id or str(purchase.get("trader_id") or "").strip()
+        truth = _np_v76_second_life_truth(purchase, tid)
+        safe_truth = {
+            k: v for k, v in truth.items()
+            if k not in {"life1", "life2"}
+        }
+        return _np_ok({
+            "success": True,
+            "release": NAIRAPIPS_SECOND_LIFE_SINGLE_TRUTH_RELEASE_V76,
+            "truth": safe_truth,
+            "generated_at": now_iso(),
+        })
+
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_SECOND_LIFE_SINGLE_TRUTH_RELEASE_V76,
+        "law": {
+            "life1_breach_no_successor": "SECOND_LIFE_AVAILABLE_OR_WAITING_MT5",
+            "activation_without_successor": "NOT_CONSUMED",
+            "later_phase1_successor": "SECOND_LIFE_CONSUMED",
+            "life2_successor_breached": "JOURNEY_CLOSED_NO_LIFE3",
+            "plan_backed_entitlement": "GLOBAL_AUTHORITY",
+            "cross_purchase_guessing": "FORBIDDEN",
+        },
+        "other_automation_changed": False,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_SECOND_LIFE_SINGLE_TRUTH_RELEASE_V76
 
