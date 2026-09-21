@@ -42976,7 +42976,7 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_RECEIPT_PIPELINE_RELEASE_V7
 #      the same database transaction as account creation.
 #   4. A post-response finalize call is a second idempotent safety net.
 # ============================================================================
-NP2_REFERRAL_RELEASE = "NP2_FINAL_FRESH_REFERRAL_2026_09_19"
+NP2_REFERRAL_RELEASE = "NP2_REGISTRATION_RESILIENCE_2026_09_20"
 NP2_REFERRAL_REGISTRATION_BASE = "https://nairapips.com/dashboard/?mode=register&ref="
 
 
@@ -43001,6 +43001,63 @@ def _np2_ref_payload_code(data):
         or data.get("ref")
         or data.get("code")
     )
+
+
+
+def _np2_ref_resolve_profile_for_code(code):
+    """Resolve a current short NP2 code or an older NP2 alias.
+
+    Returns (profile, lookup_error). A missing profile with no lookup_error means
+    the code is genuinely invalid/inactive. A lookup_error means the referral
+    database lookup itself was temporarily unavailable and registration should
+    not be destroyed because of that infrastructure problem.
+    """
+    code = _np2_ref_clean_code(code)
+    if not code:
+        return None, None
+
+    db = _np2_ref_db()
+    try:
+        rows = (
+            db.table("np2_referral_profiles")
+            .select("*")
+            .eq("code", code)
+            .eq("status", "active")
+            .limit(1)
+            .execute().data
+            or []
+        )
+        if rows:
+            return rows[0], None
+
+        aliases = (
+            db.table("np2_referral_code_aliases")
+            .select("profile_id,active")
+            .eq("alias_code", code)
+            .eq("active", True)
+            .limit(1)
+            .execute().data
+            or []
+        )
+        if aliases:
+            profile_id = str(aliases[0].get("profile_id") or "").strip()
+            if profile_id:
+                rows = (
+                    db.table("np2_referral_profiles")
+                    .select("*")
+                    .eq("id", profile_id)
+                    .eq("status", "active")
+                    .limit(1)
+                    .execute().data
+                    or []
+                )
+                if rows:
+                    return rows[0], None
+
+        return None, None
+    except Exception as exc:
+        print("NP2 REFERRAL CODE RESOLUTION ERROR:", repr(exc), flush=True)
+        return None, exc
 
 
 def _np2_ref_code_for_trader_id(trader_id, trader_name=""):
@@ -43215,26 +43272,55 @@ def _np2_register_trader_view():
 
     if code:
         if not email:
-            return _np_fail("Email is required before a referral registration can be secured", 400)
+            return _np_fail("Email is required before referral registration", 400)
+
+        # Validate current short NP2 codes and old NP2 aliases independently of staging.
+        profile, lookup_error = _np2_ref_resolve_profile_for_code(code)
+
+        if profile is None and lookup_error is None:
+            return _np_fail(
+                "This referral link is invalid or inactive. Please ask the referrer to copy their current referral link.",
+                400,
+            )
+
+        if profile is not None:
+            try:
+                owner_id = str(profile.get("trader_id") or "").strip()
+                owner_rows = (
+                    _np2_ref_db().table("traders")
+                    .select("id,email")
+                    .eq("id", owner_id)
+                    .limit(1).execute().data
+                    or []
+                )
+                owner_email = str((owner_rows[0] if owner_rows else {}).get("email") or "").strip().lower()
+                if owner_email and owner_email == email:
+                    return _np_fail("You cannot register through your own referral link.", 400)
+            except Exception as exc:
+                print("NP2 REFERRAL OWNER CHECK WARNING:", repr(exc), flush=True)
+
         try:
-            # Crucial guarantee: if first-touch cannot be staged, account creation
-            # does not proceed. This prevents a successful referred registration
-            # from disappearing from the referrer's activity.
             _np2_ref_db().rpc("np2_stage_referral", {
                 "p_code": code,
                 "p_email": email,
             }).execute()
         except Exception as exc:
-            print("NP2 REFERRAL STAGE FAILED:", repr(exc), flush=True)
-            return _np_fail(
-                "We could not secure this referral registration yet. Please retry; no trader account was created.",
-                503,
+            # Referral staging must not take the whole registration service down.
+            # The core registration route below persists ref=CODE into the trader row,
+            # and the NP2 AFTER INSERT/UPDATE capture trigger can recover it directly.
+            print(
+                "NP2 REFERRAL STAGE WARNING — CONTINUING REGISTRATION:",
+                repr(exc),
+                "code=", code,
+                "email=", email,
+                flush=True,
             )
 
+    # Core registration remains authoritative for verification, duplicate identity
+    # protection, password creation and durable referral evidence.
     result = _NP2_ORIGINAL_REGISTER_VIEW()
 
-    # Idempotent second safety net. New-trader INSERT capture already happens in
-    # the database trigger; this also covers an existing trader completing setup.
+    # Idempotent safety net. If staging failed, the trader-row trigger is the recovery path.
     if code and email:
         try:
             _np2_ref_db().rpc("np2_finalize_referral_email", {"p_email": email}).execute()
