@@ -4844,7 +4844,7 @@ def _active_account_mt5_logins(limit=5000):
 
 def _available_mt5_not_used(limit=1500):
     try:
-        mt5_rows = supabase.table("mt5_pool").select("*").order("created_at", desc=True).limit(limit).execute().data or []
+        mt5_rows = supabase.table("mt5_pool").select("*").order("created_at", desc=False).order("mt5_login", desc=False).limit(limit).execute().data or []
     except Exception as e:
         print("AVAILABLE MT5 FETCH ERROR:", e)
         mt5_rows = []
@@ -36786,7 +36786,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
                 .eq("account_size", size)
                 .eq("pool_class", expected_pool)
                 .in_("status", statuses)
-                .order("created_at", desc=True)
+                .order("created_at", desc=False).order("mt5_login", desc=False)
                 .range(start, min(start + page_size - 1, max_candidates - 1))
                 .execute().data or []
             )
@@ -36799,7 +36799,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
                     supabase.table("mt5_pool").select("*")
                     .eq("account_size", size)
                     .in_("status", statuses)
-                    .order("created_at", desc=True)
+                    .order("created_at", desc=False).order("mt5_login", desc=False)
                     .range(start, min(start + page_size - 1, max_candidates - 1))
                     .execute().data or []
                 )
@@ -36875,7 +36875,7 @@ def _np_admin_assignable_mt5_v48():
             rows = (
                 supabase.table("mt5_pool").select("*")
                 .in_("status", candidate_statuses)
-                .order("created_at", desc=True)
+                .order("created_at", desc=False).order("mt5_login", desc=False)
                 .range(start, min(start + page_size - 1, max_rows - 1))
                 .execute().data or []
             )
@@ -44983,3 +44983,13 @@ def admin_second_life_v76_status():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_SECOND_LIFE_SINGLE_TRUTH_RELEASE_V76
 
+
+
+# ============================================================================
+# NAIRAPIPS V77 — MT5 POOL FIFO / OLDEST ELIGIBLE FIRST — 21 SEP 2026
+# ============================================================================
+# Inventory policy only. Entitlement, payment, journey, single-use, two-pool and
+# prior-history protections remain unchanged. Among MT5 rows that ALREADY pass
+# every existing safety check, the oldest created_at row is offered first.
+# Accounts older than NP_MT5_AUTO_MAX_AGE_DAYS remain rejected exactly as before.
+NAIRAPIPS_MT5_FIFO_RELEASE_V77 = "V77_MT5_FIFO_OLDEST_ELIGIBLE_FIRST_2026_09_21"
