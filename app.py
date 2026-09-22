@@ -45277,3 +45277,653 @@ def admin_mt5_fifo_v77_status():
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MT5_FIFO_RELEASE_V77
 
+
+
+# ============================================================================
+# NAIRAPIPS V79 — GLOBAL INVALID MT5 RECALL / EXACT ENTITLEMENT RESTORE
+# 22 SEP 2026
+#
+# PURPOSE
+# -------
+# Repair an UNUSED invalid/stale/expired MT5 assignment without damaging the
+# journey that legitimately created it.
+#
+# LAW
+# ---
+#   exact source event -> exact entitlement -> bad MT5 (voided by Recall)
+#                      -> SAME exact entitlement becomes outstanding again
+#                      -> ONE valid same-target MT5 may fulfil it.
+#
+# This patch DOES NOT:
+#   * create a new payout renewal
+#   * create a new reset
+#   * create another Second Life
+#   * replay an old pass
+#   * advance stage
+#   * widen MT5 eligibility/pool rules
+#   * alter payout/reset/Second-Life business policy
+#
+# It only hardens the already-existing recalled-assignment path. New V8
+# Monitoring recalls stamp the exact consumed entitlement key on the recalled
+# trader_account. V79 requires Main Journey Authority to expose THAT SAME key
+# as the current outstanding entitlement before any replacement can be released.
+# ============================================================================
+
+NAIRAPIPS_INVALID_MT5_RECALL_RELEASE_V79 = "V79_GLOBAL_INVALID_MT5_RECALL_EXACT_ENTITLEMENT_2026_09_22"
+
+_np_recalled_assignment_authority_v79_legacy_core = _np_recalled_assignment_authority
+
+
+def _np_v79_recall_marker(account, name):
+    blob = " ".join(
+        str((account or {}).get(k) or "")
+        for k in ("archive_reason", "admin_note", "status", "account_status")
+    )
+    m = re.search(r"\[" + re.escape(name) + r":([^\]]+)\]", blob, re.I)
+    return str(m.group(1)).strip() if m else ""
+
+
+def _np_recalled_assignment_authority(recalled, account_rows=None, purchase=None, trader=None):
+    """V79 exact recall authority.
+
+    For NEW global invalid-MT5 recalls carrying NP_RECALL_ENTITLEMENT, no stage-
+    only fallback is allowed. The exact entitlement key must be outstanding again
+    in Journey Authority. Old historical recalls without the V8 marker continue
+    through the prior protected compatibility logic so production history is not
+    broken by this deployment.
+    """
+    recalled = recalled or {}
+    if not _np_is_recalled_wrong_assignment(recalled):
+        return {"eligible": False, "reason": "not_recalled_wrong_assignment"}
+
+    exact_key = _np_v79_recall_marker(recalled, "NP_RECALL_ENTITLEMENT")
+    if not exact_key:
+        # Historical compatibility only. New V8 recalls always carry exact_key.
+        return _np_recalled_assignment_authority_v79_legacy_core(
+            recalled, account_rows, purchase, trader
+        )
+
+    trader_id = str(recalled.get("trader_id") or "").strip()
+    purchase_id = str(
+        recalled.get("purchase_id") or recalled.get("challenge_purchase_id") or ""
+    ).strip()
+    recalled_id = str(recalled.get("id") or "").strip()
+    if not trader_id or not purchase_id or not recalled_id:
+        return {
+            "eligible": False,
+            "reason": "exact_recall_missing_journey_identity",
+            "entitlement_key": exact_key,
+        }
+
+    # A recalled MT5 containing actual trade history is not reversible.
+    try:
+        trade_rows = (
+            supabase.table("trader_trades").select("id")
+            .eq("trader_account_id", recalled_id).limit(1).execute().data or []
+        )
+    except Exception as exc:
+        return {
+            "eligible": False,
+            "reason": "exact_recall_trade_verification_failed",
+            "error": str(exc),
+            "entitlement_key": exact_key,
+        }
+    if trade_rows:
+        return {
+            "eligible": False,
+            "reason": "exact_recall_contains_trade_history",
+            "entitlement_key": exact_key,
+        }
+
+    try:
+        journey = _np_ja_journey_authority(trader_id, purchase_id)
+    except Exception as exc:
+        return {
+            "eligible": False,
+            "reason": "journey_authority_unavailable",
+            "error": str(exc),
+            "entitlement_key": exact_key,
+        }
+
+    if not isinstance(journey, dict) or journey.get("blocked"):
+        return {
+            "eligible": False,
+            "reason": "journey_blocked_after_recall",
+            "problems": (journey or {}).get("problems") or [],
+            "entitlement_key": exact_key,
+        }
+
+    ent = (journey or {}).get("outstanding_entitlement") or {}
+    restored_key = str(ent.get("entitlement_key") or "").strip()
+    if not restored_key:
+        return {
+            "eligible": False,
+            "reason": "no_outstanding_entitlement_after_recall",
+            "entitlement_key": exact_key,
+        }
+    if restored_key != exact_key:
+        return {
+            "eligible": False,
+            "reason": "different_entitlement_outstanding_after_recall",
+            "entitlement_key": exact_key,
+            "outstanding_entitlement_key": restored_key,
+        }
+
+    target_stage = _normalize_lifecycle_stage(ent.get("target_stage"))
+    recalled_stage = _normalize_lifecycle_stage(
+        recalled.get("stage") or recalled.get("phase")
+    )
+    if not target_stage or target_stage != recalled_stage:
+        return {
+            "eligible": False,
+            "reason": "recalled_stage_does_not_match_restored_entitlement",
+            "entitlement_key": exact_key,
+            "target_stage": target_stage,
+            "recalled_stage": recalled_stage,
+        }
+
+    marker_type = _np_v79_recall_marker(recalled, "NP_RECALL_TYPE")
+    marker_evidence = _np_v79_recall_marker(recalled, "NP_RECALL_EVIDENCE")
+    marker_source = _np_v79_recall_marker(recalled, "NP_RECALL_SOURCE")
+    ent_type = str(ent.get("entitlement_type") or "").strip()
+    evidence_id = str(ent.get("evidence_id") or "").strip()
+    source_id = str(ent.get("source_account_id") or "").strip()
+
+    # If V8 stamped these exact facts, they must still agree now. Never silently
+    # turn a payout renewal into a reset/pass/etc.
+    if marker_type and ent_type and marker_type != ent_type:
+        return {
+            "eligible": False,
+            "reason": "restored_entitlement_type_changed",
+            "entitlement_key": exact_key,
+            "expected_type": marker_type,
+            "actual_type": ent_type,
+        }
+    if marker_evidence and evidence_id and marker_evidence != evidence_id:
+        return {
+            "eligible": False,
+            "reason": "restored_entitlement_evidence_changed",
+            "entitlement_key": exact_key,
+            "expected_evidence_id": marker_evidence,
+            "actual_evidence_id": evidence_id,
+        }
+    if marker_source and source_id and marker_source != source_id:
+        return {
+            "eligible": False,
+            "reason": "restored_entitlement_source_changed",
+            "entitlement_key": exact_key,
+            "expected_source_account_id": marker_source,
+            "actual_source_account_id": source_id,
+        }
+
+    anchor = None
+    if source_id:
+        try:
+            rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", source_id).eq("trader_id", trader_id)
+                .limit(1).execute().data or []
+            )
+            anchor = rows[0] if rows else None
+        except Exception:
+            anchor = None
+
+    return {
+        "eligible": True,
+        "reason": "restore_exact_original_entitlement",
+        "authority": NAIRAPIPS_INVALID_MT5_RECALL_RELEASE_V79,
+        "entitlement_key": exact_key,
+        "entitlement_type": ent_type,
+        "source_event_type": ent.get("source_event_type"),
+        "evidence_id": evidence_id,
+        "target_stage": target_stage,
+        "anchor_account": anchor,
+        "anchor_account_id": source_id,
+        "anchor_mt5_login": str(ent.get("source_mt5") or (anchor or {}).get("mt5_login") or ""),
+        "recalled_account_id": recalled_id,
+        "recalled_mt5_login": str(recalled.get("mt5_login") or ""),
+        "label": (
+            f"INVALID MT5 RECALLED · RESTORE SAME {ent_type.upper() if ent_type else 'ENTITLEMENT'} "
+            f"→ {target_stage.upper()}"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Manual Recall replacement concurrency guard.
+# Existing automation routes retain their own payout/reset/Second-Life locks.
+# This guard only serialises staff assignment attempts for one recalled child.
+# ---------------------------------------------------------------------------
+_NP_V79_RECALL_ASSIGN_LOCKS = {}
+_NP_V79_RECALL_ASSIGN_LOCKS_GUARD = threading.Lock()
+
+
+def _np_v79_recall_lock(source_id):
+    key = str(source_id or "").strip()
+    with _NP_V79_RECALL_ASSIGN_LOCKS_GUARD:
+        lock = _NP_V79_RECALL_ASSIGN_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _NP_V79_RECALL_ASSIGN_LOCKS[key] = lock
+        return lock
+
+
+_np_assign_phase_v79_core = app.view_functions.get("assign_phase_mt5")
+
+
+def _np_assign_phase_v79():
+    if request.method == "OPTIONS" or not _np_assign_phase_v79_core:
+        return _np_assign_phase_v79_core()
+
+    d = request.get_json(silent=True) or {}
+    trader_id = str(d.get("trader_id") or d.get("id") or "").strip()
+    raw_source = str(
+        d.get("completed_account_id")
+        or d.get("source_account_id")
+        or d.get("trader_account_id")
+        or d.get("passed_account_id")
+        or ""
+    ).strip()
+    source_id = raw_source
+    for prefix in ("waiting:", "reset-waiting:", "recall-waiting:"):
+        if source_id.startswith(prefix):
+            source_id = source_id.split(":", 1)[1]
+            if prefix == "waiting:" and ":" in source_id:
+                source_id = source_id.split(":", 1)[0]
+            break
+
+    if not trader_id or not source_id:
+        return _np_assign_phase_v79_core()
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", source_id).eq("trader_id", trader_id)
+            .limit(1).execute().data or []
+        )
+        source = rows[0] if rows else None
+    except Exception as exc:
+        return _np_fail("Recall replacement verification failed closed: " + str(exc), 500)
+
+    if not source or not _np_is_recalled_wrong_assignment(source):
+        return _np_assign_phase_v79_core()
+
+    # Historical old recalls retain existing behaviour. V8 exact recalls use the
+    # strict marker + same-entitlement law below.
+    exact_key = _np_v79_recall_marker(source, "NP_RECALL_ENTITLEMENT")
+    if not exact_key:
+        return _np_assign_phase_v79_core()
+
+    lock = _np_v79_recall_lock(source_id)
+    if not lock.acquire(blocking=False):
+        return _np_fail(
+            "This exact recalled entitlement is already being assigned. Refresh before trying again.",
+            409,
+        )
+    try:
+        # Re-read after acquiring the lock and prove the SAME entitlement is still open.
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", source_id).eq("trader_id", trader_id)
+            .limit(1).execute().data or []
+        )
+        source = rows[0] if rows else source
+        authority = _np_recalled_assignment_authority(source)
+        if not authority.get("eligible"):
+            return _np_fail(
+                "Recall replacement blocked: " + str(authority.get("reason") or "exact original entitlement is no longer available"),
+                409,
+            )
+
+        requested_stage = _normalize_lifecycle_stage(
+            d.get("phase") or d.get("target_stage") or d.get("stage") or ""
+        )
+        required_stage = _normalize_lifecycle_stage(authority.get("target_stage"))
+        if requested_stage and requested_stage != required_stage:
+            return _np_fail(
+                f"Recall replacement must remain {required_stage.upper()}, not {requested_stage.upper()}.",
+                409,
+            )
+
+        return _np_assign_phase_v79_core()
+    finally:
+        lock.release()
+
+
+if _np_assign_phase_v79_core:
+    app.view_functions["assign_phase_mt5"] = _np_assign_phase_v79
+
+
+@app.route("/admin/invalid_mt5_recall_v79/status", methods=["GET", "OPTIONS"])
+def admin_invalid_mt5_recall_v79_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_INVALID_MT5_RECALL_RELEASE_V79,
+        "new_recall_requires_exact_consumed_entitlement_marker": True,
+        "replacement_requires_same_entitlement_key_from_journey_authority": True,
+        "stage_must_remain_same_target": True,
+        "recall_creates_new_entitlement": False,
+        "archive_event_creates_entitlement": False,
+        "payout_renewal_replayed": False,
+        "reset_replayed": False,
+        "second_life_replayed": False,
+        "old_pass_replayed": False,
+        "manual_recall_assignment_serialised_per_source": True,
+        "existing_pool_assignment_logic_changed": False,
+        "existing_payout_logic_changed": False,
+        "existing_reset_logic_changed": False,
+        "existing_second_life_logic_changed": False,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_INVALID_MT5_RECALL_RELEASE_V79
+
+
+# ============================================================================
+# NAIRAPIPS V80 — FRESHEST-SAFE MT5 INVENTORY AUTHORITY
+# 22 SEP 2026
+#
+# INCIDENT
+# --------
+# V77 deliberately selected the OLDEST still-eligible pool credential first.
+# With broker demo credentials that can become stale/invalid over time, that
+# ordering unnecessarily pushed assignments toward the edge of expiry.
+#
+# V80 LAW
+# -------
+# 1) Entitlement law is unchanged (V79 remains exact authority for recalled MT5s).
+# 2) Exact account size + exact PHASE/FUNDED vault remain mandatory.
+# 3) Any previously-used/recalled/held/invalid credential remains forbidden.
+# 4) Auto/manual assignment feed prefers FRESHEST eligible credentials first.
+# 5) Default automatic safety age is 4 days (env override 1..7 days).
+# 6) If no safe credential exists, WAIT. Never consume entitlement with a risky MT5.
+# ============================================================================
+
+NAIRAPIPS_MT5_FRESHEST_RELEASE_V80 = "V80_GLOBAL_RECALL_FRESHEST_SAFE_MT5_2026_09_22"
+
+try:
+    _v80_requested_age = float(os.getenv("NP_MT5_SAFE_ASSIGN_MAX_AGE_DAYS", "4") or 4)
+except Exception:
+    _v80_requested_age = 4.0
+NP_MT5_AUTO_MAX_AGE_DAYS = max(1.0, min(_v80_requested_age, 7.0))
+
+
+def _np_v80_bad_inventory_marker(m):
+    """Reject a pool row carrying explicit stale/invalid/hold evidence even if status says available."""
+    m = m or {}
+    blob = " ".join(
+        str(m.get(k) or "")
+        for k in (
+            "status", "account_status", "archive_reason", "admin_note",
+            "lifecycle_state", "risk_zone"
+        )
+    ).lower()
+    bad = (
+        "expired", "stale", "invalid", "recalled", "recalled_hold",
+        "quarantine", "disabled", "locked", "closed", "breached",
+        "consumed", "do not reuse", "do_not_reuse"
+    )
+    return any(token in blob for token in bad)
+
+
+def _np_v80_fresh_time(m):
+    dt = _np_parse_dt_safe((m or {}).get("created_at"))
+    if not dt:
+        return float("-inf")
+    try:
+        return dt.timestamp()
+    except Exception:
+        return float("-inf")
+
+
+def _np_v80_fresh_sort(rows):
+    return sorted(
+        list(rows or []),
+        key=lambda m: (_np_v80_fresh_time(m), str((m or {}).get("mt5_login") or "")),
+        reverse=True,
+    )
+
+
+def _np_v80_candidate_ok(m, size, target_stage):
+    if _np_v80_bad_inventory_marker(m):
+        return False
+    return bool(_np_structural_mt5_candidate_v48(m, size, target_stage))
+
+
+def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
+    """Global picker: complete exact category scan, FRESHEST SAFE credential first."""
+    expected_pool = _np_expected_pool_class(target_stage)
+    size = clean(account_size)
+    if not size:
+        return None
+
+    statuses = ["available", "unused", "new", "ready", "open"]
+    page_size = 200
+    max_candidates = 10000
+    start = 0
+    rejected_history = 0
+    rejected_structure = 0
+    rejected_marker = 0
+    total_candidates = 0
+
+    while start < max_candidates:
+        try:
+            rows = (
+                supabase.table("mt5_pool").select("*")
+                .eq("account_size", size)
+                .eq("pool_class", expected_pool)
+                .in_("status", statuses)
+                .order("created_at", desc=True)
+                .range(start, min(start + page_size - 1, max_candidates - 1))
+                .execute().data or []
+            )
+        except Exception as exc:
+            # Preserve existing migration compatibility only for PHASE inventory.
+            if expected_pool == "funded":
+                print("V80 FUNDED FRESHEST MT5 PAGE QUERY ERROR:", exc, flush=True)
+                return None
+            try:
+                rows = (
+                    supabase.table("mt5_pool").select("*")
+                    .eq("account_size", size)
+                    .in_("status", statuses)
+                    .order("created_at", desc=True)
+                    .range(start, min(start + page_size - 1, max_candidates - 1))
+                    .execute().data or []
+                )
+            except Exception as exc2:
+                print("V80 PHASE FRESHEST MT5 PAGE QUERY ERROR:", exc2, flush=True)
+                return None
+
+        if not rows:
+            break
+
+        rows = _np_v80_fresh_sort(rows)
+        total_candidates += len(rows)
+
+        structural = []
+        for m in rows:
+            if _np_v80_bad_inventory_marker(m):
+                rejected_marker += 1
+                continue
+            if _np_v80_candidate_ok(m, size, target_stage):
+                structural.append(m)
+            else:
+                rejected_structure += 1
+
+        try:
+            used = _np_used_mt5_logins_batch_v48(structural)
+        except Exception as exc:
+            # Never assign if history verification itself cannot be trusted.
+            print("V80 MT5 HISTORY CHECK FAILED CLOSED:", exc, flush=True)
+            return None
+
+        for m in structural:
+            login = str(m.get("mt5_login") or "").strip()
+            if not login or login in used:
+                rejected_history += 1
+                continue
+
+            used_one, _reason = _mt5_login_has_any_history(
+                login, exclude_mt5_pool_id=m.get("id")
+            )
+            if used_one:
+                rejected_history += 1
+                continue
+
+            return m
+
+        if len(rows) < page_size:
+            break
+        start += page_size
+
+    if total_candidates:
+        print(
+            "V80 NO SAFE MT5 — ENTITLEMENT REMAINS WAITING:",
+            "pool=", expected_pool,
+            "size=", size,
+            "candidates=", total_candidates,
+            "marker_rejected=", rejected_marker,
+            "structural_rejected=", rejected_structure,
+            "history_rejected=", rejected_history,
+            "max_age_days=", NP_MT5_AUTO_MAX_AGE_DAYS,
+            flush=True,
+        )
+    return None
+
+
+def _np_admin_assignable_mt5_v80():
+    """Admin feed mirrors automation: only freshest-safe, never-used credentials."""
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    try:
+        stage = _normalize_lifecycle_stage(request.args.get("stage") or "phase1")
+        expected_pool = _np_expected_pool_class(stage)
+        candidate_statuses = ["available", "unused", "new", "ready", "open"]
+
+        page_size = 500
+        max_rows = 10000
+        start = 0
+        candidates = []
+        seen_ids = set()
+
+        while start < max_rows:
+            rows = (
+                supabase.table("mt5_pool").select("*")
+                .in_("status", candidate_statuses)
+                .order("created_at", desc=True)
+                .range(start, min(start + page_size - 1, max_rows - 1))
+                .execute().data or []
+            )
+            if not rows:
+                break
+
+            for m in rows:
+                if _np_mt5_pool_class(m) != expected_pool:
+                    continue
+                if m.get("assigned_trader_id") or m.get("trader_id") or m.get("trader_account_id"):
+                    continue
+                if _np_v80_bad_inventory_marker(m):
+                    continue
+                age = _np_mt5_age_days(m)
+                if age is None or age > NP_MT5_AUTO_MAX_AGE_DAYS:
+                    continue
+                mid = str(m.get("id") or m.get("mt5_login") or "").strip()
+                if not mid or mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                candidates.append(m)
+
+            if len(rows) < page_size:
+                break
+            start += page_size
+
+        candidates = _np_v80_fresh_sort(candidates)
+        used = _np_used_mt5_logins_batch_v48(candidates)
+
+        out = []
+        seen_logins = set()
+        for m in candidates:
+            login = str(m.get("mt5_login") or "").strip()
+            if not login or login in used or login in seen_logins:
+                continue
+            used_one, _reason = _mt5_login_has_any_history(
+                login, exclude_mt5_pool_id=m.get("id")
+            )
+            if used_one:
+                continue
+            seen_logins.add(login)
+            out.append({
+                "id": m.get("id"),
+                "mt5_login": login,
+                "mt5_server": m.get("mt5_server"),
+                "account_size": m.get("account_size"),
+                "pool_class": _np_mt5_pool_class(m),
+                "plan_name": m.get("plan_name"),
+                "status": m.get("status"),
+                "created_at": m.get("created_at"),
+                "updated_at": m.get("updated_at"),
+                "age_days": round(float(_np_mt5_age_days(m) or 0), 2),
+                "assigned_trader_id": None,
+                "trader_id": None,
+                "trader_account_id": None,
+            })
+
+        return _np_ok({
+            "success": True,
+            "stage": stage,
+            "pool_class": expected_pool,
+            "count": len(out),
+            "excluded_used_history": len(used),
+            "mt5_pool": out,
+            "data": out,
+            "complete_category_scan": True,
+            "fresh_history_verified": True,
+            "freshest_safe_first": True,
+            "fifo_oldest_eligible_first": False,
+            "max_age_days": NP_MT5_AUTO_MAX_AGE_DAYS,
+            "release": NAIRAPIPS_MT5_FRESHEST_RELEASE_V80,
+        })
+    except Exception as exc:
+        return _np_fail(str(exc), 500)
+
+
+# Replace V77 Admin assignable feed. All automatic callers resolve
+# _np_pick_fresh_mt5 dynamically and therefore use V80 immediately.
+app.view_functions["admin_assignable_mt5_v46"] = _np_admin_assignable_mt5_v80
+
+
+@app.route("/admin/mt5_freshest_v80/status", methods=["GET", "OPTIONS"])
+def admin_mt5_freshest_v80_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_MT5_FRESHEST_RELEASE_V80,
+        "assignment_order": "FRESHEST_SAFE_FIRST",
+        "max_auto_age_days": NP_MT5_AUTO_MAX_AGE_DAYS,
+        "oldest_first_disabled": True,
+        "explicit_invalid_stale_recalled_hold_excluded": True,
+        "single_use_history_guard": True,
+        "exact_pool_guard": True,
+        "exact_size_guard": True,
+        "no_safe_inventory_behavior": "WAIT_AND_RETRY_WITHOUT_CONSUMING_ENTITLEMENT",
+        "v79_exact_recall_authority_preserved": True,
+        "business_entitlement_rules_changed": False,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MT5_FRESHEST_RELEASE_V80
