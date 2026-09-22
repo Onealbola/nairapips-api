@@ -47272,3 +47272,136 @@ def admin_recall_replacement_v85_health():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V85
+
+
+# ============================================================================
+# NAIRAPIPS V86 — SINGLE-SCAN RECALL AUTHORITY
+# 22 SEP 2026
+#
+# ROOT CAUSE FIX
+# --------------
+# Admin V45 had to discover Recall without archive_reason/admin_note, but probing
+# every archived account created a burst of concurrent requests. On traders with
+# long account history that fan-out can itself cause timeouts and can attach a
+# verifier failure to an unrelated archived MT5.
+#
+# V86 moves Recall discovery completely to the backend:
+#   browser sends ONE trader_id -> backend reads raw trader_accounts ONCE ->
+#   backend identifies only genuine recalled-wrong-assignment rows -> V85 exact
+#   authority evaluates those rows -> browser receives only real Recall evidence.
+#
+# This is READ ONLY and does not create or widen any entitlement.
+# ============================================================================
+
+NAIRAPIPS_RECALL_SINGLE_SCAN_RELEASE_V86 = "V86_SINGLE_SCAN_RECALL_AUTHORITY_2026_09_22"
+
+
+def _np_v86_recall_scan(trader_id):
+    trader_id = str(trader_id or "").strip()
+    if not trader_id:
+        return {
+            "ok": False,
+            "reason": "missing_trader_id",
+            "release": NAIRAPIPS_RECALL_SINGLE_SCAN_RELEASE_V86,
+            "recalls": [],
+        }
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", trader_id)
+            .limit(500).execute().data or []
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": "trader_account_scan_failed:" + str(exc),
+            "release": NAIRAPIPS_RECALL_SINGLE_SCAN_RELEASE_V86,
+            "recalls": [],
+        }
+
+    recalls = []
+    for row in rows:
+        try:
+            if _np_is_recalled_wrong_assignment(row):
+                recalls.append(row)
+        except Exception:
+            continue
+
+    recalls.sort(key=_np_v84_score_recall, reverse=True)
+
+    results = []
+    # A trader should normally have very few Recall rows. Cap the forensic read so
+    # corrupted historical data cannot turn this endpoint into another fan-out.
+    for row in recalls[:20]:
+        rid = str(row.get("id") or "").strip()
+        if not rid:
+            continue
+        try:
+            result = _np_v85_exact_recall_status(rid)
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "due": False,
+                "is_recalled_wrong_assignment": True,
+                "recalled_account_id": rid,
+                "recalled_mt5": str(row.get("mt5_login") or "").strip() or None,
+                "journey_id": str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip() or None,
+                "trader_id": trader_id,
+                "reason": "exact_recall_evaluation_failed:" + str(exc),
+                "release": NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V85,
+            }
+        results.append(result)
+
+    due = [r for r in results if isinstance(r, dict) and r.get("due") and r.get("entitlement")]
+    blocked = [r for r in results if isinstance(r, dict) and not r.get("due")]
+
+    return {
+        "ok": True,
+        "trader_id": trader_id,
+        "raw_account_count": len(rows),
+        "genuine_recall_count": len(recalls),
+        "evaluated_recall_count": len(results),
+        "due_count": len(due),
+        "blocked_count": len(blocked),
+        "recalls": results,
+        "release": NAIRAPIPS_RECALL_SINGLE_SCAN_RELEASE_V86,
+        "business_rules_changed": False,
+        "read_route_assigns_mt5": False,
+    }
+
+
+@app.route("/admin/recall_replacement_scan_v86", methods=["GET", "OPTIONS"])
+def admin_recall_replacement_scan_v86():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    try:
+        return _np_ok(_np_v86_recall_scan(trader_id))
+    except Exception as exc:
+        print("V86 RECALL SINGLE SCAN ERROR:", exc, flush=True)
+        return _np_fail(str(exc), 500)
+
+
+@app.route("/admin/recall_replacement_scan_v86/health", methods=["GET", "OPTIONS"])
+def admin_recall_replacement_scan_v86_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_RECALL_SINGLE_SCAN_RELEASE_V86,
+        "one_request_per_trader": True,
+        "raw_backend_recall_discovery": True,
+        "normal_archives_are_not_probed": True,
+        "v85_exact_entitlement_law_reused": True,
+        "read_route_assigns_mt5": False,
+        "business_rules_changed": False,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RECALL_SINGLE_SCAN_RELEASE_V86
