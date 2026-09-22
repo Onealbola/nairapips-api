@@ -47405,3 +47405,1095 @@ def admin_recall_replacement_scan_v86_health():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RECALL_SINGLE_SCAN_RELEASE_V86
+
+# ============================================================================
+# NAIRAPIPS V87 — UNIVERSAL JOURNEY-PRESERVING MT5 RECALL
+# 22 SEP 2026
+#
+# PURPOSE
+# -------
+# Correct ONE exact unused MT5 delivery at ANY business stage without replaying,
+# advancing, resetting, or otherwise rewriting the business journey that created
+# the delivery.
+#
+# Operational law:
+#   exact mistaken delivery -> quarantine exact MT5 -> preserve source journey ->
+#   replace only the delivery that was wrong.
+#
+# This authority is deliberately separate from Pass, Payout Renewal, Funded Reset,
+# Second Life, Purchase Approval and all normal progression engines.
+# ============================================================================
+
+NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87 = "V87_UNIVERSAL_JOURNEY_PRESERVING_RECALL_2026_09_22"
+
+_NP_UR_V87_REASON_LABELS = {
+    "invalid_login": "Invalid / expired MT5 login",
+    "stale_login": "Stale MT5 login",
+    "wrong_credentials": "Wrong MT5 credentials",
+    "wrong_trader": "MT5 assigned to wrong trader",
+    "wrong_size": "Wrong account size assigned",
+    "wrong_stage": "Wrong stage / account type assigned",
+    "duplicate_assignment": "Duplicate MT5 assignment",
+    "broker_issue": "Broker / Exness technical issue",
+    "operator_error": "Admin / operator mistake",
+    "technical_failure": "Technical assignment failure",
+    "other": "Other operational mistake",
+}
+
+_NP_UR_V87_ACTIVE = {
+    "assigned_active", "active", "current_active", "phase1_active", "phase2_active",
+    "funded_active", "live_active", "live", "funded", "approved_active",
+}
+
+
+def _np_ur_v87_s(value):
+    return str(value or "").strip()
+
+
+def _np_ur_v87_low(value):
+    return _np_ur_v87_s(value).lower()
+
+
+def _np_ur_v87_num(value):
+    try:
+        return float(value or 0)
+    except Exception:
+        return 0.0
+
+
+def _np_ur_v87_account_by_id(account_id):
+    aid = _np_ur_v87_s(account_id)
+    if not aid:
+        return None
+    rows = (
+        supabase.table("trader_accounts").select("*")
+        .eq("id", aid).limit(1).execute().data or []
+    )
+    return rows[0] if rows else None
+
+
+def _np_ur_v87_accounts_by_login(mt5_login, expected_trader_id=None):
+    login = _np_ur_v87_s(mt5_login)
+    if not login:
+        return []
+    q = supabase.table("trader_accounts").select("*").eq("mt5_login", login)
+    if _np_ur_v87_s(expected_trader_id):
+        q = q.eq("trader_id", _np_ur_v87_s(expected_trader_id))
+    return q.order("created_at", desc=True).limit(20).execute().data or []
+
+
+def _np_ur_v87_trader(trader_id):
+    tid = _np_ur_v87_s(trader_id)
+    if not tid:
+        return None
+    rows = supabase.table("traders").select("*").eq("id", tid).limit(1).execute().data or []
+    return rows[0] if rows else None
+
+
+def _np_ur_v87_purchase(purchase_id):
+    pid = _np_ur_v87_s(purchase_id)
+    if not pid:
+        return None
+    try:
+        rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def _np_ur_v87_pool_for_account(account):
+    account = account or {}
+    pool_id = _np_ur_v87_s(account.get("mt5_pool_id") or account.get("assigned_mt5_id"))
+    login = _np_ur_v87_s(account.get("mt5_login"))
+    try:
+        if pool_id:
+            rows = supabase.table("mt5_pool").select("*").eq("id", pool_id).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+        if login:
+            rows = supabase.table("mt5_pool").select("*").eq("mt5_login", login).limit(10).execute().data or []
+            if rows:
+                return rows[0]
+    except Exception:
+        pass
+    return None
+
+
+def _np_ur_v87_use_check(account):
+    """Fail closed. Operational Recall is for UNUSED mistaken deliveries only."""
+    account = account or {}
+    aid = _np_ur_v87_s(account.get("id"))
+    tid = _np_ur_v87_s(account.get("trader_id"))
+    login = _np_ur_v87_s(account.get("mt5_login"))
+    out = {
+        "safe": False,
+        "reason": "not_checked",
+        "trade_found": False,
+        "payout_found": False,
+    }
+    if not aid or not tid or not login:
+        out["reason"] = "incomplete_exact_account_identity"
+        return out
+
+    try:
+        trades = (
+            supabase.table("trader_trades").select("id")
+            .eq("trader_account_id", aid).limit(1).execute().data or []
+        )
+        if not trades:
+            # Compatibility guard for old rows that were linked only by trader + MT5.
+            trades = (
+                supabase.table("trader_trades").select("id")
+                .eq("trader_id", tid).eq("mt5_login", login)
+                .limit(1).execute().data or []
+            )
+        if trades:
+            out.update({"reason": "account_has_trade_history", "trade_found": True})
+            return out
+    except Exception as exc:
+        out["reason"] = "trade_verification_failed:" + str(exc)
+        return out
+
+    try:
+        payouts = (
+            supabase.table("payouts").select("id,status")
+            .eq("trader_account_id", aid).limit(1).execute().data or []
+        )
+        if not payouts:
+            try:
+                payouts = (
+                    supabase.table("payouts").select("id,status")
+                    .eq("trader_id", tid).eq("mt5_login", login)
+                    .limit(1).execute().data or []
+                )
+            except Exception:
+                payouts = []
+        if payouts:
+            out.update({"reason": "account_has_payout_history", "payout_found": True})
+            return out
+    except Exception as exc:
+        out["reason"] = "payout_verification_failed:" + str(exc)
+        return out
+
+    out.update({"safe": True, "reason": "unused_exact_delivery"})
+    return out
+
+
+def _np_ur_v87_parent_account(account):
+    account = account or {}
+    for key in (
+        "previous_trader_account_id", "replaces_trader_account_id",
+        "source_account_id", "reset_source_account_id", "parent_account_id",
+    ):
+        pid = _np_ur_v87_s(account.get(key))
+        if pid and pid != _np_ur_v87_s(account.get("id")):
+            row = _np_ur_v87_account_by_id(pid)
+            if row:
+                return row, key
+    return None, None
+
+
+def _np_ur_v87_status_blob(row):
+    row = row or {}
+    return " ".join(
+        _np_ur_v87_s(row.get(k))
+        for k in (
+            "account_status", "status", "risk_zone", "archive_reason", "reset_reason",
+            "admin_note", "source", "journey_source", "lifecycle_state", "phase_pass_status",
+        )
+    ).lower()
+
+
+def _np_ur_v87_is_passed(row):
+    blob = _np_ur_v87_status_blob(row)
+    return (
+        "passed" in blob
+        or "archived_phase1" in blob
+        or "archived_phase2" in blob
+        or _np_ur_v87_low((row or {}).get("risk_zone")) == "passed"
+    )
+
+
+def _np_ur_v87_is_breached(row):
+    return "breach" in _np_ur_v87_status_blob(row)
+
+
+def _np_ur_v87_prior_same_purchase(account, purchase_id, trader_id):
+    pid = _np_ur_v87_s(purchase_id)
+    tid = _np_ur_v87_s(trader_id)
+    if not pid or not tid:
+        return []
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("purchase_id", pid).eq("trader_id", tid)
+            .order("created_at", desc=False).limit(500).execute().data or []
+        )
+    except Exception:
+        try:
+            rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("challenge_purchase_id", pid).eq("trader_id", tid)
+                .order("created_at", desc=False).limit(500).execute().data or []
+            )
+        except Exception:
+            rows = []
+    aid = _np_ur_v87_s((account or {}).get("id"))
+    at = _dt_score(
+        (account or {}).get("assigned_at") or (account or {}).get("started_at")
+        or (account or {}).get("created_at") or (account or {}).get("updated_at")
+    )
+    prior = []
+    for r in rows:
+        if _np_ur_v87_s(r.get("id")) == aid:
+            continue
+        rt = _dt_score(r.get("assigned_at") or r.get("started_at") or r.get("created_at") or r.get("updated_at"))
+        if at and rt and rt > at:
+            continue
+        prior.append(r)
+    return prior
+
+
+def _np_ur_v87_expected_stage(account, purchase, trader):
+    """Return (stage, evidence, strong). Strong means safe for wrong-stage correction."""
+    account = account or {}
+    purchase = purchase or {}
+    trader = trader or {}
+    current = _normalize_lifecycle_stage(account.get("stage") or account.get("phase"))
+    blob = _np_ur_v87_status_blob(account)
+
+    marker = re.search(r"(?:TARGET_STAGE|NP_RECALL_STAGE|target_stage)[:=]([a-zA-Z0-9_ -]+)", blob, re.I)
+    if marker:
+        st = _normalize_lifecycle_stage(marker.group(1))
+        if st in ACCOUNT_STAGES:
+            return st, "explicit_assignment_marker", True
+
+    if "payout" in blob and ("renew" in blob or "paid" in blob or "fresh funded" in blob):
+        return "funded", "payout_renewal_assignment_marker", True
+    if "funded_reset" in blob or "funded reset" in blob:
+        return "funded", "funded_reset_assignment_marker", True
+    if "second_life" in blob or "second life" in blob or "life2" in blob or "life 2" in blob:
+        return "phase1", "second_life_assignment_marker", True
+
+    parent, parent_link = _np_ur_v87_parent_account(account)
+    if parent:
+        pstage = _normalize_lifecycle_stage(parent.get("stage") or parent.get("phase"))
+        if _np_ur_v87_is_passed(parent):
+            try:
+                nxt = _next_stage_for_lifecycle(pstage, parent, purchase, None, trader)
+            except Exception:
+                nxt = None
+            if nxt in ACCOUNT_STAGES:
+                return nxt, "passed_parent:" + str(parent_link or "lineage"), True
+        if _np_ur_v87_is_breached(parent):
+            if pstage == "funded":
+                return "funded", "breached_funded_parent_replacement", True
+            if pstage in {"phase1", "phase2"}:
+                return pstage, "breached_phase_parent_replacement", True
+
+    pid = _np_ur_v87_s(account.get("purchase_id") or account.get("challenge_purchase_id"))
+    tid = _np_ur_v87_s(account.get("trader_id"))
+    prior = _np_ur_v87_prior_same_purchase(account, pid, tid)
+    if prior:
+        prior_sorted = sorted(
+            prior,
+            key=lambda r: _dt_score(r.get("archived_at") or r.get("updated_at") or r.get("created_at")),
+            reverse=True,
+        )
+        for p in prior_sorted:
+            if _np_ur_v87_is_passed(p):
+                pst = _normalize_lifecycle_stage(p.get("stage") or p.get("phase"))
+                try:
+                    nxt = _next_stage_for_lifecycle(pst, p, purchase, None, trader)
+                except Exception:
+                    nxt = None
+                if nxt in ACCOUNT_STAGES:
+                    return nxt, "latest_passed_predecessor", True
+    elif pid:
+        # First account on an exact purchase is Phase 1.
+        return "phase1", "first_delivery_of_purchase", True
+
+    return current, "current_assignment_snapshot", False
+
+
+def _np_ur_v87_target(account, reason_code):
+    account = account or {}
+    reason_code = _np_ur_v87_low(reason_code)
+    old_tid = _np_ur_v87_s(account.get("trader_id"))
+    old_trader = _np_ur_v87_trader(old_tid) or {}
+    purchase_id = _np_ur_v87_s(account.get("purchase_id") or account.get("challenge_purchase_id"))
+    purchase = _np_ur_v87_purchase(purchase_id) or {}
+    parent, parent_link = _np_ur_v87_parent_account(account)
+
+    old_stage = _normalize_lifecycle_stage(account.get("stage") or account.get("phase"))
+    old_size = _np_ur_v87_num(account.get("account_size") or account.get("start_balance"))
+
+    # Owner authority.
+    purchase_owner = _np_ur_v87_s(purchase.get("trader_id"))
+    parent_owner = _np_ur_v87_s((parent or {}).get("trader_id"))
+    target_tid = old_tid
+    owner_evidence = "current_exact_assignment_owner"
+    owner_strong = True
+    if reason_code == "wrong_trader":
+        if purchase_owner and purchase_owner != old_tid:
+            target_tid = purchase_owner
+            owner_evidence = "purchase_owner"
+        elif parent_owner and parent_owner != old_tid:
+            target_tid = parent_owner
+            owner_evidence = "lineage_parent_owner"
+        else:
+            return {"ok": False, "reason": "correct_owner_cannot_be_proven_from_purchase_or_lineage"}
+    elif purchase_owner and purchase_owner != old_tid:
+        # Do not silently move an account between traders under a different reason.
+        return {
+            "ok": False,
+            "reason": "owner_mismatch_detected_choose_wrong_trader_reason",
+            "detected_purchase_owner": purchase_owner,
+            "current_owner": old_tid,
+        }
+
+    target_trader = _np_ur_v87_trader(target_tid) or {}
+    if not target_trader:
+        return {"ok": False, "reason": "target_trader_not_found"}
+
+    # Size authority. Purchase snapshot outranks the delivered account when present.
+    purchase_size = _np_ur_v87_num(purchase.get("account_size"))
+    parent_size = _np_ur_v87_num((parent or {}).get("account_size") or (parent or {}).get("start_balance"))
+    target_size = old_size
+    size_evidence = "current_assignment_snapshot"
+    size_strong = bool(old_size)
+    if purchase_size:
+        target_size = purchase_size
+        size_evidence = "purchase_account_size"
+        size_strong = True
+    elif parent_size:
+        target_size = parent_size
+        size_evidence = "lineage_parent_account_size"
+        size_strong = True
+
+    if reason_code == "wrong_size":
+        if not size_strong or not target_size:
+            return {"ok": False, "reason": "correct_account_size_cannot_be_proven"}
+        if old_size and abs(target_size - old_size) < 0.01:
+            return {"ok": False, "reason": "wrong_size_reason_selected_but_authority_matches_current_size"}
+    elif purchase_size and old_size and abs(purchase_size - old_size) > 0.01:
+        return {
+            "ok": False,
+            "reason": "size_mismatch_detected_choose_wrong_size_or_operator_error",
+            "current_size": old_size,
+            "authoritative_size": purchase_size,
+        }
+
+    # Stage authority.
+    inferred_stage, stage_evidence, stage_strong = _np_ur_v87_expected_stage(account, purchase, target_trader)
+    target_stage = old_stage
+    if reason_code == "wrong_stage":
+        if not stage_strong:
+            return {"ok": False, "reason": "correct_stage_cannot_be_proven_from_exact_lineage"}
+        if inferred_stage == old_stage:
+            return {"ok": False, "reason": "wrong_stage_reason_selected_but_lineage_matches_current_stage"}
+        target_stage = inferred_stage
+    elif reason_code in {"wrong_trader", "operator_error", "other"} and stage_strong:
+        target_stage = inferred_stage
+    elif stage_strong and inferred_stage != old_stage:
+        return {
+            "ok": False,
+            "reason": "stage_mismatch_detected_choose_wrong_stage_or_operator_error",
+            "current_stage": old_stage,
+            "authoritative_stage": inferred_stage,
+            "stage_evidence": stage_evidence,
+        }
+
+    if target_stage not in ACCOUNT_STAGES:
+        return {"ok": False, "reason": "invalid_target_stage"}
+    if not target_size:
+        return {"ok": False, "reason": "target_account_size_missing"}
+
+    return {
+        "ok": True,
+        "target_trader_id": target_tid,
+        "target_trader": target_trader,
+        "owner_evidence": owner_evidence,
+        "owner_strong": owner_strong,
+        "target_stage": target_stage,
+        "stage_evidence": stage_evidence,
+        "stage_strong": stage_strong,
+        "target_size": target_size,
+        "size_evidence": size_evidence,
+        "size_strong": size_strong,
+        "purchase_id": purchase_id or None,
+        "purchase": purchase,
+        "parent_account_id": _np_ur_v87_s((parent or {}).get("id")) or None,
+        "parent_link": parent_link,
+        "old_stage": old_stage,
+        "old_size": old_size,
+    }
+
+
+def _np_ur_v87_active_sibling(account, target):
+    """Exact same lineage already has a valid active delivery -> do not issue another."""
+    account = account or {}
+    target = target or {}
+    aid = _np_ur_v87_s(account.get("id"))
+    pid = _np_ur_v87_s(target.get("purchase_id"))
+    tid = _np_ur_v87_s(target.get("target_trader_id"))
+    stage = _np_ur_v87_s(target.get("target_stage"))
+    if not pid or not tid or not stage:
+        return None
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("purchase_id", pid).eq("trader_id", tid)
+            .order("created_at", desc=True).limit(200).execute().data or []
+        )
+    except Exception:
+        rows = []
+    for r in rows:
+        if _np_ur_v87_s(r.get("id")) == aid:
+            continue
+        if _normalize_lifecycle_stage(r.get("stage") or r.get("phase")) != stage:
+            continue
+        st = _np_ur_v87_low(r.get("account_status") or r.get("status"))
+        if st in _NP_UR_V87_ACTIVE and _np_ur_v87_s(r.get("mt5_login")):
+            return r
+    return None
+
+
+def _np_ur_v87_marker(reason_code, account, target, action, replacement=None, note=""):
+    account = account or {}
+    target = target or {}
+    replacement = replacement or {}
+    parts = [
+        f"[NP_UNIVERSAL_RECALL:{NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87}]",
+        f"[NP_RECALL_REASON:{reason_code}]",
+        f"[NP_RECALL_ACTION:{action}]",
+        f"[NP_RECALL_ORIGINAL_ACCOUNT:{_np_ur_v87_s(account.get('id'))}]",
+        f"[NP_RECALL_ORIGINAL_MT5:{_np_ur_v87_s(account.get('mt5_login'))}]",
+        f"[NP_RECALL_TARGET_TRADER:{_np_ur_v87_s(target.get('target_trader_id'))}]",
+        f"[NP_RECALL_TARGET_STAGE:{_np_ur_v87_s(target.get('target_stage'))}]",
+        f"[NP_RECALL_TARGET_SIZE:{_np_ur_v87_num(target.get('target_size'))}]",
+    ]
+    if _np_ur_v87_s(target.get("purchase_id")):
+        parts.append(f"[NP_RECALL_PURCHASE:{_np_ur_v87_s(target.get('purchase_id'))}]")
+    if replacement:
+        parts.extend([
+            f"[NP_RECALL_REPLACEMENT_ACCOUNT:{_np_ur_v87_s(replacement.get('id'))}]",
+            f"[NP_RECALL_REPLACEMENT_MT5:{_np_ur_v87_s(replacement.get('mt5_login'))}]",
+        ])
+    if note:
+        parts.append("NOTE=" + _np_ur_v87_s(note)[:500])
+    return " ".join(parts)
+
+
+def _np_ur_v87_update_compat(table, payload, column, value, optional_keys=()):
+    """Retry only for genuinely absent optional columns; never swallow other DB errors."""
+    data = dict(payload or {})
+    optional = set(optional_keys or ())
+    last = None
+    for _ in range(max(3, len(optional) + 2)):
+        try:
+            return supabase.table(table).update(data).eq(column, value).execute().data or []
+        except Exception as exc:
+            last = exc
+            msg = str(exc)
+            m = re.search(r"Could not find the ['\"]([^'\"]+)['\"] column", msg, re.I)
+            if not m:
+                raise
+            missing = _np_ur_v87_s(m.group(1))
+            if missing not in optional or missing not in data:
+                raise
+            data.pop(missing, None)
+    raise RuntimeError(str(last or "compat update failed"))
+
+
+def _np_ur_v87_insert_account(payload):
+    optional = {
+        "phase", "assigned_at", "challenge_purchase_id", "challenge_journey",
+        "journey_source", "source", "admin_note", "previous_trader_account_id",
+        "previous_mt5_login", "replaces_trader_account_id", "phase_label",
+        "payout_split", "lifecycle_state", "target_percent", "dd_limit_percent",
+    }
+    data = dict(payload or {})
+    last = None
+    for _ in range(len(optional) + 3):
+        try:
+            rows = supabase.table("trader_accounts").insert(data).execute().data or []
+            if not rows:
+                raise RuntimeError("replacement trader account insert returned no row")
+            return rows[0]
+        except Exception as exc:
+            last = exc
+            msg = str(exc)
+            m = re.search(r"Could not find the ['\"]([^'\"]+)['\"] column", msg, re.I)
+            if not m:
+                raise
+            missing = _np_ur_v87_s(m.group(1))
+            if missing not in optional or missing not in data:
+                raise
+            data.pop(missing, None)
+    raise RuntimeError(str(last or "replacement insert failed"))
+
+
+def _np_ur_v87_retire_exact(account, reason_code, target, action, replacement=None, note=""):
+    account = account or {}
+    aid = _np_ur_v87_s(account.get("id"))
+    if not aid:
+        raise RuntimeError("exact account id missing")
+    now = now_iso()
+    marker = _np_ur_v87_marker(reason_code, account, target, action, replacement, note)
+    old_reason = _np_ur_v87_s(account.get("archive_reason"))
+    old_note = _np_ur_v87_s(account.get("admin_note"))
+    combined_reason = (old_reason + " | " + marker).strip(" |") if old_reason else marker
+    combined_note = (old_note + " | " + marker).strip(" |") if old_note else marker
+    status = "recalled_operational_replaced" if replacement else "recalled_operational_hold"
+    payload = {
+        "account_status": status,
+        "monitoring_enabled": False,
+        "archive_reason": combined_reason,
+        "admin_note": combined_note,
+        "archived_at": now,
+        "updated_at": now,
+        "mt5_access_disabled": True,
+    }
+    _np_ur_v87_update_compat(
+        "trader_accounts", payload, "id", aid,
+        optional_keys={"mt5_access_disabled", "admin_note", "archived_at"},
+    )
+
+    pool = _np_ur_v87_pool_for_account(account)
+    if pool and _np_ur_v87_s(pool.get("id")):
+        pp = {
+            "status": "recalled_invalid_hold",
+            "archive_reason": combined_reason,
+            "admin_note": combined_note,
+            "archived_at": now,
+            "updated_at": now,
+        }
+        _np_ur_v87_update_compat(
+            "mt5_pool", pp, "id", pool.get("id"),
+            optional_keys={"archive_reason", "admin_note", "archived_at"},
+        )
+    return marker
+
+
+def _np_ur_v87_create_replacement(account, target, pool, reason_code, note=""):
+    account = account or {}
+    target = target or {}
+    pool = pool or {}
+    now = now_iso()
+    stage = _normalize_lifecycle_stage(target.get("target_stage"))
+    size = clean(target.get("target_size") or 0)
+    purchase = target.get("purchase") or {}
+    target_trader = target.get("target_trader") or {}
+    marker = _np_ur_v87_marker(reason_code, account, target, "replace_delivery", None, note)
+
+    # Preserve the exact journey snapshot. Only the mistaken delivery is replaced.
+    challenge_journey = account.get("challenge_journey") or account.get("journey_stages") or purchase.get("challenge_journey")
+    journey_source = account.get("journey_source") or purchase.get("journey_source") or "operational_recall_preserved"
+    try:
+        target_percent = _effective_target_percent(stage, account, purchase, _safe_plan_for_purchase(purchase) if purchase else None)
+    except Exception:
+        target_percent = account.get("target_percent") or (0 if stage == "funded" else (8 if stage == "phase2" else 10))
+
+    row = {
+        "trader_id": target.get("target_trader_id"),
+        "purchase_id": target.get("purchase_id"),
+        "mt5_pool_id": pool.get("id"),
+        "stage": stage,
+        "phase": stage,
+        "challenge_journey": challenge_journey,
+        "journey_source": journey_source,
+        "account_status": "assigned_active",
+        "mt5_login": pool.get("mt5_login"),
+        "mt5_server": pool.get("mt5_server"),
+        "mt5_master_password": pool.get("mt5_master_password") or pool.get("master_password"),
+        "mt5_investor_password": pool.get("mt5_investor_password") or pool.get("investor_password"),
+        "account_size": size,
+        "start_balance": size,
+        "current_balance": size,
+        "current_equity": size,
+        "profit": 0,
+        "profit_percent": 0,
+        "absolute_drawdown_percent": 0,
+        "dd_limit_percent": account.get("dd_limit_percent") or account.get("max_drawdown") or 20,
+        "dd_used_percent": 0,
+        "target_percent": target_percent,
+        "monitoring_enabled": True,
+        "started_at": now,
+        "assigned_at": now,
+        "created_at": now,
+        "updated_at": now,
+        "source": "universal_operational_recall_replacement",
+        "admin_note": marker,
+        "previous_trader_account_id": account.get("previous_trader_account_id") or account.get("replaces_trader_account_id") or account.get("id"),
+        "previous_mt5_login": account.get("previous_mt5_login") or account.get("mt5_login"),
+        "replaces_trader_account_id": account.get("id"),
+        "phase_label": account.get("phase_label"),
+        "payout_split": account.get("payout_split"),
+        "lifecycle_state": _active_state_for_stage(stage),
+    }
+    if account.get("challenge_purchase_id"):
+        row["challenge_purchase_id"] = account.get("challenge_purchase_id")
+
+    new_account = _np_ur_v87_insert_account(row)
+
+    # Reserve the new pool row for this exact replacement.
+    pool_payload = {
+        "status": "assigned",
+        "assigned_trader_id": target.get("target_trader_id"),
+        "assigned_trader_name": target_trader.get("name") or target_trader.get("full_name") or target_trader.get("email"),
+        "assigned_email": target_trader.get("email"),
+        "trader_account_id": new_account.get("id"),
+        "assigned_at": now,
+        "updated_at": now,
+        "admin_note": marker,
+    }
+    _np_ur_v87_update_compat(
+        "mt5_pool", pool_payload, "id", pool.get("id"),
+        optional_keys={"assigned_at", "admin_note", "assigned_trader_name", "assigned_email"},
+    )
+    return new_account
+
+
+def _np_ur_v87_update_pointers(account, target, replacement):
+    """Only swap pointers that refer to the exact bad delivery. No entitlement fields are touched."""
+    account = account or {}
+    target = target or {}
+    replacement = replacement or {}
+    old_id = _np_ur_v87_s(account.get("id"))
+    old_login = _np_ur_v87_s(account.get("mt5_login"))
+    new_id = _np_ur_v87_s(replacement.get("id"))
+    new_login = _np_ur_v87_s(replacement.get("mt5_login"))
+    target_tid = _np_ur_v87_s(target.get("target_trader_id"))
+    old_tid = _np_ur_v87_s(account.get("trader_id"))
+    pid = _np_ur_v87_s(target.get("purchase_id"))
+
+    # Purchase: credentials/pointer only; no payment, reset, pass, payout or life flags.
+    if pid:
+        p = _np_ur_v87_purchase(pid) or {}
+        cur_id = _np_ur_v87_s(p.get("trader_account_id"))
+        cur_login = _np_ur_v87_s(p.get("mt5_login"))
+        if cur_id == old_id or (old_login and cur_login == old_login) or not cur_id:
+            upd = {
+                "trader_account_id": new_id,
+                "mt5_login": new_login,
+                "mt5_server": replacement.get("mt5_server"),
+                "mt5_master_password": replacement.get("mt5_master_password"),
+                "mt5_password": replacement.get("mt5_master_password"),
+                "master_password": replacement.get("mt5_master_password"),
+                "mt5_investor_password": replacement.get("mt5_investor_password"),
+                "investor_password": replacement.get("mt5_investor_password"),
+                "assigned_mt5_id": replacement.get("mt5_pool_id"),
+                "assigned_at": replacement.get("assigned_at") or replacement.get("created_at") or now_iso(),
+                "updated_at": now_iso(),
+            }
+            _np_ur_v87_update_compat(
+                "challenge_purchases", upd, "id", pid,
+                optional_keys={
+                    "mt5_master_password", "mt5_password", "master_password",
+                    "mt5_investor_password", "investor_password", "assigned_mt5_id",
+                    "assigned_at", "mt5_server",
+                },
+            )
+
+    # Same-owner replacement: swap the compatibility pointer only when it pointed at old.
+    old_trader = _np_ur_v87_trader(old_tid) or {}
+    old_cur_id = _np_ur_v87_s(old_trader.get("current_account_id") or old_trader.get("trader_account_id"))
+    old_cur_login = _np_ur_v87_s(old_trader.get("mt5_login"))
+    if old_tid == target_tid and (old_cur_id == old_id or (old_login and old_cur_login == old_login)):
+        _np_update_trader_current_pointer_v59(target_tid, replacement, target.get("target_stage"))
+    elif old_tid != target_tid and (old_cur_id == old_id or (old_login and old_cur_login == old_login)):
+        # Wrong-owner correction: remove only this mistaken compatibility pointer.
+        # If another genuine active account exists, promote it; otherwise clear only MT5 pointer fields.
+        try:
+            remaining = (
+                supabase.table("trader_accounts").select("*")
+                .eq("trader_id", old_tid).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
+                .order("updated_at", desc=True).limit(20).execute().data or []
+            )
+        except Exception:
+            remaining = []
+        remaining = [r for r in remaining if _np_ur_v87_s(r.get("id")) != old_id]
+        if remaining:
+            r = remaining[0]
+            _np_update_trader_current_pointer_v59(old_tid, r, _normalize_lifecycle_stage(r.get("stage") or r.get("phase")))
+        else:
+            clear = {
+                "current_account_id": None,
+                "trader_account_id": None,
+                "mt5_login": None,
+                "mt5_server": None,
+                "mt5_master_password": None,
+                "mt5_password": None,
+                "master_password": None,
+                "mt5_investor_password": None,
+                "investor_password": None,
+                "monitoring_enabled": False,
+                "updated_at": now_iso(),
+            }
+            _np_ur_v87_update_compat(
+                "traders", clear, "id", old_tid,
+                optional_keys=set(clear.keys()) - {"current_account_id", "updated_at"},
+            )
+
+
+def _np_ur_v87_send_replacement_email(target, replacement, old_account, reason_code):
+    trader = target.get("target_trader") or {}
+    email = _np_ur_v87_s(trader.get("email"))
+    if not email:
+        return False
+    stage = _normalize_lifecycle_stage(target.get("target_stage"))
+    size = _np_ur_v87_num(target.get("target_size"))
+    try:
+        subject = f"NairaPips — Replacement {stage.upper()} MT5 credentials"
+        intro = (
+            f"Hello {trader.get('name') or trader.get('full_name') or 'Trader'}, "
+            f"we corrected an operational MT5 assignment issue without changing your trading journey."
+        )
+        details = (
+            f"Previous MT5: {_np_ur_v87_s((old_account or {}).get('mt5_login'))}\n"
+            f"Replacement MT5: {_np_ur_v87_s((replacement or {}).get('mt5_login'))}\n"
+            f"MT5 Server: {_np_ur_v87_s((replacement or {}).get('mt5_server'))}\n"
+            f"Master Password: {_np_ur_v87_s((replacement or {}).get('mt5_master_password'))}\n"
+            f"Investor Password: {_np_ur_v87_s((replacement or {}).get('mt5_investor_password'))}\n"
+            f"Account Size: {size:,.0f}\n"
+            f"Stage: {stage.upper()}\n\n"
+            "Your original NairaPips journey, payout/reset/pass history and entitlement usage remain unchanged.\n\n"
+            "Dashboard: https://nairapips.com/dashboard/trader_clean.html"
+        )
+        return bool(send_assignment_email_with_owner_copy(trader, subject, intro, details))
+    except Exception as exc:
+        print("V87 UNIVERSAL RECALL EMAIL ERROR:", exc, flush=True)
+        return False
+
+
+def _np_ur_v87_preview(account, reason_code):
+    reason_code = _np_ur_v87_low(reason_code or "invalid_login")
+    if reason_code not in _NP_UR_V87_REASON_LABELS:
+        return {"ok": False, "reason": "invalid_recall_reason"}
+    account = account or {}
+    use = _np_ur_v87_use_check(account)
+    target = _np_ur_v87_target(account, reason_code)
+    old_trader = _np_ur_v87_trader(account.get("trader_id")) or {}
+    result = {
+        "ok": bool(use.get("safe")) and bool(target.get("ok")),
+        "release": NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87,
+        "reason_code": reason_code,
+        "reason_label": _NP_UR_V87_REASON_LABELS.get(reason_code),
+        "trader_account_id": _np_ur_v87_s(account.get("id")),
+        "mt5_login": _np_ur_v87_s(account.get("mt5_login")),
+        "current_trader_id": _np_ur_v87_s(account.get("trader_id")),
+        "current_trader_name": _np_ur_v87_s(old_trader.get("name") or old_trader.get("full_name") or old_trader.get("email")),
+        "current_stage": _normalize_lifecycle_stage(account.get("stage") or account.get("phase")),
+        "current_size": _np_ur_v87_num(account.get("account_size") or account.get("start_balance")),
+        "account_status": _np_ur_v87_s(account.get("account_status") or account.get("status")),
+        "use_check": use,
+        "journey_policy": "DELIVERY_CORRECTION_ONLY__NO_EVENT_REPLAY",
+    }
+    if not use.get("safe"):
+        result["reason"] = use.get("reason")
+        return result
+    if not target.get("ok"):
+        result.update({"reason": target.get("reason"), "target_diagnostic": target})
+        return result
+
+    sibling = _np_ur_v87_active_sibling(account, target)
+    action = "REPLACE_EXACT_DELIVERY"
+    if sibling:
+        if reason_code == "duplicate_assignment":
+            action = "RECALL_DUPLICATE_ONLY_ALREADY_FULFILLED"
+        else:
+            result.update({
+                "ok": False,
+                "reason": "same_lineage_already_has_active_delivery",
+                "existing_active_account_id": sibling.get("id"),
+                "existing_active_mt5": sibling.get("mt5_login"),
+            })
+            return result
+    elif reason_code == "duplicate_assignment":
+        result.update({"ok": False, "reason": "duplicate_reason_selected_but_no_same_lineage_active_delivery_found"})
+        return result
+
+    fresh = None
+    if action == "REPLACE_EXACT_DELIVERY":
+        try:
+            fresh = _np_pick_fresh_mt5(target.get("target_size"), target.get("target_stage"))
+        except Exception as exc:
+            result.update({"ok": False, "reason": "fresh_mt5_lookup_failed:" + str(exc)})
+            return result
+        if not fresh:
+            result.update({
+                "ok": False,
+                "reason": "no_fresh_matching_mt5_available",
+                "target_trader_id": target.get("target_trader_id"),
+                "target_stage": target.get("target_stage"),
+                "target_size": target.get("target_size"),
+                "inventory_wait_only": True,
+            })
+            return result
+
+    result.update({
+        "ok": True,
+        "action": action,
+        "target_trader_id": target.get("target_trader_id"),
+        "target_trader_name": _np_ur_v87_s((target.get("target_trader") or {}).get("name") or (target.get("target_trader") or {}).get("full_name") or (target.get("target_trader") or {}).get("email")),
+        "target_stage": target.get("target_stage"),
+        "target_size": target.get("target_size"),
+        "owner_evidence": target.get("owner_evidence"),
+        "stage_evidence": target.get("stage_evidence"),
+        "size_evidence": target.get("size_evidence"),
+        "purchase_id": target.get("purchase_id"),
+        "fresh_mt5_ready": bool(fresh),
+        "fresh_mt5_login": _np_ur_v87_s((fresh or {}).get("mt5_login")) or None,
+        "existing_active_account_id": (sibling or {}).get("id") if sibling else None,
+        "existing_active_mt5": (sibling or {}).get("mt5_login") if sibling else None,
+        "preserves": [
+            "journey progression", "pass history", "payout history", "reset usage",
+            "second-life usage", "source event", "unrelated accounts",
+        ],
+    })
+    return result
+
+
+@app.route("/admin/universal_recall_v87/health", methods=["GET", "OPTIONS"])
+def admin_universal_recall_v87_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True, "release": NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87,
+        "scope": "ONE_EXACT_MT5_DELIVERY",
+        "works_at_any_stage": True,
+        "no_pass_replay": True,
+        "no_payout_replay": True,
+        "no_reset_replay": True,
+        "no_second_life_replay": True,
+        "old_mt5_never_returned_to_pool": True,
+        "reasons": _NP_UR_V87_REASON_LABELS,
+    })
+
+
+@app.route("/admin/universal_recall_v87/preview", methods=["GET", "OPTIONS"])
+def admin_universal_recall_v87_preview():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    account_id = _np_ur_v87_s(request.args.get("trader_account_id") or request.args.get("account_id"))
+    login = _np_ur_v87_s(request.args.get("mt5_login"))
+    expected_tid = _np_ur_v87_s(request.args.get("expected_trader_id") or request.args.get("trader_id"))
+    reason_code = _np_ur_v87_low(request.args.get("reason_code") or "invalid_login")
+    try:
+        if account_id:
+            account = _np_ur_v87_account_by_id(account_id)
+            if account and expected_tid and _np_ur_v87_s(account.get("trader_id")) != expected_tid:
+                return _np_fail("Exact account does not belong to the opened trader.", 409)
+        elif login:
+            rows = _np_ur_v87_accounts_by_login(login, expected_tid or None)
+            if not rows:
+                return _np_fail("Exact MT5 login was not found for this trader.", 404)
+            # Single-use is production law. Ambiguity must be surfaced, not guessed.
+            unique_ids = {_np_ur_v87_s(r.get("id")) for r in rows if _np_ur_v87_s(r.get("id"))}
+            if len(unique_ids) > 1:
+                active = [r for r in rows if _np_ur_v87_low(r.get("account_status") or r.get("status")) in _NP_UR_V87_ACTIVE]
+                if len(active) == 1:
+                    account = active[0]
+                else:
+                    return _np_fail(
+                        "This MT5 login has multiple trader-account records. Use the exact trader_account_id; V87 will not guess.",
+                        409,
+                    )
+            else:
+                account = rows[0]
+        else:
+            return _np_fail("Enter an exact MT5 login or trader_account_id.", 400)
+
+        if not account:
+            return _np_fail("Exact trader account not found.", 404)
+        preview = _np_ur_v87_preview(account, reason_code)
+        if not preview.get("ok"):
+            body = dict(preview)
+            body["success"] = False
+            body["error"] = str(preview.get("reason") or "Universal Recall preview blocked")
+            return _np_ok(body, 409)
+        return _np_ok(preview, 200)
+    except Exception as exc:
+        print("V87 UNIVERSAL RECALL PREVIEW ERROR:", exc, flush=True)
+        return _np_fail("Universal Recall preview failed: " + str(exc), 500)
+
+
+@app.route("/admin/universal_recall_v87/execute", methods=["POST", "OPTIONS"])
+def admin_universal_recall_v87_execute():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    d = request.get_json(silent=True) or {}
+    account_id = _np_ur_v87_s(d.get("trader_account_id") or d.get("account_id"))
+    login = _np_ur_v87_s(d.get("mt5_login"))
+    expected_tid = _np_ur_v87_s(d.get("expected_trader_id") or d.get("trader_id"))
+    reason_code = _np_ur_v87_low(d.get("reason_code") or "invalid_login")
+    note = _np_ur_v87_s(d.get("admin_note") or d.get("note"))
+
+    if reason_code not in _NP_UR_V87_REASON_LABELS:
+        return _np_fail("Choose a valid Recall reason.", 400)
+
+    try:
+        if account_id:
+            account = _np_ur_v87_account_by_id(account_id)
+        else:
+            rows = _np_ur_v87_accounts_by_login(login, expected_tid or None)
+            if len({_np_ur_v87_s(r.get('id')) for r in rows if _np_ur_v87_s(r.get('id'))}) != 1:
+                return _np_fail("Exact MT5 could not be resolved to one trader_account_id.", 409)
+            account = rows[0] if rows else None
+        if not account:
+            return _np_fail("Exact trader account not found.", 404)
+        if expected_tid and _np_ur_v87_s(account.get("trader_id")) != expected_tid:
+            return _np_fail("Recall stopped: exact account owner changed or does not match the opened trader.", 409)
+
+        # Idempotency: a completed V87 replacement can never issue a second MT5.
+        status_blob = _np_ur_v87_status_blob(account)
+        if "np_universal_recall:" in status_blob and "np_recall_replacement_mt5:" in status_blob:
+            return _np_ok({
+                "success": True,
+                "release": NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87,
+                "status": "ALREADY_REPLACED",
+                "trader_account_id": account.get("id"),
+                "old_mt5": account.get("mt5_login"),
+                "message": "This exact delivery has already been corrected. No second MT5 was issued.",
+            })
+
+        preview = _np_ur_v87_preview(account, reason_code)
+        if not preview.get("ok"):
+            body = dict(preview)
+            body["success"] = False
+            body["error"] = str(preview.get("reason") or "Universal Recall blocked")
+            return _np_ok(body, 409)
+
+        target = _np_ur_v87_target(account, reason_code)
+        if not target.get("ok"):
+            return _np_fail("Recall authority changed before execution: " + str(target.get("reason")), 409)
+
+        sibling = _np_ur_v87_active_sibling(account, target)
+        if preview.get("action") == "RECALL_DUPLICATE_ONLY_ALREADY_FULFILLED":
+            if not sibling:
+                return _np_fail("Duplicate fulfillment changed before execution; no action taken.", 409)
+            marker = _np_ur_v87_retire_exact(
+                account, reason_code, target, "duplicate_recall_only", sibling, note
+            )
+            _audit_safe(
+                "universal_recall", "duplicate_delivery_recalled",
+                f"old_mt5={account.get('mt5_login')}; existing_mt5={sibling.get('mt5_login')}; purchase={target.get('purchase_id')}; reason={reason_code}",
+                admin_user or {"name":"admin","username":"admin","role":"admin"},
+                _np_ur_v87_s(account.get("id")),
+            )
+            try:
+                np_invalidate_admin_bootstrap("all")
+                _invalidate_trader_bootstrap_cache(account.get("trader_id"))
+            except Exception:
+                pass
+            return _np_ok({
+                "success": True,
+                "release": NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87,
+                "status": "DUPLICATE_RECALLED_NO_NEW_MT5",
+                "old_mt5": account.get("mt5_login"),
+                "existing_valid_mt5": sibling.get("mt5_login"),
+                "journey_unchanged": True,
+                "marker": marker,
+            })
+
+        # Re-check the fresh account at execution time. No inventory = NO mutation.
+        fresh = _np_pick_fresh_mt5(target.get("target_size"), target.get("target_stage"))
+        if not fresh:
+            return _np_ok({
+                "success": False,
+                "release": NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87,
+                "reason": "no_fresh_matching_mt5_available",
+                "message": "No account was changed. Add a fresh matching MT5 and try Recall again.",
+                "target_stage": target.get("target_stage"),
+                "target_size": target.get("target_size"),
+            }, 409)
+
+        # Re-validate the exact bad delivery immediately before mutation.
+        use = _np_ur_v87_use_check(account)
+        if not use.get("safe"):
+            return _np_ok({
+                "success": False,
+                "reason": use.get("reason"),
+                "message": "Recall stopped because the exact account is no longer unused.",
+            }, 409)
+
+        # Quarantine first; if the replacement insert unexpectedly fails, the old
+        # invalid MT5 stays safely quarantined and this same V87 action can be retried.
+        hold_marker = _np_ur_v87_retire_exact(
+            account, reason_code, target, "replacement_in_progress", None, note
+        )
+
+        try:
+            replacement = _np_ur_v87_create_replacement(account, target, fresh, reason_code, note)
+            _np_ur_v87_update_pointers(account, target, replacement)
+            final_marker = _np_ur_v87_retire_exact(
+                account, reason_code, target, "replacement_completed", replacement, note
+            )
+        except Exception as exc:
+            _audit_safe(
+                "universal_recall", "replacement_failed_after_quarantine",
+                f"old_mt5={account.get('mt5_login')}; reason={reason_code}; error={exc}; marker={hold_marker}",
+                admin_user or {"name":"admin","username":"admin","role":"admin"},
+                _np_ur_v87_s(account.get("id")),
+            )
+            raise
+
+        email_sent = _np_ur_v87_send_replacement_email(target, replacement, account, reason_code)
+        _audit_safe(
+            "universal_recall", "exact_delivery_replaced",
+            (
+                f"old_mt5={account.get('mt5_login')} -> new_mt5={replacement.get('mt5_login')}; "
+                f"old_owner={account.get('trader_id')}; target_owner={target.get('target_trader_id')}; "
+                f"stage={target.get('target_stage')}; size={target.get('target_size')}; "
+                f"purchase={target.get('purchase_id')}; reason={reason_code}; journey_event_replayed=false"
+            ),
+            admin_user or {"name":"admin","username":"admin","role":"admin"},
+            _np_ur_v87_s(account.get("id")),
+        )
+        try:
+            np_invalidate_admin_bootstrap("all")
+            _invalidate_trader_bootstrap_cache(account.get("trader_id"))
+            if target.get("target_trader_id") != account.get("trader_id"):
+                _invalidate_trader_bootstrap_cache(target.get("target_trader_id"))
+        except Exception:
+            pass
+
+        return _np_ok({
+            "success": True,
+            "release": NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87,
+            "status": "REPLACED",
+            "old_account_id": account.get("id"),
+            "old_mt5": account.get("mt5_login"),
+            "replacement_account_id": replacement.get("id"),
+            "replacement_mt5": replacement.get("mt5_login"),
+            "target_trader_id": target.get("target_trader_id"),
+            "target_stage": target.get("target_stage"),
+            "target_size": target.get("target_size"),
+            "purchase_id": target.get("purchase_id"),
+            "journey_unchanged": True,
+            "pass_replayed": False,
+            "payout_replayed": False,
+            "reset_replayed": False,
+            "second_life_replayed": False,
+            "email_sent": email_sent,
+            "marker": final_marker,
+        })
+    except Exception as exc:
+        print("V87 UNIVERSAL RECALL EXECUTE ERROR:", exc, flush=True)
+        return _np_fail("Universal Recall failed safely: " + str(exc), 500)
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87
