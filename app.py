@@ -46490,3 +46490,282 @@ def admin_recall_handoff_v82_status():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_ADMIN_RECALL_ROUTE_RELEASE_V82
+
+
+# ============================================================================
+# NAIRAPIPS V83 — IDENTITY-GROUP RECALL HAND-OFF
+# 22 SEP 2026
+#
+# INCIDENT
+# --------
+# Journey History V5 deliberately merges exact normalized duplicate trader rows
+# for the SAME customer (same verified email/phone identity graph). V82 searched
+# recalled trader_accounts and payout evidence only under the one Admin-selected
+# trader_id, so an exact recalled child owned by another linked identity row could
+# be visible in Journey History but invisible to the V82 recall overlay.
+#
+# V83 LAW
+# -------
+# * Use ONLY bundle.identity_trader_ids already proven by Journey History.
+# * Same exact journey/purchase id is still mandatory.
+# * Same exact recalled account + NP_RECALL_ENTITLEMENT marker is mandatory.
+# * Payout renewal still requires the exact PAID payout id and exact source account.
+# * No matching by name, account size, MT5 size, or stage guess.
+# * No new entitlement is created; this only exposes the same entitlement restored
+#   by Recall across linked historical trader-profile rows.
+# ============================================================================
+
+NAIRAPIPS_ADMIN_RECALL_ROUTE_RELEASE_V83 = "V83_IDENTITY_GROUP_RECALL_HANDOFF_2026_09_22"
+
+
+def _np_v83_identity_ids(bundle, selected_trader_id):
+    ids=[]
+    seen=set()
+    for raw in [selected_trader_id] + list((bundle or {}).get("identity_trader_ids") or []):
+        value=str(raw or "").strip()
+        if value and value not in seen:
+            seen.add(value); ids.append(value)
+    return ids
+
+
+def _np_v83_load_identity_accounts(identity_ids):
+    ids=[str(x or "").strip() for x in (identity_ids or []) if str(x or "").strip()]
+    if not ids:
+        return []
+    try:
+        if len(ids)==1:
+            return supabase.table("trader_accounts").select("*").eq("trader_id",ids[0]).limit(1000).execute().data or []
+        return supabase.table("trader_accounts").select("*").in_("trader_id",ids).limit(2000).execute().data or []
+    except Exception as exc:
+        print("V83 IDENTITY ACCOUNT BATCH LOAD FALLBACK:",exc,flush=True)
+        rows=[]; seen=set()
+        for tid in ids:
+            try:
+                part=supabase.table("trader_accounts").select("*").eq("trader_id",tid).limit(750).execute().data or []
+                for row in part:
+                    rid=str(row.get("id") or "").strip()
+                    if rid and rid not in seen:
+                        seen.add(rid); rows.append(row)
+            except Exception as subexc:
+                print("V83 IDENTITY ACCOUNT LOAD SKIPPED:",tid,subexc,flush=True)
+        return rows
+
+
+def _np_v83_overlay_recalled_entitlements(bundle, selected_trader_id):
+    bundle=bundle or {}
+    journeys=list(bundle.get("journeys") or [])
+    if not journeys:
+        return bundle
+
+    journey_map={
+        str(j.get("journey_id") or "").strip():j
+        for j in journeys if str(j.get("journey_id") or "").strip()
+    }
+    if not journey_map:
+        return bundle
+
+    identity_ids=_np_v83_identity_ids(bundle,selected_trader_id)
+    identity_set=set(identity_ids)
+    all_accounts=_np_v83_load_identity_accounts(identity_ids)
+
+    accounts_by_id={
+        str(a.get("id") or "").strip():a
+        for a in all_accounts if str(a.get("id") or "").strip()
+    }
+
+    recalled_rows=[]
+    for row in all_accounts:
+        jid=str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip()
+        if jid not in journey_map:
+            continue
+        if str(row.get("trader_id") or "").strip() not in identity_set:
+            continue
+        if not _np_is_recalled_wrong_assignment(row):
+            continue
+        if not _np_v79_recall_marker(row,"NP_RECALL_ENTITLEMENT"):
+            continue
+        recalled_rows.append(row)
+
+    recalled_rows.sort(key=_np_v81_row_time)
+    latest_by_journey={}
+    for row in recalled_rows:
+        jid=str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip()
+        latest_by_journey[jid]=row
+
+    for jid,recalled in latest_by_journey.items():
+        journey=journey_map.get(jid)
+        if not journey:
+            continue
+
+        exact_key=_np_v79_recall_marker(recalled,"NP_RECALL_ENTITLEMENT")
+        ent_type=_np_v79_recall_marker(recalled,"NP_RECALL_TYPE")
+        evidence_id=_np_v79_recall_marker(recalled,"NP_RECALL_EVIDENCE")
+        source_id=_np_v79_recall_marker(recalled,"NP_RECALL_SOURCE")
+        target_stage=_np_v81_exact_recall_target(recalled)
+
+        if not exact_key or not ent_type or target_stage not in ACCOUNT_STAGES:
+            continue
+        if journey.get("blocked") and list(journey.get("problems") or []):
+            continue
+        if _np_v81_recall_has_forbidden_use(recalled):
+            continue
+        if _np_v81_recall_already_replaced(journey,recalled):
+            continue
+
+        # Exact payout evidence, but owner may be ANY identity row already proven
+        # by the same normalized identity graph.
+        if ent_type=="payout_renewal":
+            if not evidence_id:
+                continue
+            try:
+                prows=supabase.table("payouts").select("*").eq("id",evidence_id).limit(1).execute().data or []
+            except Exception as exc:
+                print("V83 PAYOUT EVIDENCE LOAD SKIPPED:",exc,flush=True)
+                continue
+            if not prows:
+                continue
+            payout=prows[0]
+            if payout_status(payout)!="paid":
+                continue
+            payout_owner=str(payout.get("trader_id") or "").strip()
+            if payout_owner and payout_owner not in identity_set:
+                continue
+            payout_source=str(payout.get("trader_account_id") or payout.get("account_id") or "").strip()
+            if source_id and payout_source!=source_id:
+                continue
+
+        source=accounts_by_id.get(source_id) if source_id else None
+        reason_label={
+            "payout_renewal":"INVALID MT5 RECALLED → SAME PAYOUT RENEWAL RESTORED → FRESH FUNDED MT5 REQUIRED",
+            "phase_pass":"INVALID MT5 RECALLED → SAME PASS ENTITLEMENT RESTORED",
+            "second_life":"INVALID MT5 RECALLED → SAME SECOND-LIFE ENTITLEMENT RESTORED",
+            "second_life_activation":"INVALID MT5 RECALLED → SAME SECOND-LIFE ENTITLEMENT RESTORED",
+            "initial_purchase":"INVALID MT5 RECALLED → SAME PURCHASE ENTITLEMENT RESTORED",
+        }.get(ent_type,"INVALID MT5 RECALLED → SAME EXACT ENTITLEMENT RESTORED")
+        source_event={
+            "payout_renewal":"payout_paid",
+            "phase_pass":"pass",
+            "second_life":"breach",
+            "second_life_activation":"breach",
+            "initial_purchase":"purchase_approved",
+        }.get(ent_type,"recalled_assignment")
+
+        ent={
+            "entitlement_key":exact_key,
+            "entitlement_type":ent_type,
+            "source_event_type":source_event,
+            "source_account_id":source_id or None,
+            "source_mt5":str((source or {}).get("mt5_login") or "") or None,
+            "evidence_id":evidence_id or None,
+            "target_stage":target_stage,
+            "status":"AVAILABLE",
+            "reason":reason_label,
+            "restored_from_recall":True,
+            "recalled_account_id":str(recalled.get("id") or ""),
+            "recalled_mt5":str(recalled.get("mt5_login") or ""),
+        }
+        journey["outstanding_entitlement"]=ent
+        journey["state"]="WAITING_MT5"
+        journey["closed"]=False
+        journey["next_action"]="ASSIGN_MT5"
+        journey["blocked"]=False
+        journey["ok"]=True
+        journey["accountability_status"]="RECONCILED"
+        journey["recall_restored_entitlement"]=True
+        journey["recall_recalled_account_id"]=str(recalled.get("id") or "")
+        journey["recall_recalled_mt5"]=str(recalled.get("mt5_login") or "")
+
+        ledger=list(journey.get("ledger") or [])
+        if not any(
+            str((ev or {}).get("type") or "").upper()=="ENTITLEMENT_RESTORED"
+            and str((ev or {}).get("entitlement_key") or "")==exact_key
+            for ev in ledger
+        ):
+            ledger.append({
+                "type":"ENTITLEMENT_RESTORED",
+                "at":recalled.get("archived_at") or recalled.get("updated_at") or now_iso(),
+                "journey_id":jid,"purchase_id":jid,
+                "account_id":recalled.get("id"),"mt5_login":recalled.get("mt5_login"),
+                "source_account_id":source_id or None,"stage":target_stage,
+                "entitlement_key":exact_key,"detail":reason_label,
+                "authority":{
+                    "entitlement_key":exact_key,"entitlement_type":ent_type,
+                    "source_account_id":source_id or None,
+                    "source_mt5":str((source or {}).get("mt5_login") or "") or None,
+                    "evidence_id":evidence_id or None,"target_stage":target_stage,
+                },
+            })
+            ledger=[x for x in ledger if x.get("at")]
+            ledger.sort(key=lambda x:_np_ja_score(x.get("at")))
+            journey["ledger"]=ledger
+
+        acct=dict(journey.get("accountability") or {})
+        acct["outstanding_entitlement"]=1
+        acct["balance"]=1
+        acct["status"]="RECONCILED"
+        journey["accountability"]=acct
+
+    bundle["journeys"]=journeys
+    bundle["recall_handoff_release"]=NAIRAPIPS_ADMIN_RECALL_ROUTE_RELEASE_V83
+    bundle["recall_handoff_identity_trader_ids"]=identity_ids
+    return bundle
+
+
+def _np_admin_journey_authority_v83():
+    if request.method=="OPTIONS":
+        return _np_ok({})
+    staff=_require_staff_request()
+    if isinstance(staff,tuple):
+        return staff
+    trader_id=str(request.args.get("trader_id") or "").strip()
+    journey_id=str(request.args.get("journey_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required",400)
+    try:
+        bundle=_np_all_journeys_preserved_v5(trader_id)
+        bundle=_np_v83_overlay_recalled_entitlements(bundle,trader_id)
+        payload={
+            "cutover_date":bundle.get("cutover_date"),
+            "identity_trader_ids":bundle.get("identity_trader_ids") or [],
+            "identity_profiles":bundle.get("identity_profiles") or [],
+            "reconciliation":bundle.get("reconciliation") or [],
+            "history_debug":bundle.get("history_debug") or {},
+            "recall_handoff_release":bundle.get("recall_handoff_release"),
+            "recall_handoff_identity_trader_ids":bundle.get("recall_handoff_identity_trader_ids") or [],
+            "generated_at":now_iso(),
+        }
+        if journey_id:
+            journey=next((j for j in bundle.get("journeys") or [] if str(j.get("journey_id") or "")==journey_id),None)
+            if not journey:
+                return _np_fail("journey not found",404)
+            payload["journey"]=journey
+        else:
+            payload["journeys"]=bundle.get("journeys") or []
+        return _np_ok(payload)
+    except Exception as exc:
+        print("JOURNEY AUTHORITY V83 ERROR:",exc,flush=True)
+        return _np_fail(str(exc),500)
+
+# Rebind production Admin route LAST.
+app.view_functions["admin_journey_authority"]=_np_admin_journey_authority_v83
+
+@app.route("/admin/recall_handoff_v83/status",methods=["GET","OPTIONS"])
+def admin_recall_handoff_v83_status():
+    if request.method=="OPTIONS":
+        return _np_ok({"success":True})
+    admin_user,auth_response=_require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success":True,
+        "release":NAIRAPIPS_ADMIN_RECALL_ROUTE_RELEASE_V83,
+        "identity_group_aware":True,
+        "same_journey_required":True,
+        "exact_recall_marker_required":True,
+        "exact_paid_payout_required":True,
+        "same_source_account_required":True,
+        "name_or_size_guessing":False,
+        "business_rules_changed":False,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE=NAIRAPIPS_ADMIN_RECALL_ROUTE_RELEASE_V83
