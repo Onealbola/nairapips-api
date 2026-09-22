@@ -45927,3 +45927,299 @@ def admin_mt5_freshest_v80_status():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MT5_FRESHEST_RELEASE_V80
+
+
+# ============================================================================
+# NAIRAPIPS V81 — RECALLED ENTITLEMENT PRIORITY / JOURNEY HAND-OFF FIX
+# 22 SEP 2026
+#
+# INCIDENT
+# --------
+# Monitoring V9 correctly quarantines an UNUSED invalid/stale MT5 and stamps the
+# exact entitlement that created it. The base Journey Authority excluded the
+# recalled child from legal accounts, but could then fall back to an older branch
+# (for example an already-consumed Funded Reset) instead of exposing the recalled
+# entitlement as outstanding. That left Recall half-complete: bad MT5 archived,
+# but replacement entitlement invisible.
+#
+# LAW
+# ---
+# A V9 exact Recall marker is immutable restoration evidence:
+#   exact entitlement -> invalid child -> RECALL -> SAME entitlement WAITING again.
+# It outranks historical display fallbacks, but NEVER outranks a real later MT5
+# assignment, trade/payout use, or an unrelated Journey Authority block.
+# ============================================================================
+
+NAIRAPIPS_RECALL_HANDOFF_RELEASE_V81 = "V81_RECALLED_ENTITLEMENT_PRIORITY_2026_09_22"
+_np_ja_journey_authority_v81_core = _np_ja_journey_authority
+
+
+def _np_v81_row_time(row):
+    row = row or {}
+    return _np_ja_score(
+        row.get("archived_at") or row.get("updated_at") or row.get("assigned_at")
+        or row.get("started_at") or row.get("created_at")
+    )
+
+
+def _np_v81_exact_recall_target(row):
+    blob = " ".join(str((row or {}).get(k) or "") for k in (
+        "archive_reason", "admin_note", "status", "account_status"
+    ))
+    m = re.search(r"target_stage\s*=\s*([a-z0-9_]+)", blob, re.I)
+    raw = str(m.group(1) if m else ((row or {}).get("stage") or (row or {}).get("phase") or "")).strip()
+    return _normalize_lifecycle_stage(raw)
+
+
+def _np_v81_exact_recall_rows(trader_id, journey_id):
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", trader_id).limit(500).execute().data or []
+        )
+    except Exception:
+        return []
+    out = []
+    for row in rows:
+        pid = str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip()
+        if pid != str(journey_id or "").strip():
+            continue
+        if not _np_is_recalled_wrong_assignment(row):
+            continue
+        if not _np_v79_recall_marker(row, "NP_RECALL_ENTITLEMENT"):
+            continue
+        out.append(row)
+    out.sort(key=_np_v81_row_time)
+    return out
+
+
+def _np_v81_recall_already_replaced(auth, recalled):
+    """Fail closed if any later MT5 has already been delivered after this Recall."""
+    recalled_id = str((recalled or {}).get("id") or "").strip()
+    recall_time = _np_v81_row_time(recalled)
+    for ev in list((auth or {}).get("ledger") or []):
+        if str((ev or {}).get("type") or "").strip().upper() != "MT5_ASSIGNED":
+            continue
+        aid = str((ev or {}).get("account_id") or "").strip()
+        if aid and aid == recalled_id:
+            continue
+        at = _np_ja_score((ev or {}).get("at"))
+        if recall_time and at and at > recall_time:
+            return True
+    return False
+
+
+def _np_v81_recall_has_forbidden_use(recalled):
+    rid = str((recalled or {}).get("id") or "").strip()
+    tid = str((recalled or {}).get("trader_id") or "").strip()
+    login = str((recalled or {}).get("mt5_login") or "").strip()
+    if not rid or not tid:
+        return True
+    try:
+        trades = (
+            supabase.table("trader_trades").select("id")
+            .eq("trader_account_id", rid).limit(1).execute().data or []
+        )
+        if trades:
+            return True
+    except Exception:
+        return True
+    try:
+        payouts = (
+            supabase.table("payouts").select("id")
+            .eq("trader_id", tid).eq("trader_account_id", rid)
+            .limit(1).execute().data or []
+        )
+        if not payouts and login:
+            payouts = (
+                supabase.table("payouts").select("id")
+                .eq("trader_id", tid).eq("mt5_login", login)
+                .limit(1).execute().data or []
+            )
+        if payouts:
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _np_ja_journey_authority(trader_id, journey_id):
+    out = _np_ja_journey_authority_v81_core(trader_id, journey_id)
+    if not isinstance(out, dict):
+        return out
+
+    recalls = _np_v81_exact_recall_rows(str(trader_id or "").strip(), str(journey_id or "").strip())
+    if not recalls:
+        return out
+
+    recalled = recalls[-1]
+    exact_key = _np_v79_recall_marker(recalled, "NP_RECALL_ENTITLEMENT")
+    ent_type = _np_v79_recall_marker(recalled, "NP_RECALL_TYPE")
+    evidence_id = _np_v79_recall_marker(recalled, "NP_RECALL_EVIDENCE")
+    source_id = _np_v79_recall_marker(recalled, "NP_RECALL_SOURCE")
+    target_stage = _np_v81_exact_recall_target(recalled)
+
+    if not exact_key or not ent_type or target_stage not in ACCOUNT_STAGES:
+        return out
+
+    # Never hide an unrelated integrity conflict merely because a Recall marker exists.
+    problems = list(out.get("problems") or [])
+    if out.get("blocked") and problems:
+        return out
+
+    # Recall is reversible only for an unused child. Monitoring V9 checks this
+    # before mutation; Journey Authority independently verifies it again.
+    if _np_v81_recall_has_forbidden_use(recalled):
+        return out
+
+    # Once a later MT5 has been delivered, this Recall entitlement is consumed again.
+    if _np_v81_recall_already_replaced(out, recalled):
+        return out
+
+    # Strong payout-renewal evidence check. The immutable payout row must still be
+    # PAID and attached to the exact source that the Recall marker names.
+    if ent_type == "payout_renewal":
+        if not evidence_id:
+            return out
+        try:
+            prows = (
+                supabase.table("payouts").select("*")
+                .eq("id", evidence_id).limit(1).execute().data or []
+            )
+        except Exception:
+            return out
+        if not prows:
+            return out
+        p = prows[0]
+        if payout_status(p) != "paid":
+            return out
+        if str(p.get("trader_id") or "").strip() != str(trader_id or "").strip():
+            return out
+        payout_source = str(p.get("trader_account_id") or p.get("account_id") or "").strip()
+        if source_id and payout_source != source_id:
+            return out
+
+    source = None
+    if source_id:
+        try:
+            srows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("id", source_id).eq("trader_id", trader_id)
+                .limit(1).execute().data or []
+            )
+            source = srows[0] if srows else None
+        except Exception:
+            source = None
+
+    existing = dict(out.get("outstanding_entitlement") or {})
+    if str(existing.get("entitlement_key") or "").strip() == exact_key:
+        existing["restored_from_recall"] = True
+        existing["recalled_account_id"] = str(recalled.get("id") or "")
+        existing["recalled_mt5"] = str(recalled.get("mt5_login") or "")
+        out["outstanding_entitlement"] = existing
+        out["recall_restored_entitlement"] = True
+        out["recall_recalled_account_id"] = str(recalled.get("id") or "")
+        out["recall_recalled_mt5"] = str(recalled.get("mt5_login") or "")
+        return out
+
+    source_event = {
+        "payout_renewal": "payout_paid",
+        "phase_pass": "pass",
+        "second_life": "breach",
+        "second_life_activation": "breach",
+        "initial_purchase": "purchase_approved",
+    }.get(ent_type, "recalled_assignment")
+
+    reason_label = {
+        "payout_renewal": "INVALID MT5 RECALLED → SAME PAYOUT RENEWAL RESTORED → FRESH FUNDED MT5 REQUIRED",
+        "phase_pass": "INVALID MT5 RECALLED → SAME PASS ENTITLEMENT RESTORED",
+        "second_life": "INVALID MT5 RECALLED → SAME SECOND-LIFE ENTITLEMENT RESTORED",
+        "second_life_activation": "INVALID MT5 RECALLED → SAME SECOND-LIFE ENTITLEMENT RESTORED",
+        "initial_purchase": "INVALID MT5 RECALLED → SAME PURCHASE ENTITLEMENT RESTORED",
+    }.get(ent_type, "INVALID MT5 RECALLED → SAME EXACT ENTITLEMENT RESTORED")
+
+    ent = {
+        "entitlement_key": exact_key,
+        "entitlement_type": ent_type,
+        "source_event_type": source_event,
+        "source_account_id": source_id or None,
+        "source_mt5": str((source or {}).get("mt5_login") or "") or None,
+        "evidence_id": evidence_id or None,
+        "target_stage": target_stage,
+        "status": "AVAILABLE",
+        "reason": reason_label,
+        "restored_from_recall": True,
+        "recalled_account_id": str(recalled.get("id") or ""),
+        "recalled_mt5": str(recalled.get("mt5_login") or ""),
+    }
+
+    out["outstanding_entitlement"] = ent
+    out["state"] = "WAITING_MT5"
+    out["closed"] = False
+    out["next_action"] = "ASSIGN_MT5"
+    out["blocked"] = False
+    out["ok"] = True
+    out["accountability_status"] = "RECONCILED"
+    out["recall_restored_entitlement"] = True
+    out["recall_recalled_account_id"] = str(recalled.get("id") or "")
+    out["recall_recalled_mt5"] = str(recalled.get("mt5_login") or "")
+
+    ledger = list(out.get("ledger") or [])
+    if not any(
+        str((ev or {}).get("type") or "").upper() == "ENTITLEMENT_RESTORED"
+        and str((ev or {}).get("entitlement_key") or "") == exact_key
+        for ev in ledger
+    ):
+        ledger.append({
+            "type": "ENTITLEMENT_RESTORED",
+            "at": recalled.get("archived_at") or recalled.get("updated_at") or now_iso(),
+            "journey_id": journey_id,
+            "purchase_id": journey_id,
+            "account_id": recalled.get("id"),
+            "mt5_login": recalled.get("mt5_login"),
+            "source_account_id": source_id or None,
+            "stage": target_stage,
+            "entitlement_key": exact_key,
+            "detail": reason_label,
+            "authority": {
+                "entitlement_key": exact_key,
+                "entitlement_type": ent_type,
+                "source_account_id": source_id or None,
+                "source_mt5": str((source or {}).get("mt5_login") or "") or None,
+                "evidence_id": evidence_id or None,
+                "target_stage": target_stage,
+            },
+        })
+        ledger = [x for x in ledger if x.get("at")]
+        ledger.sort(key=lambda x: _np_ja_score(x.get("at")))
+        out["ledger"] = ledger
+
+    acct = dict(out.get("accountability") or {})
+    acct["outstanding_entitlement"] = 1
+    acct["balance"] = 1
+    acct["status"] = "RECONCILED"
+    out["accountability"] = acct
+    return out
+
+
+@app.route("/admin/recall_handoff_v81/status", methods=["GET", "OPTIONS"])
+def admin_recall_handoff_v81_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_RECALL_HANDOFF_RELEASE_V81,
+        "exact_recall_marker_has_priority": True,
+        "historical_reset_fallback_cannot_hide_recalled_entitlement": True,
+        "later_mt5_assignment_blocks_reopen": True,
+        "trade_or_payout_use_blocks_reopen": True,
+        "payout_renewal_requires_exact_paid_payout": True,
+        "same_entitlement_only": True,
+        "business_rules_changed": False,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RECALL_HANDOFF_RELEASE_V81
