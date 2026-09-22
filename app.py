@@ -47066,3 +47066,209 @@ def admin_recall_replacement_v84_health():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V84
+
+
+# ============================================================================
+# NAIRAPIPS V85 — FORENSIC RECALL VISIBILITY / FAIL-CLOSED DIAGNOSTICS
+# 22 SEP 2026
+#
+# PURPOSE
+# -------
+# V84 correctly protected entitlement law, but one early blocked path returned a
+# reason without recalled_account_id. Admin V44 used recalled_account_id to tell a
+# genuine Recall from a normal archive, so that reason could be silently discarded.
+# V85 does NOT create or widen entitlement. It normalizes every genuine Recall
+# response so Admin can always see the exact backend conclusion.
+# ============================================================================
+
+NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V85 = "V85_FORENSIC_RECALL_VISIBILITY_2026_09_22"
+
+
+def _np_v85_recall_use_evidence(recalled):
+    """Return exact evidence for why a recalled MT5 is unsafe to reopen.
+
+    Query failures are reported separately from actual trade/payout use. We still
+    fail closed, but we never mislabel a database/query failure as trader activity.
+    """
+    recalled = recalled or {}
+    rid = str(recalled.get("id") or "").strip()
+    tid = str(recalled.get("trader_id") or "").strip()
+    login = str(recalled.get("mt5_login") or "").strip()
+    out = {
+        "blocked": False,
+        "trade_rows_found": False,
+        "payout_rows_found": False,
+        "check_errors": [],
+    }
+    if not rid or not tid:
+        out["blocked"] = True
+        out["reason"] = "recalled_identity_incomplete"
+        return out
+
+    try:
+        trades = (
+            supabase.table("trader_trades").select("id")
+            .eq("trader_account_id", rid).limit(1).execute().data or []
+        )
+        out["trade_rows_found"] = bool(trades)
+    except Exception as exc:
+        out["check_errors"].append("trades_check_failed:" + str(exc))
+
+    try:
+        payouts = (
+            supabase.table("payouts").select("id")
+            .eq("trader_id", tid).eq("trader_account_id", rid)
+            .limit(1).execute().data or []
+        )
+        if not payouts and login:
+            payouts = (
+                supabase.table("payouts").select("id")
+                .eq("trader_id", tid).eq("mt5_login", login)
+                .limit(1).execute().data or []
+            )
+        out["payout_rows_found"] = bool(payouts)
+    except Exception as exc:
+        out["check_errors"].append("payout_check_failed:" + str(exc))
+
+    if out["trade_rows_found"] and out["payout_rows_found"]:
+        out["blocked"] = True
+        out["reason"] = "recalled_account_has_trade_and_payout_use"
+    elif out["trade_rows_found"]:
+        out["blocked"] = True
+        out["reason"] = "recalled_account_has_trade_use"
+    elif out["payout_rows_found"]:
+        out["blocked"] = True
+        out["reason"] = "recalled_account_has_payout_use"
+    elif out["check_errors"]:
+        out["blocked"] = True
+        out["reason"] = "recall_use_verification_error"
+    else:
+        out["reason"] = "no_trade_or_payout_use_found"
+    return out
+
+
+def _np_v85_exact_recall_status(account_id):
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return {
+            "ok": False, "due": False, "is_recalled_wrong_assignment": False,
+            "reason": "missing_trader_account_id",
+            "release": NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V85,
+        }
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", account_id).limit(1).execute().data or []
+        )
+    except Exception as exc:
+        return {
+            "ok": False, "due": False, "is_recalled_wrong_assignment": False,
+            "account_id": account_id,
+            "reason": "recalled_account_lookup_failed:" + str(exc),
+            "release": NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V85,
+        }
+
+    if not rows:
+        return {
+            "ok": False, "due": False, "is_recalled_wrong_assignment": False,
+            "account_id": account_id,
+            "reason": "recalled_account_not_found",
+            "release": NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V85,
+        }
+
+    recalled = rows[0]
+    rid = str(recalled.get("id") or "").strip()
+    tid = str(recalled.get("trader_id") or "").strip()
+    pid = str(recalled.get("purchase_id") or recalled.get("challenge_purchase_id") or "").strip()
+    login = str(recalled.get("mt5_login") or "").strip()
+    is_recall = bool(_np_is_recalled_wrong_assignment(recalled))
+
+    base = {
+        "account_id": rid or account_id,
+        "trader_id": tid or None,
+        "journey_id": pid or None,
+        "mt5_login": login or None,
+        "is_recalled_wrong_assignment": is_recall,
+        "release": NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V85,
+    }
+
+    if not is_recall:
+        return dict(base, ok=True, due=False, reason="account_is_not_a_recalled_wrong_assignment")
+
+    # From this point onward the row is definitely a Recall. Always expose its ID,
+    # even when a safety rule blocks replacement. This is the V84 visibility fix.
+    base["recalled_account_id"] = rid
+    base["recalled_mt5"] = login or None
+
+    use_check = _np_v85_recall_use_evidence(recalled)
+    if use_check.get("blocked"):
+        return dict(
+            base,
+            ok=True,
+            due=False,
+            reason=str(use_check.get("reason") or "recalled_account_use_check_blocked"),
+            use_check=use_check,
+        )
+
+    # Reuse V84's exact payout-chain / entitlement law. Normalize its response so a
+    # genuine Recall can never become invisible to Admin again.
+    try:
+        v84 = _np_v84_exact_recall_status(account_id)
+    except Exception as exc:
+        return dict(
+            base,
+            ok=False,
+            due=False,
+            reason="v84_exact_recall_evaluation_failed:" + str(exc),
+            use_check=use_check,
+        )
+
+    result = dict(base)
+    if isinstance(v84, dict):
+        result.update(v84)
+    result["is_recalled_wrong_assignment"] = True
+    result["recalled_account_id"] = rid
+    result["recalled_mt5"] = login or None
+    result["journey_id"] = str(result.get("journey_id") or pid or "").strip() or None
+    result["trader_id"] = str(result.get("trader_id") or tid or "").strip() or None
+    result["use_check"] = use_check
+    result["release"] = NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V85
+    if not result.get("reason") and not result.get("due"):
+        result["reason"] = "no_replacement_entitlement_verified"
+    return result
+
+
+@app.route("/admin/recall_replacement_status_v85", methods=["GET", "OPTIONS"])
+def admin_recall_replacement_status_v85():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    account_id = str(request.args.get("trader_account_id") or request.args.get("account_id") or "").strip()
+    try:
+        return _np_ok(_np_v85_exact_recall_status(account_id))
+    except Exception as exc:
+        print("V85 FORENSIC RECALL STATUS ERROR:", exc, flush=True)
+        return _np_fail(str(exc), 500)
+
+
+@app.route("/admin/recall_replacement_v85/health", methods=["GET", "OPTIONS"])
+def admin_recall_replacement_v85_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V85,
+        "genuine_recall_always_returns_recalled_account_id": True,
+        "trade_payout_use_is_distinguished_from_query_failure": True,
+        "v84_entitlement_law_reused": True,
+        "read_route_assigns_mt5": False,
+        "business_rules_changed": False,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V85
