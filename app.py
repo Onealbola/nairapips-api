@@ -47424,7 +47424,7 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RECALL_SINGLE_SCAN_RELEASE_V86
 # Second Life, Purchase Approval and all normal progression engines.
 # ============================================================================
 
-NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87 = "V88_SCHEMA_SAFE_UNIVERSAL_RECALL_2026_09_22"
+NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87 = "V89_RECALL_POOL_DIAGNOSTIC_7DAY_2026_09_22"
 
 _NP_UR_V87_REASON_LABELS = {
     "invalid_login": "Invalid / expired MT5 login",
@@ -47459,6 +47459,198 @@ def _np_ur_v87_num(value):
         return float(value or 0)
     except Exception:
         return 0.0
+
+
+# Universal Recall is a controlled admin recovery path.  It keeps the normal
+# global assignment picker unchanged (V80 defaults to 4 days), but may use an
+# otherwise-safe credential up to 7 days old after the normal picker returns no
+# candidate.  This prevents Recall from falsely reporting empty inventory just
+# because all matching credentials are 5-7 days old, while still refusing stale,
+# previously-used, recalled, assigned, or wrong-vault credentials.
+NP_UR_RECALL_MAX_AGE_DAYS = 7.0
+
+
+def _np_ur_v89_pool_scan(account_size, target_stage):
+    size = clean(account_size)
+    stage = _normalize_lifecycle_stage(target_stage)
+    expected_pool = _np_expected_pool_class(stage)
+    statuses = {"available", "unused", "new", "ready", "open", ""}
+    summary = {
+        "target_size": size,
+        "target_stage": stage,
+        "required_pool": expected_pool,
+        "global_auto_max_age_days": float(NP_MT5_AUTO_MAX_AGE_DAYS or 0),
+        "recall_max_age_days": NP_UR_RECALL_MAX_AGE_DAYS,
+        "exact_size_rows": 0,
+        "required_pool_rows": 0,
+        "wrong_pool_rows": 0,
+        "available_status_rows": 0,
+        "unavailable_status_rows": 0,
+        "assigned_evidence_rows": 0,
+        "bad_marker_rows": 0,
+        "missing_age_rows": 0,
+        "older_than_recall_limit_rows": 0,
+        "used_history_rows": 0,
+        "eligible_recall_rows": 0,
+        "pool_breakdown": {},
+        "status_breakdown": {},
+    }
+    if not size or stage not in ACCOUNT_STAGES:
+        return {"candidate": None, "summary": summary, "candidates": []}
+
+    rows = []
+    start = 0
+    page_size = 250
+    max_rows = 10000
+    while start < max_rows:
+        try:
+            page = (
+                supabase.table("mt5_pool").select("*")
+                .eq("account_size", size)
+                .order("created_at", desc=True)
+                .range(start, min(start + page_size - 1, max_rows - 1))
+                .execute().data or []
+            )
+        except Exception as exc:
+            summary["query_error"] = str(exc)
+            return {"candidate": None, "summary": summary, "candidates": []}
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        start += page_size
+
+    summary["exact_size_rows"] = len(rows)
+    structural = []
+    for m in rows:
+        pool = _np_mt5_pool_class(m)
+        st = str(m.get("status") or "").strip().lower()
+        summary["pool_breakdown"][pool] = int(summary["pool_breakdown"].get(pool, 0)) + 1
+        summary["status_breakdown"][st or "blank"] = int(summary["status_breakdown"].get(st or "blank", 0)) + 1
+        if pool != expected_pool:
+            summary["wrong_pool_rows"] += 1
+            continue
+        summary["required_pool_rows"] += 1
+        if st not in statuses:
+            summary["unavailable_status_rows"] += 1
+            continue
+        summary["available_status_rows"] += 1
+        if m.get("assigned_trader_id") or m.get("trader_id") or m.get("trader_account_id"):
+            summary["assigned_evidence_rows"] += 1
+            continue
+        if _np_v80_bad_inventory_marker(m):
+            summary["bad_marker_rows"] += 1
+            continue
+        age = _np_mt5_age_days(m)
+        if age is None:
+            summary["missing_age_rows"] += 1
+            continue
+        if float(age) > NP_UR_RECALL_MAX_AGE_DAYS:
+            summary["older_than_recall_limit_rows"] += 1
+            continue
+        login = str(m.get("mt5_login") or "").strip()
+        if not login:
+            summary["bad_marker_rows"] += 1
+            continue
+        x = dict(m)
+        x["_np_recall_age_days"] = round(float(age), 2)
+        structural.append(x)
+
+    # Batch history check first.  If history verification fails, fail closed.
+    try:
+        used = _np_used_mt5_logins_batch_v48(structural) if structural else set()
+    except Exception as exc:
+        summary["history_check_error"] = str(exc)
+        return {"candidate": None, "summary": summary, "candidates": []}
+
+    eligible = []
+    for m in structural:
+        login = str(m.get("mt5_login") or "").strip()
+        if login in used:
+            summary["used_history_rows"] += 1
+            continue
+        try:
+            used_one, _reason = _mt5_login_has_any_history(login, exclude_mt5_pool_id=m.get("id"))
+        except Exception as exc:
+            summary["history_check_error"] = str(exc)
+            return {"candidate": None, "summary": summary, "candidates": []}
+        if used_one:
+            summary["used_history_rows"] += 1
+            continue
+        eligible.append(m)
+
+    eligible = _np_v80_fresh_sort(eligible)
+    summary["eligible_recall_rows"] = len(eligible)
+    public_candidates = [
+        {
+            "id": m.get("id"),
+            "mt5_login": m.get("mt5_login"),
+            "status": m.get("status"),
+            "pool_class": _np_mt5_pool_class(m),
+            "account_size": clean(m.get("account_size")),
+            "plan_name": m.get("plan_name"),
+            "created_at": m.get("created_at"),
+            "age_days": m.get("_np_recall_age_days"),
+        }
+        for m in eligible[:12]
+    ]
+    return {
+        "candidate": eligible[0] if eligible else None,
+        "summary": summary,
+        "candidates": public_candidates,
+    }
+
+
+def _np_ur_v89_inventory_message(scan):
+    info = (scan or {}).get("summary") or {}
+    size = clean(info.get("target_size") or 0)
+    stage = str(info.get("target_stage") or "").upper()
+    pool = str(info.get("required_pool") or "").upper()
+    exact = int(info.get("exact_size_rows") or 0)
+    req = int(info.get("required_pool_rows") or 0)
+    wrong = int(info.get("wrong_pool_rows") or 0)
+    avail = int(info.get("available_status_rows") or 0)
+    old = int(info.get("older_than_recall_limit_rows") or 0)
+    used = int(info.get("used_history_rows") or 0)
+    assigned = int(info.get("assigned_evidence_rows") or 0)
+    bad = int(info.get("bad_marker_rows") or 0)
+    missing = int(info.get("missing_age_rows") or 0)
+    if info.get("query_error"):
+        return "Recall inventory check failed safely: " + str(info.get("query_error"))
+    if info.get("history_check_error"):
+        return "Recall inventory history check failed safely: " + str(info.get("history_check_error"))
+    size_text = f"₦{int(size):,}" if size else "this size"
+    return (
+        f"No safe replacement selected for {size_text} {stage}. "
+        f"The pool contains {exact} row(s) at this exact size: {req} in the required {pool} vault and {wrong} in another vault. "
+        f"Within the required vault, {avail} have an available-like status; exclusions include "
+        f"{old} older than {int(NP_UR_RECALL_MAX_AGE_DAYS)} days, {used} already used in history, "
+        f"{assigned} carrying assignment evidence, {bad} marked invalid/recalled/held, and {missing} with no valid upload date. "
+        "Nothing was changed."
+    )
+
+
+def _np_ur_v89_pick_replacement(account_size, target_stage):
+    # Keep the global assignment engine untouched. Try its normal freshest-safe
+    # authority first; only Universal Recall gets the controlled 7-day fallback.
+    normal = _np_pick_fresh_mt5(account_size, target_stage)
+    if normal:
+        return normal, {
+            "source": "GLOBAL_FRESHEST_SAFE",
+            "summary": {
+                "target_size": clean(account_size),
+                "target_stage": _normalize_lifecycle_stage(target_stage),
+                "required_pool": _np_expected_pool_class(target_stage),
+                "global_auto_max_age_days": float(NP_MT5_AUTO_MAX_AGE_DAYS or 0),
+                "recall_max_age_days": NP_UR_RECALL_MAX_AGE_DAYS,
+            },
+            "candidates": [],
+        }
+    scan = _np_ur_v89_pool_scan(account_size, target_stage)
+    return scan.get("candidate"), {
+        "source": "RECALL_SAFE_7_DAY_FALLBACK" if scan.get("candidate") else "NO_SAFE_RECALL_CANDIDATE",
+        "summary": scan.get("summary") or {},
+        "candidates": scan.get("candidates") or [],
+    }
 
 
 def _np_ur_v87_account_by_id(account_id):
@@ -48226,18 +48418,20 @@ def _np_ur_v87_preview(account, reason_code):
     fresh = None
     if action == "REPLACE_EXACT_DELIVERY":
         try:
-            fresh = _np_pick_fresh_mt5(target.get("target_size"), target.get("target_stage"))
+            fresh, inventory_diag = _np_ur_v89_pick_replacement(target.get("target_size"), target.get("target_stage"))
         except Exception as exc:
             result.update({"ok": False, "reason": "fresh_mt5_lookup_failed:" + str(exc)})
             return result
         if not fresh:
             result.update({
                 "ok": False,
-                "reason": "no_fresh_matching_mt5_available",
+                "reason": "no_safe_matching_mt5_available",
+                "message": _np_ur_v89_inventory_message(inventory_diag),
                 "target_trader_id": target.get("target_trader_id"),
                 "target_stage": target.get("target_stage"),
                 "target_size": target.get("target_size"),
                 "inventory_wait_only": True,
+                "inventory_diagnostic": inventory_diag,
             })
             return result
 
@@ -48254,6 +48448,8 @@ def _np_ur_v87_preview(account, reason_code):
         "purchase_id": target.get("purchase_id"),
         "fresh_mt5_ready": bool(fresh),
         "fresh_mt5_login": _np_ur_v87_s((fresh or {}).get("mt5_login")) or None,
+        "fresh_mt5_source": (inventory_diag or {}).get("source") if action == "REPLACE_EXACT_DELIVERY" else None,
+        "inventory_diagnostic": inventory_diag if action == "REPLACE_EXACT_DELIVERY" else None,
         "existing_active_account_id": (sibling or {}).get("id") if sibling else None,
         "existing_active_mt5": (sibling or {}).get("mt5_login") if sibling else None,
         "preserves": [
@@ -48328,7 +48524,7 @@ def admin_universal_recall_v87_preview():
         if not preview.get("ok"):
             body = dict(preview)
             body["success"] = False
-            body["error"] = str(preview.get("reason") or "Universal Recall preview blocked")
+            body["error"] = str(preview.get("message") or preview.get("reason") or "Universal Recall preview blocked")
             return _np_ok(body, 409)
         return _np_ok(preview, 200)
     except Exception as exc:
@@ -48383,7 +48579,7 @@ def admin_universal_recall_v87_execute():
         if not preview.get("ok"):
             body = dict(preview)
             body["success"] = False
-            body["error"] = str(preview.get("reason") or "Universal Recall blocked")
+            body["error"] = str(preview.get("message") or preview.get("reason") or "Universal Recall blocked")
             return _np_ok(body, 409)
 
         target = _np_ur_v87_target(account, reason_code)
@@ -48419,15 +48615,17 @@ def admin_universal_recall_v87_execute():
             })
 
         # Re-check the fresh account at execution time. No inventory = NO mutation.
-        fresh = _np_pick_fresh_mt5(target.get("target_size"), target.get("target_stage"))
+        fresh, inventory_diag = _np_ur_v89_pick_replacement(target.get("target_size"), target.get("target_stage"))
         if not fresh:
             return _np_ok({
                 "success": False,
                 "release": NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87,
-                "reason": "no_fresh_matching_mt5_available",
-                "message": "No account was changed. Add a fresh matching MT5 and try Recall again.",
+                "reason": "no_safe_matching_mt5_available",
+                "error": _np_ur_v89_inventory_message(inventory_diag),
+                "message": _np_ur_v89_inventory_message(inventory_diag),
                 "target_stage": target.get("target_stage"),
                 "target_size": target.get("target_size"),
+                "inventory_diagnostic": inventory_diag,
             }, 409)
 
         # Re-validate the exact bad delivery immediately before mutation.
@@ -48506,3 +48704,308 @@ def admin_universal_recall_v87_execute():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87
+
+# ============================================================================
+# NAIRAPIPS V90 — OPERATIONAL WAITING-ASSIGNMENT RECOVERY
+# 22 SEP 2026
+#
+# PURPOSE
+# -------
+# This is NOT another Reset and NOT another Recall entitlement.
+# It exists for the exact operational case where staff used Reset only as a
+# temporary workaround after a wrong/invalid MT5 assignment, leaving the trader
+# in approved_reset_waiting_mt5 with no usable assignment trigger.
+#
+# V90 converts that temporary waiting record into one SAME-STAGE operational
+# replacement, voids only the workaround reset order, and restores the reset-used
+# flag unless an earlier genuine reset for the same journey was already consumed.
+# Pass, payout, Second Life and unrelated accounts are untouched.
+# ============================================================================
+
+NAIRAPIPS_WAITING_RECOVERY_RELEASE_V90 = "V90_OPERATIONAL_WAITING_ASSIGNMENT_RECOVERY_2026_09_22"
+
+
+def _np_v90_s(v):
+    return str(v or "").strip()
+
+
+def _np_v90_reset_refs(order):
+    order = order or {}
+    note = _np_v90_s(order.get("admin_note"))
+    m = re.search(r"\[NP_RESET_REQUEST:([^:\]]+):([^:\]]+):(phase1|phase2|funded)\]", note, re.I)
+    if m:
+        return {
+            "source_account_id": _np_v90_s(m.group(1)),
+            "parent_purchase_id": _np_v90_s(m.group(2)),
+            "stage": _normalize_lifecycle_stage(m.group(3)),
+        }
+    sid = _np_v90_s(order.get("reset_source_account_id"))
+    pid = _np_v90_s(order.get("reset_parent_purchase_id") or order.get("parent_purchase_id"))
+    stage = _normalize_lifecycle_stage(order.get("stage") or order.get("phase"))
+    return {"source_account_id": sid, "parent_purchase_id": pid, "stage": stage}
+
+
+def _np_v90_waiting_orders(trader_id):
+    tid = _np_v90_s(trader_id)
+    if not tid:
+        return []
+    try:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("trader_id", tid)
+            .in_("status", ["approved_reset_waiting_mt5", "reset_assigning"])
+            .order("updated_at", desc=True).limit(100).execute().data or []
+        )
+    except Exception:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("trader_id", tid).order("updated_at", desc=True).limit(300).execute().data or []
+        )
+        rows = [r for r in rows if _np_v90_s(r.get("status")).lower() in {"approved_reset_waiting_mt5", "reset_assigning"}]
+    out = []
+    for order in rows:
+        refs = _np_v90_reset_refs(order)
+        sid = refs.get("source_account_id")
+        pid = refs.get("parent_purchase_id")
+        stage = refs.get("stage")
+        if not sid or not pid or stage not in ACCOUNT_STAGES:
+            continue
+        if _np_v90_s(order.get("payment_status")).lower() != "approved":
+            continue
+        src_rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", sid).eq("trader_id", tid).limit(1).execute().data or []
+        )
+        par_rows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("id", pid).eq("trader_id", tid).limit(1).execute().data or []
+        )
+        if not src_rows or not par_rows:
+            continue
+        source = src_rows[0]
+        parent = par_rows[0]
+        existing = None
+        try:
+            existing = _np_reset_existing_child_v43(source, order)
+        except Exception:
+            existing = None
+        out.append({"order": order, "refs": refs, "source": source, "parent": parent, "existing": existing})
+    return out
+
+
+def _np_v90_prior_genuine_reset_consumed(trader_id, parent_id, stage, exclude_order_id):
+    tid = _np_v90_s(trader_id); pid = _np_v90_s(parent_id); oid = _np_v90_s(exclude_order_id)
+    if not tid or not pid:
+        return False
+    try:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("trader_id", tid).order("updated_at", desc=True).limit(500).execute().data or []
+        )
+    except Exception:
+        return False
+    for order in rows:
+        if _np_v90_s(order.get("id")) == oid:
+            continue
+        refs = _np_v90_reset_refs(order)
+        if _np_v90_s(refs.get("parent_purchase_id")) != pid:
+            continue
+        if _normalize_lifecycle_stage(refs.get("stage")) != _normalize_lifecycle_stage(stage):
+            continue
+        sid = _np_v90_s(refs.get("source_account_id"))
+        if not sid:
+            continue
+        try:
+            src_rows = supabase.table("trader_accounts").select("*").eq("id", sid).eq("trader_id", tid).limit(1).execute().data or []
+            if not src_rows:
+                continue
+            child = _np_reset_existing_child_v43(src_rows[0], order)
+            if child:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _np_v90_set_parent_reset_flag(parent_id, stage, value):
+    pid = _np_v90_s(parent_id)
+    field = "funded_reset_used" if _normalize_lifecycle_stage(stage) == "funded" else "challenge_reset_used"
+    try:
+        supabase.table("challenge_purchases").update({field: bool(value), "updated_at": now_iso()}).eq("id", pid).execute()
+        return True
+    except Exception as exc:
+        # Older schemas may not have the optional boolean. In that case the exact
+        # reset-order status remains the authority and no failure is necessary.
+        if "Could not find the '" + field + "'" in str(exc) or ("column" in str(exc).lower() and field in str(exc)):
+            return True
+        raise
+
+
+def _np_v90_preview_payload(bundle):
+    order = bundle["order"]; refs = bundle["refs"]; source = bundle["source"]; parent = bundle["parent"]
+    stage = _normalize_lifecycle_stage(refs.get("stage") or source.get("stage") or source.get("phase"))
+    size = clean(source.get("account_size") or source.get("start_balance") or parent.get("account_size") or 0)
+    fresh, inv = _np_ur_v89_pick_replacement(size, stage)
+    return {
+        "success": True,
+        "ok": True,
+        "release": NAIRAPIPS_WAITING_RECOVERY_RELEASE_V90,
+        "order_id": order.get("id"),
+        "source_account_id": source.get("id"),
+        "old_mt5": source.get("mt5_login"),
+        "target_stage": stage,
+        "target_size": size,
+        "fresh_mt5_ready": bool(fresh),
+        "fresh_mt5_login": (fresh or {}).get("mt5_login"),
+        "inventory_diagnostic": inv,
+        "will_void_workaround_reset_order": True,
+        "will_preserve_pass": True,
+        "will_preserve_payout": True,
+        "will_preserve_second_life": True,
+        "will_restore_reset_right_when_no_prior_genuine_reset": True,
+        "message": "Exact reset-waiting workaround found. V90 will replace the bad delivery without replaying the journey.",
+    }
+
+
+@app.route("/admin/operational_waiting_recovery_v90/preview", methods=["GET", "OPTIONS"])
+def admin_operational_waiting_recovery_v90_preview():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True, "release": NAIRAPIPS_WAITING_RECOVERY_RELEASE_V90})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    tid = _np_v90_s(request.args.get("trader_id"))
+    rows = _np_v90_waiting_orders(tid)
+    open_rows = [b for b in rows if not b.get("existing")]
+    if not open_rows:
+        if rows and rows[0].get("existing"):
+            return _np_ok({"success": False, "ok": False, "reason": "waiting_assignment_already_fulfilled", "existing_mt5": rows[0]["existing"].get("mt5_login")}, 409)
+        return _np_ok({"success": False, "ok": False, "reason": "no_approved_reset_waiting_assignment_for_this_trader"}, 409)
+    if len(open_rows) > 1:
+        return _np_ok({
+            "success": False, "ok": False, "reason": "multiple_waiting_assignments_need_exact_order",
+            "orders": [{"order_id": b["order"].get("id"), "source_account_id": b["source"].get("id"), "mt5_login": b["source"].get("mt5_login"), "stage": b["refs"].get("stage")} for b in open_rows[:20]],
+        }, 409)
+    return _np_ok(_np_v90_preview_payload(open_rows[0]))
+
+
+@app.route("/admin/operational_waiting_recovery_v90/execute", methods=["POST", "OPTIONS"])
+def admin_operational_waiting_recovery_v90_execute():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True, "release": NAIRAPIPS_WAITING_RECOVERY_RELEASE_V90})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    d = request.get_json(silent=True) or {}
+    tid = _np_v90_s(d.get("trader_id"))
+    requested_oid = _np_v90_s(d.get("order_id"))
+    rows = _np_v90_waiting_orders(tid)
+    rows = [b for b in rows if not b.get("existing") and (not requested_oid or _np_v90_s(b["order"].get("id")) == requested_oid)]
+    if len(rows) != 1:
+        return _np_ok({"success": False, "reason": "exact_waiting_assignment_not_unique", "count": len(rows)}, 409)
+
+    b = rows[0]; order=b["order"]; refs=b["refs"]; source=b["source"]; parent=b["parent"]
+    oid=_np_v90_s(order.get("id")); sid=_np_v90_s(source.get("id")); pid=_np_v90_s(parent.get("id"))
+    stage=_normalize_lifecycle_stage(refs.get("stage") or source.get("stage") or source.get("phase"))
+    size=clean(source.get("account_size") or source.get("start_balance") or parent.get("account_size") or 0)
+    trader=get_trader_by_id(tid) or {}
+    if not trader:
+        return _np_fail("Trader not found for waiting assignment recovery.", 404)
+
+    fresh, inv = _np_ur_v89_pick_replacement(size, stage)
+    if not fresh:
+        return _np_ok({
+            "success": False,
+            "reason": "no_safe_matching_mt5_for_waiting_assignment",
+            "message": _np_ur_v89_inventory_message({"summary": (inv or {}).get("summary") or {}}),
+            "inventory_diagnostic": inv,
+        }, 409)
+
+    old_order_status = _np_v90_s(order.get("status")) or "approved_reset_waiting_mt5"
+    old_source_status = _np_v90_s(source.get("account_status") or source.get("status")) or f"archived_reset_{stage}"
+    old_reason = _np_v90_s(source.get("archive_reason"))
+    prior_reset = _np_v90_prior_genuine_reset_consumed(tid, pid, stage, oid)
+    marker = f"[NP_OPERATIONAL_WAITING_RECOVERY:{NAIRAPIPS_WAITING_RECOVERY_RELEASE_V90}:{oid}:{sid}]"
+
+    try:
+        # Stop the reset worker from racing this manual operational correction.
+        supabase.table("challenge_purchases").update({
+            "status": "cancelled",
+            "updated_at": now_iso(),
+            "admin_note": (_np_v90_s(order.get("admin_note")) + " | " + marker + " | RESET WORKAROUND VOIDED FOR OPERATIONAL CORRECTION").strip(" |"),
+        }).eq("id", oid).eq("trader_id", tid).execute()
+
+        _np_v90_set_parent_reset_flag(pid, stage, prior_reset)
+
+        supabase.table("trader_accounts").update({
+            "account_status": "archived",
+            "monitoring_enabled": False,
+            "archive_reason": (old_reason + " | " + marker + " | OPERATIONAL WRONG-ASSIGNMENT RECOVERY").strip(" |"),
+            "updated_at": now_iso(),
+        }).eq("id", sid).eq("trader_id", tid).execute()
+
+        actor = admin_user or {"name":"admin","username":"admin","role":"admin"}
+        replacement, _updated = _assign_mt5_to_trader(
+            trader, fresh, stage, parent, actor,
+            f"OPERATIONAL WAITING ASSIGNMENT RECOVERY V90 · source={sid} · workaround_order={oid} · SAME STAGE/SIZE"
+        )
+
+        # Record the exact replacement on the retired source using fields that are
+        # optional in production; failure here must not undo a successful assignment.
+        try:
+            supabase.table("trader_accounts").update({
+                "archive_reason": (old_reason + " | " + marker + f" | [NP_OPERATIONAL_REPLACEMENT_MT5:{replacement.get('mt5_login')}]").strip(" |"),
+                "updated_at": now_iso(),
+            }).eq("id", sid).eq("trader_id", tid).execute()
+        except Exception:
+            pass
+
+        _audit_safe(
+            "operational_recovery", "waiting_assignment_recovered",
+            f"trader={tid}; source={sid}; bad_mt5={source.get('mt5_login')}; order={oid}; replacement={replacement.get('id')}; mt5={replacement.get('mt5_login')}; stage={stage}; size={size}; prior_genuine_reset={prior_reset}",
+            actor, sid,
+        )
+        try:
+            np_invalidate_admin_bootstrap("all")
+            _invalidate_trader_bootstrap_cache(tid)
+        except Exception:
+            pass
+
+        return _np_ok({
+            "success": True,
+            "release": NAIRAPIPS_WAITING_RECOVERY_RELEASE_V90,
+            "status": "WAITING_ASSIGNMENT_RECOVERED",
+            "old_mt5": source.get("mt5_login"),
+            "replacement_mt5": replacement.get("mt5_login"),
+            "replacement_account_id": replacement.get("id"),
+            "stage": stage,
+            "account_size": size,
+            "workaround_reset_order_voided": True,
+            "reset_right_restored": not prior_reset,
+            "prior_genuine_reset_preserved": prior_reset,
+            "journey_unchanged": True,
+            "pass_replayed": False,
+            "payout_replayed": False,
+            "second_life_replayed": False,
+        })
+    except Exception as exc:
+        # Best-effort rollback to the exact waiting state if the replacement itself
+        # fails after the workaround order was paused.
+        try:
+            supabase.table("challenge_purchases").update({"status": old_order_status, "updated_at": now_iso()}).eq("id", oid).eq("trader_id", tid).execute()
+        except Exception:
+            pass
+        try:
+            _np_v90_set_parent_reset_flag(pid, stage, True)
+        except Exception:
+            pass
+        try:
+            supabase.table("trader_accounts").update({"account_status": old_source_status, "archive_reason": old_reason, "updated_at": now_iso()}).eq("id", sid).eq("trader_id", tid).execute()
+        except Exception:
+            pass
+        print("V90 WAITING ASSIGNMENT RECOVERY ERROR:", exc, flush=True)
+        return _np_fail("Waiting assignment recovery failed safely: " + str(exc), 500)
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_WAITING_RECOVERY_RELEASE_V90
+
