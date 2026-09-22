@@ -4844,7 +4844,7 @@ def _active_account_mt5_logins(limit=5000):
 
 def _available_mt5_not_used(limit=1500):
     try:
-        mt5_rows = supabase.table("mt5_pool").select("*").order("created_at", desc=False).order("mt5_login", desc=False).limit(limit).execute().data or []
+        mt5_rows = supabase.table("mt5_pool").select("*").order("created_at", desc=True).limit(limit).execute().data or []
     except Exception as e:
         print("AVAILABLE MT5 FETCH ERROR:", e)
         mt5_rows = []
@@ -36786,7 +36786,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
                 .eq("account_size", size)
                 .eq("pool_class", expected_pool)
                 .in_("status", statuses)
-                .order("created_at", desc=False).order("mt5_login", desc=False)
+                .order("created_at", desc=True)
                 .range(start, min(start + page_size - 1, max_candidates - 1))
                 .execute().data or []
             )
@@ -36799,7 +36799,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
                     supabase.table("mt5_pool").select("*")
                     .eq("account_size", size)
                     .in_("status", statuses)
-                    .order("created_at", desc=False).order("mt5_login", desc=False)
+                    .order("created_at", desc=True)
                     .range(start, min(start + page_size - 1, max_candidates - 1))
                     .execute().data or []
                 )
@@ -36875,7 +36875,7 @@ def _np_admin_assignable_mt5_v48():
             rows = (
                 supabase.table("mt5_pool").select("*")
                 .in_("status", candidate_statuses)
-                .order("created_at", desc=False).order("mt5_login", desc=False)
+                .order("created_at", desc=True)
                 .range(start, min(start + page_size - 1, max_rows - 1))
                 .execute().data or []
             )
@@ -44986,10 +44986,294 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_SECOND_LIFE_SINGLE_TRUTH_RELEASE_
 
 
 # ============================================================================
-# NAIRAPIPS V77 — MT5 POOL FIFO / OLDEST ELIGIBLE FIRST — 21 SEP 2026
+# NAIRAPIPS V77 — MT5 FIFO / OLDEST ELIGIBLE FIRST
+# 22 SEP 2026
+#
+# BUSINESS PURPOSE
+# ----------------
+# Available MT5 credentials should leave the pool in age order:
+# the OLDEST still-valid/fresh credential is assigned before a newer one.
+#
+# Existing protections remain mandatory:
+# - exact PHASE/FUNDED pool class
+# - exact account size
+# - status must be available/fresh
+# - no ownership/assignment evidence
+# - MT5 login must never have been used anywhere
+# - age must be <= NP_MT5_AUTO_MAX_AGE_DAYS (currently 7 days)
+# - final assignment endpoint still rechecks single-use history
+#
+# This changes PICK ORDER only. It does not create or widen entitlements.
 # ============================================================================
-# Inventory policy only. Entitlement, payment, journey, single-use, two-pool and
-# prior-history protections remain unchanged. Among MT5 rows that ALREADY pass
-# every existing safety check, the oldest created_at row is offered first.
-# Accounts older than NP_MT5_AUTO_MAX_AGE_DAYS remain rejected exactly as before.
-NAIRAPIPS_MT5_FIFO_RELEASE_V77 = "V77_MT5_FIFO_OLDEST_ELIGIBLE_FIRST_2026_09_21"
+
+NAIRAPIPS_MT5_FIFO_RELEASE_V77 = "V77_MT5_FIFO_OLDEST_ELIGIBLE_2026_09_22"
+
+
+def _np_v77_fifo_time(mt5):
+    """Stable pool-age timestamp. Missing/invalid dates sort last and remain ineligible."""
+    m = mt5 or {}
+    raw = (
+        m.get("created_at")
+        or m.get("uploaded_at")
+        or m.get("added_at")
+        or m.get("updated_at")
+    )
+    dt = _np_parse_dt_safe(raw)
+    if not dt:
+        return float("inf")
+    try:
+        return dt.timestamp()
+    except Exception:
+        return float("inf")
+
+
+def _np_v77_fifo_sort(rows):
+    """Oldest pool credential first; deterministic MT5-login tie-break."""
+    return sorted(
+        list(rows or []),
+        key=lambda m: (
+            _np_v77_fifo_time(m),
+            str((m or {}).get("mt5_login") or ""),
+        ),
+    )
+
+
+def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
+    """
+    GLOBAL AUTO-PICK AUTHORITY — FIFO.
+
+    Scan the complete exact size/vault category from OLDEST to NEWEST and return
+    the first credential that passes every existing structural + history guard.
+    """
+    expected_pool = _np_expected_pool_class(target_stage)
+    size = clean(account_size)
+    if not size:
+        return None
+
+    statuses = ["available", "unused", "new", "ready", "open"]
+    page_size = 200
+    max_candidates = 10000
+    start = 0
+    rejected_history = 0
+    structural_rejected = 0
+    total_candidates = 0
+
+    while start < max_candidates:
+        try:
+            rows = (
+                supabase.table("mt5_pool").select("*")
+                .eq("account_size", size)
+                .eq("pool_class", expected_pool)
+                .in_("status", statuses)
+                .order("created_at", desc=False)
+                .range(start, min(start + page_size - 1, max_candidates - 1))
+                .execute().data or []
+            )
+        except Exception as exc:
+            # Existing migration compatibility remains PHASE-only.
+            if expected_pool == "funded":
+                print("V77 FUNDED MT5 FIFO PAGE QUERY ERROR:", exc, flush=True)
+                return None
+            try:
+                rows = (
+                    supabase.table("mt5_pool").select("*")
+                    .eq("account_size", size)
+                    .in_("status", statuses)
+                    .order("created_at", desc=False)
+                    .range(start, min(start + page_size - 1, max_candidates - 1))
+                    .execute().data or []
+                )
+            except Exception as exc2:
+                print("V77 PHASE MT5 FIFO PAGE QUERY ERROR:", exc2, flush=True)
+                return None
+
+        if not rows:
+            break
+
+        rows = _np_v77_fifo_sort(rows)
+        total_candidates += len(rows)
+
+        structural = []
+        for m in rows:
+            if _np_structural_mt5_candidate_v48(m, size, target_stage):
+                structural.append(m)
+            else:
+                structural_rejected += 1
+
+        try:
+            used = _np_used_mt5_logins_batch_v48(structural)
+        except Exception as exc:
+            # Fail closed exactly like V48.
+            print("V77 FRESH MT5 BATCH HISTORY CHECK FAILED:", exc, flush=True)
+            return None
+
+        for m in structural:
+            login = str(m.get("mt5_login") or "").strip()
+            if not login or login in used:
+                rejected_history += 1
+                continue
+
+            # Final existing single-login guard immediately before returning.
+            used_one, reason = _mt5_login_has_any_history(
+                login, exclude_mt5_pool_id=m.get("id")
+            )
+            if used_one:
+                rejected_history += 1
+                continue
+
+            return m
+
+        if len(rows) < page_size:
+            break
+        start += page_size
+
+    if total_candidates:
+        print(
+            "V77 NO FRESH MT5 AFTER FIFO COMPLETE SCAN:",
+            "pool=", expected_pool,
+            "size=", size,
+            "candidates=", total_candidates,
+            "history_rejected=", rejected_history,
+            "structural_rejected=", structural_rejected,
+            flush=True,
+        )
+    return None
+
+
+def _np_admin_assignable_mt5_v77():
+    """
+    Admin assignment feed uses the SAME freshness/single-use protections and
+    returns OLDEST eligible inventory first.
+    """
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    try:
+        stage = _normalize_lifecycle_stage(request.args.get("stage") or "phase1")
+        expected_pool = _np_expected_pool_class(stage)
+        candidate_statuses = ["available", "unused", "new", "ready", "open"]
+
+        page_size = 500
+        max_rows = 10000
+        start = 0
+        candidates = []
+        seen_ids = set()
+
+        while start < max_rows:
+            rows = (
+                supabase.table("mt5_pool").select("*")
+                .in_("status", candidate_statuses)
+                .order("created_at", desc=False)
+                .range(start, min(start + page_size - 1, max_rows - 1))
+                .execute().data or []
+            )
+            if not rows:
+                break
+
+            for m in rows:
+                if _np_mt5_pool_class(m) != expected_pool:
+                    continue
+
+                if (
+                    m.get("assigned_trader_id")
+                    or m.get("trader_id")
+                    or m.get("trader_account_id")
+                ):
+                    continue
+
+                # Same freshness window as automation. Old/undated rows are still
+                # visible in the MT5 Pool module, but not offered for assignment.
+                age = _np_mt5_age_days(m)
+                if age is None or age > NP_MT5_AUTO_MAX_AGE_DAYS:
+                    continue
+
+                mid = str(m.get("id") or m.get("mt5_login") or "").strip()
+                if not mid or mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                candidates.append(m)
+
+            if len(rows) < page_size:
+                break
+            start += page_size
+
+        candidates = _np_v77_fifo_sort(candidates)
+
+        # Never-used history verification from V48 remains decisive.
+        used = _np_used_mt5_logins_batch_v48(candidates)
+
+        out = []
+        seen_logins = set()
+        for m in candidates:
+            login = str(m.get("mt5_login") or "").strip()
+            if not login or login in used or login in seen_logins:
+                continue
+            seen_logins.add(login)
+
+            out.append({
+                "id": m.get("id"),
+                "mt5_login": login,
+                "mt5_server": m.get("mt5_server"),
+                "account_size": m.get("account_size"),
+                "pool_class": _np_mt5_pool_class(m),
+                "plan_name": m.get("plan_name"),
+                "status": m.get("status"),
+                "created_at": m.get("created_at"),
+                "updated_at": m.get("updated_at"),
+                "age_days": round(float(_np_mt5_age_days(m) or 0), 2),
+                "assigned_trader_id": None,
+                "trader_id": None,
+                "trader_account_id": None,
+            })
+
+        return _np_ok({
+            "success": True,
+            "stage": stage,
+            "pool_class": expected_pool,
+            "count": len(out),
+            "excluded_used_history": len(used),
+            "mt5_pool": out,
+            "data": out,
+            "complete_category_scan": True,
+            "fresh_history_verified": True,
+            "fifo_oldest_eligible_first": True,
+            "max_age_days": NP_MT5_AUTO_MAX_AGE_DAYS,
+            "release": NAIRAPIPS_MT5_FIFO_RELEASE_V77,
+        })
+
+    except Exception as exc:
+        return _np_fail(str(exc), 500)
+
+
+# Replace the existing V46/V48 endpoint implementation without duplicate route.
+app.view_functions["admin_assignable_mt5_v46"] = _np_admin_assignable_mt5_v77
+
+
+@app.route("/admin/mt5_fifo_v77/status", methods=["GET", "OPTIONS"])
+def admin_mt5_fifo_v77_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_MT5_FIFO_RELEASE_V77,
+        "assignment_order": "OLDEST_ELIGIBLE_FIRST",
+        "max_auto_age_days": NP_MT5_AUTO_MAX_AGE_DAYS,
+        "single_use_history_guard": True,
+        "exact_pool_guard": True,
+        "exact_size_guard": True,
+        "entitlement_logic_changed": False,
+        "second_life_logic_changed": False,
+        "reset_logic_changed": False,
+        "payout_logic_changed": False,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MT5_FIFO_RELEASE_V77
+
