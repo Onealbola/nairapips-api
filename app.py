@@ -47424,7 +47424,7 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RECALL_SINGLE_SCAN_RELEASE_V86
 # Second Life, Purchase Approval and all normal progression engines.
 # ============================================================================
 
-NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87 = "V87_UNIVERSAL_JOURNEY_PRESERVING_RECALL_2026_09_22"
+NAIRAPIPS_UNIVERSAL_RECALL_RELEASE_V87 = "V88_SCHEMA_SAFE_UNIVERSAL_RECALL_2026_09_22"
 
 _NP_UR_V87_REASON_LABELS = {
     "invalid_login": "Invalid / expired MT5 login",
@@ -47945,7 +47945,14 @@ def _np_ur_v87_retire_exact(account, reason_code, target, action, replacement=No
     old_note = _np_ur_v87_s(account.get("admin_note"))
     combined_reason = (old_reason + " | " + marker).strip(" |") if old_reason else marker
     combined_note = (old_note + " | " + marker).strip(" |") if old_note else marker
-    status = "recalled_operational_replaced" if replacement else "recalled_operational_hold"
+    # V88 SCHEMA-SAFE RECALL:
+    # Production Supabase constrains trader_accounts.account_status to the
+    # established lifecycle values. Recall identity therefore lives in the
+    # immutable NP_UNIVERSAL_RECALL marker (archive_reason/admin_note), while
+    # the exact bad delivery uses the already-supported terminal status
+    # `archived`. This quarantines only the selected trader_account and does
+    # not create/consume/replay any journey entitlement.
+    status = "archived"
     payload = {
         "account_status": status,
         "monitoring_enabled": False,
@@ -47963,7 +47970,9 @@ def _np_ur_v87_retire_exact(account, reason_code, target, action, replacement=No
     pool = _np_ur_v87_pool_for_account(account)
     if pool and _np_ur_v87_s(pool.get("id")):
         pp = {
-            "status": "recalled_invalid_hold",
+            # mt5_pool.status is also constrained in production; keep Recall
+            # evidence in archive_reason/admin_note and use supported `archived`.
+            "status": "archived",
             "archive_reason": combined_reason,
             "admin_note": combined_note,
             "archived_at": now,
