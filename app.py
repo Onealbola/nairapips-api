@@ -46223,3 +46223,270 @@ def admin_recall_handoff_v81_status():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RECALL_HANDOFF_RELEASE_V81
+
+
+# ============================================================================
+# NAIRAPIPS V82 — ADMIN JOURNEY ROUTE RECALL HAND-OFF
+# 22 SEP 2026
+#
+# V81 correctly restored recalled entitlements inside _np_ja_journey_authority,
+# but production Admin /admin_journey_authority is intentionally bound to the
+# older read-only V27 bundle route. Therefore Cockpit never saw the V81 overlay.
+#
+# V82 applies the SAME exact-recall law directly to the V27 Admin bundle before
+# returning it. No business entitlement is invented and no assignment is fired.
+# ============================================================================
+
+NAIRAPIPS_ADMIN_RECALL_ROUTE_RELEASE_V82 = "V82_ADMIN_ROUTE_RECALL_HANDOFF_2026_09_22"
+_np_admin_journey_authority_v82_core = _np_admin_journey_authority_v27
+
+
+def _np_v82_overlay_recalled_entitlements(bundle, trader_id):
+    bundle = bundle or {}
+    journeys = list(bundle.get("journeys") or [])
+    if not journeys:
+        return bundle
+
+    journey_map = {
+        str(j.get("journey_id") or "").strip(): j
+        for j in journeys
+        if str(j.get("journey_id") or "").strip()
+    }
+    if not journey_map:
+        return bundle
+
+    try:
+        all_accounts = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", str(trader_id or "").strip())
+            .limit(500).execute().data or []
+        )
+    except Exception as exc:
+        print("V82 RECALL OVERLAY ACCOUNT LOAD SKIPPED:", exc, flush=True)
+        return bundle
+
+    accounts_by_id = {
+        str(a.get("id") or "").strip(): a
+        for a in all_accounts
+        if str(a.get("id") or "").strip()
+    }
+
+    recalled_rows = []
+    for row in all_accounts:
+        jid = str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip()
+        if jid not in journey_map:
+            continue
+        if not _np_is_recalled_wrong_assignment(row):
+            continue
+        if not _np_v79_recall_marker(row, "NP_RECALL_ENTITLEMENT"):
+            continue
+        recalled_rows.append(row)
+
+    recalled_rows.sort(key=_np_v81_row_time)
+
+    # Newest valid recalled entitlement wins within each journey. Older recalled
+    # children remain immutable history and cannot manufacture parallel rights.
+    latest_by_journey = {}
+    for row in recalled_rows:
+        jid = str(row.get("purchase_id") or row.get("challenge_purchase_id") or "").strip()
+        latest_by_journey[jid] = row
+
+    for jid, recalled in latest_by_journey.items():
+        journey = journey_map.get(jid)
+        if not journey:
+            continue
+
+        exact_key = _np_v79_recall_marker(recalled, "NP_RECALL_ENTITLEMENT")
+        ent_type = _np_v79_recall_marker(recalled, "NP_RECALL_TYPE")
+        evidence_id = _np_v79_recall_marker(recalled, "NP_RECALL_EVIDENCE")
+        source_id = _np_v79_recall_marker(recalled, "NP_RECALL_SOURCE")
+        target_stage = _np_v81_exact_recall_target(recalled)
+
+        if not exact_key or not ent_type or target_stage not in ACCOUNT_STAGES:
+            continue
+
+        # Never hide a real integrity block.
+        if journey.get("blocked") and list(journey.get("problems") or []):
+            continue
+
+        # Recall is only reversible while the invalid child itself remained unused.
+        if _np_v81_recall_has_forbidden_use(recalled):
+            continue
+
+        # If a later MT5 was already delivered after Recall, the restored entitlement
+        # has already been fulfilled again and must not be shown as due.
+        if _np_v81_recall_already_replaced(journey, recalled):
+            continue
+
+        # Payout renewal requires the immutable exact PAID payout that created it.
+        if ent_type == "payout_renewal":
+            if not evidence_id:
+                continue
+            try:
+                prows = (
+                    supabase.table("payouts").select("*")
+                    .eq("id", evidence_id).limit(1).execute().data or []
+                )
+            except Exception as exc:
+                print("V82 PAYOUT EVIDENCE LOAD SKIPPED:", exc, flush=True)
+                continue
+            if not prows:
+                continue
+            payout = prows[0]
+            if payout_status(payout) != "paid":
+                continue
+            if str(payout.get("trader_id") or "").strip() != str(trader_id or "").strip():
+                continue
+            payout_source = str(payout.get("trader_account_id") or payout.get("account_id") or "").strip()
+            if source_id and payout_source != source_id:
+                continue
+
+        source = accounts_by_id.get(source_id) if source_id else None
+        reason_label = {
+            "payout_renewal": "INVALID MT5 RECALLED → SAME PAYOUT RENEWAL RESTORED → FRESH FUNDED MT5 REQUIRED",
+            "phase_pass": "INVALID MT5 RECALLED → SAME PASS ENTITLEMENT RESTORED",
+            "second_life": "INVALID MT5 RECALLED → SAME SECOND-LIFE ENTITLEMENT RESTORED",
+            "second_life_activation": "INVALID MT5 RECALLED → SAME SECOND-LIFE ENTITLEMENT RESTORED",
+            "initial_purchase": "INVALID MT5 RECALLED → SAME PURCHASE ENTITLEMENT RESTORED",
+        }.get(ent_type, "INVALID MT5 RECALLED → SAME EXACT ENTITLEMENT RESTORED")
+
+        source_event = {
+            "payout_renewal": "payout_paid",
+            "phase_pass": "pass",
+            "second_life": "breach",
+            "second_life_activation": "breach",
+            "initial_purchase": "purchase_approved",
+        }.get(ent_type, "recalled_assignment")
+
+        ent = {
+            "entitlement_key": exact_key,
+            "entitlement_type": ent_type,
+            "source_event_type": source_event,
+            "source_account_id": source_id or None,
+            "source_mt5": str((source or {}).get("mt5_login") or "") or None,
+            "evidence_id": evidence_id or None,
+            "target_stage": target_stage,
+            "status": "AVAILABLE",
+            "reason": reason_label,
+            "restored_from_recall": True,
+            "recalled_account_id": str(recalled.get("id") or ""),
+            "recalled_mt5": str(recalled.get("mt5_login") or ""),
+        }
+
+        journey["outstanding_entitlement"] = ent
+        journey["state"] = "WAITING_MT5"
+        journey["closed"] = False
+        journey["next_action"] = "ASSIGN_MT5"
+        journey["blocked"] = False
+        journey["ok"] = True
+        journey["accountability_status"] = "RECONCILED"
+        journey["recall_restored_entitlement"] = True
+        journey["recall_recalled_account_id"] = str(recalled.get("id") or "")
+        journey["recall_recalled_mt5"] = str(recalled.get("mt5_login") or "")
+
+        ledger = list(journey.get("ledger") or [])
+        if not any(
+            str((ev or {}).get("type") or "").upper() == "ENTITLEMENT_RESTORED"
+            and str((ev or {}).get("entitlement_key") or "") == exact_key
+            for ev in ledger
+        ):
+            ledger.append({
+                "type": "ENTITLEMENT_RESTORED",
+                "at": recalled.get("archived_at") or recalled.get("updated_at") or now_iso(),
+                "journey_id": jid,
+                "purchase_id": jid,
+                "account_id": recalled.get("id"),
+                "mt5_login": recalled.get("mt5_login"),
+                "source_account_id": source_id or None,
+                "stage": target_stage,
+                "entitlement_key": exact_key,
+                "detail": reason_label,
+                "authority": {
+                    "entitlement_key": exact_key,
+                    "entitlement_type": ent_type,
+                    "source_account_id": source_id or None,
+                    "source_mt5": str((source or {}).get("mt5_login") or "") or None,
+                    "evidence_id": evidence_id or None,
+                    "target_stage": target_stage,
+                },
+            })
+            ledger = [x for x in ledger if x.get("at")]
+            ledger.sort(key=lambda x: _np_ja_score(x.get("at")))
+            journey["ledger"] = ledger
+
+        acct = dict(journey.get("accountability") or {})
+        acct["outstanding_entitlement"] = 1
+        acct["balance"] = 1
+        acct["status"] = "RECONCILED"
+        journey["accountability"] = acct
+
+    bundle["journeys"] = journeys
+    bundle["recall_handoff_release"] = NAIRAPIPS_ADMIN_RECALL_ROUTE_RELEASE_V82
+    return bundle
+
+
+def _np_admin_journey_authority_v82():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    journey_id = str(request.args.get("journey_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+
+    try:
+        bundle = _np_all_journeys_preserved_v5(trader_id)
+        bundle = _np_v82_overlay_recalled_entitlements(bundle, trader_id)
+        payload = {
+            "cutover_date": bundle.get("cutover_date"),
+            "identity_trader_ids": bundle.get("identity_trader_ids") or [],
+            "identity_profiles": bundle.get("identity_profiles") or [],
+            "reconciliation": bundle.get("reconciliation") or [],
+            "history_debug": bundle.get("history_debug") or {},
+            "recall_handoff_release": bundle.get("recall_handoff_release"),
+            "generated_at": now_iso(),
+        }
+        if journey_id:
+            journey = next(
+                (j for j in bundle.get("journeys") or []
+                 if str(j.get("journey_id") or "") == journey_id),
+                None,
+            )
+            if not journey:
+                return _np_fail("journey not found", 404)
+            payload["journey"] = journey
+        else:
+            payload["journeys"] = bundle.get("journeys") or []
+        return _np_ok(payload)
+    except Exception as exc:
+        print("JOURNEY AUTHORITY V82 ERROR:", exc, flush=True)
+        return _np_fail(str(exc), 500)
+
+
+# This is the production Admin route used by Journey Cockpit. Rebind it LAST.
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v82
+
+
+@app.route("/admin/recall_handoff_v82/status", methods=["GET", "OPTIONS"])
+def admin_recall_handoff_v82_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_ADMIN_RECALL_ROUTE_RELEASE_V82,
+        "admin_route_rebound": True,
+        "v27_bundle_preserved": True,
+        "exact_recall_overlay_applied": True,
+        "same_entitlement_only": True,
+        "assignment_fired_by_read_route": False,
+        "business_rules_changed": False,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_ADMIN_RECALL_ROUTE_RELEASE_V82
