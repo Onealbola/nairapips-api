@@ -46769,3 +46769,300 @@ def admin_recall_handoff_v83_status():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE=NAIRAPIPS_ADMIN_RECALL_ROUTE_RELEASE_V83
+
+# ============================================================================
+# NAIRAPIPS V84 — FAST EXACT RECALL RECOVERY AUTHORITY
+# 22 SEP 2026
+#
+# FORENSIC ROOT CAUSE
+# -------------------
+# Admin Journey Cockpit gives the broad /admin_journey_authority request only a
+# short read budget. That broad route rebuilds full identity history and can time
+# out, after which Admin falls back to old local Reset history. A valid recalled
+# invalid-MT5 entitlement can therefore be hidden even though Recall succeeded.
+#
+# V84 does NOT change business entitlement law. It provides one small authenticated
+# read endpoint keyed by the exact recalled trader_account_id. It verifies:
+#   * exact recalled account evidence,
+#   * no trade/payout use on the recalled MT5,
+#   * no later MT5 delivered after Recall,
+#   * exact PAID payout + exact source account for payout-renewal recovery,
+# and returns the SAME entitlement only. No assignment is fired by this GET.
+# ============================================================================
+
+NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V84 = "V84_FAST_EXACT_RECALL_RECOVERY_2026_09_22"
+
+
+def _np_v84_score_account_assignment(row):
+    row = row or {}
+    return _np_ja_score(
+        row.get("assigned_at") or row.get("started_at") or row.get("created_at")
+        or row.get("updated_at")
+    )
+
+
+def _np_v84_score_recall(row):
+    row = row or {}
+    return _np_ja_score(
+        row.get("archived_at") or row.get("updated_at") or row.get("assigned_at")
+        or row.get("created_at")
+    )
+
+
+def _np_v84_payout_time(row):
+    row = row or {}
+    return _np_ja_score(row.get("paid_at") or row.get("updated_at") or row.get("created_at"))
+
+
+def _np_v84_exact_payout_chain(recalled):
+    """Reconstruct only an exact PAID-payout -> recalled Funded child chain.
+
+    This is a forensic fallback for a corrupted/missing old journey-ledger marker.
+    It never guesses by name, account size or stage alone.
+    """
+    recalled = recalled or {}
+    rid = str(recalled.get("id") or "").strip()
+    tid = str(recalled.get("trader_id") or "").strip()
+    pid = str(recalled.get("purchase_id") or recalled.get("challenge_purchase_id") or "").strip()
+    stage = _normalize_lifecycle_stage(recalled.get("stage") or recalled.get("phase"))
+    if not rid or not tid or not pid or stage != "funded":
+        return None, "recalled_identity_or_stage_not_exact"
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", tid).eq("purchase_id", pid)
+            .order("created_at", desc=False).limit(500).execute().data or []
+        )
+    except Exception as exc:
+        return None, "account_chain_load_failed:" + str(exc)
+
+    by_id = {str(a.get("id") or "").strip(): a for a in rows if str(a.get("id") or "").strip()}
+    assigned_at = _np_v84_score_account_assignment(recalled)
+    recall_at = _np_v84_score_recall(recalled)
+
+    # If another genuine assignment was delivered AFTER this Recall, the restored
+    # right has already been fulfilled again and must not be exposed.
+    for row in rows:
+        if str(row.get("id") or "").strip() == rid:
+            continue
+        t = _np_v84_score_account_assignment(row)
+        if recall_at and t and t > recall_at and str(row.get("mt5_login") or "").strip():
+            blob = " ".join(str(row.get(k) or "") for k in (
+                "account_status", "status", "archive_reason", "admin_note"
+            )).lower()
+            if "wrong_assignment_recalled" not in blob and "recalled_wrong_assignment" not in blob:
+                return None, "later_mt5_already_delivered"
+
+    try:
+        payouts = (
+            supabase.table("payouts").select("*")
+            .eq("trader_id", tid).eq("status", "paid")
+            .order("paid_at", desc=True).limit(100).execute().data or []
+        )
+    except Exception as exc:
+        return None, "payout_chain_load_failed:" + str(exc)
+
+    candidates = []
+    for payout in payouts:
+        source_id = str(payout.get("trader_account_id") or payout.get("account_id") or "").strip()
+        source = by_id.get(source_id)
+        if not source:
+            continue
+        if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "funded":
+            continue
+        pt = _np_v84_payout_time(payout)
+        st = _np_v84_score_account_assignment(source)
+        if assigned_at and pt and pt > assigned_at:
+            continue
+        if assigned_at and st and st >= assigned_at:
+            continue
+        payout_login = str(payout.get("mt5_login") or "").strip()
+        source_login = str(source.get("mt5_login") or "").strip()
+        if payout_login and source_login and payout_login != source_login:
+            continue
+
+        # There must be no other genuine Funded assignment between this PAID payout
+        # and the recalled child. This proves the child is the immediate payout-renewal delivery.
+        ambiguous = False
+        for other in rows:
+            oid = str(other.get("id") or "").strip()
+            if oid in {source_id, rid}:
+                continue
+            if _normalize_lifecycle_stage(other.get("stage") or other.get("phase")) != "funded":
+                continue
+            ot = _np_v84_score_account_assignment(other)
+            if pt and assigned_at and ot and pt < ot < assigned_at:
+                oblob = " ".join(str(other.get(k) or "") for k in (
+                    "account_status", "status", "archive_reason", "admin_note"
+                )).lower()
+                if "wrong_assignment_recalled" not in oblob and "recalled_wrong_assignment" not in oblob:
+                    ambiguous = True
+                    break
+        if ambiguous:
+            continue
+
+        candidates.append((pt, payout, source))
+
+    if not candidates:
+        return None, "no_exact_paid_payout_predecessor"
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _pt, payout, source = candidates[0]
+    payout_id = str(payout.get("id") or "").strip()
+    source_id = str(source.get("id") or "").strip()
+
+    # Final existing production payout engine verification. It independently checks
+    # paid status, exact source linkage, stage, owner, successor and inventory law.
+    truth = _np_exact_payout_funded_due_v34(payout_id)
+    if not truth.get("ok"):
+        return None, "exact_payout_engine_blocked:" + str(truth.get("reason") or "unknown")
+    if truth.get("fulfilled"):
+        return None, "exact_payout_already_fulfilled"
+    if not truth.get("due") and not truth.get("manual_only"):
+        return None, "exact_payout_not_due:" + str(truth.get("reason") or "unknown")
+    if str(truth.get("source_account_id") or "").strip() != source_id:
+        return None, "exact_payout_source_disagreement"
+
+    return {
+        "entitlement_key": f"payout:{payout_id}:renewal",
+        "entitlement_type": "payout_renewal",
+        "source_event_type": "payout_paid",
+        "source_account_id": source_id,
+        "source_mt5": str(source.get("mt5_login") or "").strip() or None,
+        "evidence_id": payout_id,
+        "payout_id": payout_id,
+        "target_stage": "funded",
+        "status": "AVAILABLE",
+        "reason": "INVALID MT5 RECALLED → SAME PAYOUT RENEWAL RESTORED → FRESH FUNDED MT5 REQUIRED",
+        "restored_from_recall": True,
+        "recalled_account_id": rid,
+        "recalled_mt5": str(recalled.get("mt5_login") or "").strip(),
+        "authority_source": "EXACT_PAID_PAYOUT_CHAIN_V84",
+    }, None
+
+
+def _np_v84_exact_recall_status(account_id):
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return {"ok": False, "due": False, "reason": "missing_trader_account_id"}
+
+    rows = (
+        supabase.table("trader_accounts").select("*")
+        .eq("id", account_id).limit(1).execute().data or []
+    )
+    if not rows:
+        return {"ok": False, "due": False, "reason": "recalled_account_not_found"}
+    recalled = rows[0]
+
+    if not _np_is_recalled_wrong_assignment(recalled):
+        return {"ok": True, "due": False, "reason": "account_is_not_a_recalled_wrong_assignment"}
+    if _np_v81_recall_has_forbidden_use(recalled):
+        return {"ok": True, "due": False, "reason": "recalled_account_has_irreversible_trade_or_payout_use"}
+
+    rid = str(recalled.get("id") or "").strip()
+    tid = str(recalled.get("trader_id") or "").strip()
+    pid = str(recalled.get("purchase_id") or recalled.get("challenge_purchase_id") or "").strip()
+
+    exact_key = _np_v79_recall_marker(recalled, "NP_RECALL_ENTITLEMENT")
+    ent_type = _np_v79_recall_marker(recalled, "NP_RECALL_TYPE").lower()
+    evidence_id = _np_v79_recall_marker(recalled, "NP_RECALL_EVIDENCE")
+    source_id = _np_v79_recall_marker(recalled, "NP_RECALL_SOURCE")
+    target_stage = _np_v81_exact_recall_target(recalled)
+
+    # Strongest path: exact Recall marker says payout renewal and the existing exact
+    # payout engine agrees that this payout is due again after the recalled child.
+    if exact_key and ent_type == "payout_renewal" and evidence_id and source_id:
+        truth = _np_exact_payout_funded_due_v34(evidence_id)
+        if truth.get("ok") and truth.get("due") and str(truth.get("source_account_id") or "").strip() == source_id:
+            try:
+                srows = supabase.table("trader_accounts").select("*").eq("id", source_id).limit(1).execute().data or []
+            except Exception:
+                srows = []
+            source = srows[0] if srows else {}
+            ent = {
+                "entitlement_key": exact_key,
+                "entitlement_type": "payout_renewal",
+                "source_event_type": "payout_paid",
+                "source_account_id": source_id,
+                "source_mt5": str(source.get("mt5_login") or truth.get("source_mt5") or "").strip() or None,
+                "evidence_id": evidence_id,
+                "payout_id": evidence_id,
+                "target_stage": "funded",
+                "status": "AVAILABLE",
+                "reason": "INVALID MT5 RECALLED → SAME PAYOUT RENEWAL RESTORED → FRESH FUNDED MT5 REQUIRED",
+                "restored_from_recall": True,
+                "recalled_account_id": rid,
+                "recalled_mt5": str(recalled.get("mt5_login") or "").strip(),
+                "authority_source": "EXACT_RECALL_MARKER_PLUS_PAYOUT_ENGINE_V84",
+            }
+            return {
+                "ok": True, "due": True, "journey_id": pid, "trader_id": tid,
+                "recalled_account_id": rid, "recalled_mt5": recalled.get("mt5_login"),
+                "entitlement": ent, "marker_type": ent_type,
+                "release": NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V84,
+            }
+
+    # Forensic correction path: the old ledger marker may itself have been wrong.
+    # Reconstruct only if an exact paid-payout predecessor chain independently proves it.
+    ent, err = _np_v84_exact_payout_chain(recalled)
+    if ent:
+        return {
+            "ok": True, "due": True, "journey_id": pid, "trader_id": tid,
+            "recalled_account_id": rid, "recalled_mt5": recalled.get("mt5_login"),
+            "entitlement": ent,
+            "marker_entitlement_key": exact_key or None,
+            "marker_type": ent_type or None,
+            "marker_evidence_id": evidence_id or None,
+            "marker_source_account_id": source_id or None,
+            "marker_target_stage": target_stage or None,
+            "marker_conflict_corrected_by_exact_chain": bool(ent_type and ent_type != "payout_renewal"),
+            "release": NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V84,
+        }
+
+    return {
+        "ok": True, "due": False, "journey_id": pid, "trader_id": tid,
+        "recalled_account_id": rid, "recalled_mt5": recalled.get("mt5_login"),
+        "reason": err or "no_replacement_entitlement_verified",
+        "marker_entitlement_key": exact_key or None,
+        "marker_type": ent_type or None,
+        "marker_evidence_id": evidence_id or None,
+        "marker_source_account_id": source_id or None,
+        "marker_target_stage": target_stage or None,
+        "release": NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V84,
+    }
+
+
+@app.route("/admin/recall_replacement_status_v84", methods=["GET", "OPTIONS"])
+def admin_recall_replacement_status_v84():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    account_id = str(request.args.get("trader_account_id") or request.args.get("account_id") or "").strip()
+    try:
+        return _np_ok(_np_v84_exact_recall_status(account_id))
+    except Exception as exc:
+        print("V84 FAST RECALL STATUS ERROR:", exc, flush=True)
+        return _np_fail(str(exc), 500)
+
+
+@app.route("/admin/recall_replacement_v84/health", methods=["GET", "OPTIONS"])
+def admin_recall_replacement_v84_health():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V84,
+        "bypasses_full_journey_rebuild": True,
+        "exact_recalled_account_required": True,
+        "exact_paid_payout_chain_supported": True,
+        "read_route_assigns_mt5": False,
+        "business_rules_changed": False,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_FAST_RECALL_RECOVERY_RELEASE_V84
