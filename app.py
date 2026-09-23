@@ -1513,6 +1513,31 @@ def _pending_reset_replacements_from_accounts(account_rows, trader=None):
             if not str(candidate.get("mt5_login") or "").strip():
                 continue
 
+            # V98 RESET FULFILMENT VISIBILITY AUTHORITY:
+            # Explicit source->replacement lineage is stronger than purchase/stage
+            # heuristics. Once the fresh MT5 directly identifies this reset source
+            # (or the source points back to this child), the old reset can never
+            # remain in pending_replacements / trader selector as WAITING.
+            candidate_id = str(candidate.get("id") or "").strip()
+            direct_parent_ids = {
+                str(candidate.get("replaces_trader_account_id") or "").strip(),
+                str(candidate.get("replaced_trader_account_id") or "").strip(),
+                str(candidate.get("reset_trader_account_id") or "").strip(),
+                str(candidate.get("previous_trader_account_id") or "").strip(),
+                str(candidate.get("source_trader_account_id") or "").strip(),
+                str(candidate.get("source_account_id") or "").strip(),
+            }
+            source_child_ids = {
+                str(old.get("reset_replacement_account_id") or "").strip(),
+                str(old.get("replacement_account_id") or "").strip(),
+            }
+            if old_id and old_id in direct_parent_ids:
+                consumed = True
+                break
+            if candidate_id and candidate_id in source_child_ids:
+                consumed = True
+                break
+
             ctime = _dt_score(
                 candidate.get("assigned_at")
                 or candidate.get("started_at")
@@ -37763,6 +37788,7 @@ def _np_reset_entitlement_for_source(source, trader=None):
     if (
         "np_consumed:paid_reset:" in blob
         or "reset_consumed replacement_account_id=" in blob
+        or "[np_reset_consumed:" in blob
         or "np_consumed:admin_recovery:" in blob
     ):
         return {
@@ -49729,3 +49755,12 @@ def admin_fast_actions_v97_status():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_FAST_ADMIN_ACTION_RELEASE_V97
+
+
+# ============================================================================
+# NAIRAPIPS V98 — RESET WAITING FULFILLED VISIBILITY FIX
+# 23 SEP 2026
+# Direct reset source/replacement lineage now closes stale pending_replacements
+# even when legacy purchase/stage metadata differs. History is preserved.
+# ============================================================================
+NAIRAPIPS_RESET_WAITING_VISIBILITY_RELEASE_V98 = "V98_RESET_WAITING_FULFILLED_VISIBILITY_2026_09_23"
