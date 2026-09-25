@@ -49764,3 +49764,140 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_FAST_ADMIN_ACTION_RELEASE_V97
 # even when legacy purchase/stage metadata differs. History is preserved.
 # ============================================================================
 NAIRAPIPS_RESET_WAITING_VISIBILITY_RELEASE_V98 = "V98_RESET_WAITING_FULFILLED_VISIBILITY_2026_09_23"
+
+
+# ============================================================================
+# NAIRAPIPS V75 — ONE PURCHASE -> ONE INITIAL ASSIGNMENT DATABASE CLAIM LOCK
+# 25 SEP 2026
+#
+# Incident: one approved new purchase could be processed by two concurrent
+# approval requests/workers. Existing guards were check-then-act and therefore
+# both workers could observe "no account yet" before either insert committed.
+#
+# LAW:
+#   ONE PURCHASE -> ONE INITIAL ENTITLEMENT -> ONE INITIAL MT5 ASSIGNMENT.
+#
+# This wrapper uses challenge_purchases.status itself as an atomic database
+# compare-and-set claim. It works across Gunicorn workers/processes because the
+# winner is decided by Postgres/Supabase, not by an in-memory Python lock.
+# ============================================================================
+NAIRAPIPS_ONE_PURCHASE_LOCK_RELEASE = "V75_ONE_PURCHASE_ONE_ASSIGNMENT_LOCK_2026_09_25"
+_np_v75_approve_purchase_core = app.view_functions.get("approve_purchase")
+
+def _np_v75_purchase_has_account(pid):
+    try:
+        rows = (supabase.table("trader_accounts")
+                .select("id,mt5_login,purchase_id,stage,account_status")
+                .eq("purchase_id", pid).limit(1).execute().data or [])
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+def _np_v75_approve_purchase_route():
+    if request.method == "OPTIONS":
+        return _np_v75_approve_purchase_core()
+
+    d = request.get_json(silent=True) or {}
+    pid = str(d.get("id") or d.get("purchase_id") or "").strip()
+    if not pid:
+        return _np_v75_approve_purchase_core()
+
+    # Fast permanent-consumption check before attempting a claim.
+    existing = _np_v75_purchase_has_account(pid)
+    if existing:
+        _audit_safe(
+            "purchase_assignment", "duplicate_initial_assignment_blocked",
+            f"V75 purchase={pid} already consumed by account={existing.get('id')} MT5={existing.get('mt5_login')}",
+            _admin_from_payload(d), pid,
+        )
+        return _np_fail(
+            f"ONE PURCHASE / ONE ASSIGNMENT: this purchase is already consumed by MT5 {existing.get('mt5_login')}. Refresh the page.",
+            409,
+        )
+
+    rows = (supabase.table("challenge_purchases").select("*")
+            .eq("id", pid).limit(1).execute().data or [])
+    if not rows:
+        return _np_fail("Purchase not found", 404)
+    p = rows[0]
+
+    # Mirror evidence is also permanent consumption evidence.
+    if (p.get("trader_account_id") or p.get("assigned_mt5_id")
+            or str(p.get("mt5_login") or "").strip()):
+        return _np_fail("ONE PURCHASE / ONE ASSIGNMENT: this purchase is already assigned. Refresh the page.", 409)
+
+    old_status = p.get("status")
+    claim_status = "purchase_assignment_claimed"
+    now = now_iso()
+
+    # Atomic compare-and-set. Only ONE concurrent request can change the exact
+    # status value it originally read to purchase_assignment_claimed.
+    q = (supabase.table("challenge_purchases")
+         .update({
+             "status": claim_status,
+             "lifecycle_state": "phase1_assigning",
+             "updated_at": now,
+         })
+         .eq("id", pid))
+    if old_status is None:
+        q = q.is_("status", "null")
+    else:
+        q = q.eq("status", old_status)
+    claimed = q.execute().data or []
+
+    if not claimed:
+        # Another process either owns the claim or completed assignment.
+        existing = _np_v75_purchase_has_account(pid)
+        if existing:
+            msg = f"Purchase already consumed by MT5 {existing.get('mt5_login')}."
+        else:
+            msg = "Purchase assignment is already being processed by another worker. Do not assign another MT5."
+        _audit_safe(
+            "purchase_assignment", "concurrent_initial_assignment_blocked",
+            f"V75 purchase={pid}; {msg}", _admin_from_payload(d), pid,
+        )
+        return _np_fail("ONE PURCHASE / ONE ASSIGNMENT: " + msg, 409)
+
+    _audit_safe(
+        "purchase_assignment", "initial_assignment_claim_acquired",
+        f"V75 atomic claim acquired purchase={pid}", _admin_from_payload(d), pid,
+    )
+
+    try:
+        resp = _np_v75_approve_purchase_core()
+        code = int(getattr(resp, "status_code", 200) or 200)
+
+        # If the core returned an error BEFORE creating an account, release the
+        # claim so staff can retry the same purchase. If an account exists, the
+        # entitlement stays permanently consumed regardless of later side-effect
+        # failures (email/audit/cache etc.).
+        if code >= 400 and not _np_v75_purchase_has_account(pid):
+            release = {
+                "status": old_status,
+                "lifecycle_state": p.get("lifecycle_state"),
+                "updated_at": now_iso(),
+            }
+            (supabase.table("challenge_purchases").update(release)
+             .eq("id", pid).eq("status", claim_status).execute())
+            _audit_safe(
+                "purchase_assignment", "initial_assignment_claim_released",
+                f"V75 purchase={pid}; core returned HTTP {code}; no account created",
+                _admin_from_payload(d), pid,
+            )
+        return resp
+    except Exception:
+        # Same recovery rule for exceptions: release only if no assignment was
+        # created. Never reopen a consumed purchase.
+        if not _np_v75_purchase_has_account(pid):
+            try:
+                (supabase.table("challenge_purchases").update({
+                    "status": old_status,
+                    "lifecycle_state": p.get("lifecycle_state"),
+                    "updated_at": now_iso(),
+                }).eq("id", pid).eq("status", claim_status).execute())
+            except Exception:
+                pass
+        raise
+
+if _np_v75_approve_purchase_core:
+    app.view_functions["approve_purchase"] = _np_v75_approve_purchase_route
