@@ -49767,137 +49767,284 @@ NAIRAPIPS_RESET_WAITING_VISIBILITY_RELEASE_V98 = "V98_RESET_WAITING_FULFILLED_VI
 
 
 # ============================================================================
-# NAIRAPIPS V75 — ONE PURCHASE -> ONE INITIAL ASSIGNMENT DATABASE CLAIM LOCK
+# NAIRAPIPS V99 — PAID RESET SINGLE-CONSUMPTION LOCK
 # 25 SEP 2026
 #
-# Incident: one approved new purchase could be processed by two concurrent
-# approval requests/workers. Existing guards were check-then-act and therefore
-# both workers could observe "no account yet" before either insert committed.
+# SURGICAL SCOPE
+# --------------
+# Paid Challenge/Funded reset only.
+# DOES NOT alter Recall/Wrong-Assignment, login/auth, Second Life, payout renewal,
+# normal purchase assignment, Phase1->Funded progression, breach rules or MT5
+# inventory selection.
 #
-# LAW:
-#   ONE PURCHASE -> ONE INITIAL ENTITLEMENT -> ONE INITIAL MT5 ASSIGNMENT.
-#
-# This wrapper uses challenge_purchases.status itself as an atomic database
-# compare-and-set claim. It works across Gunicorn workers/processes because the
-# winner is decided by Postgres/Supabase, not by an in-memory Python lock.
+# LAW
+# ----
+# ONE RESET SOURCE -> ONE RESET ORDER -> ONE REPLACEMENT MT5 -> CONSUMED FOREVER.
+# A retry may finish the SAME entitlement; it may never allocate a second MT5.
 # ============================================================================
-NAIRAPIPS_ONE_PURCHASE_LOCK_RELEASE = "V75_ONE_PURCHASE_ONE_ASSIGNMENT_LOCK_2026_09_25"
-_np_v75_approve_purchase_core = app.view_functions.get("approve_purchase")
+NAIRAPIPS_RESET_SINGLE_CONSUMPTION_RELEASE_V99 = "V99_RESET_SINGLE_CONSUMPTION_LOCK_2026_09_25"
 
-def _np_v75_purchase_has_account(pid):
+
+def _np_v99_source_id_from_payload(d):
+    raw = str(
+        (d or {}).get("completed_account_id")
+        or (d or {}).get("source_account_id")
+        or (d or {}).get("trader_account_id")
+        or (d or {}).get("passed_account_id")
+        or ""
+    ).strip()
+    for prefix in ("waiting:", "reset-waiting:", "recall-waiting:"):
+        if raw.startswith(prefix):
+            raw = raw.split(":", 1)[1]
+            if prefix == "waiting:" and ":" in raw:
+                raw = raw.split(":", 1)[0]
+            break
+    return raw
+
+
+def _np_v99_paid_reset_marker(source):
+    blob = _np_kill_blob(source or {})
+    return bool(
+        "[np_entitlement:funded_reset_paid:" in blob
+        or "[np_entitlement:challenge_reset_paid:" in blob
+        or "np_consumed:paid_reset:" in blob
+        or "reset_consumed replacement_account_id=" in blob
+        or "funded_reset_paid" in blob
+        or "challenge_reset_paid" in blob
+    )
+
+
+def _np_v99_consumed_marker(source):
+    blob = _np_kill_blob(source or {})
+    return bool(
+        "np_consumed:paid_reset:" in blob
+        or "reset_consumed replacement_account_id=" in blob
+        or "[np_reset_consumed:" in blob
+    )
+
+
+def _np_v99_exact_successor(source):
+    """Use existing exact lineage authority; never infer from another purchase."""
     try:
-        rows = (supabase.table("trader_accounts")
-                .select("id,mt5_login,purchase_id,stage,account_status")
-                .eq("purchase_id", pid).limit(1).execute().data or [])
-        return rows[0] if rows else None
+        child = _np_v72_exact_reset_successor(source or {})
+        if child and str(child.get("mt5_login") or "").strip():
+            return child
     except Exception:
-        return None
+        pass
+    return None
 
-def _np_v75_approve_purchase_route():
-    if request.method == "OPTIONS":
-        return _np_v75_approve_purchase_core()
+
+def _np_v99_stamp_consumed(source, order, child):
+    """Schema-safe permanent evidence using columns proven to exist in production."""
+    source = source or {}; order = order or {}; child = child or {}
+    sid = str(source.get("id") or "").strip()
+    oid = str(order.get("id") or "").strip()
+    tid = str(source.get("trader_id") or order.get("trader_id") or "").strip()
+    cid = str(child.get("id") or "").strip()
+    cmt5 = str(child.get("mt5_login") or "").strip()
+    if not sid or not oid or not tid or not cid or not cmt5:
+        return False
+    now = now_iso()
+    marker = f"[NP_CONSUMED:PAID_RESET:{oid}] replacement_account_id={cid} replacement_mt5={cmt5}"
+
+    # trader_accounts production schema has archive_reason + updated_at.
+    old_reason = str(source.get("archive_reason") or "").strip()
+    if marker.lower() not in old_reason.lower():
+        supabase.table("trader_accounts").update({
+            "archive_reason": (old_reason + " | " + marker).strip(" |"),
+            "updated_at": now,
+        }).eq("id", sid).eq("trader_id", tid).execute()
+
+    # challenge_purchases production schema has status/admin_note/updated_at.
+    old_note = str(order.get("admin_note") or "").strip()
+    note = old_note if marker.lower() in old_note.lower() else (old_note + " | " + marker).strip(" |")
+    supabase.table("challenge_purchases").update({
+        "status": "completed",
+        "admin_note": note,
+        "updated_at": now,
+    }).eq("id", oid).eq("trader_id", tid).execute()
+    return True
+
+
+# Card/policy kill switch: a fulfilled paid reset belongs to HISTORY only.
+_np_v69_previous_reset_action_v99_core = globals().get("_np_v69_previous_reset_action")
+def _np_v69_previous_reset_action(account, trader):
+    a = account or {}
+    # Recall/wrong-assignment is explicitly outside this patch.
+    try:
+        if _np_is_recalled_wrong_assignment(a):
+            return _np_v69_previous_reset_action_v99_core(a, trader)
+    except Exception:
+        pass
+    if _np_v99_paid_reset_marker(a):
+        child = _np_v99_exact_successor(a)
+        if child or _np_v99_consumed_marker(a):
+            return None
+    return _np_v69_previous_reset_action_v99_core(a, trader)
+
+
+# Payment firewall: even a stale frontend card cannot open a second reset order.
+_np_create_reset_purchase_v99_core = app.view_functions.get("create_reset_purchase")
+def _np_create_reset_purchase_v99():
+    if request.method == "OPTIONS" or not _np_create_reset_purchase_v99_core:
+        return _np_create_reset_purchase_v99_core()
+    d = request.get_json(silent=True) or {}
+    tid = str(d.get("trader_id") or "").strip()
+    sid = str(d.get("trader_account_id") or d.get("source_account_id") or "").strip()
+    if sid:
+        try:
+            q = supabase.table("trader_accounts").select("*").eq("id", sid)
+            if tid: q = q.eq("trader_id", tid)
+            rows = q.limit(1).execute().data or []
+            if rows:
+                source = rows[0]
+                # Never intercept Recall with paid-reset logic.
+                if not _np_is_recalled_wrong_assignment(source):
+                    child = _np_v99_exact_successor(source)
+                    if child or _np_v99_consumed_marker(source):
+                        return _np_fail(
+                            f"Reset already fulfilled by MT5 {child.get('mt5_login') if child else 'replacement account'}. Do not pay again.",
+                            409,
+                        )
+        except Exception as exc:
+            return _np_fail("Reset consumption verification failed closed: " + str(exc), 500)
+    return _np_create_reset_purchase_v99_core()
+
+if _np_create_reset_purchase_v99_core:
+    app.view_functions["create_reset_purchase"] = _np_create_reset_purchase_v99
+
+
+# Assignment lock: atomically claim the exact APPROVED reset order before allowing
+# the existing assignment stack (including V79 Recall protections) to run.
+_np_assign_phase_v99_core = app.view_functions.get("assign_phase_mt5")
+def _np_assign_phase_v99():
+    if request.method == "OPTIONS" or not _np_assign_phase_v99_core:
+        return _np_assign_phase_v99_core()
 
     d = request.get_json(silent=True) or {}
-    pid = str(d.get("id") or d.get("purchase_id") or "").strip()
-    if not pid:
-        return _np_v75_approve_purchase_core()
+    tid = str(d.get("trader_id") or d.get("id") or "").strip()
+    sid = _np_v99_source_id_from_payload(d)
+    if not tid or not sid:
+        return _np_assign_phase_v99_core()
 
-    # Fast permanent-consumption check before attempting a claim.
-    existing = _np_v75_purchase_has_account(pid)
-    if existing:
-        _audit_safe(
-            "purchase_assignment", "duplicate_initial_assignment_blocked",
-            f"V75 purchase={pid} already consumed by account={existing.get('id')} MT5={existing.get('mt5_login')}",
-            _admin_from_payload(d), pid,
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", sid).eq("trader_id", tid).limit(1).execute().data or []
         )
+        source = rows[0] if rows else None
+    except Exception as exc:
+        return _np_fail("Reset assignment verification failed closed: " + str(exc), 500)
+
+    if not source:
+        return _np_assign_phase_v99_core()
+
+    # CRITICAL ISOLATION: Recall/Wrong Assignment passes untouched into V79.
+    try:
+        if _np_is_recalled_wrong_assignment(source):
+            return _np_assign_phase_v99_core()
+    except Exception:
+        return _np_assign_phase_v99_core()
+
+    if not _np_v99_paid_reset_marker(source):
+        return _np_assign_phase_v99_core()
+
+    child = _np_v99_exact_successor(source)
+    if child or _np_v99_consumed_marker(source):
         return _np_fail(
-            f"ONE PURCHASE / ONE ASSIGNMENT: this purchase is already consumed by MT5 {existing.get('mt5_login')}. Refresh the page.",
+            f"Duplicate reset assignment blocked: source MT5 {source.get('mt5_login') or '—'} already produced replacement MT5 {child.get('mt5_login') if child else 'recorded replacement'}.",
             409,
         )
 
-    rows = (supabase.table("challenge_purchases").select("*")
-            .eq("id", pid).limit(1).execute().data or [])
-    if not rows:
-        return _np_fail("Purchase not found", 404)
-    p = rows[0]
+    order = _np_reset_open_order(sid) or {}
+    oid = str(order.get("id") or "").strip()
+    if not oid:
+        return _np_fail("Paid reset assignment blocked: exact reset order was not found.", 409)
 
-    # Mirror evidence is also permanent consumption evidence.
-    if (p.get("trader_account_id") or p.get("assigned_mt5_id")
-            or str(p.get("mt5_login") or "").strip()):
-        return _np_fail("ONE PURCHASE / ONE ASSIGNMENT: this purchase is already assigned. Refresh the page.", 409)
+    # Reuse the existing V71 proof/approval firewall when available.
+    fw = globals().get("_np_v71_paid_reset_order_firewall")
+    if callable(fw):
+        ok_fw, reason_fw, _ = fw(order)
+        if not ok_fw:
+            return _np_fail("Paid reset assignment blocked: " + str(reason_fw), 409)
 
-    old_status = p.get("status")
-    claim_status = "purchase_assignment_claimed"
+    state = str(order.get("status") or "").strip().lower()
+    if state == "completed":
+        return _np_fail("Paid reset already consumed. No further MT5 is due.", 409)
+    if state == "reset_assigning":
+        return _np_fail("This exact reset is already being assigned. Refresh before retrying.", 409)
+    if state != "approved_reset_waiting_mt5":
+        return _np_fail("Paid reset is not in the approved waiting-for-MT5 state.", 409)
+
+    # Database compare-and-set claim. Across simultaneous workers only the first
+    # request can move approved_reset_waiting_mt5 -> reset_assigning.
     now = now_iso()
-
-    # Atomic compare-and-set. Only ONE concurrent request can change the exact
-    # status value it originally read to purchase_assignment_claimed.
-    q = (supabase.table("challenge_purchases")
-         .update({
-             "status": claim_status,
-             "lifecycle_state": "phase1_assigning",
-             "updated_at": now,
-         })
-         .eq("id", pid))
-    if old_status is None:
-        q = q.is_("status", "null")
-    else:
-        q = q.eq("status", old_status)
-    claimed = q.execute().data or []
-
-    if not claimed:
-        # Another process either owns the claim or completed assignment.
-        existing = _np_v75_purchase_has_account(pid)
-        if existing:
-            msg = f"Purchase already consumed by MT5 {existing.get('mt5_login')}."
-        else:
-            msg = "Purchase assignment is already being processed by another worker. Do not assign another MT5."
-        _audit_safe(
-            "purchase_assignment", "concurrent_initial_assignment_blocked",
-            f"V75 purchase={pid}; {msg}", _admin_from_payload(d), pid,
-        )
-        return _np_fail("ONE PURCHASE / ONE ASSIGNMENT: " + msg, 409)
-
-    _audit_safe(
-        "purchase_assignment", "initial_assignment_claim_acquired",
-        f"V75 atomic claim acquired purchase={pid}", _admin_from_payload(d), pid,
+    claimed = (
+        supabase.table("challenge_purchases")
+        .update({"status": "reset_assigning", "updated_at": now})
+        .eq("id", oid).eq("trader_id", tid)
+        .eq("status", "approved_reset_waiting_mt5")
+        .execute().data or []
     )
+    if not claimed:
+        return _np_fail("This exact reset was already claimed by another assignment worker. Refresh before retrying.", 409)
 
     try:
-        resp = _np_v75_approve_purchase_core()
-        code = int(getattr(resp, "status_code", 200) or 200)
+        resp = _np_assign_phase_v99_core()
+        # Assignment is synchronous in the existing stack. Re-read lineage now.
+        fresh_source_rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", sid).eq("trader_id", tid).limit(1).execute().data or []
+        )
+        fresh_source = fresh_source_rows[0] if fresh_source_rows else source
+        child = _np_v99_exact_successor(fresh_source)
+        if child:
+            _np_v99_stamp_consumed(fresh_source, claimed[0] if claimed else order, child)
+            return resp
 
-        # If the core returned an error BEFORE creating an account, release the
-        # claim so staff can retry the same purchase. If an account exists, the
-        # entitlement stays permanently consumed regardless of later side-effect
-        # failures (email/audit/cache etc.).
-        if code >= 400 and not _np_v75_purchase_has_account(pid):
-            release = {
-                "status": old_status,
-                "lifecycle_state": p.get("lifecycle_state"),
-                "updated_at": now_iso(),
-            }
-            (supabase.table("challenge_purchases").update(release)
-             .eq("id", pid).eq("status", claim_status).execute())
-            _audit_safe(
-                "purchase_assignment", "initial_assignment_claim_released",
-                f"V75 purchase={pid}; core returned HTTP {code}; no account created",
-                _admin_from_payload(d), pid,
-            )
+        # No successor exists: entitlement remains the SAME entitlement and may retry.
+        # Never consume another MT5 merely because this attempt failed downstream.
+        supabase.table("challenge_purchases").update({
+            "status": "approved_reset_waiting_mt5",
+            "updated_at": now_iso(),
+        }).eq("id", oid).eq("trader_id", tid).eq("status", "reset_assigning").execute()
         return resp
     except Exception:
-        # Same recovery rule for exceptions: release only if no assignment was
-        # created. Never reopen a consumed purchase.
-        if not _np_v75_purchase_has_account(pid):
-            try:
-                (supabase.table("challenge_purchases").update({
-                    "status": old_status,
-                    "lifecycle_state": p.get("lifecycle_state"),
-                    "updated_at": now_iso(),
-                }).eq("id", pid).eq("status", claim_status).execute())
-            except Exception:
-                pass
+        try:
+            supabase.table("challenge_purchases").update({
+                "status": "approved_reset_waiting_mt5",
+                "updated_at": now_iso(),
+            }).eq("id", oid).eq("trader_id", tid).eq("status", "reset_assigning").execute()
+        except Exception:
+            pass
         raise
 
-if _np_v75_approve_purchase_core:
-    app.view_functions["approve_purchase"] = _np_v75_approve_purchase_route
+if _np_assign_phase_v99_core:
+    app.view_functions["assign_phase_mt5"] = _np_assign_phase_v99
+
+
+@app.route("/admin/reset_single_consumption_v99/status", methods=["GET", "OPTIONS"])
+def admin_reset_single_consumption_v99_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_RESET_SINGLE_CONSUMPTION_RELEASE_V99,
+        "law": "ONE RESET SOURCE -> ONE RESET ORDER -> ONE REPLACEMENT MT5 -> CONSUMED FOREVER",
+        "database_claim": "approved_reset_waiting_mt5 -> reset_assigning -> completed",
+        "failed_assignment_retries_same_entitlement": True,
+        "fulfilled_reset_hidden_from_previous_account_action": True,
+        "stale_frontend_second_payment_blocked": True,
+        "recall_wrong_assignment_logic_changed": False,
+        "login_auth_logic_changed": False,
+        "second_life_logic_changed": False,
+        "payout_renewal_logic_changed": False,
+        "normal_purchase_assignment_logic_changed": False,
+        "phase1_to_funded_logic_changed": False,
+        "mt5_inventory_logic_changed": False,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_SINGLE_CONSUMPTION_RELEASE_V99
