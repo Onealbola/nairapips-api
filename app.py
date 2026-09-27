@@ -50048,3 +50048,196 @@ def admin_reset_single_consumption_v99_status():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_RESET_SINGLE_CONSUMPTION_RELEASE_V99
+
+# ============================================================================
+# NAIRAPIPS V100 — SERVER LIFECYCLE RECOVERY / WEB PROTECTION PRESERVED
+# 26 SEP 2026
+#
+# PURPOSE
+# - Preserve V96 protection: broad Second-Life sweeps stay OFF web requests.
+# - Restore the SAME proven Second-Life retry queue ONLY inside the background
+#   lifecycle worker.
+# - Preserve existing exact Phase1->Funded retry authority.
+# - Preserve V74 cross-process heavy-scan lock.
+#
+# NON-GOALS / PROTECTED PRODUCTION LOGIC
+# - Recall / Wrong Assignment: unchanged.
+# - Login/authentication: unchanged.
+# - Paid reset / reset consumption V99: unchanged.
+# - Payout renewal: unchanged.
+# - Normal purchase assignment: unchanged.
+# - MT5 inventory selection/claim rules: unchanged.
+# - Second-Life entitlement/lineage rules: unchanged.
+# - No Life 3 creation.
+# ============================================================================
+
+NAIRAPIPS_SERVER_LIFECYCLE_RECOVERY_RELEASE_V100 = (
+    "V100_SERVER_LIFECYCLE_RECOVERY_2026_09_26"
+)
+
+# V96 intentionally saved the last proven Second-Life retry implementation
+# before replacing the public/web-callable symbol with a deferred no-op.
+# Use that saved implementation only from this server worker.
+_np_v100_second_life_server_core = globals().get(
+    "_np_retry_waiting_second_lives_v96_core"
+)
+
+def _np_v100_retry_second_life_server_only(limit=100):
+    core = _np_v100_second_life_server_core
+    if not callable(core):
+        return {
+            "checked": 0,
+            "assigned": 0,
+            "errors": 1,
+            "server_only": True,
+            "error": "saved_second_life_core_unavailable",
+            "release": NAIRAPIPS_SERVER_LIFECYCLE_RECOVERY_RELEASE_V100,
+        }
+
+    result = core(limit=min(max(int(limit or 100), 10), 100))
+    if isinstance(result, dict):
+        result = dict(result)
+        result["server_only"] = True
+        result["web_resource_protection_preserved"] = True
+        result["release_v100"] = NAIRAPIPS_SERVER_LIFECYCLE_RECOVERY_RELEASE_V100
+    return result
+
+
+# The already-running V40 worker resolves this function by global name on every
+# cycle. Replacing ONLY this cycle function therefore repairs background work
+# without starting a second daemon/thread.
+_np_run_verified_lifecycle_cycle_v100_previous = globals().get(
+    "_np_run_verified_lifecycle_cycle_v40"
+)
+
+def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
+    global _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40
+
+    # Keep the same V74 cross-Gunicorn exclusion used by the production worker.
+    lock_fn = globals().get("_np_v74_try_file_lock")
+    unlock_fn = globals().get("_np_v74_release_file_lock")
+    lock = lock_fn() if callable(lock_fn) else True
+
+    if not lock:
+        summary = {
+            "release": NAIRAPIPS_SERVER_LIFECYCLE_RECOVERY_RELEASE_V100,
+            "trigger": trigger,
+            "started_at": now_iso(),
+            "finished_at": now_iso(),
+            "deferred_cross_process_busy": True,
+            "first_phase1": {},
+            "phase_pass_to_funded": {},
+            "second_life": {},
+            "errors": 0,
+        }
+        _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40 = summary
+        return summary
+
+    try:
+        # Preserve interactive/admin priority protection.
+        priority_fn = globals().get("_np_interactive_priority_active_v47")
+        if callable(priority_fn):
+            try:
+                if priority_fn():
+                    summary = {
+                        "release": NAIRAPIPS_SERVER_LIFECYCLE_RECOVERY_RELEASE_V100,
+                        "trigger": trigger,
+                        "started_at": now_iso(),
+                        "finished_at": now_iso(),
+                        "deferred_for_admin_read": True,
+                        "first_phase1": {},
+                        "phase_pass_to_funded": {},
+                        "second_life": {},
+                        "errors": 0,
+                    }
+                    _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40 = summary
+                    return summary
+            except Exception:
+                pass
+
+        summary = {
+            "release": NAIRAPIPS_SERVER_LIFECYCLE_RECOVERY_RELEASE_V100,
+            "trigger": trigger,
+            "started_at": now_iso(),
+            "first_phase1": {},
+            "phase_pass_to_funded": {},
+            "second_life": {},
+            "errors": 0,
+        }
+
+        # Existing exact first-purchase assignment authority.
+        try:
+            summary["first_phase1"] = _np_retry_approved_first_phase1_v60(limit=100)
+        except Exception as exc:
+            summary["errors"] += 1
+            summary["first_phase1"] = {"errors": 1, "error": str(exc)}
+
+        # Existing exact Phase1 PASS -> Funded authority. No new rule added.
+        try:
+            summary["phase_pass_to_funded"] = _np_retry_clean_pass_funded_v19(limit=100)
+        except Exception as exc:
+            summary["errors"] += 1
+            summary["phase_pass_to_funded"] = {"errors": 1, "error": str(exc)}
+
+        # Critical V100 repair:
+        # background worker uses saved proven retry core; web requests remain
+        # protected by the V96 deferred wrapper.
+        try:
+            summary["second_life"] = _np_v100_retry_second_life_server_only(limit=100)
+        except Exception as exc:
+            summary["errors"] += 1
+            summary["second_life"] = {"errors": 1, "error": str(exc)}
+
+        summary["finished_at"] = now_iso()
+        _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40 = summary
+
+        try:
+            _NP_V74_LAST_HEAVY_SCAN["lifecycle"] = now_iso()
+        except Exception:
+            pass
+
+        print("V100 SERVER LIFECYCLE CYCLE:", summary, flush=True)
+        return summary
+
+    finally:
+        if lock is not True and callable(unlock_fn):
+            try:
+                unlock_fn(lock)
+            except Exception:
+                pass
+
+
+@app.route("/admin/server_lifecycle_v100/status", methods=["GET", "OPTIONS"])
+def admin_server_lifecycle_v100_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_SERVER_LIFECYCLE_RECOVERY_RELEASE_V100,
+        "worker_started": bool(globals().get("_NP_LIFECYCLE_WORKER_STARTED_V40")),
+        "worker_interval_seconds": globals().get("_NP_LIFECYCLE_WORKER_INTERVAL_V40"),
+        "web_second_life_sweeps_disabled": bool(
+            globals().get("_NP_DISABLE_SECOND_LIFE_WEB_SWEEPS_V96")
+        ),
+        "server_second_life_retry_core_available": callable(
+            globals().get("_np_v100_second_life_server_core")
+        ),
+        "last_summary": globals().get("_NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40"),
+        "recall_wrong_assignment_logic_changed": False,
+        "login_auth_logic_changed": False,
+        "paid_reset_logic_changed": False,
+        "payout_renewal_logic_changed": False,
+        "normal_purchase_assignment_logic_changed": False,
+        "mt5_inventory_logic_changed": False,
+        "second_life_entitlement_logic_changed": False,
+        "phase1_to_funded_business_rule_changed": False,
+        "web_resource_protection_preserved": True,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = (
+    NAIRAPIPS_SERVER_LIFECYCLE_RECOVERY_RELEASE_V100
+)
