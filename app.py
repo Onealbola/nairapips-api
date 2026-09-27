@@ -51803,3 +51803,181 @@ def _np_admin_journey_authority_v108():
 
 app.view_functions["admin_journey_authority"]=_np_admin_journey_authority_v108
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE=NAIRAPIPS_MANAGEMENT_SOURCE_AUTHORITY_V108
+
+
+# ============================================================================
+# NAIRAPIPS V109 — UNIQUE SUCCESSOR RECONCILIATION
+# 27 SEP 2026
+#
+# Some early Management Returns were completed before the child row carried
+# durable parent columns/return markers. The recalled source row still proves
+# Management Hold. For those historical rows only, reconcile when there is
+# EXACTLY ONE later same-trader + same-purchase + same-stage + same-size MT5.
+# Ambiguity => no reconciliation (fail closed).
+# READ/REPORTING ONLY. No workflow mutation.
+# ============================================================================
+
+NAIRAPIPS_MANAGEMENT_UNIQUE_SUCCESSOR_V109="V109_UNIQUE_SUCCESSOR_RECONCILIATION_2026_09_27"
+
+def _np_mh_unique_successor_pairs_v109(rows):
+    rows=list(rows or [])
+    pairs={}
+    for source in rows:
+        sb=_np_mh_blob(source)
+        if "[np_management_hold:active]" not in sb:
+            continue
+        sid=_np_mh_s(source.get("id"))
+        tid=_np_mh_s(source.get("trader_id"))
+        pid=_np_mh_purchase_id(source)
+        stage=_normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+        size=clean(source.get("account_size") or source.get("start_balance") or 0)
+        if not sid or not tid or not pid or not stage or not size:
+            continue
+        # Prefer exact structural/source-receipt proof if present.
+        exact=_np_mh_structural_pairs_v106(rows).get(sid) or _np_mh_source_pairs_v108(rows).get(sid)
+        if exact:
+            child=exact.get("child") if isinstance(exact,dict) else None
+            pairs[sid]={
+                "source_account_id":sid,
+                "source_mt5":_np_mh_s(source.get("mt5_login")),
+                "return_account_id":_np_mh_s((child or {}).get("id")) or _np_mh_s(exact.get("return_account_id")),
+                "return_mt5":_np_mh_s((child or {}).get("mt5_login")) or _np_mh_s(exact.get("return_mt5")),
+                "same_life":True,"same_workflow":True,"proof":"exact_marker_or_structure"
+            }
+            continue
+        source_time=_np_parse_dt_safe(source.get("archived_at") or source.get("updated_at") or source.get("created_at"))
+        candidates=[]
+        for child in rows:
+            if _np_mh_s(child.get("id"))==sid: continue
+            if _np_mh_s(child.get("trader_id"))!=tid: continue
+            if _np_mh_purchase_id(child)!=pid: continue
+            if _normalize_lifecycle_stage(child.get("stage") or child.get("phase"))!=stage: continue
+            csize=clean(child.get("account_size") or child.get("start_balance") or 0)
+            if abs(float(csize)-float(size))>0.01: continue
+            if not _np_mh_s(child.get("mt5_login")): continue
+            cb=_np_mh_blob(child)
+            if "[np_management_hold:active]" in cb: continue
+            ctime=_np_parse_dt_safe(child.get("assigned_at") or child.get("started_at") or child.get("created_at") or child.get("updated_at"))
+            if source_time and ctime and ctime <= source_time: continue
+            candidates.append(child)
+        # This is the safety rule: NEVER guess among multiple possible children.
+        if len(candidates)!=1:
+            continue
+        child=candidates[0]
+        pairs[sid]={
+            "source_account_id":sid,
+            "source_mt5":_np_mh_s(source.get("mt5_login")),
+            "return_account_id":_np_mh_s(child.get("id")),
+            "return_mt5":_np_mh_s(child.get("mt5_login")),
+            "same_life":True,"same_workflow":True,"proof":"unique_later_same_chain"
+        }
+    return pairs
+
+_np_ops_build_v109_core=_np_ops_build_v108_core
+def _np_ops_build():
+    out=_np_ops_build_v109_core()
+    try:
+        kept=[]
+        for item in list((out or {}).get("actions") or []):
+            if _np_mh_s(item.get("code")).upper()!="THIRD_LIFE_DETECTED":
+                kept.append(item); continue
+            tid=_np_mh_s(item.get("trader_id")); pid=_np_mh_s(item.get("purchase_id"))
+            if not tid or not pid:
+                kept.append(item); continue
+            rows=(supabase.table("trader_accounts").select("*").eq("trader_id",tid)
+                  .order("created_at",desc=False).limit(1000).execute().data or [])
+            rows=[r for r in rows if _np_mh_purchase_id(r)==pid]
+            phase1=[r for r in rows if _normalize_lifecycle_stage(r.get("stage") or r.get("phase"))=="phase1"]
+            pairs=_np_mh_unique_successor_pairs_v109(phase1)
+            effective=[r for r in phase1 if _np_mh_s(r.get("id")) not in pairs]
+            if len(phase1)>2 and len(effective)<=2 and pairs:
+                continue
+            kept.append(item)
+        out["actions"]=kept
+        s=dict(out.get("summary") or {})
+        s["critical"]=sum(1 for x in kept if _np_mh_s(x.get("severity")).lower()=="critical")
+        s["action_required"]=sum(1 for x in kept if _np_mh_s(x.get("severity")).lower()=="action")
+        s["money"]=sum(1 for x in kept if _np_mh_s(x.get("severity")).lower()=="money")
+        s["data_integrity"]=sum(1 for x in kept if _np_mh_s(x.get("severity")).lower()=="data")
+        s["open_items"]=len(kept)
+        out["summary"]=s
+        out["management_lineage_release"]=NAIRAPIPS_MANAGEMENT_UNIQUE_SUCCESSOR_V109
+    except Exception as exc:
+        print("V109 OPS RECONCILIATION FAILED CLOSED:",exc,flush=True)
+    return out
+
+def _np_management_unique_overlay_v109(bundle,trader_id):
+    bundle=bundle or {}
+    journeys=list(bundle.get("journeys") or [])
+    try:
+        raw=(supabase.table("trader_accounts").select("*").eq("trader_id",_np_mh_s(trader_id))
+             .order("created_at",desc=False).limit(1000).execute().data or [])
+        pairs=_np_mh_unique_successor_pairs_v109(raw)
+        for j in journeys:
+            pid=_np_mh_s(j.get("purchase_id") or j.get("journey_id"))
+            jp=[p for p in pairs.values() if any(_np_mh_s(r.get("id"))==p["source_account_id"] and (not pid or _np_mh_purchase_id(r)==pid) for r in raw)]
+            if not jp: continue
+            bs={p["source_account_id"]:p for p in jp}; br={p["return_account_id"]:p for p in jp}
+            for a in list(j.get("accounts") or []):
+                aid=_np_mh_s(a.get("id"))
+                if aid in bs:
+                    a["management_lineage"]={"role":"RECALLED_SOURCE",**bs[aid]}
+                    a["management_display_status"]="MANAGEMENT_RECALLED"; a["counts_as_challenge_life"]=False
+                elif aid in br:
+                    a["management_lineage"]={"role":"RETURN_SUCCESSOR",**br[aid]}
+                    a["management_display_status"]="MANAGEMENT_RETURNED_SAME_LIFE"
+            for ev in list(j.get("ledger") or []):
+                aid=_np_mh_s(ev.get("account_id") or ev.get("trader_account_id")); mt5=_np_mh_s(ev.get("mt5_login"))
+                p=bs.get(aid) or next((x for x in jp if x["source_mt5"]==mt5),None)
+                if p:
+                    ev["management_lineage"]={"role":"RECALLED_SOURCE",**p}; ev["display_type"]="MANAGEMENT_RECALLED"
+                    ev["display_detail"]=f"Taken back by Management · returned as MT5 {p['return_mt5']} · historical delivery only"; continue
+                p=br.get(aid) or next((x for x in jp if x["return_mt5"]==mt5),None)
+                if p:
+                    ev["management_lineage"]={"role":"RETURN_SUCCESSOR",**p}; ev["display_type"]="MANAGEMENT_RETURNED"
+                    ev["display_detail"]=f"Replaces recalled MT5 {p['source_mt5']} · same workflow / same Life position"
+            j["management_lineage_pairs"]=jp
+            # Reconcile journey-local false contradiction too.
+            probs=[]
+            for pr in list(j.get("problems") or []):
+                if _np_mh_s(pr.get("code")).upper() in {"THIRD_LIFE_DETECTED","MORE_THAN_TWO_LIVES"}:
+                    continue
+                probs.append(pr)
+            j["problems"]=probs
+            acct=dict(j.get("accountability") or {})
+            acct["management_recall_history_rows_excluded"]=len(jp)
+            acct["management_return_same_life_pairs"]=len(jp)
+            if not probs:
+                acct["status"]="RECONCILED"; j["accountability_status"]="RECONCILED"; j["blocked"]=False; j["ok"]=True
+            j["accountability"]=acct
+        bundle["journeys"]=journeys
+        bundle["management_lineage_release"]=NAIRAPIPS_MANAGEMENT_UNIQUE_SUCCESSOR_V109
+    except Exception as exc:
+        print("V109 JOURNEY OVERLAY FAILED CLOSED:",exc,flush=True)
+    return bundle
+
+def _np_admin_journey_authority_v109():
+    if request.method=="OPTIONS": return _np_ok({})
+    staff=_require_staff_request()
+    if isinstance(staff,tuple): return staff
+    tid=_np_mh_s(request.args.get("trader_id")); jid=_np_mh_s(request.args.get("journey_id"))
+    if not tid:return _np_fail("trader_id is required",400)
+    try:
+        bundle=_np_all_journeys_preserved_v5(tid)
+        bundle=_np_v82_overlay_recalled_entitlements(bundle,tid)
+        bundle=_np_management_unique_overlay_v109(bundle,tid)
+        payload={"cutover_date":bundle.get("cutover_date"),"identity_trader_ids":bundle.get("identity_trader_ids") or [],
+                 "identity_profiles":bundle.get("identity_profiles") or [],"reconciliation":bundle.get("reconciliation") or [],
+                 "history_debug":bundle.get("history_debug") or {},"recall_handoff_release":bundle.get("recall_handoff_release"),
+                 "management_lineage_release":bundle.get("management_lineage_release"),"generated_at":now_iso()}
+        if jid:
+            j=next((x for x in bundle.get("journeys") or [] if _np_mh_s(x.get("journey_id"))==jid),None)
+            if not j:return _np_fail("journey not found",404)
+            payload["journey"]=j
+        else:payload["journeys"]=bundle.get("journeys") or []
+        return _np_ok(payload)
+    except Exception as exc:
+        print("JOURNEY AUTHORITY V109 ERROR:",exc,flush=True); return _np_fail(str(exc),500)
+
+app.view_functions["admin_journey_authority"]=_np_admin_journey_authority_v109
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE=NAIRAPIPS_MANAGEMENT_UNIQUE_SUCCESSOR_V109
