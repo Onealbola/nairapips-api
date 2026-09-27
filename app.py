@@ -50241,3 +50241,165 @@ def admin_server_lifecycle_v100_status():
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = (
     NAIRAPIPS_SERVER_LIFECYCLE_RECOVERY_RELEASE_V100
 )
+
+# ============================================================================
+# NAIRAPIPS V101 — EXACT LIFE-2 RETRY RECOVERY
+# 27 SEP 2026
+#
+# ROOT CAUSE FOUND:
+# Older automatic-assignment cores still contain the historical 09-Sep cutover
+# check. A valid purchase created before that date can therefore have:
+#   - genuine breached Life 1
+#   - Second Life already activated
+#   - life2_waiting_mt5
+#   - eligible fresh inventory
+# and still be rejected before inventory claim.
+#
+# SAFETY SCOPE:
+# This patch DOES NOT remove the global cutoff and DOES NOT reclassify old
+# journeys globally. It creates one narrow exception only for an entitlement
+# that the later V76 lineage authority independently proves is WAITING_MT5.
+#
+# No database date is changed. The synthetic date exists only in the in-memory
+# copy passed through the already-protected assignment stack.
+#
+# UNCHANGED:
+# Recall/Wrong Assignment, login/auth, reset/payment, payout renewal, normal
+# purchase assignment, Phase->Funded progression, breach rules, MT5 pool
+# eligibility, duplicate guards, and Life-3 prohibition.
+# ============================================================================
+
+NAIRAPIPS_EXACT_LIFE2_RETRY_RELEASE_V101 = (
+    "V101_EXACT_LIFE2_RETRY_RECOVERY_2026_09_27"
+)
+
+_np_retry_waiting_second_life_assignment_v101_core = (
+    _np_retry_waiting_second_life_assignment
+)
+
+def _np_retry_waiting_second_life_assignment(purchase, trader_id, actor=None):
+    p = dict(purchase or {})
+    tid = str(trader_id or "").strip()
+    pid = str(p.get("id") or "").strip()
+
+    if not tid or not pid:
+        return None
+
+    # First let the complete existing V76/V59 production stack handle the case.
+    result = _np_retry_waiting_second_life_assignment_v101_core(
+        p, tid, actor
+    )
+    if result:
+        return result
+
+    # Narrow recovery authority: V76 must independently prove this exact journey
+    # is an activated, unfulfilled Life-2 entitlement.
+    try:
+        truth = _np_v76_second_life_truth(p, tid) or {}
+    except Exception as exc:
+        _audit_safe(
+            "second_life", "v101_truth_check_failed",
+            f"purchase={pid}; fail_closed={exc}",
+            actor or {"name":"system","username":"system","role":"system"},
+            pid,
+        )
+        return None
+
+    state = str(truth.get("state") or "").strip().upper()
+    if state not in {"WAITING_MT5", "SYNC_RECOVERY"}:
+        return None
+
+    # Must still be exactly Life 2. Never manufacture/reactivate entitlement.
+    if not _second_life_bool(p.get("second_life_used")):
+        return None
+    sl_status = str(p.get("second_life_status") or "").strip().lower()
+    if sl_status not in {"life2_waiting_mt5", "waiting_mt5", "activated"}:
+        return None
+
+    source = truth.get("life1") or truth.get("source_account") or {}
+    source_id = str(source.get("id") or truth.get("life1_account_id") or "").strip()
+    source_mt5 = str(source.get("mt5_login") or truth.get("life1_mt5") or "").strip()
+
+    if not source_id or not source_mt5:
+        return None
+    if str(source.get("trader_id") or "").strip() != tid:
+        return None
+    if str(source.get("purchase_id") or "").strip() != pid:
+        return None
+    if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "phase1":
+        return None
+    if "breach" not in str(source.get("account_status") or "").strip().lower():
+        return None
+
+    # V59's bridge deliberately bypasses the later V43 manual-only classifier,
+    # but an older V6 core still checks the historical 09-Sep purchase date.
+    # Supply a temporary in-memory eligibility timestamp ONLY for this already-
+    # proven Life-2 entitlement. The actual challenge_purchases.created_at row
+    # remains untouched.
+    retry_purchase = dict(p)
+    retry_purchase["created_at"] = "2026-09-12T00:00:01+00:00"
+    retry_purchase["second_life_enabled"] = True
+    retry_purchase["second_life_used"] = True
+    retry_purchase["second_life_status"] = "life2_waiting_mt5"
+
+    try:
+        recovered = _np_retry_waiting_second_life_assignment_v101_core(
+            retry_purchase, tid, actor
+        )
+    except Exception as exc:
+        _audit_safe(
+            "second_life", "v101_exact_retry_error",
+            f"purchase={pid}; source={source_id}; source_mt5={source_mt5}; error={exc}",
+            actor or {"name":"system","username":"system","role":"system"},
+            pid,
+        )
+        return None
+
+    if recovered:
+        acct = (recovered or {}).get("account") or {}
+        _audit_safe(
+            "second_life", "v101_exact_retry_recovered",
+            (
+                f"purchase={pid}; source={source_id}; source_mt5={source_mt5}; "
+                f"life2_mt5={acct.get('mt5_login') or ''}; "
+                "historical_cutoff_bypassed_in_memory_only"
+            ),
+            actor or {"name":"system","username":"system","role":"system"},
+            pid,
+        )
+        return recovered
+
+    return None
+
+
+@app.route("/admin/exact_life2_retry_v101/status", methods=["GET", "OPTIONS"])
+def admin_exact_life2_retry_v101_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_EXACT_LIFE2_RETRY_RELEASE_V101,
+        "scope": "already-activated exact Life-2 entitlement only",
+        "database_purchase_created_at_changed": False,
+        "global_cutoff_removed": False,
+        "life3_creation_allowed": False,
+        "recall_wrong_assignment_logic_changed": False,
+        "login_auth_logic_changed": False,
+        "paid_reset_logic_changed": False,
+        "payout_renewal_logic_changed": False,
+        "normal_purchase_assignment_logic_changed": False,
+        "phase1_to_funded_logic_changed": False,
+        "breach_logic_changed": False,
+        "mt5_inventory_logic_changed": False,
+        "duplicate_assignment_guards_preserved": True,
+        "v76_exact_lineage_authority_required": True,
+        "fail_closed": True,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = (
+    NAIRAPIPS_EXACT_LIFE2_RETRY_RELEASE_V101
+)
