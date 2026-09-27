@@ -3982,7 +3982,52 @@ def admin_reset_trader_account():
                 return _np_fail("Linked purchase does not belong to this trader. Reset cancelled before any account change.", 409)
             purchase_account_id = str(linked_purchase.get("trader_account_id") or "").strip()
             if purchase_account_id and purchase_account_id != requested_account_id:
-                return _np_fail("Linked purchase points to a different trader account. Reset cancelled before any account change.", 409)
+                # V110 — PAID PAYOUT EXACT-SOURCE AUTHORITY
+                #
+                # A challenge purchase pointer is allowed to move forward as the journey
+                # progresses.  For an ordinary operational reset a pointer mismatch is
+                # still a hard stop.  The ONLY exception is an already-proven exact PAID
+                # payout reset:
+                #
+                #   payout.trader_id         == trader_id
+                #   payout.trader_account_id == requested_account_id
+                #   payout.status            == paid
+                #   no open payout remains for that exact source
+                #   selected source stage    == funded
+                #   linked purchase owner    == trader_id   (validated above)
+                #
+                # This exception does NOT rewrite the purchase pointer and does NOT make
+                # the newer pointed account the reset source.  The historical Funded
+                # account that earned the PAID payout remains the exact reset authority.
+                if not paid_payout_reset_ok:
+                    return _np_fail("Linked purchase points to a different trader account. Reset cancelled before any account change.", 409)
+
+                _paid_source_stage = _normalize_lifecycle_stage(
+                    account.get("stage") or account.get("phase")
+                )
+                if _paid_source_stage != "funded":
+                    return _np_fail(
+                        "PAID payout reset authority is valid only for the exact Funded source account. Reset cancelled before any account change.",
+                        409,
+                    )
+                if not paid_payout_reset_id:
+                    return _np_fail(
+                        "Exact PAID payout authority could not be identified. Reset cancelled before any account change.",
+                        409,
+                    )
+
+                _audit_safe(
+                    "payout_reset",
+                    "paid_payout_pointer_mismatch_authorized",
+                    (
+                        f"V110 EXACT PAID PAYOUT AUTHORITY: payout={paid_payout_reset_id}; "
+                        f"source_account={requested_account_id}; purchase={account_purchase_id}; "
+                        f"purchase_current_account={purchase_account_id}; "
+                        "historical Funded payout source authorized without rewriting purchase pointer"
+                    ),
+                    staff,
+                    requested_account_id,
+                )
         elif requested_purchase_id:
             return _np_fail("Selected account has no purchase_id, but a purchase_id was supplied. Reset cancelled before any account change.", 409)
 
@@ -51981,3 +52026,15 @@ def _np_admin_journey_authority_v109():
 
 app.view_functions["admin_journey_authority"]=_np_admin_journey_authority_v109
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE=NAIRAPIPS_MANAGEMENT_UNIQUE_SUCCESSOR_V109
+
+
+# ============================================================================
+# NAIRAPIPS V110 — PAID PAYOUT EXACT-SOURCE AUTHORITY — 27 SEP 2026
+# Narrow production repair:
+# - ordinary pointer mismatch protection remains fail-closed
+# - exact PAID payout + exact Funded source may pass a moved purchase pointer
+# - no purchase pointer rewrite
+# - no Recall / Management Recall / Second Life / Reset-payment / progression change
+# ============================================================================
+NAIRAPIPS_PAID_PAYOUT_EXACT_SOURCE_RELEASE_V110 = "V110_PAID_PAYOUT_EXACT_SOURCE_AUTHORITY_2026_09_27"
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAID_PAYOUT_EXACT_SOURCE_RELEASE_V110
