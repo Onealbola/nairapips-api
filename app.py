@@ -50996,3 +50996,174 @@ def admin_management_recall_v103_status():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MANAGEMENT_RECALL_RELEASE_V103
+
+
+# ============================================================================
+# NAIRAPIPS V104 — MANAGEMENT RETURN EXACT-LIFE RECONCILIATION
+# 27 SEP 2026
+#
+# LIVE TEST FINDING:
+# A Management Return successor is a replacement delivery for the recalled
+# source account, not another challenge Life. V103's Operations filter depended
+# too heavily on the old source row carrying both hold markers. V104 proves the
+# relationship from BOTH SIDES, especially the immutable marker written on the
+# RETURN successor:
+#
+#   [NP_MH_SOURCE_ACCOUNT:<recalled account id>]
+#   [NP_MH_SOURCE_MT5:<recalled mt5>]
+#
+# Only a cryptographically-uninteresting but exact database lineage pair on the
+# same trader + purchase + stage is collapsed for Life counting.
+# Historical rows are never deleted. Universal Recall V87 remains untouched.
+# ============================================================================
+
+NAIRAPIPS_MANAGEMENT_RETURN_RELEASE_V104 = "V104_MANAGEMENT_RETURN_EXACT_LIFE_RECONCILIATION_2026_09_27"
+
+def _np_mh_source_account_from_return_v104(row):
+    m = re.search(r"\[np_mh_source_account:([^\]]+)\]", _np_mh_blob(row), re.I)
+    return _np_mh_s(m.group(1)) if m else ""
+
+def _np_mh_source_mt5_from_return_v104(row):
+    m = re.search(r"\[np_mh_source_mt5:([^\]]+)\]", _np_mh_blob(row), re.I)
+    return _np_mh_s(m.group(1)) if m else ""
+
+def _np_mh_return_pairs_v104(rows):
+    """
+    Return {source_account_id: successor_row} only for exact Management Return
+    pairs. Fail closed on trader/purchase/stage mismatch or ambiguity.
+    """
+    rows = list(rows or [])
+    by_id = {_np_mh_s(r.get("id")): r for r in rows if _np_mh_s(r.get("id"))}
+    pairs = {}
+    ambiguous = set()
+
+    for child in rows:
+        blob = _np_mh_blob(child)
+        source_id = _np_mh_source_account_from_return_v104(child)
+        if not source_id or "management_recall_exact_return" not in blob:
+            continue
+        source = by_id.get(source_id)
+        if not source:
+            continue
+
+        # Exact lineage invariants.
+        if _np_mh_s(source.get("trader_id")) != _np_mh_s(child.get("trader_id")):
+            continue
+        if _np_mh_purchase_id(source) != _np_mh_purchase_id(child):
+            continue
+        if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != \
+           _normalize_lifecycle_stage(child.get("stage") or child.get("phase")):
+            continue
+
+        source_mt5_marker = _np_mh_source_mt5_from_return_v104(child)
+        if source_mt5_marker and source_mt5_marker != _np_mh_s(source.get("mt5_login")):
+            continue
+
+        # Source must actually be historical/non-live after the take-back.
+        source_status = _np_mh_s(source.get("account_status") or source.get("status")).lower()
+        if source_status in {str(x).lower() for x in ACTIVE_ACCOUNT_STATUSES} or source_status in _NP_UR_V87_ACTIVE:
+            continue
+
+        # Successor must be the Management Return delivery, not another random row.
+        child_status = _np_mh_s(child.get("account_status") or child.get("status")).lower()
+        if child_status not in {str(x).lower() for x in ACTIVE_ACCOUNT_STATUSES} and child_status not in _NP_UR_V87_ACTIVE:
+            # A later archived Return is still a valid lineage pair for historical
+            # counting only when it carries the exact return source marker.
+            if not _np_mh_s(child.get("source")).lower() == "management_recall_exact_return":
+                continue
+
+        if source_id in pairs:
+            ambiguous.add(source_id)
+        else:
+            pairs[source_id] = child
+
+    for sid in ambiguous:
+        pairs.pop(sid, None)
+    return pairs
+
+def _np_mh_effective_rows_v104(rows):
+    rows = list(rows or [])
+    pairs = _np_mh_return_pairs_v104(rows)
+    # Source recall row remains history, but its Return successor occupies the
+    # same entitlement/Life position. Exclude only the proven source shadow.
+    return [r for r in rows if _np_mh_s(r.get("id")) not in pairs], pairs
+
+
+# Replace only the V103 Operations post-filter. The underlying Operations Centre
+# and all of its real contradiction checks remain unchanged.
+_np_ops_build_v104_core = _np_ops_build_v103_core
+
+def _np_ops_build():
+    out = _np_ops_build_v104_core()
+    try:
+        actions = list((out or {}).get("actions") or [])
+        kept = []
+        for item in actions:
+            if str(item.get("code") or "").upper() != "THIRD_LIFE_DETECTED":
+                kept.append(item)
+                continue
+
+            pid = _np_mh_s(item.get("purchase_id"))
+            tid = _np_mh_s(item.get("trader_id"))
+            if not pid:
+                kept.append(item)
+                continue
+
+            rows = (supabase.table("trader_accounts").select("*")
+                    .eq("purchase_id", pid)
+                    .order("created_at", desc=False).limit(500).execute().data or [])
+            if tid:
+                rows = [r for r in rows if _np_mh_s(r.get("trader_id")) == tid]
+
+            phase1 = [r for r in rows
+                      if _normalize_lifecycle_stage(r.get("stage") or r.get("phase")) == "phase1"]
+            effective, pairs = _np_mh_effective_rows_v104(phase1)
+
+            # Suppress ONLY the false third-life warning when exact Management
+            # Return lineage fully explains the extra historical row(s).
+            if len(phase1) > 2 and len(effective) <= 2 and pairs:
+                continue
+
+            kept.append(item)
+
+        out["actions"] = kept
+        summary = dict(out.get("summary") or {})
+        summary["critical"] = sum(1 for x in kept if str(x.get("severity") or "").lower() == "critical")
+        summary["action_required"] = sum(1 for x in kept if str(x.get("severity") or "").lower() == "action")
+        summary["money"] = sum(1 for x in kept if str(x.get("severity") or "").lower() == "money")
+        summary["data_integrity"] = sum(1 for x in kept if str(x.get("severity") or "").lower() == "data")
+        summary["open_items"] = len(kept)
+        out["summary"] = summary
+        out["management_return_lineage_release"] = NAIRAPIPS_MANAGEMENT_RETURN_RELEASE_V104
+    except Exception as exc:
+        # Fail closed: if lineage proof cannot be reconstructed, preserve the
+        # original warning rather than hiding a genuine third Life.
+        print("V104 OPS EXACT-LIFE RECONCILIATION FAILED CLOSED:", exc, flush=True)
+        return _np_ops_build_v104_core()
+    return out
+
+
+@app.route("/admin/management_return_v104/status", methods=["GET","OPTIONS"])
+def admin_management_return_v104_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth = _require_admin()
+    if auth:
+        return auth
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_MANAGEMENT_RETURN_RELEASE_V104,
+        "management_return_is_new_life": False,
+        "exact_source_successor_pair_required": True,
+        "same_trader_required": True,
+        "same_purchase_required": True,
+        "same_stage_required": True,
+        "ambiguous_pair_fails_closed": True,
+        "historical_source_preserved": True,
+        "universal_recall_changed": False,
+        "management_recall_changed": False,
+        "management_return_changed": False,
+        "assignment_workers_changed": False,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MANAGEMENT_RETURN_RELEASE_V104
