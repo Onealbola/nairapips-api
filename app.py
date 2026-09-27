@@ -51325,3 +51325,295 @@ def _np_admin_journey_authority_v105():
 
 app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v105
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MANAGEMENT_LINEAGE_API_V105
+
+
+# ============================================================================
+# NAIRAPIPS V106 — MANAGEMENT RETURN STRUCTURAL LINEAGE AUTHORITY
+# 27 SEP 2026
+#
+# LIVE FIX:
+# Do not depend only on optional text markers. The replacement row created by
+# the existing Recall authority already carries durable structural lineage:
+#   replaces_trader_account_id / previous_trader_account_id
+#   previous_mt5_login
+# plus the recalled source row carries NP_MANAGEMENT_HOLD.
+#
+# This overlay is READ-ONLY. It changes no MT5, purchase, entitlement, pool,
+# worker, Reset, Second Life, Payout or Recall/Return state.
+# ============================================================================
+
+NAIRAPIPS_MANAGEMENT_STRUCTURAL_LINEAGE_V106 = "V106_MANAGEMENT_RETURN_STRUCTURAL_LINEAGE_2026_09_27"
+
+def _np_mh_structural_pairs_v106(rows):
+    rows = list(rows or [])
+    by_id = {_np_mh_s(r.get("id")): r for r in rows if _np_mh_s(r.get("id"))}
+    pairs = {}
+    ambiguous = set()
+
+    for child in rows:
+        child_id = _np_mh_s(child.get("id"))
+        source_id = (
+            _np_mh_source_account_from_return_v104(child)
+            or _np_mh_s(child.get("replaces_trader_account_id"))
+            or _np_mh_s(child.get("previous_trader_account_id"))
+        )
+        if not child_id or not source_id or source_id == child_id:
+            continue
+        source = by_id.get(source_id)
+        if not source:
+            continue
+
+        sb = _np_mh_blob(source)
+        cb = _np_mh_blob(child)
+
+        # Source MUST be a real Management Recall/Hold. This prevents Universal
+        # Recall and ordinary replacements from being reclassified.
+        if "[np_management_hold:active]" not in sb:
+            continue
+
+        # The child must prove it replaced this exact source structurally.
+        structural = (
+            _np_mh_s(child.get("replaces_trader_account_id")) == source_id
+            or _np_mh_s(child.get("previous_trader_account_id")) == source_id
+        )
+        marker = _np_mh_source_account_from_return_v104(child) == source_id
+        if not (structural or marker):
+            continue
+
+        # Exact-chain invariants.
+        if _np_mh_s(source.get("trader_id")) != _np_mh_s(child.get("trader_id")):
+            continue
+        if _np_mh_purchase_id(source) != _np_mh_purchase_id(child):
+            continue
+        if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != \
+           _normalize_lifecycle_stage(child.get("stage") or child.get("phase")):
+            continue
+
+        source_mt5 = _np_mh_s(source.get("mt5_login"))
+        prev_mt5 = _np_mh_s(child.get("previous_mt5_login"))
+        marker_mt5 = _np_mh_source_mt5_from_return_v104(child)
+        if prev_mt5 and source_mt5 and prev_mt5 != source_mt5:
+            continue
+        if marker_mt5 and source_mt5 and marker_mt5 != source_mt5:
+            continue
+
+        if source_id in pairs:
+            ambiguous.add(source_id)
+        else:
+            pairs[source_id] = {
+                "source": source,
+                "child": child,
+                "source_account_id": source_id,
+                "source_mt5": source_mt5,
+                "return_account_id": child_id,
+                "return_mt5": _np_mh_s(child.get("mt5_login")),
+            }
+
+    for sid in ambiguous:
+        pairs.pop(sid, None)
+    return pairs
+
+
+def _np_management_lineage_overlay_v106(bundle, trader_id):
+    bundle = bundle or {}
+    journeys = list(bundle.get("journeys") or [])
+    if not journeys:
+        return bundle
+
+    tids = {_np_mh_s(trader_id)}
+    tids.update(_np_mh_s(j.get("trader_id")) for j in journeys if _np_mh_s(j.get("trader_id")))
+    raw = []
+    for tid in [x for x in tids if x]:
+        try:
+            raw += supabase.table("trader_accounts").select("*").eq("trader_id", tid).limit(1000).execute().data or []
+        except Exception:
+            pass
+
+    pairs = _np_mh_structural_pairs_v106(raw)
+    by_source = pairs
+    by_return = {p["return_account_id"]: p for p in pairs.values()}
+
+    for j in journeys:
+        jpid = _np_mh_s(j.get("purchase_id") or j.get("journey_id"))
+        jpairs = {
+            sid:p for sid,p in pairs.items()
+            if not jpid or _np_mh_purchase_id(p["source"]) == jpid
+        }
+        if not jpairs:
+            continue
+        jreturns = {p["return_account_id"]:p for p in jpairs.values()}
+
+        # Decorate the journey's existing account objects without replacing them.
+        accounts = list(j.get("accounts") or [])
+        for a in accounts:
+            aid = _np_mh_s(a.get("id"))
+            p = jpairs.get(aid)
+            if p:
+                a["management_lineage"] = {
+                    "role":"RECALLED_SOURCE",
+                    "source_account_id":p["source_account_id"],
+                    "source_mt5":p["source_mt5"],
+                    "return_account_id":p["return_account_id"],
+                    "return_mt5":p["return_mt5"],
+                    "same_life":True, "same_workflow":True,
+                }
+                a["management_display_status"] = "MANAGEMENT_RECALLED"
+                a["counts_as_challenge_life"] = False
+                continue
+            p = jreturns.get(aid)
+            if p:
+                a["management_lineage"] = {
+                    "role":"RETURN_SUCCESSOR",
+                    "source_account_id":p["source_account_id"],
+                    "source_mt5":p["source_mt5"],
+                    "return_account_id":p["return_account_id"],
+                    "return_mt5":p["return_mt5"],
+                    "same_life":True, "same_workflow":True,
+                }
+                a["management_display_status"] = "MANAGEMENT_RETURNED_SAME_LIFE"
+        j["accounts"] = accounts
+
+        # Decorate ledger by exact account id first, MT5 second.
+        ledger = list(j.get("ledger") or [])
+        for ev in ledger:
+            aid = _np_mh_s(ev.get("account_id") or ev.get("trader_account_id"))
+            mt5 = _np_mh_s(ev.get("mt5_login"))
+            p = jpairs.get(aid) or next((x for x in jpairs.values() if mt5 and x["source_mt5"] == mt5), None)
+            if p:
+                ev["management_lineage"] = {
+                    "role":"RECALLED_SOURCE",
+                    "source_account_id":p["source_account_id"], "source_mt5":p["source_mt5"],
+                    "return_account_id":p["return_account_id"], "return_mt5":p["return_mt5"],
+                    "same_life":True, "same_workflow":True,
+                }
+                ev["display_type"] = "MANAGEMENT_RECALLED"
+                ev["display_detail"] = f"Taken back by Management · returned as MT5 {p['return_mt5']} · historical delivery only"
+                continue
+            p = jreturns.get(aid) or next((x for x in jreturns.values() if mt5 and x["return_mt5"] == mt5), None)
+            if p:
+                ev["management_lineage"] = {
+                    "role":"RETURN_SUCCESSOR",
+                    "source_account_id":p["source_account_id"], "source_mt5":p["source_mt5"],
+                    "return_account_id":p["return_account_id"], "return_mt5":p["return_mt5"],
+                    "same_life":True, "same_workflow":True,
+                }
+                ev["display_type"] = "MANAGEMENT_RETURNED"
+                ev["display_detail"] = f"Replaces recalled MT5 {p['source_mt5']} · same workflow / same Life position"
+        j["ledger"] = ledger
+
+        # Reconcile ONLY false life-count contradictions explained exactly by
+        # Management Recall -> Return pairs on this same purchase.
+        phase1_raw = [
+            r for r in raw
+            if (not jpid or _np_mh_purchase_id(r) == jpid)
+            and _normalize_lifecycle_stage(r.get("stage") or r.get("phase")) == "phase1"
+        ]
+        excluded_ids = set(jpairs.keys())
+        phase1_effective = [r for r in phase1_raw if _np_mh_s(r.get("id")) not in excluded_ids]
+
+        problems = list(j.get("problems") or [])
+        filtered = []
+        for problem in problems:
+            code = _np_mh_s(problem.get("code")).upper()
+            if code in {"THIRD_LIFE_DETECTED","MORE_THAN_TWO_LIVES"} and len(phase1_effective) <= 2:
+                continue
+            if code == "ENTITLEMENT_BALANCE_MISMATCH":
+                acct = dict(j.get("accountability") or {})
+                try:
+                    delivered = int(acct.get("delivered_mt5") or 0)
+                    consumed = int(acct.get("entitlements_consumed") or 0)
+                    if delivered - len(excluded_ids) == consumed:
+                        continue
+                except Exception:
+                    pass
+            filtered.append(problem)
+        j["problems"] = filtered
+
+        acct = dict(j.get("accountability") or {})
+        if "delivered_mt5" in acct:
+            try:
+                acct["delivered_mt5"] = max(0, int(acct.get("delivered_mt5") or 0) - len(excluded_ids))
+            except Exception:
+                pass
+        acct["management_recall_history_rows_excluded"] = len(excluded_ids)
+        acct["management_return_same_life_pairs"] = len(jpairs)
+        if not filtered:
+            acct["status"] = "RECONCILED"
+            j["accountability_status"] = "RECONCILED"
+            j["blocked"] = False
+            j["ok"] = True
+        j["accountability"] = acct
+        j["management_lineage_pairs"] = [
+            {
+                "source_account_id":p["source_account_id"], "source_mt5":p["source_mt5"],
+                "return_account_id":p["return_account_id"], "return_mt5":p["return_mt5"],
+                "same_life":True, "same_workflow":True,
+            } for p in jpairs.values()
+        ]
+
+    bundle["journeys"] = journeys
+    bundle["management_lineage_release"] = NAIRAPIPS_MANAGEMENT_STRUCTURAL_LINEAGE_V106
+    return bundle
+
+
+def _np_admin_journey_authority_v106():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+    trader_id = _np_mh_s(request.args.get("trader_id"))
+    journey_id = _np_mh_s(request.args.get("journey_id"))
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+    try:
+        bundle = _np_all_journeys_preserved_v5(trader_id)
+        bundle = _np_v82_overlay_recalled_entitlements(bundle, trader_id)
+        bundle = _np_management_lineage_overlay_v106(bundle, trader_id)
+        payload = {
+            "cutover_date":bundle.get("cutover_date"),
+            "identity_trader_ids":bundle.get("identity_trader_ids") or [],
+            "identity_profiles":bundle.get("identity_profiles") or [],
+            "reconciliation":bundle.get("reconciliation") or [],
+            "history_debug":bundle.get("history_debug") or {},
+            "recall_handoff_release":bundle.get("recall_handoff_release"),
+            "management_lineage_release":bundle.get("management_lineage_release"),
+            "generated_at":now_iso(),
+        }
+        if journey_id:
+            journey = next((j for j in bundle.get("journeys") or [] if _np_mh_s(j.get("journey_id")) == journey_id), None)
+            if not journey:
+                return _np_fail("journey not found",404)
+            payload["journey"] = journey
+        else:
+            payload["journeys"] = bundle.get("journeys") or []
+        return _np_ok(payload)
+    except Exception as exc:
+        print("JOURNEY AUTHORITY V106 STRUCTURAL LINEAGE ERROR:", exc, flush=True)
+        return _np_fail(str(exc),500)
+
+# Production Journey Cockpit route: bind structural authority last.
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v106
+
+@app.route("/admin/management_lineage_v106/status", methods=["GET","OPTIONS"])
+def admin_management_lineage_v106_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success":True})
+    admin, auth = _require_admin()
+    if auth:
+        return auth
+    return _np_ok({
+        "success":True,
+        "release":NAIRAPIPS_MANAGEMENT_STRUCTURAL_LINEAGE_V106,
+        "read_only_overlay":True,
+        "uses_structural_replaces_account_id":True,
+        "uses_previous_account_id":True,
+        "requires_management_hold_source":True,
+        "same_trader_purchase_stage_required":True,
+        "universal_recall_changed":False,
+        "management_recall_changed":False,
+        "management_return_changed":False,
+        "assignment_workers_changed":False,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MANAGEMENT_STRUCTURAL_LINEAGE_V106
