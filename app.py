@@ -51167,3 +51167,161 @@ def admin_management_return_v104_status():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MANAGEMENT_RETURN_RELEASE_V104
+
+
+# ============================================================================
+# NAIRAPIPS V105 — MANAGEMENT RECALL/RETURN LINEAGE API OVERLAY
+# 27 SEP 2026
+#
+# READ-ONLY PRESENTATION OVERLAY.
+# It does not create, consume, reopen, close or assign any entitlement/MT5.
+# It exposes the already-persisted Management Return relationship to the
+# production Admin Journey route so the cockpit can distinguish:
+#   source delivery = MANAGEMENT RECALLED
+#   successor       = MANAGEMENT RETURNED (same Life/workflow position)
+# ============================================================================
+
+NAIRAPIPS_MANAGEMENT_LINEAGE_API_V105 = "V105_MANAGEMENT_LINEAGE_API_2026_09_27"
+
+def _np_management_lineage_overlay_v105(bundle, trader_id):
+    bundle = bundle or {}
+    journeys = list(bundle.get("journeys") or [])
+    if not journeys:
+        return bundle
+
+    tids = {str(trader_id or "").strip()}
+    for j in journeys:
+        if str(j.get("trader_id") or "").strip():
+            tids.add(str(j.get("trader_id")).strip())
+
+    raw = []
+    for tid in [x for x in tids if x]:
+        try:
+            raw += supabase.table("trader_accounts").select("*").eq("trader_id", tid).limit(1000).execute().data or []
+        except Exception:
+            pass
+
+    raw_by_id = {str(a.get("id") or "").strip(): a for a in raw if a.get("id")}
+    pairs = {}
+    for child in raw:
+        source_id = _np_mh_source_account_from_return_v104(child)
+        source_mt5 = _np_mh_source_mt5_from_return_v104(child)
+        blob = _np_mh_blob(child)
+        if not source_id or "management_recall_exact_return" not in blob:
+            continue
+        source = raw_by_id.get(source_id)
+        if not source:
+            continue
+        # Same exact chain safeguards used by V104.
+        if _np_mh_s(source.get("trader_id")) != _np_mh_s(child.get("trader_id")):
+            continue
+        if _np_mh_purchase_id(source) != _np_mh_purchase_id(child):
+            continue
+        if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != _normalize_lifecycle_stage(child.get("stage") or child.get("phase")):
+            continue
+        if source_mt5 and source_mt5 != _np_mh_s(source.get("mt5_login")):
+            continue
+        pairs[source_id] = {
+            "source_account_id": source_id,
+            "source_mt5": _np_mh_s(source.get("mt5_login")),
+            "return_account_id": _np_mh_s(child.get("id")),
+            "return_mt5": _np_mh_s(child.get("mt5_login")),
+            "same_life": True,
+            "same_workflow": True,
+        }
+
+    if not pairs:
+        bundle["management_lineage_release"] = NAIRAPIPS_MANAGEMENT_LINEAGE_API_V105
+        return bundle
+
+    return_to_pair = {p["return_account_id"]: p for p in pairs.values()}
+
+    for j in journeys:
+        accounts = list(j.get("accounts") or [])
+        for a in accounts:
+            aid = _np_mh_s(a.get("id"))
+            if aid in pairs:
+                p = pairs[aid]
+                a["management_lineage"] = {
+                    "role": "RECALLED_SOURCE",
+                    **p,
+                }
+                a["management_display_status"] = "MANAGEMENT_RECALLED"
+            elif aid in return_to_pair:
+                p = return_to_pair[aid]
+                a["management_lineage"] = {
+                    "role": "RETURN_SUCCESSOR",
+                    **p,
+                }
+                a["management_display_status"] = "MANAGEMENT_RETURNED_SAME_LIFE"
+
+        ledger = list(j.get("ledger") or [])
+        for ev in ledger:
+            aid = _np_mh_s(ev.get("account_id") or ev.get("trader_account_id"))
+            mt5 = _np_mh_s(ev.get("mt5_login"))
+            p = pairs.get(aid)
+            if not p and mt5:
+                p = next((x for x in pairs.values() if x["source_mt5"] == mt5), None)
+            if p:
+                ev["management_lineage"] = {"role":"RECALLED_SOURCE", **p}
+                ev["display_type"] = "MANAGEMENT_RECALLED"
+                ev["display_detail"] = f"Taken back by Management · returned as MT5 {p['return_mt5']} · historical delivery only"
+                continue
+            p = return_to_pair.get(aid)
+            if not p and mt5:
+                p = next((x for x in pairs.values() if x["return_mt5"] == mt5), None)
+            if p:
+                ev["management_lineage"] = {"role":"RETURN_SUCCESSOR", **p}
+                ev["display_type"] = "MANAGEMENT_RETURNED"
+                ev["display_detail"] = f"Replaces recalled MT5 {p['source_mt5']} · same workflow / same Life position"
+
+        j["accounts"] = accounts
+        j["ledger"] = ledger
+        j["management_lineage_pairs"] = list(pairs.values())
+
+    bundle["journeys"] = journeys
+    bundle["management_lineage_release"] = NAIRAPIPS_MANAGEMENT_LINEAGE_API_V105
+    return bundle
+
+
+# Rebind the production Journey route LAST, preserving the complete V82 bundle
+# and adding only the read-only lineage overlay.
+def _np_admin_journey_authority_v105():
+    if request.method == "OPTIONS":
+        return _np_ok({})
+    staff = _require_staff_request()
+    if isinstance(staff, tuple):
+        return staff
+    trader_id = str(request.args.get("trader_id") or "").strip()
+    journey_id = str(request.args.get("journey_id") or "").strip()
+    if not trader_id:
+        return _np_fail("trader_id is required", 400)
+    try:
+        bundle = _np_all_journeys_preserved_v5(trader_id)
+        bundle = _np_v82_overlay_recalled_entitlements(bundle, trader_id)
+        bundle = _np_management_lineage_overlay_v105(bundle, trader_id)
+        payload = {
+            "cutover_date": bundle.get("cutover_date"),
+            "identity_trader_ids": bundle.get("identity_trader_ids") or [],
+            "identity_profiles": bundle.get("identity_profiles") or [],
+            "reconciliation": bundle.get("reconciliation") or [],
+            "history_debug": bundle.get("history_debug") or {},
+            "recall_handoff_release": bundle.get("recall_handoff_release"),
+            "management_lineage_release": bundle.get("management_lineage_release"),
+            "generated_at": now_iso(),
+        }
+        if journey_id:
+            journey = next((j for j in bundle.get("journeys") or []
+                            if str(j.get("journey_id") or "") == journey_id), None)
+            if not journey:
+                return _np_fail("journey not found", 404)
+            payload["journey"] = journey
+        else:
+            payload["journeys"] = bundle.get("journeys") or []
+        return _np_ok(payload)
+    except Exception as exc:
+        print("JOURNEY AUTHORITY V105 LINEAGE ERROR:", exc, flush=True)
+        return _np_fail(str(exc), 500)
+
+app.view_functions["admin_journey_authority"] = _np_admin_journey_authority_v105
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MANAGEMENT_LINEAGE_API_V105
