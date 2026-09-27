@@ -51617,3 +51617,189 @@ def admin_management_lineage_v106_status():
     })
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MANAGEMENT_STRUCTURAL_LINEAGE_V106
+
+
+# ============================================================================
+# NAIRAPIPS V108 — MANAGEMENT SOURCE-MARKER AUTHORITY
+# 27 SEP 2026
+#
+# FINAL APPROACH:
+# The V102 RETURN transaction writes the durable relationship onto the recalled
+# SOURCE row itself:
+#   [NP_MANAGEMENT_HOLD:RETURNED]
+#   [NP_MH_RETURN_ACCOUNT:<id>]
+#   [NP_MH_RETURN_MT5:<login>]
+#
+# Use that source-side receipt as authority. Do not depend on optional child
+# columns or child-note normalization. This is read/reconciliation only.
+# ============================================================================
+
+NAIRAPIPS_MANAGEMENT_SOURCE_AUTHORITY_V108="V108_MANAGEMENT_SOURCE_MARKER_AUTHORITY_2026_09_27"
+
+def _np_mh_source_receipt_v108(row):
+    r=row or {}
+    blob=_np_mh_blob(r)
+    if "[np_management_hold:active]" not in blob or "[np_management_hold:returned]" not in blob:
+        return None
+    mid=re.search(r"\[np_mh_return_account:([^\]]+)\]",blob,re.I)
+    mmt5=re.search(r"\[np_mh_return_mt5:([^\]]+)\]",blob,re.I)
+    rid=_np_mh_s(mid.group(1)) if mid else ""
+    rmt5=_np_mh_s(mmt5.group(1)) if mmt5 else ""
+    if not rid and not rmt5:
+        return None
+    return {"return_account_id":rid,"return_mt5":rmt5}
+
+def _np_mh_source_pairs_v108(rows):
+    rows=list(rows or [])
+    by_id={_np_mh_s(x.get("id")):x for x in rows if _np_mh_s(x.get("id"))}
+    by_mt5={_np_mh_s(x.get("mt5_login")):x for x in rows if _np_mh_s(x.get("mt5_login"))}
+    pairs={}
+    for source in rows:
+        receipt=_np_mh_source_receipt_v108(source)
+        if not receipt:
+            continue
+        child=(by_id.get(receipt["return_account_id"]) if receipt["return_account_id"] else None)
+        if child is None and receipt["return_mt5"]:
+            child=by_mt5.get(receipt["return_mt5"])
+        if not child:
+            continue
+        # Exact-chain proof. A source-side receipt alone never overrides mismatch.
+        if _np_mh_s(source.get("trader_id")) != _np_mh_s(child.get("trader_id")):
+            continue
+        if _np_mh_purchase_id(source) != _np_mh_purchase_id(child):
+            continue
+        if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != _normalize_lifecycle_stage(child.get("stage") or child.get("phase")):
+            continue
+        if receipt["return_account_id"] and receipt["return_account_id"] != _np_mh_s(child.get("id")):
+            continue
+        if receipt["return_mt5"] and receipt["return_mt5"] != _np_mh_s(child.get("mt5_login")):
+            continue
+        pairs[_np_mh_s(source.get("id"))]={
+            "source_account_id":_np_mh_s(source.get("id")),
+            "source_mt5":_np_mh_s(source.get("mt5_login")),
+            "return_account_id":_np_mh_s(child.get("id")),
+            "return_mt5":_np_mh_s(child.get("mt5_login")),
+            "same_life":True,
+            "same_workflow":True,
+        }
+    return pairs
+
+# Operations Centre: remove ONLY false THIRD_LIFE_DETECTED actions proven by
+# V102's source-side Return receipt. All other critical checks remain untouched.
+_np_ops_build_v108_core=_np_ops_build_v104_core
+def _np_ops_build():
+    out=_np_ops_build_v108_core()
+    try:
+        actions=list((out or {}).get("actions") or [])
+        kept=[]
+        for item in actions:
+            if _np_mh_s(item.get("code")).upper()!="THIRD_LIFE_DETECTED":
+                kept.append(item); continue
+            pid=_np_mh_s(item.get("purchase_id"))
+            tid=_np_mh_s(item.get("trader_id"))
+            if not pid:
+                kept.append(item); continue
+            # Match the original builder's purchase alias behavior.
+            rows=(supabase.table("trader_accounts").select("*")
+                  .eq("trader_id",tid).order("created_at",desc=False)
+                  .limit(1000).execute().data or []) if tid else []
+            rows=[r for r in rows if _np_mh_purchase_id(r)==pid]
+            phase1=[r for r in rows if _normalize_lifecycle_stage(r.get("stage") or r.get("phase"))=="phase1"]
+            pairs=_np_mh_source_pairs_v108(phase1)
+            effective=[r for r in phase1 if _np_mh_s(r.get("id")) not in pairs]
+            if len(phase1)>2 and len(effective)<=2 and pairs:
+                continue
+            kept.append(item)
+        out["actions"]=kept
+        summary=dict(out.get("summary") or {})
+        summary["critical"]=sum(1 for x in kept if _np_mh_s(x.get("severity")).lower()=="critical")
+        summary["action_required"]=sum(1 for x in kept if _np_mh_s(x.get("severity")).lower()=="action")
+        summary["money"]=sum(1 for x in kept if _np_mh_s(x.get("severity")).lower()=="money")
+        summary["data_integrity"]=sum(1 for x in kept if _np_mh_s(x.get("severity")).lower()=="data")
+        summary["open_items"]=len(kept)
+        out["summary"]=summary
+        out["management_source_authority_release"]=NAIRAPIPS_MANAGEMENT_SOURCE_AUTHORITY_V108
+    except Exception as exc:
+        print("V108 OPS SOURCE RECEIPT FILTER FAILED CLOSED:",exc,flush=True)
+    return out
+
+# Journey route: expose the same source-side receipt directly to Admin.
+def _np_management_source_overlay_v108(bundle,trader_id):
+    bundle=bundle or {}
+    journeys=list(bundle.get("journeys") or [])
+    try:
+        raw=(supabase.table("trader_accounts").select("*")
+             .eq("trader_id",_np_mh_s(trader_id))
+             .order("created_at",desc=False).limit(1000).execute().data or [])
+        pairs=_np_mh_source_pairs_v108(raw)
+        if not pairs:
+            bundle["management_lineage_release"]=NAIRAPIPS_MANAGEMENT_SOURCE_AUTHORITY_V108
+            return bundle
+        for j in journeys:
+            pid=_np_mh_s(j.get("purchase_id") or j.get("journey_id"))
+            jpairs=[p for p in pairs.values()
+                    if any(_np_mh_s(r.get("id"))==p["source_account_id"] and (not pid or _np_mh_purchase_id(r)==pid) for r in raw)]
+            if not jpairs: continue
+            j["management_lineage_pairs"]=jpairs
+            bys={p["source_account_id"]:p for p in jpairs}
+            byr={p["return_account_id"]:p for p in jpairs}
+            for a in list(j.get("accounts") or []):
+                aid=_np_mh_s(a.get("id"))
+                if aid in bys:
+                    a["management_lineage"]={"role":"RECALLED_SOURCE",**bys[aid]}
+                    a["counts_as_challenge_life"]=False
+                elif aid in byr:
+                    a["management_lineage"]={"role":"RETURN_SUCCESSOR",**byr[aid]}
+            for ev in list(j.get("ledger") or []):
+                aid=_np_mh_s(ev.get("account_id") or ev.get("trader_account_id"))
+                mt5=_np_mh_s(ev.get("mt5_login"))
+                p=bys.get(aid) or next((x for x in jpairs if x["source_mt5"]==mt5),None)
+                if p:
+                    ev["management_lineage"]={"role":"RECALLED_SOURCE",**p}
+                    ev["display_type"]="MANAGEMENT_RECALLED"
+                    ev["display_detail"]=f"Taken back by Management · returned as MT5 {p['return_mt5']} · historical delivery only"
+                    continue
+                p=byr.get(aid) or next((x for x in jpairs if x["return_mt5"]==mt5),None)
+                if p:
+                    ev["management_lineage"]={"role":"RETURN_SUCCESSOR",**p}
+                    ev["display_type"]="MANAGEMENT_RETURNED"
+                    ev["display_detail"]=f"Replaces recalled MT5 {p['source_mt5']} · same workflow / same Life position"
+        bundle["journeys"]=journeys
+        bundle["management_lineage_release"]=NAIRAPIPS_MANAGEMENT_SOURCE_AUTHORITY_V108
+    except Exception as exc:
+        print("V108 JOURNEY SOURCE RECEIPT OVERLAY FAILED CLOSED:",exc,flush=True)
+    return bundle
+
+def _np_admin_journey_authority_v108():
+    if request.method=="OPTIONS": return _np_ok({})
+    staff=_require_staff_request()
+    if isinstance(staff,tuple): return staff
+    tid=_np_mh_s(request.args.get("trader_id"))
+    jid=_np_mh_s(request.args.get("journey_id"))
+    if not tid: return _np_fail("trader_id is required",400)
+    try:
+        bundle=_np_all_journeys_preserved_v5(tid)
+        bundle=_np_v82_overlay_recalled_entitlements(bundle,tid)
+        bundle=_np_management_source_overlay_v108(bundle,tid)
+        payload={
+            "cutover_date":bundle.get("cutover_date"),
+            "identity_trader_ids":bundle.get("identity_trader_ids") or [],
+            "identity_profiles":bundle.get("identity_profiles") or [],
+            "reconciliation":bundle.get("reconciliation") or [],
+            "history_debug":bundle.get("history_debug") or {},
+            "recall_handoff_release":bundle.get("recall_handoff_release"),
+            "management_lineage_release":bundle.get("management_lineage_release"),
+            "generated_at":now_iso(),
+        }
+        if jid:
+            j=next((x for x in bundle.get("journeys") or [] if _np_mh_s(x.get("journey_id"))==jid),None)
+            if not j:return _np_fail("journey not found",404)
+            payload["journey"]=j
+        else: payload["journeys"]=bundle.get("journeys") or []
+        return _np_ok(payload)
+    except Exception as exc:
+        print("JOURNEY AUTHORITY V108 ERROR:",exc,flush=True)
+        return _np_fail(str(exc),500)
+
+app.view_functions["admin_journey_authority"]=_np_admin_journey_authority_v108
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE=NAIRAPIPS_MANAGEMENT_SOURCE_AUTHORITY_V108
