@@ -50793,3 +50793,206 @@ def admin_management_recall_v102_status():
         return _np_ok({"success":True,"release":NAIRAPIPS_MANAGEMENT_RECALL_RELEASE_V102,"holds":holds,"count":len(holds)})
     except Exception as exc:
         return _np_fail("Management Hold status failed: "+str(exc),500)
+
+
+# ============================================================================
+# NAIRAPIPS V103 — MANAGEMENT RECALL LINEAGE PROTECTION
+# 27 SEP 2026
+#
+# Fixes discovered during live Recall -> Return test:
+# 1) A returned Management Recall is a DELIVERY REPLACEMENT, not a new Life.
+# 2) Historical recalled MT5 remains visible as history, but is excluded from
+#    challenge-life / delivered-entitlement counting when its exact Return
+#    successor is proven.
+# 3) No worker is allowed to reinterpret an ACTIVE Management Hold as waiting.
+# 4) Existing Universal Recall V87 remains untouched.
+# ============================================================================
+
+NAIRAPIPS_MANAGEMENT_RECALL_RELEASE_V103 = "V103_MANAGEMENT_RECALL_LINEAGE_PROTECTION_2026_09_27"
+
+def _np_mh_return_successor_id_v103(row):
+    blob = _np_mh_blob(row)
+    m = re.search(r"\[np_mh_return_account:([^\]]+)\]", blob, re.I)
+    return str(m.group(1)).strip() if m else ""
+
+def _np_mh_return_successor_mt5_v103(row):
+    blob = _np_mh_blob(row)
+    m = re.search(r"\[np_mh_return_mt5:([^\]]+)\]", blob, re.I)
+    return str(m.group(1)).strip() if m else ""
+
+def _np_mh_is_returned_shadow_v103(row, rows=None):
+    """
+    True only when this historical row is a V102/V103 Management Recall source
+    AND its exact Return successor can be proven on the same trader/purchase/stage.
+    It remains history, but must never count as an additional challenge Life.
+    """
+    r = row or {}
+    blob = _np_mh_blob(r)
+    if "[np_management_hold:active]" not in blob or "[np_management_hold:returned]" not in blob:
+        return False
+    sid = _np_mh_return_successor_id_v103(r)
+    smt5 = _np_mh_return_successor_mt5_v103(r)
+    if not sid and not smt5:
+        return False
+    candidates = list(rows or [])
+    if not candidates:
+        try:
+            candidates = (supabase.table("trader_accounts").select("*")
+                          .eq("trader_id", r.get("trader_id"))
+                          .order("updated_at", desc=True).limit(500).execute().data or [])
+        except Exception:
+            return False
+    pid = _np_mh_purchase_id(r)
+    stage = _normalize_lifecycle_stage(r.get("stage") or r.get("phase"))
+    for x in candidates:
+        if sid and _np_mh_s(x.get("id")) != sid:
+            continue
+        if smt5 and _np_mh_s(x.get("mt5_login")) != smt5:
+            continue
+        if _np_mh_s(x.get("trader_id")) != _np_mh_s(r.get("trader_id")):
+            continue
+        if pid and _np_mh_purchase_id(x) != pid:
+            continue
+        if _normalize_lifecycle_stage(x.get("stage") or x.get("phase")) != stage:
+            continue
+        if "management_recall_exact_return" not in _np_mh_blob(x):
+            continue
+        return True
+    return False
+
+def _np_mh_effective_rows_v103(rows):
+    rows = list(rows or [])
+    return [r for r in rows if not _np_mh_is_returned_shadow_v103(r, rows)]
+
+# Operations Centre: a Recall->Return replacement must not be called Life 3.
+_np_ops_build_v103_core = _np_ops_build
+def _np_ops_build():
+    out = _np_ops_build_v103_core()
+    try:
+        actions = list((out or {}).get("actions") or [])
+        kept = []
+        for item in actions:
+            if str(item.get("code") or "").upper() != "THIRD_LIFE_DETECTED":
+                kept.append(item)
+                continue
+            pid = _np_mh_s(item.get("purchase_id"))
+            tid = _np_mh_s(item.get("trader_id"))
+            if not pid:
+                kept.append(item); continue
+            rows = (supabase.table("trader_accounts").select("*")
+                    .eq("purchase_id", pid).order("created_at", desc=False)
+                    .limit(500).execute().data or [])
+            if tid:
+                rows = [r for r in rows if _np_mh_s(r.get("trader_id")) == tid]
+            phase1 = [r for r in rows if _normalize_lifecycle_stage(r.get("stage") or r.get("phase")) == "phase1"]
+            effective = _np_mh_effective_rows_v103(phase1)
+            # Suppress ONLY when the apparent third Life is fully explained by
+            # a proven Management Recall -> exact Return lineage.
+            if len(phase1) > 2 and len(effective) <= 2 and any(_np_mh_is_returned_shadow_v103(r, phase1) for r in phase1):
+                continue
+            kept.append(item)
+        out["actions"] = kept
+        summary = dict(out.get("summary") or {})
+        summary["critical"] = sum(1 for x in kept if str(x.get("severity") or "") == "critical")
+        summary["action_required"] = sum(1 for x in kept if str(x.get("severity") or "") == "action")
+        summary["money"] = sum(1 for x in kept if str(x.get("severity") or "") == "money")
+        summary["data_integrity"] = sum(1 for x in kept if str(x.get("severity") or "") == "data")
+        summary["open_items"] = len(kept)
+        out["summary"] = summary
+    except Exception as exc:
+        print("V103 OPS LINEAGE FILTER FAILED CLOSED:", exc, flush=True)
+    return out
+
+# Journey Authority: preserve the recalled source in history but identify it as
+# a delivery shadow so it cannot create false entitlement/life contradictions.
+_np_ja_journey_authority_v103_core = _np_ja_journey_authority
+def _np_ja_journey_authority(trader_id, journey_id):
+    out = _np_ja_journey_authority_v103_core(trader_id, journey_id)
+    if not isinstance(out, dict):
+        return out
+    try:
+        rows = list(out.get("accounts") or [])
+        if not rows:
+            return out
+        shadows = [r for r in rows if _np_mh_is_returned_shadow_v103(r, rows)]
+        if not shadows:
+            return out
+        out = dict(out)
+        decorated = []
+        for r in rows:
+            rr = dict(r)
+            if any(_np_mh_s(s.get("id")) == _np_mh_s(rr.get("id")) for s in shadows):
+                rr["management_recall_history_only"] = True
+                rr["management_recall_returned"] = True
+                rr["counts_as_challenge_life"] = False
+            decorated.append(rr)
+        out["accounts"] = decorated
+
+        effective = _np_mh_effective_rows_v103(rows)
+        phase1_effective = [r for r in effective if _normalize_lifecycle_stage(r.get("stage") or r.get("phase")) == "phase1"]
+        problems = list(out.get("problems") or [])
+        filtered = []
+        for p in problems:
+            code = str(p.get("code") or "").upper()
+            if code in {"THIRD_LIFE_DETECTED", "MORE_THAN_TWO_LIVES"} and len(phase1_effective) <= 2:
+                continue
+            # Balance mismatch may be exactly one-for-one historical Recall shadows.
+            if code == "ENTITLEMENT_BALANCE_MISMATCH":
+                acct = dict(out.get("accountability") or {})
+                delivered = int(acct.get("delivered_mt5") or 0)
+                consumed = int(acct.get("entitlements_consumed") or 0)
+                if delivered - len(shadows) == consumed:
+                    continue
+            filtered.append(p)
+        out["problems"] = filtered
+        if not filtered:
+            out["blocked"] = False
+            out["ok"] = True
+            out["accountability_status"] = "RECONCILED"
+            acct = dict(out.get("accountability") or {})
+            if "delivered_mt5" in acct:
+                acct["delivered_mt5"] = max(0, int(acct.get("delivered_mt5") or 0) - len(shadows))
+            acct["management_recall_history_rows_excluded"] = len(shadows)
+            acct["status"] = "RECONCILED"
+            out["accountability"] = acct
+    except Exception as exc:
+        print("V103 JOURNEY LINEAGE FILTER FAILED CLOSED:", exc, flush=True)
+    return out
+
+# Stronger hold-state contract for any caller: active Management Hold is never
+# a waiting entitlement. It is a management suspension only.
+def _np_mh_state_v103(trader_id, purchase_id=None):
+    h = _np_mh_find_active(trader_id, purchase_id)
+    if not h:
+        return None
+    return {
+        "state": "MANAGEMENT_HOLD",
+        "assignment_due": False,
+        "automation_allowed": False,
+        "replacement_due": False,
+        "return_authority": "MANAGEMENT_RETURN_ONLY",
+        "source_account_id": h.get("id"),
+        "source_mt5": h.get("mt5_login"),
+        "purchase_id": _np_mh_purchase_id(h),
+        "stage": _normalize_lifecycle_stage(h.get("stage") or h.get("phase")),
+    }
+
+@app.route("/admin/management_recall_v103/status", methods=["GET","OPTIONS"])
+def admin_management_recall_v103_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin, auth = _require_admin()
+    if auth: return auth
+    tid = _np_mh_s(request.args.get("trader_id"))
+    pid = _np_mh_s(request.args.get("purchase_id"))
+    if not tid: return _np_fail("trader_id is required", 400)
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_MANAGEMENT_RECALL_RELEASE_V103,
+        "hold": _np_mh_state_v103(tid, pid or None),
+        "universal_recall_unchanged": True,
+        "returned_replacement_counts_as_same_life": True,
+        "historical_recalled_mt5_preserved": True,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MANAGEMENT_RECALL_RELEASE_V103
