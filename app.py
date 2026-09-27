@@ -50403,3 +50403,393 @@ def admin_exact_life2_retry_v101_status():
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = (
     NAIRAPIPS_EXACT_LIFE2_RETRY_RELEASE_V101
 )
+
+
+
+# ============================================================================
+# NAIRAPIPS V102 — MANAGEMENT RECALL AUTHORITY / HARD HOLD / EXACT RETURN
+# 27 SEP 2026
+#
+# PURPOSE
+# -------
+# Owner/Admin authority to withdraw ONE exact active MT5 WITHOUT replacement.
+# This is deliberately NOT Universal Recall. Universal Recall remains untouched.
+#
+# Law:
+#   ACTIVE DELIVERY -> MANAGEMENT HOLD -> NO WORKER MAY REPLACE IT
+#   MANAGEMENT HOLD -> explicit ADMIN RETURN -> SAME EXACT JOURNEY/STAGE/SIZE
+#
+# Fail closed. No Reset/Pass/Payout/Second-Life entitlement is created or consumed.
+# ============================================================================
+
+NAIRAPIPS_MANAGEMENT_RECALL_RELEASE_V102 = "V102_MANAGEMENT_RECALL_HARD_HOLD_EXACT_RETURN_2026_09_27"
+_NP_MH_ACTIVE = "[NP_MANAGEMENT_HOLD:ACTIVE]"
+_NP_MH_RETURNED = "[NP_MANAGEMENT_HOLD:RETURNED]"
+_NP_MH_LOCK = __import__('threading').RLock()
+
+
+def _np_mh_s(v):
+    return str(v or "").strip()
+
+
+def _np_mh_blob(row):
+    row = row or {}
+    return " ".join(_np_mh_s(row.get(k)) for k in ("archive_reason","admin_note","message","source")).lower()
+
+
+def _np_mh_is_active_account(row):
+    b = _np_mh_blob(row)
+    return "[np_management_hold:active]" in b and "[np_management_hold:returned]" not in b
+
+
+def _np_mh_purchase_id(row):
+    return _np_mh_s((row or {}).get("purchase_id") or (row or {}).get("challenge_purchase_id"))
+
+
+def _np_mh_find_active(trader_id, purchase_id=None):
+    tid, pid = _np_mh_s(trader_id), _np_mh_s(purchase_id)
+    if not tid:
+        return None
+    try:
+        q = supabase.table("trader_accounts").select("*").eq("trader_id", tid)
+        if pid:
+            # purchase_id is canonical in current production; fallback below handles legacy alias.
+            rows = q.order("updated_at", desc=True).limit(500).execute().data or []
+            rows = [r for r in rows if _np_mh_purchase_id(r) == pid]
+        else:
+            rows = q.order("updated_at", desc=True).limit(500).execute().data or []
+        for r in rows:
+            if _np_mh_is_active_account(r):
+                return r
+    except Exception as exc:
+        print("V102 MANAGEMENT HOLD LOOKUP FAILED CLOSED:", exc, flush=True)
+        # Failure must not authorize an assignment. Return sentinel truthy hold.
+        return {"id":"LOOKUP_FAILED_CLOSED","trader_id":tid,"purchase_id":pid,"archive_reason":_NP_MH_ACTIVE}
+    return None
+
+
+def _np_mh_blocked(trader_id, purchase_id=None):
+    return bool(_np_mh_find_active(trader_id, purchase_id))
+
+
+def _np_mh_account(account_id, trader_id=None):
+    aid, tid = _np_mh_s(account_id), _np_mh_s(trader_id)
+    if not aid:
+        return None
+    q = supabase.table("trader_accounts").select("*").eq("id", aid)
+    if tid:
+        q = q.eq("trader_id", tid)
+    rows = q.limit(1).execute().data or []
+    return rows[0] if rows else None
+
+
+def _np_mh_clear_current_pointer(account):
+    a = account or {}
+    tid, aid = _np_mh_s(a.get("trader_id")), _np_mh_s(a.get("id"))
+    if not tid or not aid:
+        return
+    trader = _np_ur_v87_trader(tid) or {}
+    cur = _np_mh_s(trader.get("current_account_id") or trader.get("trader_account_id"))
+    cur_login = _np_mh_s(trader.get("mt5_login"))
+    if cur != aid and cur_login != _np_mh_s(a.get("mt5_login")):
+        return
+    try:
+        rows = (supabase.table("trader_accounts").select("*")
+                .eq("trader_id", tid).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
+                .order("updated_at", desc=True).limit(100).execute().data or [])
+    except Exception:
+        rows = []
+    rows = [r for r in rows if _np_mh_s(r.get("id")) != aid]
+    if rows:
+        r = rows[0]
+        _np_update_trader_current_pointer_v59(tid, r, _normalize_lifecycle_stage(r.get("stage") or r.get("phase")))
+        return
+    clear = {
+        "current_account_id": None, "trader_account_id": None,
+        "mt5_login": None, "mt5_server": None,
+        "mt5_master_password": None, "mt5_password": None, "master_password": None,
+        "mt5_investor_password": None, "investor_password": None,
+        "monitoring_enabled": False, "mt5_account_active": False,
+        "updated_at": now_iso(),
+    }
+    _np_ur_v87_update_compat("traders", clear, "id", tid,
+        optional_keys=set(clear.keys()) - {"current_account_id","updated_at"})
+
+
+def _np_mh_quarantine(account, actor, reason, note=""):
+    a = account or {}
+    now = now_iso()
+    hold_id = str(__import__('uuid').uuid4())
+    stage = _normalize_lifecycle_stage(a.get("stage") or a.get("phase"))
+    pid = _np_mh_purchase_id(a)
+    size = clean(a.get("account_size") or a.get("start_balance") or 0)
+    marker = (
+        f"{_NP_MH_ACTIVE} [NP_MH_ID:{hold_id}] [NP_MH_TRADER:{_np_mh_s(a.get('trader_id'))}] "
+        f"[NP_MH_PURCHASE:{pid or 'NONE'}] [NP_MH_ACCOUNT:{_np_mh_s(a.get('id'))}] "
+        f"[NP_MH_MT5:{_np_mh_s(a.get('mt5_login'))}] [NP_MH_STAGE:{stage}] "
+        f"[NP_MH_SIZE:{size}] [NP_MH_AT:{now}] [NP_MH_REASON:{_np_mh_s(reason)[:120]}]"
+    )
+    if note:
+        marker += " [NP_MH_NOTE:" + _np_mh_s(note).replace("[","(").replace("]",")")[:300] + "]"
+    old_reason = _np_mh_s(a.get("archive_reason"))
+    old_note = _np_mh_s(a.get("admin_note"))
+    payload = {
+        "account_status":"archived", "monitoring_enabled":False,
+        "archive_reason":(old_reason+" | "+marker).strip(" |"),
+        "admin_note":(old_note+" | "+marker).strip(" |"),
+        "archived_at":now, "updated_at":now, "mt5_access_disabled":True,
+    }
+    _np_ur_v87_update_compat("trader_accounts", payload, "id", a.get("id"),
+        optional_keys={"admin_note","archived_at","mt5_access_disabled"})
+
+    pool = _np_ur_v87_pool_for_account(a)
+    if pool and _np_mh_s(pool.get("id")):
+        pp = {
+            "status":"archived", "archive_reason":marker,
+            "admin_note":marker, "archived_at":now, "updated_at":now,
+        }
+        _np_ur_v87_update_compat("mt5_pool", pp, "id", pool.get("id"),
+            optional_keys={"archive_reason","admin_note","archived_at"})
+
+    # Remove delivery pointers only. Never mutate entitlement/life/reset/pass/payout fields.
+    if pid:
+        try:
+            p = _np_ur_v87_purchase(pid) or {}
+            if (_np_mh_s(p.get("trader_account_id")) == _np_mh_s(a.get("id"))
+                or _np_mh_s(p.get("mt5_login")) == _np_mh_s(a.get("mt5_login"))):
+                upd = {"trader_account_id":None,"mt5_login":None,"mt5_server":None,
+                       "mt5_master_password":None,"mt5_password":None,"master_password":None,
+                       "mt5_investor_password":None,"investor_password":None,
+                       "assigned_mt5_id":None,"updated_at":now}
+                _np_ur_v87_update_compat("challenge_purchases", upd, "id", pid,
+                    optional_keys=set(upd.keys())-{"updated_at"})
+        except Exception as exc:
+            print("V102 PURCHASE POINTER CLEAR WARNING:", exc, flush=True)
+    _np_mh_clear_current_pointer(a)
+    _audit_safe("management_recall","management_hold_created",
+        f"hold={hold_id}; trader={a.get('trader_id')}; purchase={pid}; account={a.get('id')}; mt5={a.get('mt5_login')}; stage={stage}; size={size}; no_replacement=true",
+        actor or {"name":"admin","username":"admin","role":"admin"}, a.get("id"))
+    return marker, hold_id
+
+
+def _np_mh_active_sibling(hold):
+    h = hold or {}
+    tid, pid = _np_mh_s(h.get("trader_id")), _np_mh_purchase_id(h)
+    stage = _normalize_lifecycle_stage(h.get("stage") or h.get("phase"))
+    if not tid:
+        return None
+    try:
+        rows = (supabase.table("trader_accounts").select("*").eq("trader_id",tid)
+                .in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
+                .order("updated_at",desc=True).limit(200).execute().data or [])
+    except Exception:
+        return {"id":"LOOKUP_FAILED_CLOSED","mt5_login":"UNKNOWN"}
+    for r in rows:
+        if _np_mh_s(r.get("id")) == _np_mh_s(h.get("id")):
+            continue
+        if pid and _np_mh_purchase_id(r) != pid:
+            continue
+        if _normalize_lifecycle_stage(r.get("stage") or r.get("phase")) != stage:
+            continue
+        return r
+    return None
+
+
+@app.route("/admin/management_recall_v102/preview", methods=["GET","OPTIONS"])
+def admin_management_recall_v102_preview():
+    if request.method == "OPTIONS": return _np_ok({"success":True})
+    admin, auth = _require_admin()
+    if auth: return auth
+    aid = _np_mh_s(request.args.get("trader_account_id") or request.args.get("account_id"))
+    tid = _np_mh_s(request.args.get("trader_id") or request.args.get("expected_trader_id"))
+    try:
+        a = _np_mh_account(aid, tid)
+        if not a: return _np_fail("Exact trader account not found.",404)
+        status = _np_mh_s(a.get("account_status") or a.get("status")).lower()
+        if status not in {str(x).lower() for x in ACTIVE_ACCOUNT_STATUSES} and status not in _NP_UR_V87_ACTIVE:
+            return _np_fail("Management Recall is only for an exact currently-active MT5 delivery.",409)
+        if _np_mh_is_active_account(a):
+            return _np_ok({"success":True,"already_on_hold":True,"account":a})
+        return _np_ok({"success":True,"action":"MANAGEMENT_RECALL_NO_REPLACEMENT",
+            "trader_account_id":a.get("id"),"trader_id":a.get("trader_id"),
+            "purchase_id":_np_mh_purchase_id(a),"mt5_login":a.get("mt5_login"),
+            "stage":_normalize_lifecycle_stage(a.get("stage") or a.get("phase")),
+            "account_size":a.get("account_size") or a.get("start_balance"),
+            "replacement":False,"automation_hard_hold":True})
+    except Exception as exc:
+        return _np_fail("Management Recall preview failed: "+str(exc),500)
+
+
+@app.route("/admin/management_recall_v102/execute", methods=["POST","OPTIONS"])
+def admin_management_recall_v102_execute():
+    if request.method == "OPTIONS": return _np_ok({"success":True})
+    admin, auth = _require_admin()
+    if auth: return auth
+    d = request.get_json(silent=True) or {}
+    aid = _np_mh_s(d.get("trader_account_id") or d.get("account_id"))
+    tid = _np_mh_s(d.get("trader_id") or d.get("expected_trader_id"))
+    reason = _np_mh_s(d.get("reason") or "management_authority")
+    note = _np_mh_s(d.get("admin_note") or d.get("note"))
+    if not aid: return _np_fail("Exact trader_account_id is required.",400)
+    with _NP_MH_LOCK:
+        try:
+            a = _np_mh_account(aid, tid)
+            if not a: return _np_fail("Exact trader account not found.",404)
+            if _np_mh_is_active_account(a):
+                return _np_ok({"success":True,"status":"ALREADY_ON_MANAGEMENT_HOLD","old_mt5":a.get("mt5_login"),"replacement_mt5":None})
+            status = _np_mh_s(a.get("account_status") or a.get("status")).lower()
+            if status not in {str(x).lower() for x in ACTIVE_ACCOUNT_STATUSES} and status not in _NP_UR_V87_ACTIVE:
+                return _np_fail("Management Recall stopped: exact MT5 is no longer active.",409)
+            marker, hid = _np_mh_quarantine(a, admin, reason, note)
+            try:
+                np_invalidate_admin_bootstrap("all"); _invalidate_trader_bootstrap_cache(a.get("trader_id"))
+            except Exception: pass
+            return _np_ok({"success":True,"release":NAIRAPIPS_MANAGEMENT_RECALL_RELEASE_V102,
+                "status":"MANAGEMENT_HOLD","hold_id":hid,"old_mt5":a.get("mt5_login"),
+                "replacement_mt5":None,"hard_hold":True,"journey_preserved":True,"marker":marker})
+        except Exception as exc:
+            print("V102 MANAGEMENT RECALL ERROR:",exc,flush=True)
+            return _np_fail("Management Recall failed safely: "+str(exc),500)
+
+
+@app.route("/admin/management_recall_v102/return", methods=["POST","OPTIONS"])
+def admin_management_recall_v102_return():
+    if request.method == "OPTIONS": return _np_ok({"success":True})
+    admin, auth = _require_admin()
+    if auth: return auth
+    d = request.get_json(silent=True) or {}
+    aid = _np_mh_s(d.get("trader_account_id") or d.get("account_id"))
+    tid = _np_mh_s(d.get("trader_id") or d.get("expected_trader_id"))
+    if not aid: return _np_fail("Exact held trader_account_id is required.",400)
+    with _NP_MH_LOCK:
+        try:
+            hold = _np_mh_account(aid, tid)
+            if not hold: return _np_fail("Held account not found.",404)
+            if not _np_mh_is_active_account(hold):
+                return _np_fail("This exact account is not on an active Management Hold, or it was already returned.",409)
+            sibling = _np_mh_active_sibling(hold)
+            if sibling:
+                return _np_fail("Return blocked: this exact journey/stage already has an active MT5. No duplicate was issued.",409)
+            stage = _normalize_lifecycle_stage(hold.get("stage") or hold.get("phase"))
+            size = clean(hold.get("account_size") or hold.get("start_balance") or 0)
+            pid = _np_mh_purchase_id(hold)
+            trader = _np_ur_v87_trader(hold.get("trader_id")) or {}
+            purchase = _np_ur_v87_purchase(pid) if pid else {}
+            if not trader or not stage or not size:
+                return _np_fail("Return blocked: exact original trader/stage/size snapshot is incomplete.",409)
+            fresh, diag = _np_ur_v89_pick_replacement(size, stage)
+            if not fresh:
+                return _np_ok({"success":False,"reason":"no_safe_matching_mt5_available","inventory_diagnostic":diag},409)
+            target={"target_trader_id":hold.get("trader_id"),"target_stage":stage,"target_size":size,
+                    "purchase_id":pid,"purchase":purchase or {},"target_trader":trader}
+            return_marker = f"[NP_MANAGEMENT_RETURN] [NP_MH_SOURCE_ACCOUNT:{hold.get('id')}] [NP_MH_SOURCE_MT5:{hold.get('mt5_login')}] [NP_MH_RETURN_AT:{now_iso()}]"
+            replacement = _np_ur_v87_create_replacement(hold,target,fresh,"other",return_marker)
+            # Remove Universal-Recall semantics from this separately-authorized delivery.
+            try:
+                supabase.table("trader_accounts").update({"source":"management_recall_exact_return","admin_note":return_marker,"updated_at":now_iso()}).eq("id",replacement.get("id")).execute()
+                supabase.table("mt5_pool").update({"admin_note":return_marker,"updated_at":now_iso()}).eq("id",fresh.get("id")).execute()
+            except Exception as exc:
+                print("V102 RETURN LABEL NORMALIZATION WARNING:",exc,flush=True)
+            _np_ur_v87_update_pointers(hold,target,replacement)
+            _np_update_trader_current_pointer_v59(hold.get("trader_id"),replacement,stage)
+            returned = f"{_NP_MH_RETURNED} [NP_MH_RETURN_ACCOUNT:{replacement.get('id')}] [NP_MH_RETURN_MT5:{replacement.get('mt5_login')}] [NP_MH_RETURN_AT:{now_iso()}]"
+            old_reason=_np_mh_s(hold.get("archive_reason")); old_note=_np_mh_s(hold.get("admin_note"))
+            _np_ur_v87_update_compat("trader_accounts",{
+                "archive_reason":(old_reason+" | "+returned).strip(" |"),
+                "admin_note":(old_note+" | "+returned).strip(" |"),"updated_at":now_iso()},
+                "id",hold.get("id"),optional_keys={"admin_note"})
+            _audit_safe("management_recall","management_hold_returned",
+                f"source_account={hold.get('id')}; old_mt5={hold.get('mt5_login')}; new_account={replacement.get('id')}; new_mt5={replacement.get('mt5_login')}; purchase={pid}; stage={stage}; size={size}; exact_chain=true",
+                admin or {"name":"admin","username":"admin","role":"admin"},hold.get("id"))
+            try:
+                np_invalidate_admin_bootstrap("all"); _invalidate_trader_bootstrap_cache(hold.get("trader_id"))
+            except Exception: pass
+            return _np_ok({"success":True,"release":NAIRAPIPS_MANAGEMENT_RECALL_RELEASE_V102,
+                "status":"RETURNED_TO_EXACT_CHAIN","old_mt5":hold.get("mt5_login"),
+                "replacement_mt5":replacement.get("mt5_login"),"replacement_account_id":replacement.get("id"),
+                "purchase_id":pid,"stage":stage,"account_size":size,"exact_chain":True})
+        except Exception as exc:
+            print("V102 MANAGEMENT RETURN ERROR:",exc,flush=True)
+            return _np_fail("Management Return failed safely: "+str(exc),500)
+
+
+# ---- CENTRAL HARD-HOLD FIREWALL: automatic lifecycle assignment ----
+_np_auto_assign_waiting_stage_v102_core = _np_auto_assign_waiting_stage
+def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"):
+    tid = _np_mh_s((trader or {}).get("id") or (purchase or {}).get("trader_id") or (source_account or {}).get("trader_id"))
+    pid = _np_mh_s((purchase or {}).get("id") or _np_mh_purchase_id(source_account or {}))
+    if tid and _np_mh_blocked(tid,pid or None):
+        try: _audit_safe("management_recall","worker_blocked_by_management_hold",f"trader={tid}; purchase={pid}; target={stage}; reason={reason}",{"name":"system","username":"system","role":"system"},pid or tid)
+        except Exception: pass
+        return None
+    return _np_auto_assign_waiting_stage_v102_core(trader,stage,purchase,source_account,reason)
+
+
+# ---- HARD-HOLD FIREWALL: payout-renewal path ----
+_np_auto_post_payout_renewal_v102_core = _np_auto_post_payout_renewal
+def _np_auto_post_payout_renewal(payout):
+    p = payout or {}
+    sid = _np_mh_s(p.get("trader_account_id") or p.get("account_id"))
+    try:
+        source = _np_mh_account(sid) if sid else None
+        if source and _np_mh_blocked(source.get("trader_id"),_np_mh_purchase_id(source)):
+            return None
+    except Exception:
+        return None
+    return _np_auto_post_payout_renewal_v102_core(payout)
+
+
+# ---- HARD-HOLD FIREWALL: staff/manual assignment route ----
+_np_assign_phase_v102_core = app.view_functions.get("assign_phase_mt5")
+def _np_assign_phase_v102():
+    if request.method == "OPTIONS" or not _np_assign_phase_v102_core:
+        return _np_assign_phase_v102_core()
+    d=request.get_json(silent=True) or {}
+    tid=_np_mh_s(d.get("trader_id") or d.get("id"))
+    sid=_np_mh_s(d.get("completed_account_id") or d.get("source_account_id") or d.get("trader_account_id"))
+    pid=_np_mh_s(d.get("purchase_id") or d.get("challenge_purchase_id"))
+    try:
+        source=_np_mh_account(sid,tid or None) if sid else None
+        pid=pid or _np_mh_purchase_id(source or {})
+        tid=tid or _np_mh_s((source or {}).get("trader_id"))
+        if tid and _np_mh_blocked(tid,pid or None):
+            return _np_fail("Assignment blocked by MANAGEMENT HOLD. Use Management Return for this exact journey.",409)
+    except Exception:
+        return _np_fail("Assignment blocked: Management Hold verification failed closed.",500)
+    return _np_assign_phase_v102_core()
+if _np_assign_phase_v102_core:
+    app.view_functions["assign_phase_mt5"]=_np_assign_phase_v102
+
+
+@app.route("/admin/management_recall_v102/health",methods=["GET","OPTIONS"])
+def admin_management_recall_v102_health():
+    if request.method=="OPTIONS": return _np_ok({"success":True})
+    admin,auth=_require_admin()
+    if auth:return auth
+    return _np_ok({"success":True,"release":NAIRAPIPS_MANAGEMENT_RECALL_RELEASE_V102,
+        "universal_recall_unchanged":True,"no_replacement_on_recall":True,
+        "hard_hold_blocks_workers":True,"return_exact_chain_only":True,
+        "return_single_use":True,"fail_closed":True})
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_MANAGEMENT_RECALL_RELEASE_V102
+
+@app.route("/admin/management_recall_v102/status",methods=["GET","OPTIONS"])
+def admin_management_recall_v102_status():
+    if request.method=="OPTIONS": return _np_ok({"success":True})
+    admin,auth=_require_admin()
+    if auth:return auth
+    tid=_np_mh_s(request.args.get("trader_id"))
+    if not tid:return _np_fail("trader_id is required",400)
+    try:
+        rows=(supabase.table("trader_accounts").select("*").eq("trader_id",tid)
+              .order("updated_at",desc=True).limit(500).execute().data or [])
+        holds=[]
+        for a in rows:
+            if _np_mh_is_active_account(a):
+                holds.append({"trader_account_id":a.get("id"),"mt5_login":a.get("mt5_login"),
+                    "purchase_id":_np_mh_purchase_id(a),"stage":_normalize_lifecycle_stage(a.get("stage") or a.get("phase")),
+                    "account_size":a.get("account_size") or a.get("start_balance"),"active_hold":True,
+                    "updated_at":a.get("updated_at"),"archive_reason":a.get("archive_reason")})
+        return _np_ok({"success":True,"release":NAIRAPIPS_MANAGEMENT_RECALL_RELEASE_V102,"holds":holds,"count":len(holds)})
+    except Exception as exc:
+        return _np_fail("Management Hold status failed: "+str(exc),500)
