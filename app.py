@@ -6266,6 +6266,23 @@ def upload_payment_proof():
         print("UPLOAD PAYMENT PROOF ERROR:", repr(e))
         return jsonify({"success": False, "error": str(e), "hint": "Confirm the PUBLIC Supabase Storage bucket payment-proofs exists and the service-role key is configured."}), 400
 
+@app.route("/admin/traders_count", methods=["GET"])
+def admin_traders_count():
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    try:
+        # Exact database count without downloading every trader row.
+        res = supabase.table("traders").select("id", count="exact").limit(1).execute()
+        exact_count = getattr(res, "count", None)
+        if exact_count is None:
+            # Compatibility fallback for client versions that do not expose count.
+            rows = supabase.table("traders").select("id").execute().data or []
+            exact_count = len(rows)
+        return jsonify({"success": True, "count": int(exact_count or 0)})
+    except Exception as e:
+        return bad(e)
+
 @app.route("/traders_raw", methods=["GET"])
 def get_traders_raw():
     admin, auth_response = _require_admin()
