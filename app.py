@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V12_PARALLEL_JOURNEY_TIMELINE_2026_09_10"
+NAIRAPIPS_RELEASE = "V112_PRIVATE_COMPLIANCE_REPORT_2026_09_28"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1033,7 +1033,7 @@ def _trader_safe_offer_row(row):
         "target_account_reference", "target_name", "show_on_dashboard",
         "delivery_dashboard", "offer_code", "promo_code",
         "discount_percent", "discount_type", "discount_value",
-        "require_ack", "read_at"
+        "require_ack", "read_at", "payout_id", "mt5_login"
     }
     return _only_fields(row, allowed)
 
@@ -11901,7 +11901,9 @@ def reject_payout():
             "message_only":True,
             "audience_segment":"single",
             "audience_label":"Compliance Decision",
-            "notice_type":"payout_compliance"
+            "notice_type":"payout_compliance",
+            "payout_id":pid,
+            "mt5_login":str(payout.get("mt5_login") or "")
         }
         try:
             supabase.table("announcements").insert(dashboard_row).execute()
@@ -11930,7 +11932,9 @@ def reject_payout():
                 "show_on_dashboard":True,
                 "delivery_email":False,
                 "delivery_whatsapp":False,
-                "created_by":"NairaPips Compliance"
+                "created_by":"NairaPips Compliance",
+                "payout_id":pid,
+                "mt5_login":str(payout.get("mt5_login") or "")
             }
             try:
                 supabase.table("announcements").insert({
@@ -12402,6 +12406,85 @@ def close_ticket():
         if not tid: return bad("Missing ticket id")
         return ok(supabase.table("support_tickets").update({"status":"closed","closed_at":now_iso(),"last_updated_at":now_iso()}).eq("id",tid).execute().data, "Support ticket closed")
     except Exception as e: return bad(e)
+
+# ============================================================
+# V112 PRIVATE COMPLIANCE REPORT DELIVERY · 2026-09-28
+# Trader dashboard receives only public notices + notices targeted to itself.
+# Opening a private compliance report creates a server-side timestamped audit.
+# ============================================================
+@app.route("/trader_announcements", methods=["GET", "OPTIONS"])
+def trader_announcements():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    try:
+        requested_id = str(request.args.get("trader_id") or "").strip()
+        authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+        trader = _get_trader_by_id(authed_id) or {}
+        verified_email = str(trader.get("email") or "").strip().lower()
+        rows = supabase.table("announcements").select("*").eq("status", "active").order("created_at", desc=True).limit(250).execute().data or []
+        visible = []
+        for raw in rows:
+            row = _np_offer_merge_meta(raw)
+            target_id = str(row.get("target_trader_id") or "").strip()
+            target_email = str(row.get("target_email") or "").strip().lower()
+            # A targeted notice is private. Never send another trader's notice to this browser.
+            if target_id or target_email:
+                if target_id and target_id != authed_id:
+                    continue
+                if (not target_id) and target_email and target_email != verified_email:
+                    continue
+            elif not bool(row.get("show_on_dashboard", True)):
+                continue
+            visible.append(_trader_safe_offer_row(row))
+        return jsonify(visible)
+    except Exception as exc:
+        print("TRADER ANNOUNCEMENTS ERROR:", exc)
+        return _np_fail("Could not load trader announcements", 500)
+
+
+@app.route("/trader_announcement_read", methods=["POST", "OPTIONS"])
+def trader_announcement_read():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    try:
+        d = request.get_json(silent=True) or {}
+        requested_id = str(d.get("trader_id") or "").strip()
+        authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+        announcement_id = str(d.get("announcement_id") or "").strip()
+        if not announcement_id:
+            return _np_fail("Missing announcement id", 400)
+        rows = supabase.table("announcements").select("*").eq("id", announcement_id).limit(1).execute().data or []
+        if not rows:
+            return _np_fail("Announcement not found", 404)
+        row = _np_offer_merge_meta(rows[0])
+        trader = _get_trader_by_id(authed_id) or {}
+        verified_email = str(trader.get("email") or "").strip().lower()
+        target_id = str(row.get("target_trader_id") or "").strip()
+        target_email = str(row.get("target_email") or "").strip().lower()
+        if target_id and target_id != authed_id:
+            return _np_fail("Announcement does not belong to this trader", 403)
+        if (not target_id) and target_email and target_email != verified_email:
+            return _np_fail("Announcement does not belong to this trader", 403)
+        opened_at = now_iso()
+        try:
+            supabase.table("announcements").update({"read_at": opened_at}).eq("id", announcement_id).execute()
+        except Exception as read_exc:
+            print("ANNOUNCEMENT READ_AT OPTIONAL COLUMN ERROR:", read_exc)
+        _audit_safe(
+            "announcements", "trader_opened_private_notice",
+            f"Trader opened dashboard notice {announcement_id} at {opened_at}",
+            {"name": trader.get("name") or "trader", "username": trader.get("email") or authed_id, "role": "trader"},
+            announcement_id,
+        )
+        return _np_ok({"success": True, "opened_at": opened_at})
+    except Exception as exc:
+        print("TRADER ANNOUNCEMENT READ ERROR:", exc)
+        return _np_fail("Could not record notice opening", 500)
+
 
 @app.route("/announcements", methods=["GET"])
 def announcements():
