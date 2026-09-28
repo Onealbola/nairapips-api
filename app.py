@@ -6266,23 +6266,6 @@ def upload_payment_proof():
         print("UPLOAD PAYMENT PROOF ERROR:", repr(e))
         return jsonify({"success": False, "error": str(e), "hint": "Confirm the PUBLIC Supabase Storage bucket payment-proofs exists and the service-role key is configured."}), 400
 
-@app.route("/admin/traders_count", methods=["GET"])
-def admin_traders_count():
-    admin, auth_response = _require_admin()
-    if auth_response:
-        return auth_response
-    try:
-        # Exact database count without downloading every trader row.
-        res = supabase.table("traders").select("id", count="exact").limit(1).execute()
-        exact_count = getattr(res, "count", None)
-        if exact_count is None:
-            # Compatibility fallback for client versions that do not expose count.
-            rows = supabase.table("traders").select("id").execute().data or []
-            exact_count = len(rows)
-        return jsonify({"success": True, "count": int(exact_count or 0)})
-    except Exception as e:
-        return bad(e)
-
 @app.route("/traders_raw", methods=["GET"])
 def get_traders_raw():
     admin, auth_response = _require_admin()
@@ -11232,6 +11215,58 @@ def create_payout():
         if not eligible:
             return bad(reason, 403)
 
+        # V111 — REJECTED PAYOUT ACCOUNT LOCK
+        # A compliance-rejected payout is terminal for NEW payout requests on
+        # this exact Funded trader_account. The trader may not simply submit
+        # another request after Admin rejection.
+        #
+        # Scope is deliberately exact-account only:
+        #   same trader_id + same trader_account_id + status=rejected
+        # It does NOT block a different Funded account, a legitimate later
+        # payout-renewal account, Reset, Second Life, Recall, progression, etc.
+        #
+        # Fail closed: if rejection history cannot be verified, do not create a
+        # new money liability.
+        try:
+            rejected_rows = (
+                supabase.table("payouts")
+                .select("id,status,amount,created_at,rejected_at")
+                .eq("trader_id", trader_row.get("id"))
+                .eq("trader_account_id", account.get("id"))
+                .eq("status", "rejected")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+        except Exception as rejected_check_error:
+            print("V111 REJECTED PAYOUT LOCK CHECK ERROR:", rejected_check_error, flush=True)
+            return bad(
+                "Payout safety verification is temporarily unavailable. "
+                "No new payout request was created. Please try again later.",
+                503,
+            )
+
+        if rejected_rows:
+            rejected_request = rejected_rows[0]
+            _audit_safe(
+                "payouts",
+                "rejected_account_resubmission_blocked",
+                (
+                    f"V111 blocked new payout on exact account={account.get('id')} "
+                    f"after rejected payout={rejected_request.get('id')}"
+                ),
+                {"name": "system", "username": "system"},
+                account.get("id"),
+            )
+            return bad(
+                "This funded account has a REJECTED payout decision and is locked "
+                "from submitting another payout request. Contact NairaPips Support "
+                "if the rejection is being formally reviewed.",
+                403,
+            )
+
         # Standalone payout safety: one open request per exact funded account.
         # This does not call, modify, or share logic with the breach/reset system.
         open_payout_statuses = ["pending", "approved", "processing", "payment_processing"]
@@ -11818,12 +11853,10 @@ def reject_payout():
             f"Trader Email: {payout.get('email') or (trader_row or {}).get('email') or '—'}\n"
             f"Payout ID: {pid}\n"
             f"MT5: {payout.get('mt5_login') or '—'}\n"
-            f"Account Size: {(account or {}).get('account_size') or (account or {}).get('start_balance') or payout.get('account_size') or '—'}\n"
             f"Amount: {payout.get('amount') or 0}\n"
             f"Reasons: {'; '.join(reasons)}\n"
-            f"Review Evidence: {evidence}\n"
-            + (("Selected Trade Snapshot:\n" + "\n".join(trade_summary) + "\n") if trade_summary else "")
-            + "\nEXACT NOTICE SENT TO TRADER\n"
+            f"Review Evidence: {evidence}\n\n"
+            "EXACT NOTICE SENT TO TRADER\n"
             "--------------------------------\n"
             f"{final_message}"
         )
@@ -52059,4 +52092,20 @@ NAIRAPIPS_PAID_PAYOUT_EXACT_SOURCE_RELEASE_V110 = "V110_PAID_PAYOUT_EXACT_SOURCE
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAID_PAYOUT_EXACT_SOURCE_RELEASE_V110
 
 
-# NAIRAPIPS_BACKEND_RELEASE = "V61_TRADER_COUNT_DIRECT_2026_09_28"
+# ============================================================================
+# NAIRAPIPS V111 — REJECTED PAYOUT EXACT-ACCOUNT LOCK — 28 SEP 2026
+# Production safety law:
+#   REJECTED payout on exact Funded account -> no new payout request on that
+#   same trader_account until an explicit future management review authority
+#   changes the rejection state.
+#
+# Isolation:
+# - does not change existing rejected payout records
+# - does not change trading-account lifecycle state
+# - does not touch payout approval/payment
+# - does not touch payout renewal/reset
+# - does not touch Second Life, progression, Universal Recall or Management Recall
+# - different legitimate Funded accounts remain independent
+# ============================================================================
+NAIRAPIPS_REJECTED_PAYOUT_LOCK_RELEASE_V111 = "V111_REJECTED_PAYOUT_ACCOUNT_LOCK_2026_09_28"
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_REJECTED_PAYOUT_LOCK_RELEASE_V111
