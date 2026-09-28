@@ -11801,10 +11801,12 @@ def reject_payout():
             f"Trader Email: {payout.get('email') or (trader_row or {}).get('email') or '—'}\n"
             f"Payout ID: {pid}\n"
             f"MT5: {payout.get('mt5_login') or '—'}\n"
+            f"Account Size: {(account or {}).get('account_size') or (account or {}).get('start_balance') or payout.get('account_size') or '—'}\n"
             f"Amount: {payout.get('amount') or 0}\n"
             f"Reasons: {'; '.join(reasons)}\n"
-            f"Review Evidence: {evidence}\n\n"
-            "EXACT NOTICE SENT TO TRADER\n"
+            f"Review Evidence: {evidence}\n"
+            + (("Selected Trade Snapshot:\n" + "\n".join(trade_summary) + "\n") if trade_summary else "")
+            + "\nEXACT NOTICE SENT TO TRADER\n"
             "--------------------------------\n"
             f"{final_message}"
         )
