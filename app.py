@@ -22070,92 +22070,6 @@ if _NP_PREVIOUS_TRADER_RESET_OPPORTUNITIES_VIEW:
     app.view_functions["trader_reset_opportunities"] = _np_final_trader_reset_opportunities_20260911
 
 
-
-# ============================================================================
-# NAIRAPIPS V113 — EXACT UNFINISHED PAYOUT RECOVERY FOR MT5 477244378 ONLY
-# 29 SEP 2026
-#
-# This is deliberately NOT a global payout-rule change.
-# Existing _payout_eligibility remains authoritative for every other account.
-#
-# Exact recovery case:
-#   MT5 477244378 is Funded and still owns an unfinished payout lifecycle, but
-#   its trader_accounts.account_status is no longer assigned_active.
-#
-# Safety:
-# - exact MT5 477244378 only
-# - exact requested trader_account_id still resolved by existing authority
-# - existing ownership + Funded-stage + MT5 checks must already have passed
-# - bypasses ONLY the assigned_active rejection
-# - fails closed if PAID already exists for this exact trader_account_id
-# - does not update trader_accounts, traders, payouts, purchases or MT5 pool
-# - once PAID, normal post-payout reset/renewal remains authoritative
-# ============================================================================
-
-NAIRAPIPS_V113_477244378_UNFINISHED_PAYOUT_RECOVERY_ONLY_2026_09_29 = True
-_np_payout_eligibility_before_v113_477244378 = _payout_eligibility
-
-def _payout_eligibility(trader, requested_account_id=None):
-    eligible, reason, account = _np_payout_eligibility_before_v113_477244378(
-        trader, requested_account_id=requested_account_id
-    )
-
-    if eligible:
-        return eligible, reason, account
-
-    # Never change any other payout failure or any other MT5.
-    if reason != "Payouts require the selected funded account to be assigned and active.":
-        return eligible, reason, account
-    if not account or str(account.get("mt5_login") or "").strip() != "477244378":
-        return eligible, reason, account
-
-    trader_id = str((trader or {}).get("id") or "").strip()
-    account_id = str(account.get("id") or "").strip()
-    if not trader_id or not account_id:
-        return eligible, reason, account
-
-    # Re-assert the critical facts before the one-status exception.
-    if str(account.get("trader_id") or "").strip() != trader_id:
-        return False, "Selected payout account does not belong to this trader.", account
-
-    stage = str(account.get("stage") or account.get("phase") or "").strip().lower()
-    if stage != "funded":
-        return False, "Payouts are available only on Funded accounts.", account
-
-    if str(account.get("programme_type") or "").strip().lower() == "traders_league":
-        return False, "Traders League accounts are not eligible for funded payouts.", account
-
-    if not str(account.get("mt5_login") or "").strip():
-        return False, "Selected funded account has no MT5 login.", account
-
-    # Its unfinished job ends as soon as this exact source has a PAID payout.
-    # Database uncertainty fails closed.
-    try:
-        paid = (
-            supabase.table("payouts")
-            .select("id,status,paid_at")
-            .eq("trader_id", trader_id)
-            .eq("trader_account_id", account_id)
-            .eq("status", "paid")
-            .limit(1)
-            .execute().data
-            or []
-        )
-    except Exception as exc:
-        print("V113 477244378 paid guard failed:", exc, flush=True)
-        return False, "Could not safely verify this payout cycle. Refresh and try again.", account
-
-    if paid:
-        return False, "This funded payout cycle is already paid and must continue through payout reset/renewal.", account
-
-    print(
-        "V113 477244378: exact unfinished payout recovery allowed "
-        f"trader={trader_id} account={account_id}",
-        flush=True,
-    )
-    return True, "Exact unfinished payout recovery for MT5 477244378", account
-
-
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
@@ -52278,3 +52192,82 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAID_PAYOUT_EXACT_SOURCE_RELEASE_
 # ============================================================================
 NAIRAPIPS_REJECTED_PAYOUT_LOCK_RELEASE_V111 = "V111_REJECTED_PAYOUT_ACCOUNT_LOCK_2026_09_28"
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_REJECTED_PAYOUT_LOCK_RELEASE_V111
+
+
+# ============================================================================
+# NAIRAPIPS V114 — FINAL EXACT PAYOUT RECOVERY OVERRIDE — MT5 477244378 ONLY
+# 29 SEP 2026
+#
+# IMPORTANT:
+# This patch is intentionally at END OF FILE, after V75's later redefinition of
+# _payout_eligibility. The previous attempted placement was overwritten by V75.
+#
+# Scope:
+# - MT5 477244378 only
+# - bypasses only V75's assigned_active rejection for this unfinished Funded payout
+# - all other V75 checks and all /create_payout safety checks remain unchanged
+# - no DB status mutation
+# - stops permanently once exact account has a PAID payout
+# ============================================================================
+
+NAIRAPIPS_V114_477244378_FINAL_PAYOUT_RECOVERY_2026_09_29 = True
+_np_payout_eligibility_v114_base = _payout_eligibility
+
+def _payout_eligibility(trader, requested_account_id=None):
+    eligible, reason, account = _np_payout_eligibility_v114_base(
+        trader, requested_account_id=requested_account_id
+    )
+    if eligible:
+        return eligible, reason, account
+
+    # Exact failure + exact MT5 only. Everything else stays untouched.
+    if reason != "Payouts require the selected funded account to be assigned and active.":
+        return eligible, reason, account
+    if not account or str(account.get("mt5_login") or "").strip() != "477244378":
+        return eligible, reason, account
+
+    trader_id = str((trader or {}).get("id") or "").strip()
+    account_id = str(account.get("id") or "").strip()
+    if not trader_id or not account_id:
+        return eligible, reason, account
+
+    # Reassert ownership and Funded stage.
+    if str(account.get("trader_id") or "").strip() != trader_id:
+        return False, "Selected payout account does not belong to this trader.", account
+    if str(account.get("stage") or account.get("phase") or "").strip().lower() != "funded":
+        return False, "The selected payout account is not a funded-stage account.", account
+    if str(account.get("programme_type") or "").strip().lower() == "traders_league":
+        return False, "League competition accounts are not eligible for paid payouts.", account
+    if not str(account.get("mt5_login") or "").strip():
+        return False, "Payouts require an active funded MT5 login.", account
+
+    # Once paid, this exact recovery ends and normal payout reset/renewal owns it.
+    try:
+        paid_rows = (
+            supabase.table("payouts")
+            .select("id,status,paid_at")
+            .eq("trader_id", trader_id)
+            .eq("trader_account_id", account_id)
+            .eq("status", "paid")
+            .limit(1)
+            .execute().data or []
+        )
+    except Exception as exc:
+        print("V114 477244378 PAID GUARD ERROR:", exc, flush=True)
+        return False, "Could not safely verify this payout cycle. Refresh and try again.", account
+
+    if paid_rows:
+        return False, (
+            "This funded payout cycle is already paid and must continue through "
+            "the normal payout reset/renewal."
+        ), account
+
+    print(
+        "V114 477244378: unfinished Funded payout recovery ALLOWED "
+        f"trader={trader_id} account={account_id}",
+        flush=True,
+    )
+    return True, "Exact unfinished payout recovery for MT5 477244378", account
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "V114_477244378_FINAL_PAYOUT_RECOVERY_2026_09_29"
+
