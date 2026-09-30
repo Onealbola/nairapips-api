@@ -2259,8 +2259,21 @@ def _payout_eligibility(trader, requested_account_id=None):
 
     if stage != "funded":
         return False, "The selected payout account is not a funded-stage account.", account
-    if status != "assigned_active":
+
+    # V116 — FUNDED PROFIT-CAP PAYOUT AUTHORITY
+    # A funded account that has reached the 15% cycle cap is still the trader's
+    # exact funded account. Trading is locked, but payout must remain available.
+    # Do NOT require the account to be reopened as assigned_active just to withdraw.
+    payout_active_statuses = {"assigned_active", "funded_profit_cap_reached"}
+    if status not in payout_active_statuses:
         return False, "Payouts require the selected funded account to be assigned and active.", account
+
+    if status == "funded_profit_cap_reached":
+        # Fail closed against real terminal/replacement evidence. A cap lock is
+        # financial state, not permission to resurrect a breached/reset account.
+        if account.get("breached_at") or account.get("reset_at") or account.get("replaced_at") or account.get("superseded_at"):
+            return False, "This funded account has terminal lifecycle evidence and cannot open a payout automatically.", account
+
     if not str(account.get("mt5_login") or "").strip():
         return False, "Payouts require an active funded MT5 login.", account
 
@@ -7539,6 +7552,178 @@ def _np_bootstrap_lifecycle_authority(trader, accounts, purchases, plan_by_id):
     }
 
 
+# ============================================================
+# V113B — RESTORE FUNDED PROFIT-CAP ACCOUNTS THAT WERE WRONGLY ARCHIVED
+# 30 SEP 2026
+#
+# Business rule:
+#   Hitting the funded 15% cycle cap is NOT an archive/reset/breach event.
+#   The same funded MT5 remains the current account, visible to the trader,
+#   while trading is locked until the payout cycle is completed.
+#
+# This repair is intentionally narrow. It only restores the trader's exact
+# current/mirrored funded MT5 when the row is an archived funded row, carries
+# strong cap evidence (>=14.99% profit or explicit cap wording), has no breach/
+# reset/recall/replacement evidence, and has no PAID payout for that account.
+# ============================================================
+def _np_restore_wrongly_archived_unpaid_funded_cap(trader, account_rows):
+    trader = trader or {}
+    rows = list(account_rows or [])
+    trader_id = str(trader.get("id") or "").strip()
+    if not trader_id or not rows:
+        return rows
+
+    current_id = str(trader.get("current_account_id") or trader.get("trader_account_id") or "").strip()
+    mirror_login = str(trader.get("mt5_login") or "").strip()
+    paid_states = {"paid", "completed", "complete", "settled", "success", "successful"}
+
+    def _blob(r):
+        return " ".join(str((r or {}).get(k) or "") for k in (
+            "account_status", "status", "stage", "phase", "archive_reason",
+            "breach_reason", "reset_reason", "closed_reason", "admin_note",
+            "message", "lifecycle_state", "challenge_state"
+        )).lower().replace("-", "_")
+
+    candidates = []
+    for r in rows:
+        rid = str(r.get("id") or "").strip()
+        login = str(r.get("mt5_login") or "").strip()
+        stage = _normalize_lifecycle_stage(r.get("stage") or r.get("phase"))
+        status = str(r.get("account_status") or r.get("status") or "").strip().lower()
+        if stage != "funded" or not rid or not login:
+            continue
+        if status not in {"archived_funded", "archived"}:
+            continue
+        # Only the exact account the trader mirror still points at can self-heal.
+        if current_id and rid != current_id and (not mirror_login or login != mirror_login):
+            continue
+        if not current_id and mirror_login and login != mirror_login:
+            continue
+
+        b = _blob(r)
+        forbidden = (
+            "breach", "max_drawdown", "archived_reset", "reset_",
+            "wrong_assignment", "recalled", "recall", "replacement",
+            "replaced", "management_hold", "blacklist", "compliance_reject"
+        )
+        if any(x in b for x in forbidden) or r.get("breached_at") or r.get("reset_at") or r.get("replaced_at"):
+            continue
+
+        start = clean(r.get("start_balance") or r.get("account_size") or 0)
+        eq = clean(r.get("current_equity") or r.get("current_balance") or start)
+        pct = clean(r.get("profit_percent") or 0)
+        if start > 0 and pct <= 0 and eq > 0:
+            pct = ((eq - start) / start) * 100.0
+        cap_words = any(x in b for x in (
+            "funded_profit_cap", "profit_cap", "profit cap", "15%",
+            "15 percent", "cap_reached", "cap reached", "profit ceiling"
+        ))
+        if not cap_words and pct < 14.99:
+            continue
+        candidates.append((r, pct))
+
+    if not candidates:
+        return rows
+
+    candidates.sort(key=lambda item: str(item[0].get("updated_at") or item[0].get("archived_at") or item[0].get("created_at") or ""), reverse=True)
+    account, pct = candidates[0]
+    account_id = str(account.get("id") or "").strip()
+
+    # A paid payout closes that cycle. Never resurrect a paid/renewed historical row.
+    try:
+        payout_rows = (
+            supabase.table("payouts").select("id,status,trader_account_id,paid_at,created_at")
+            .eq("trader_id", trader_id).eq("trader_account_id", account_id)
+            .order("created_at", desc=True).limit(30).execute().data or []
+        )
+    except Exception as exc:
+        print("CAP VISIBILITY PAYOUT CHECK FAILED CLOSED:", account_id, exc, flush=True)
+        return rows
+
+    if any(str(p.get("status") or "").strip().lower() in paid_states or p.get("paid_at") for p in payout_rows):
+        return rows
+
+    now = now_iso()
+    old_archived_at = account.get("archived_at")
+    old_reason = str(account.get("archive_reason") or "").strip()
+    marker = f"[NP_CAP_VISIBILITY_RESTORED:{now}] [ORIGINAL_ARCHIVED_AT:{old_archived_at or 'NONE'}]"
+    reason = (old_reason + " " + marker).strip()[:1800]
+
+    payload = {
+        "account_status": "funded_profit_cap_reached",
+        "stage": "funded",
+        "monitoring_enabled": True,
+        # Visibility repair must NOT reopen trading. The account remains locked
+        # at the 15% cycle cap until the payout cycle is completed.
+        "mt5_access_disabled": True,
+        "archived_at": None,
+        "archive_reason": reason,
+        "updated_at": now,
+    }
+    try:
+        repaired = (
+            supabase.table("trader_accounts").update(payload)
+            .eq("id", account_id).eq("trader_id", trader_id).execute().data or []
+        )
+        if not repaired:
+            print("CAP VISIBILITY REPAIR DID NOT UPDATE ROW:", account_id, flush=True)
+            return rows
+        repaired_row = repaired[0]
+
+        # Restore the trader's exact current pointer WITHOUT using the normal
+        # active-pointer helper, because that helper intentionally sets
+        # mt5_access_disabled=False for ordinary active accounts. A cap account
+        # must remain visible AND locked.
+        trader_cap_payload = {
+            "current_account_id": account_id,
+            "trader_account_id": account_id,
+            "challenge_state": "funded_profit_cap_reached",
+            "phase": "funded",
+            "status": "funded",
+            "mt5_login": repaired_row.get("mt5_login"),
+            "mt5_server": repaired_row.get("mt5_server"),
+            "mt5_master_password": repaired_row.get("mt5_master_password"),
+            "mt5_password": repaired_row.get("mt5_master_password"),
+            "master_password": repaired_row.get("mt5_master_password"),
+            "mt5_investor_password": repaired_row.get("mt5_investor_password"),
+            "investor_password": repaired_row.get("mt5_investor_password"),
+            "account_size": repaired_row.get("account_size"),
+            "monitoring_enabled": True,
+            "mt5_account_active": True,
+            "mt5_access_disabled": True,
+            "payout_blocked": False,
+            "payout_eligible": True,
+            "lifecycle_updated_at": now,
+            "updated_at": now,
+        }
+        _np_ur_v87_update_compat(
+            "traders", trader_cap_payload, "id", trader_id,
+            optional_keys={
+                "trader_account_id", "mt5_master_password", "mt5_password",
+                "master_password", "mt5_investor_password", "investor_password",
+                "account_size", "monitoring_enabled", "mt5_account_active",
+                "mt5_access_disabled", "payout_blocked", "payout_eligible",
+                "lifecycle_updated_at",
+            },
+        )
+        _log_lifecycle_event(
+            trader_id, account_id, "archived_funded", "funded_profit_cap_reached",
+            "repair_wrong_cap_archive_before_payout",
+            f"Restored visible funded cap-lock account; mt5={repaired_row.get('mt5_login')}; profit_percent={round(pct,4)}; payout_not_paid=true",
+            {"name": "system", "username": "system"},
+        )
+        np_invalidate_admin_bootstrap("traders")
+        try:
+            _TRADER_BOOTSTRAP_CACHE.clear()
+        except Exception:
+            pass
+        print("CAP VISIBILITY AUTO-REPAIRED:", trader_id, account_id, repaired_row.get("mt5_login"), flush=True)
+        return [repaired_row if str(r.get("id") or "") == account_id else r for r in rows]
+    except Exception as exc:
+        print("CAP VISIBILITY AUTO-REPAIR FAILED CLOSED:", account_id, repr(exc), flush=True)
+        return rows
+
+
 @app.route("/trader_bootstrap", methods=["GET", "OPTIONS"])
 def trader_bootstrap():
     """Fast trader shell/account feed.
@@ -7586,7 +7771,7 @@ def trader_bootstrap():
         if not _np_verify_auth_token_cached(token, trader.get("id")):
             return _np_fail("Trader authentication is required", 401)
 
-        key = _cache_key("trader_bootstrap_fast", trader.get("id"), lookup)
+        key = _cache_key("trader_bootstrap_fast_cap_visibility_v2", trader.get("id"), lookup)
         cached = _cache_get(_TRADER_BOOTSTRAP_CACHE, key, TRADER_BOOTSTRAP_TTL_SECONDS)
         if cached:
             # Cached lifecycle data is safe only when it already carries the
@@ -7620,6 +7805,16 @@ def trader_bootstrap():
                 purchase_rows = purchase_future.result() or []
         except Exception as e:
             print("TRADER BOOTSTRAP CORE PARALLEL ERROR:", e)
+
+        # V113B: repair only exact funded cap rows wrongly archived before payout.
+        account_rows = _np_restore_wrongly_archived_unpaid_funded_cap(trader, account_rows)
+        # Refresh trader mirror if the repair changed current_account_id/state.
+        try:
+            refreshed = _critical_rest_rows("traders", [("id", trader.get("id"))], "updated_at", True, 1)
+            if refreshed:
+                trader = refreshed[0]
+        except Exception as _cap_refresh_exc:
+            print("CAP VISIBILITY TRADER REFRESH WARNING:", _cap_refresh_exc, flush=True)
 
         purchases = _dedupe_by_id(purchase_rows)
         purchase_by_id = {
@@ -11118,20 +11313,25 @@ def _set_funded_payout_trade_lock(trader_row, account, payout_id=None, reason="P
     # Production trader_accounts lifecycle field is account_status (not status).
     # Keep the exact funded account monitorable so the MT5 watchdog can enforce
     # the payout trading lock without disturbing independent accounts.
+    current_status = str((account or {}).get("account_status") or (account or {}).get("status") or "").strip().lower()
+    cap_locked = current_status == "funded_profit_cap_reached"
+    expected_status = "funded_profit_cap_reached" if cap_locked else "profit_protected"
     account_payload = {
-        "account_status": "profit_protected",
+        "account_status": expected_status,
         "monitoring_enabled": True,
+        # Keep the exact MT5 locked from trading while payout is open.
+        "mt5_access_disabled": True,
         "updated_at": now,
     }
     db.table("trader_accounts").update(account_payload).eq("id", account_id).eq("trader_id", trader_id).execute()
 
     locked = (
         db.table("trader_accounts")
-        .select("id,trader_id,account_status,monitoring_enabled")
+        .select("id,trader_id,account_status,monitoring_enabled,mt5_access_disabled")
         .eq("id", account_id).eq("trader_id", trader_id).limit(1).execute().data or []
     )
-    if not locked or str(locked[0].get("account_status") or "").strip().lower() != "profit_protected":
-        raise RuntimeError("Exact funded trader account did not enter profit_protected payout lock state")
+    if not locked or str(locked[0].get("account_status") or "").strip().lower() != expected_status:
+        raise RuntimeError(f"Exact funded trader account did not enter payout lock state {expected_status}")
 
     # Trader row remains a compatibility mirror. Do not require newer optional
     # payout columns that are absent from the live production schema.
@@ -11168,13 +11368,16 @@ def _release_funded_payout_trade_lock(trader_row, account, reason="Payout reques
     ).strip().lower()
     if current_status and current_status not in {
         "payout_pending", "approved_payout_pending", "payment_processing",
-        "profit_protected", "funded_active", "active", "assigned_active"
+        "profit_protected", "funded_active", "active", "assigned_active",
+        "funded_profit_cap_reached"
     }:
         raise ValueError(f"Non-payout lock/status {current_status}; refusing automatic unlock")
 
+    cap_locked = current_status == "funded_profit_cap_reached"
     account_payload = {
-        "account_status": "assigned_active",
+        "account_status": "funded_profit_cap_reached" if cap_locked else "assigned_active",
         "monitoring_enabled": True,
+        "mt5_access_disabled": True if cap_locked else False,
         "updated_at": now,
     }
     db.table("trader_accounts").update(account_payload).eq("id", account_id).eq("trader_id", trader_id).execute()
@@ -11182,8 +11385,11 @@ def _release_funded_payout_trade_lock(trader_row, account, reason="Payout reques
     trader_payload = {
         "payout_blocked": False,
         "payout_eligible": True,
-        "mt5_access_disabled": False,
+        "mt5_access_disabled": True if cap_locked else False,
         "monitoring_enabled": True,
+        "challenge_state": "funded_profit_cap_reached" if cap_locked else "funded_active",
+        "status": "funded",
+        "phase": "funded",
         "admin_note": reason,
         "updated_at": now,
     }
@@ -11510,7 +11716,7 @@ def cancel_payout():
             reopened.get("account_status") or reopened.get("status") or ""
         ).strip().lower()
 
-        if reopened_status != "assigned_active":
+        if reopened_status not in {"assigned_active", "funded_profit_cap_reached"}:
             try:
                 _staff_db().table("trader_accounts").update({
                     "account_status": "assigned_active",
@@ -11521,7 +11727,7 @@ def cancel_payout():
                 }).eq("id", account.get("id")).eq("trader_id", authed_trader_id).execute()
             except Exception as reopen_error:
                 print("PAYOUT CANCEL EXACT ACCOUNT REOPEN ERROR:", reopen_error)
-                return bad("Payout was cancelled but the funded account could not be reopened automatically. Please contact Admin.", 500)
+                return bad("Payout was cancelled but the funded account could not be restored automatically. Please contact Admin.", 500)
 
         # Clear trader-level payout lock mirrors only when no OTHER open payout exists.
         try:
