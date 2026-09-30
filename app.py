@@ -44417,11 +44417,26 @@ def _payout_eligibility(trader, requested_account_id=None):
     if stage != "funded":
         return False, "The selected payout account is not a funded-stage account.", account
 
-    if status != "assigned_active":
-        # This naturally blocks a payout-pending/profit-protected exact account,
-        # a breached account, archived account, passed challenge, waiting account,
-        # etc. We do not need a trader-wide mirror to do that.
+    # V117 — GLOBAL FUNDED CAP PAYOUT AUTHORITY
+    # This is the EFFECTIVE V75 validator defined later in this large production
+    # module. Earlier _payout_eligibility definitions are shadowed by this one.
+    # A funded account at the 15% cycle cap remains the exact funded payout
+    # account. Trading stays locked; payout access must remain open.
+    payout_eligible_statuses = {"assigned_active", "funded_profit_cap_reached"}
+    if status not in payout_eligible_statuses:
+        # This naturally blocks payout-pending/profit-protected, breached,
+        # reset, archived, passed, waiting and other non-payable lifecycle states.
         return False, "Payouts require the selected funded account to be assigned and active.", account
+
+    if status == "funded_profit_cap_reached":
+        # Cap lock is NOT terminal. Do not reject merely because trading is
+        # disabled. But never resurrect a genuinely breached/reset/replaced row.
+        if (account.get("breached_at") or account.get("reset_at") or
+                account.get("replaced_at") or account.get("superseded_at")):
+            return False, (
+                "This funded account has terminal lifecycle evidence and cannot "
+                "open a payout automatically."
+            ), account
 
     if not str(account.get("mt5_login") or "").strip():
         return False, "Payouts require an active funded MT5 login.", account
@@ -44448,7 +44463,8 @@ def admin_payout_eligibility_v75_status():
         "trader_level_payout_blocked_role": "COMPATIBILITY_MIRROR_ONLY",
         "exact_account_must_be": {
             "stage": "funded",
-            "account_status": "assigned_active",
+            "account_status": ["assigned_active", "funded_profit_cap_reached"],
+            "cap_state_rule": "visible funded account; trading locked; payout allowed",
             "mt5_login": "required",
         },
         "one_open_payout_per_exact_account": True,
@@ -52444,3 +52460,16 @@ def _payout_eligibility(trader, requested_account_id=None):
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "V115_ADERETI_477162786_PAYOUT_RECOVERY_ONLY_20260929"
 
+
+
+# ============================================================================
+# NAIRAPIPS V117 — FINAL GLOBAL FUNDED-CAP PAYOUT AUTHORITY — 30 SEP 2026
+# Forensic fix: a later V75 _payout_eligibility definition shadowed the earlier
+# cap-aware validator. V75 now explicitly accepts funded_profit_cap_reached.
+# V115 remains a narrow historical recovery overlay; because its base is now
+# cap-aware, all legitimate capped Funded accounts can request payout globally.
+# Trading lock, rejected-payout lock, one-open-payout guard and paid-cycle rules
+# remain unchanged.
+# ============================================================================
+NAIRAPIPS_CAP_PAYOUT_ELIGIBILITY_RELEASE_V117 = "V117_GLOBAL_FUNDED_CAP_PAYOUT_AUTHORITY_2026_09_30"
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_CAP_PAYOUT_ELIGIBILITY_RELEASE_V117
