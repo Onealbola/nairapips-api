@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V112_PRIVATE_COMPLIANCE_REPORT_2026_09_28"
+NAIRAPIPS_RELEASE = "V113_PROFIT_CAP_VISIBILITY_LOCK_2026_09_30"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -517,6 +517,7 @@ ACTIVE_ACCOUNT_STATUSES = {
     "assigned_active", "active", "current_active",
     "phase1_active", "phase2_active", "funded_active",
     "live_active", "live", "funded", "approved_active",
+    "funded_profit_cap_reached",
 }
 TERMINAL_ACCOUNT_STATUSES = {
     "archived", "archived_phase1", "archived_phase2",
@@ -4895,7 +4896,7 @@ def _fetch_phase_assignment_queue():
         except Exception as e:
             print("PHASE QUEUE TRADER FETCH ERROR:", e)
         try:
-            active_rows = supabase.table("trader_accounts").select("id,trader_id,purchase_id,stage,phase,account_status,status,mt5_login,account_size,start_balance").in_("trader_id", trader_ids).in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"]).limit(3000).execute().data or []
+            active_rows = supabase.table("trader_accounts").select("id,trader_id,purchase_id,stage,phase,account_status,status,mt5_login,account_size,start_balance").in_("trader_id", trader_ids).in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded", "funded_profit_cap_reached"]).limit(3000).execute().data or []
             for row in active_rows:
                 tid = str(row.get("trader_id") or "").strip()
                 if tid:
@@ -4906,7 +4907,7 @@ def _fetch_phase_assignment_queue():
 
 def _active_account_mt5_logins(limit=5000):
     try:
-        rows = supabase.table("trader_accounts").select("mt5_login,account_status").in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"]).limit(limit).execute().data or []
+        rows = supabase.table("trader_accounts").select("mt5_login,account_status").in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded", "funded_profit_cap_reached"]).limit(limit).execute().data or []
         return {str(r.get("mt5_login") or "").strip() for r in rows if str(r.get("mt5_login") or "").strip()}
     except Exception as e:
         print("ACTIVE ACCOUNT MT5 LOGIN FETCH ERROR:", e)
@@ -7680,7 +7681,8 @@ def trader_bootstrap():
             live_statuses = {
                 "assigned_active", "active", "current_active", "funded",
                 "funded_active", "live", "profit_protected", "payout_pending",
-                "approved_payout_pending", "payment_processing"
+                "approved_payout_pending", "payment_processing",
+                "funded_profit_cap_reached"
             }
             account = next(
                 (
@@ -18050,7 +18052,7 @@ def np_assignment_center():
         purchase_rows = []
         active_accounts = []
         try:
-            active_accounts = supabase.table("trader_accounts").select("id,trader_id,purchase_id,account_size,start_balance,account_status,mt5_login").in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"]).limit(5000).execute().data or []
+            active_accounts = supabase.table("trader_accounts").select("id,trader_id,purchase_id,account_size,start_balance,account_status,mt5_login").in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded", "funded_profit_cap_reached"]).limit(5000).execute().data or []
         except Exception as e:
             print("ASSIGNMENT CENTER ACTIVE ACCOUNT FETCH ERROR:", e)
         try:
@@ -24226,6 +24228,7 @@ def admin_league_flags_set():
 _NP_OPS_ACTIVE_ACCOUNT_STATUSES = {
     "assigned_active", "active", "current_active", "phase1_active", "phase2_active",
     "funded_active", "live_active", "live", "funded", "approved_active",
+    "funded_profit_cap_reached",
 }
 _NP_OPS_OPEN_PAYOUT_STATUSES = {
     "pending", "submitted", "requested", "approved", "processing",
