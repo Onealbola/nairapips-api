@@ -52982,3 +52982,598 @@ def admin_payout_renewal_v119_status():
 
 _np_v119_start_catchup_worker()
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_AUTO_RENEWAL_RELEASE_V119
+
+# ============================================================================
+# NAIRAPIPS V120 — SINGLE-AUTHORITY PAID PAYOUT -> FUNDED AUTO ASSIGNMENT
+# 01 OCT 2026
+#
+# Fixes V119 operational gaps:
+#   1) one effective payout-renewal engine only (old async executor no longer fires)
+#   2) stale payout_renewal_assigning claims recover after a bounded lease
+#   3) exact PAID payout marker is enough to recover legacy archived/waiting sources
+#   4) robust full FUNDED vault scan fallback keeps the same single-use/freshness laws
+#   5) one payout_id can create at most one successor; source + payout both stamped
+# ============================================================================
+
+NAIRAPIPS_PAYOUT_AUTO_RENEWAL_RELEASE_V120 = "V120_SINGLE_AUTHORITY_PAID_TO_FUNDED_2026_10_01"
+_NP_V120_LOCK = threading.Lock()
+_NP_V120_RUNNING = set()
+_NP_V120_RESULTS = {}
+_NP_V120_CLAIM_LEASE_SECONDS = 120
+
+
+def _np_v120_dt(v):
+    try:
+        if not v:
+            return None
+        s = str(v).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _np_v120_claim_is_stale(source):
+    source = source or {}
+    if str(source.get("account_status") or "").strip().lower() != "payout_renewal_assigning":
+        return False
+    dt = _np_v120_dt(source.get("updated_at") or source.get("created_at"))
+    if not dt:
+        return True
+    try:
+        return (datetime.now(timezone.utc) - dt).total_seconds() >= _NP_V120_CLAIM_LEASE_SECONDS
+    except Exception:
+        return True
+
+
+def _np_v120_result(pid, **payload):
+    pid = str(pid or "").strip()
+    out = {
+        "release": NAIRAPIPS_PAYOUT_AUTO_RENEWAL_RELEASE_V120,
+        "payout_id": pid,
+        "updated_at": now_iso(),
+        **payload,
+    }
+    if pid:
+        with _NP_V120_LOCK:
+            _NP_V120_RESULTS[pid] = dict(out)
+    return out
+
+
+def _np_v120_source_has_paid_authority(source, payout_id):
+    blob = _np_kill_blob(source or {}).lower()
+    pid = str(payout_id or "").strip().lower()
+    return bool(pid and (
+        f"[np_payout_paid:{pid}]" in blob
+        or f"[np_payout_claim:{pid}]" in blob
+        or f"[np_consumed:payout:{pid}]" in blob
+    ))
+
+
+def _np_v120_scan_funded_inventory(account_size):
+    """Robust full Funded vault scan.
+
+    Uses the existing picker first. If that returns nothing, scan the matching
+    size/status rows without a server-side pool_class predicate and apply the
+    SAME pool-class, age and never-used protections in Python. This cannot turn
+    PHASE inventory into FUNDED inventory: _np_mt5_pool_class must still resolve
+    to funded and history checks must pass.
+    """
+    size = clean(account_size)
+    if not size:
+        return None, {"reason": "missing_account_size"}
+
+    try:
+        chosen = _np_pick_fresh_mt5(size, "funded")
+        if chosen:
+            return chosen, {"reason": "primary_picker", "mt5_login": chosen.get("mt5_login")}
+    except Exception as exc:
+        primary_error = str(exc)[:240]
+    else:
+        primary_error = ""
+
+    statuses = ["available", "unused", "new", "ready", "open"]
+    start = 0
+    page_size = 250
+    max_rows = 10000
+    counts = {
+        "rows": 0, "wrong_pool": 0, "bad_structure": 0,
+        "used_history": 0, "marker_rejected": 0,
+    }
+    while start < max_rows:
+        try:
+            rows = (
+                supabase.table("mt5_pool").select("*")
+                .eq("account_size", size)
+                .in_("status", statuses)
+                .order("created_at", desc=True)
+                .range(start, min(start + page_size - 1, max_rows - 1))
+                .execute().data or []
+            )
+        except Exception as exc:
+            return None, {
+                "reason": "fallback_query_failed",
+                "primary_error": primary_error,
+                "fallback_error": str(exc)[:240],
+                **counts,
+            }
+        if not rows:
+            break
+        counts["rows"] += len(rows)
+        try:
+            rows = _np_v80_fresh_sort(rows) if "_np_v80_fresh_sort" in globals() else rows
+        except Exception:
+            pass
+        for m in rows:
+            if _np_mt5_pool_class(m) != "funded":
+                counts["wrong_pool"] += 1
+                continue
+            try:
+                if "_np_v80_bad_inventory_marker" in globals() and _np_v80_bad_inventory_marker(m):
+                    counts["marker_rejected"] += 1
+                    continue
+            except Exception:
+                pass
+            try:
+                ok = _np_structural_mt5_candidate_v48(m, size, "funded")
+            except Exception:
+                ok = False
+            if not ok:
+                counts["bad_structure"] += 1
+                continue
+            login = str(m.get("mt5_login") or "").strip()
+            if not login:
+                counts["bad_structure"] += 1
+                continue
+            try:
+                used, _reason = _mt5_login_has_any_history(login, exclude_mt5_pool_id=m.get("id"))
+            except TypeError:
+                used, _reason = _mt5_login_has_any_history(login, m.get("id"))
+            except Exception as exc:
+                return None, {"reason": "history_check_failed", "error": str(exc)[:240], **counts}
+            if used:
+                counts["used_history"] += 1
+                continue
+            return m, {"reason": "fallback_full_scan", "mt5_login": login, **counts}
+        if len(rows) < page_size:
+            break
+        start += page_size
+
+    return None, {"reason": "no_safe_funded_inventory", "primary_error": primary_error, **counts}
+
+
+def _np_v120_existing_successor(source, payout, trader_id):
+    source = source or {}
+    payout = payout or {}
+    payout_id = str(payout.get("id") or "").strip()
+
+    # Strong consumed marker authority first.
+    try:
+        child = _np_v119_existing_consumed_child(source, payout_id, trader_id)
+        if child is False:
+            return False
+        if child:
+            return child
+    except Exception:
+        pass
+
+    # Payout-side durable receipt (V120).
+    note = str(payout.get("admin_note") or "")
+    m = re.search(r"\[NP_RENEWAL_ASSIGNED:([^:\]]+):([^\]]+)\]", note, re.I)
+    if m:
+        cid, clogin = str(m.group(1) or "").strip(), str(m.group(2) or "").strip()
+        try:
+            rows = (supabase.table("trader_accounts").select("*")
+                    .eq("id", cid).eq("trader_id", trader_id).limit(1).execute().data or [])
+            if rows and (not clogin or str(rows[0].get("mt5_login") or "").strip() == clogin):
+                return rows[0]
+        except Exception:
+            return False
+
+    # Existing exact lineage authority.
+    try:
+        all_rows = (supabase.table("trader_accounts").select("*")
+                    .eq("trader_id", trader_id).order("created_at", desc=False)
+                    .limit(1500).execute().data or [])
+        return _np_exact_post_payout_replacement_20260908(
+            source, payout, all_rows, get_trader_by_id(trader_id) or {}
+        )
+    except Exception:
+        return False
+
+
+def _np_v120_process_paid_payout(payout):
+    p = payout or {}
+    payout_id = str(p.get("id") or "").strip()
+    trader_id = str(p.get("trader_id") or "").strip()
+    source_id = str(p.get("trader_account_id") or p.get("account_id") or "").strip()
+
+    if not payout_id or not trader_id or not source_id:
+        return _np_v120_result(payout_id, state="blocked", reason="missing_exact_identity")
+    if payout_status(p) != "paid":
+        return _np_v120_result(payout_id, state="blocked", reason="payout_not_paid")
+
+    try:
+        srows = (supabase.table("trader_accounts").select("*")
+                 .eq("id", source_id).eq("trader_id", trader_id).limit(1).execute().data or [])
+    except Exception as exc:
+        return _np_v120_result(payout_id, state="blocked", reason="source_lookup_failed", error=str(exc)[:240])
+    if not srows:
+        return _np_v120_result(payout_id, state="blocked", reason="exact_source_not_found")
+    source = _np_canonical_account_purchase_link_v21(srows[0]) if "_np_canonical_account_purchase_link_v21" in globals() else srows[0]
+
+    if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "funded":
+        return _np_v120_result(payout_id, state="blocked", reason="source_not_funded", source_status=source.get("account_status"))
+
+    payout_login = str(p.get("mt5_login") or "").strip()
+    source_login = str(source.get("mt5_login") or "").strip()
+    if payout_login and source_login and payout_login != source_login:
+        return _np_v120_result(payout_id, state="blocked", reason="payout_source_mt5_mismatch", payout_mt5=payout_login, source_mt5=source_login)
+
+    # Exact paid marker is durable authority for catch-up/retry. Add if missing.
+    source = _np_v119_stamp_paid_marker(source, payout_id)
+
+    # Management Hold remains absolute.
+    try:
+        if "_np_mh_blocked" in globals() and _np_mh_blocked(trader_id, _np_mh_purchase_id(source) or None):
+            return _np_v120_result(payout_id, state="blocked", reason="management_hold")
+    except Exception as exc:
+        return _np_v120_result(payout_id, state="blocked", reason="management_hold_verification_failed", error=str(exc)[:200])
+
+    purchase, preason = _np_v119_purchase_for_source(source)
+    if not purchase:
+        return _np_v120_result(payout_id, state="blocked", reason=preason)
+
+    existing = _np_v120_existing_successor(source, p, trader_id)
+    if existing is False:
+        return _np_v120_result(payout_id, state="blocked", reason="successor_evidence_inconsistent")
+    if existing:
+        marker = (f"[NP_CONSUMED:PAYOUT:{payout_id}] "
+                  f"replacement_account_id={existing.get('id')} replacement_mt5={existing.get('mt5_login')}")
+        try:
+            _np_append_account_marker(source_id, trader_id, marker)
+        except Exception:
+            pass
+        return _np_v120_result(payout_id, state="already_fulfilled", account_id=existing.get("id"), mt5_login=existing.get("mt5_login"))
+
+    # Recover abandoned V119/V120 claims after lease. A new deployment cannot
+    # legitimately own an old claim, so this repairs the exact stuck records.
+    status = str(source.get("account_status") or source.get("status") or "").strip().lower()
+    if status == "payout_renewal_assigning":
+        if not _np_v120_claim_is_stale(source):
+            return _np_v120_result(payout_id, state="busy", reason="active_claim_lease", source_updated_at=source.get("updated_at"))
+        try:
+            recovered = (supabase.table("trader_accounts").update({
+                "account_status": "payout_renewal_waiting_mt5",
+                "monitoring_enabled": False,
+                "updated_at": now_iso(),
+            }).eq("id", source_id).eq("trader_id", trader_id)
+              .eq("account_status", "payout_renewal_assigning").execute().data or [])
+            if recovered:
+                source = recovered[0]
+                status = "payout_renewal_waiting_mt5"
+        except Exception as exc:
+            return _np_v120_result(payout_id, state="blocked", reason="stale_claim_recovery_failed", error=str(exc)[:240])
+
+    # PAID payout + exact source marker is the renewal authority. Historical
+    # archived/payment-processing labels must not kill an unpaid renewal debt.
+    if status in {"breached", "breached_archived"}:
+        # A paid payout cycle should not be re-opened through a later breach without
+        # explicit review. Fail closed rather than issue another MT5.
+        return _np_v120_result(payout_id, state="blocked", reason="source_breached_after_paid")
+    if "recall" in _np_kill_blob(source).lower() or "wrong_assignment" in _np_kill_blob(source).lower():
+        return _np_v120_result(payout_id, state="blocked", reason="source_recalled_or_wrong_assignment")
+
+    # Atomic claim from the exact observed account_status. If account_status is
+    # blank, normalize it first using exact paid authority, then claim.
+    observed_account_status = str(source.get("account_status") or "").strip().lower()
+    if not observed_account_status:
+        try:
+            norm = (supabase.table("trader_accounts").update({
+                "account_status": "payout_renewal_waiting_mt5",
+                "monitoring_enabled": False,
+                "updated_at": now_iso(),
+            }).eq("id", source_id).eq("trader_id", trader_id).execute().data or [])
+            if norm:
+                source = norm[0]
+                observed_account_status = "payout_renewal_waiting_mt5"
+        except Exception as exc:
+            return _np_v120_result(payout_id, state="blocked", reason="source_status_normalize_failed", error=str(exc)[:240])
+
+    claim_marker = f"[NP_PAYOUT_CLAIM:{payout_id}]"
+    old_reason = str(source.get("archive_reason") or "").strip()
+    claim_reason = old_reason if claim_marker.lower() in old_reason.lower() else (old_reason + " | " + claim_marker).strip(" |")
+    try:
+        claimed = (supabase.table("trader_accounts").update({
+            "account_status": "payout_renewal_assigning",
+            "monitoring_enabled": False,
+            "archive_reason": claim_reason,
+            "updated_at": now_iso(),
+        }).eq("id", source_id).eq("trader_id", trader_id)
+          .eq("account_status", observed_account_status).execute().data or [])
+    except Exception as exc:
+        return _np_v120_result(payout_id, state="blocked", reason="atomic_claim_failed", error=str(exc)[:240])
+    if not claimed:
+        # Re-read: another worker may already have completed the exact payout.
+        try:
+            fresh_source = (supabase.table("trader_accounts").select("*")
+                            .eq("id", source_id).eq("trader_id", trader_id).limit(1).execute().data or [None])[0]
+            if fresh_source:
+                existing = _np_v120_existing_successor(fresh_source, p, trader_id)
+                if existing and existing is not False:
+                    return _np_v120_result(payout_id, state="already_fulfilled", account_id=existing.get("id"), mt5_login=existing.get("mt5_login"))
+        except Exception:
+            pass
+        return _np_v120_result(payout_id, state="busy", reason="atomic_claim_lost")
+
+    trader = get_trader_by_id(trader_id)
+    if not trader:
+        try:
+            supabase.table("trader_accounts").update({"account_status":"payout_renewal_waiting_mt5","updated_at":now_iso()}).eq("id",source_id).eq("trader_id",trader_id).execute()
+        except Exception:
+            pass
+        return _np_v120_result(payout_id, state="blocked", reason="trader_not_found_after_claim")
+
+    size = clean(source.get("account_size") or source.get("start_balance") or p.get("account_size") or purchase.get("account_size") or 0)
+    if not size:
+        try:
+            supabase.table("trader_accounts").update({"account_status":"payout_renewal_waiting_mt5","updated_at":now_iso()}).eq("id",source_id).eq("trader_id",trader_id).execute()
+        except Exception:
+            pass
+        return _np_v120_result(payout_id, state="blocked", reason="missing_account_size")
+
+    mt5, inv = _np_v120_scan_funded_inventory(size)
+    if not mt5:
+        try:
+            supabase.table("trader_accounts").update({
+                "account_status": "payout_renewal_waiting_mt5",
+                "monitoring_enabled": False,
+                "archive_reason": claim_reason,
+                "updated_at": now_iso(),
+            }).eq("id",source_id).eq("trader_id",trader_id).execute()
+        except Exception:
+            pass
+        try:
+            _np_inventory_wait_alert("funded", size, f"V120 exact paid payout {payout_id}", trader)
+        except Exception:
+            pass
+        return _np_v120_result(payout_id, state="waiting_inventory", account_size=size, inventory=inv)
+
+    try:
+        account, _trader_row = _assign_mt5_to_trader(
+            trader, mt5, "funded", purchase,
+            {"name":"payout_renewal_v120","username":"payout_renewal_v120","role":"system"},
+            f"V120 PAYOUT RENEWAL payout_id={payout_id}; source_account={source_id}"
+        )
+    except Exception as exc:
+        try:
+            supabase.table("trader_accounts").update({
+                "account_status": "payout_renewal_waiting_mt5",
+                "monitoring_enabled": False,
+                "archive_reason": (claim_reason + f" | V120_ASSIGN_ERROR={str(exc)[:180]}").strip(" |"),
+                "updated_at": now_iso(),
+            }).eq("id",source_id).eq("trader_id",trader_id).execute()
+        except Exception:
+            pass
+        _audit_safe("automation", "v120_payout_assignment_failed",
+                    f"payout={payout_id}; source={source_id}; mt5={mt5.get('mt5_login')}; error={exc}",
+                    {"name":"payout_renewal_v120","username":"payout_renewal_v120","role":"system"}, payout_id)
+        return _np_v120_result(payout_id, state="assignment_error", reason=str(exc)[:240], candidate_mt5=mt5.get("mt5_login"), inventory=inv)
+
+    if not account or not str(account.get("id") or "").strip() or not str(account.get("mt5_login") or "").strip():
+        return _np_v120_result(payout_id, state="assignment_error", reason="assignment_result_incomplete")
+
+    consumed = (f"[NP_CONSUMED:PAYOUT:{payout_id}] replacement_account_id={account.get('id')} "
+                f"replacement_mt5={account.get('mt5_login')}")
+    try:
+        supabase.table("trader_accounts").update({
+            "account_status": "archived",
+            "monitoring_enabled": False,
+            "archive_reason": (claim_reason + " | " + consumed).strip(" |"),
+            "updated_at": now_iso(),
+        }).eq("id",source_id).eq("trader_id",trader_id).execute()
+    except Exception as exc:
+        try:
+            _np_append_account_marker(source_id, trader_id, consumed + f" V120_SOURCE_STAMP_WARNING={str(exc)[:120]}")
+        except Exception:
+            pass
+
+    # Second durable receipt on the financial event itself. This is timestamped.
+    try:
+        freshp = (supabase.table("payouts").select("admin_note").eq("id",payout_id).limit(1).execute().data or [{}])[0]
+        old_note = str(freshp.get("admin_note") or "").strip()
+        receipt = f"[NP_RENEWAL_ASSIGNED:{account.get('id')}:{account.get('mt5_login')}]"
+        new_note = old_note if receipt.lower() in old_note.lower() else (old_note + " | " + receipt).strip(" |")
+        supabase.table("payouts").update({"admin_note":new_note,"updated_at":now_iso()}).eq("id",payout_id).execute()
+    except Exception as exc:
+        print("V120 PAYOUT RECEIPT STAMP WARNING:", exc, flush=True)
+
+    try:
+        _np_stamp_exact_payout_consumed_20260908(source, account, trader_id)
+    except Exception:
+        pass
+    try:
+        np_invalidate_admin_bootstrap("all")
+        _invalidate_trader_bootstrap_cache(trader_id)
+    except Exception:
+        pass
+    _audit_safe("automation", "v120_payout_renewal_assigned",
+                f"payout={payout_id}; source={source_id}; replacement={account.get('id')}; mt5={account.get('mt5_login')}; exact_once=true",
+                {"name":"payout_renewal_v120","username":"payout_renewal_v120","role":"system"}, payout_id)
+    return _np_v120_result(payout_id, state="assigned", account_id=account.get("id"), mt5_login=account.get("mt5_login"), account_size=size, inventory=inv)
+
+
+# This is now the ONE effective payout-renewal function. Old workers that resolve
+# this symbol dynamically automatically use V120 rather than an older rule set.
+def _np_auto_post_payout_renewal(payout):
+    return _np_v120_process_paid_payout(payout)
+
+
+def _np_v120_worker(payout_id):
+    pid = str(payout_id or "").strip()
+    try:
+        rows = (supabase.table("payouts").select("*").eq("id",pid).limit(1).execute().data or [])
+        if not rows:
+            _np_v120_result(pid, state="blocked", reason="payout_not_found")
+            return
+        _np_v120_process_paid_payout(rows[0])
+    except Exception as exc:
+        _np_v120_result(pid, state="executor_error", reason=str(exc)[:300])
+        print("V120 PAYOUT EXECUTOR ERROR:", pid, exc, flush=True)
+    finally:
+        with _NP_V120_LOCK:
+            _NP_V120_RUNNING.discard(pid)
+
+
+def _np_v120_start(payout_id):
+    pid = str(payout_id or "").strip()
+    if not pid:
+        return {"state":"blocked","reason":"missing_payout_id"}
+    with _NP_V120_LOCK:
+        if pid in _NP_V120_RUNNING:
+            return {"state":"processing","reason":"already_processing","payout_id":pid}
+        _NP_V120_RUNNING.add(pid)
+        _NP_V120_RESULTS[pid] = {"release":NAIRAPIPS_PAYOUT_AUTO_RENEWAL_RELEASE_V120,"payout_id":pid,"state":"queued","updated_at":now_iso()}
+    threading.Thread(target=_np_v120_worker,args=(pid,),name=f"np-v120-payout-{pid[:8]}",daemon=True).start()
+    return {"state":"queued","payout_id":pid}
+
+
+# Replace MARK PAID itself so only V120 is launched. This intentionally bypasses
+# the older V34/V35 parallel executor chain while preserving payment, email and audit.
+def _np_mark_paid_v120():
+    try:
+        d = request.get_json(silent=True) or {}
+        pid = str(d.get("id") or "").strip()
+        if not pid:
+            return bad("Missing payout id")
+        payout = get_payout_by_id(pid)
+        if not payout:
+            return bad("Payout not found",404)
+        if payout_status(payout) != "approved":
+            return bad("Only approved payouts can be marked paid",409)
+        note = d.get("admin_note","")
+        paid_now = now_iso()
+        result = supabase.table("payouts").update({
+            "status":"paid","paid_at":paid_now,"admin_note":note,"updated_at":paid_now
+        }).eq("id",pid).execute().data
+
+        # Durable exact financial -> source authority marker; do not mutate an
+        # optional trader_accounts.status mirror here.
+        try:
+            source_id = str(payout.get("trader_account_id") or "").strip()
+            if source_id:
+                rows = (supabase.table("trader_accounts").select("id,trader_id,archive_reason")
+                        .eq("id",source_id).limit(1).execute().data or [])
+                if rows:
+                    old = str(rows[0].get("archive_reason") or "").strip()
+                    marker = f"[NP_PAYOUT_PAID:{pid}]"
+                    new = old if marker.lower() in old.lower() else (old + " | " + marker).strip(" |")
+                    supabase.table("trader_accounts").update({
+                        "archive_reason":new,"updated_at":paid_now
+                    }).eq("id",source_id).execute()
+        except Exception as exc:
+            print("V120 PAID AUTHORITY STAMP WARNING:", exc, flush=True)
+
+        try:
+            send_email_safe(
+                payout.get("email"),
+                "NairaPips payout received - your certificate is ready",
+                f"""Hello {payout.get('trader_name') or 'Trader'},\n\nYour NairaPips payout has been completed successfully.\n\nAmount Received: {email_money(payout.get('amount'))}\nStatus: PAID\nAdmin Note: {note or 'Payment completed.'}\n\nYour official NairaPips Payout Certificate is now available in your Trader Dashboard under Payouts. You can view, download and share it from there.\n\nTRADED. PROFITED. REWARDED.\n\nNairaPips Team\nRewarding Nigerian Traders. Changing Trading Stories."""
+            )
+        except Exception as exc:
+            print("V120 PAYOUT PAID EMAIL WARNING:", exc, flush=True)
+
+        started = _np_v120_start(pid)
+        _audit_safe("payouts","payout_paid",f"Payout {pid} marked paid; V120 renewal={started.get('state')}",_admin_from_payload(d),pid)
+        np_invalidate_admin_bootstrap("payouts")
+        return ok({"payout":result,"renewal":started,"release":NAIRAPIPS_PAYOUT_AUTO_RENEWAL_RELEASE_V120},"Payout marked paid; fresh Funded assignment queued")
+    except Exception as exc:
+        return bad(exc)
+
+app.view_functions["mark_paid"] = _np_mark_paid_v120
+
+
+# Exact manual retry endpoint now uses the same V120 authority, never an older executor.
+def _np_admin_retry_exact_payout_renewal_v120():
+    if request.method == "OPTIONS":
+        return _np_ok({"success":True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    d = request.get_json(silent=True) or {}
+    pid = str(d.get("payout_id") or d.get("id") or "").strip()
+    if not pid:
+        return _np_fail("Exact payout_id is required.",400)
+    rows = (supabase.table("payouts").select("id,status").eq("id",pid).limit(1).execute().data or [])
+    if not rows:
+        return _np_fail("Payout not found.",404)
+    if payout_status(rows[0]) != "paid":
+        return _np_fail("Only a PAID payout can receive automatic Funded renewal.",409)
+    started = _np_v120_start(pid)
+    return _np_ok({"success":True,"release":NAIRAPIPS_PAYOUT_AUTO_RENEWAL_RELEASE_V120,**started},202)
+
+if "admin_retry_exact_payout_renewal_v30" in app.view_functions:
+    app.view_functions["admin_retry_exact_payout_renewal_v30"] = _np_admin_retry_exact_payout_renewal_v120
+
+
+# Override the existing catch-up function used by the already-running V119 daemon.
+# It sees only exact PAID markers, so deployment immediately repairs the two recent
+# paid payouts without any historical broad sweep.
+def _np_v119_catchup_once(limit=250):
+    summary = {"release":NAIRAPIPS_PAYOUT_AUTO_RENEWAL_RELEASE_V120,"checked":0,"assigned":0,"fulfilled":0,"waiting":0,"busy":0,"blocked":0,"errors":0,"at":now_iso()}
+    try:
+        payouts = (supabase.table("payouts").select("*").eq("status","paid")
+                   .order("paid_at",desc=True).limit(limit).execute().data or [])
+    except Exception as exc:
+        summary["errors"] += 1; summary["error"] = str(exc)[:240]; return summary
+    for p in payouts:
+        pid = str(p.get("id") or "").strip(); sid = str(p.get("trader_account_id") or "").strip(); tid = str(p.get("trader_id") or "").strip()
+        if not pid or not sid or not tid:
+            continue
+        try:
+            srows = (supabase.table("trader_accounts").select("*").eq("id",sid).eq("trader_id",tid).limit(1).execute().data or [])
+            if not srows or not _np_v120_source_has_paid_authority(srows[0],pid):
+                continue
+            summary["checked"] += 1
+            rr = _np_v120_process_paid_payout(p) or {}
+            st = str(rr.get("state") or "blocked")
+            if st == "assigned": summary["assigned"] += 1
+            elif st == "already_fulfilled": summary["fulfilled"] += 1
+            elif st == "waiting_inventory": summary["waiting"] += 1
+            elif st == "busy": summary["busy"] += 1
+            else: summary["blocked"] += 1
+        except Exception as exc:
+            summary["errors"] += 1
+            print("V120 CATCHUP ITEM ERROR:", pid, exc, flush=True)
+    return summary
+
+
+@app.route("/admin/payout_renewal_v120/status", methods=["GET","OPTIONS"])
+def admin_payout_renewal_v120_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success":True})
+    admin, auth = _require_admin()
+    if auth:
+        return auth
+    pid = str(request.args.get("payout_id") or "").strip()
+    if pid:
+        with _NP_V120_LOCK:
+            cached = dict(_NP_V120_RESULTS.get(pid) or {})
+        return _np_ok({"success":True,"release":NAIRAPIPS_PAYOUT_AUTO_RENEWAL_RELEASE_V120,"result":cached})
+    with _NP_V120_LOCK:
+        latest = list(_NP_V120_RESULTS.values())[-20:]
+    return _np_ok({
+        "success":True,
+        "release":NAIRAPIPS_PAYOUT_AUTO_RENEWAL_RELEASE_V120,
+        "single_authority":True,
+        "stale_claim_recovery_seconds":_NP_V120_CLAIM_LEASE_SECONDS,
+        "no_cutover_gate":True,
+        "exact_paid_marker_catchup":True,
+        "full_funded_pool_fallback_scan":True,
+        "exactly_once_per_payout_id":True,
+        "recent_results":latest,
+    })
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_AUTO_RENEWAL_RELEASE_V120
