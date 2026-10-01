@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V113_PROFIT_CAP_VISIBILITY_LOCK_2026_09_30"
+NAIRAPIPS_RELEASE = "V118_SCHEMA_SAFE_PAYOUT_LOCK_NO_CANCEL_SPAM_2026_10_01"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1015,6 +1015,31 @@ def _trader_safe_purchase_row(row):
 
 def _trader_safe_payout_row(row):
     return _only_fields(row, _TRADER_PAYOUT_RESPONSE_FIELDS)
+
+
+def _np_is_technical_payout_lock_failure(row):
+    """Hide infrastructure-only payout attempts from trader-facing history.
+
+    These rows are retained in the payouts table for financial/audit evidence, but
+    they are not genuine trader cancellations and must not flood the customer UI.
+    """
+    row = row or {}
+    status = str(row.get("status") or "").strip().lower()
+    note = " ".join([
+        str(row.get("admin_note") or ""),
+        str(row.get("note") or ""),
+        str(row.get("decision_reason") or ""),
+        str(row.get("message") or ""),
+    ]).strip().lower()
+    if status not in {"cancelled", "canceled", "failed", "failed_technical", "technical_failed"}:
+        return False
+    return (
+        "auto-cancelled because trade lock failed" in note
+        or "auto-canceled because trade lock failed" in note
+        or "funded account could not be locked safely" in note
+        or ("trade lock failed" in note and "pgrst204" in note)
+        or ("mt5_access_disabled" in note and "schema cache" in note)
+    )
 
 
 def _trader_safe_trade_row(row):
@@ -11184,6 +11209,7 @@ def payouts():
                 _row["note"] = ""
 
         if trader_id:
+            rows = [r for r in rows if not _np_is_technical_payout_lock_failure(r)]
             rows = [_trader_safe_payout_row(r) for r in rows]
         return jsonify(rows)
     except Exception as e:
@@ -11290,6 +11316,10 @@ def trader_payout_history():
             merged[key]={**(merged.get(key) or {}), **row}
 
         rows=list(merged.values())
+        # Infrastructure lock failures are audit events, not trader cancellations.
+        # Keep them in the database/Admin evidence, but remove them from every
+        # trader-facing payout history globally.
+        rows=[r for r in rows if not _np_is_technical_payout_lock_failure(r)]
         rows.sort(key=lambda r: str(r.get("requested_at") or r.get("created_at") or r.get("updated_at") or ""), reverse=True)
         safe_rows=[_trader_safe_payout_row(r) for r in rows[:limit]]
         return _np_ok({
@@ -11316,18 +11346,19 @@ def _set_funded_payout_trade_lock(trader_row, account, payout_id=None, reason="P
     current_status = str((account or {}).get("account_status") or (account or {}).get("status") or "").strip().lower()
     cap_locked = current_status == "funded_profit_cap_reached"
     expected_status = "funded_profit_cap_reached" if cap_locked else "profit_protected"
+    # IMPORTANT: live production trader_accounts does NOT have an
+    # mt5_access_disabled column. The lifecycle status itself is the account-level
+    # lock authority; the trader compatibility row carries mt5_access_disabled.
     account_payload = {
         "account_status": expected_status,
         "monitoring_enabled": True,
-        # Keep the exact MT5 locked from trading while payout is open.
-        "mt5_access_disabled": True,
         "updated_at": now,
     }
     db.table("trader_accounts").update(account_payload).eq("id", account_id).eq("trader_id", trader_id).execute()
 
     locked = (
         db.table("trader_accounts")
-        .select("id,trader_id,account_status,monitoring_enabled,mt5_access_disabled")
+        .select("id,trader_id,account_status,monitoring_enabled")
         .eq("id", account_id).eq("trader_id", trader_id).limit(1).execute().data or []
     )
     if not locked or str(locked[0].get("account_status") or "").strip().lower() != expected_status:
@@ -11377,7 +11408,6 @@ def _release_funded_payout_trade_lock(trader_row, account, reason="Payout reques
     account_payload = {
         "account_status": "funded_profit_cap_reached" if cap_locked else "assigned_active",
         "monitoring_enabled": True,
-        "mt5_access_disabled": True if cap_locked else False,
         "updated_at": now,
     }
     db.table("trader_accounts").update(account_payload).eq("id", account_id).eq("trader_id", trader_id).execute()
@@ -11538,6 +11568,20 @@ def create_payout():
         if method in {"usdt", "btc", "crypto"} and (not bank_name or not account_number):
             return bad("Wallet/network and wallet address are required for crypto payout.", 400)
 
+        # V118: acquire the exact-account trading lock BEFORE inserting the payout
+        # liability. If lock persistence fails, no payout row is created, so there
+        # is no fake CANCELLED financial record to leak into customer history.
+        try:
+            _set_funded_payout_trade_lock(
+                trader_row,
+                account,
+                payout_id=None,
+                reason="Payout submission in progress. Trading locked before payout liability creation.",
+            )
+        except Exception as lock_error:
+            print("CRITICAL PAYOUT PRE-LOCK FAILURE:", lock_error, flush=True)
+            return bad("Payout was not opened because the funded account could not be locked safely.", 503)
+
         now = now_iso()
         row={
             "trader_id":trader_row.get("id"),
@@ -11567,49 +11611,53 @@ def create_payout():
             "created_at":now,
         }
         try:
-            created = supabase.table("payouts").insert(row).execute().data
-        except Exception as insert_error:
-            # Backward compatible fallback for older payouts table schemas.
-            fallback={
-                "trader_id":row["trader_id"],
-                "trader_account_id":row["trader_account_id"],
-                "trader_name":row["trader_name"],
-                "email":row["email"],
-                "phone":row["phone"],
-                "amount":row["amount"],
-                "bank_name":row["bank_name"],
-                "account_number":row["account_number"],
-                "account_name":row["account_name"],
-                "status":"pending",
-                "note":row["note"],
-                "admin_note":"",
-                "requested_at":now,
-            }
-            created = supabase.table("payouts").insert(fallback).execute().data
-            row.update(fallback)
-            print("PAYOUT RICH INSERT FALLBACK:", insert_error)
+            try:
+                created = supabase.table("payouts").insert(row).execute().data
+            except Exception as insert_error:
+                # Backward compatible fallback for older payouts table schemas.
+                fallback={
+                    "trader_id":row["trader_id"],
+                    "trader_account_id":row["trader_account_id"],
+                    "trader_name":row["trader_name"],
+                    "email":row["email"],
+                    "phone":row["phone"],
+                    "amount":row["amount"],
+                    "bank_name":row["bank_name"],
+                    "account_number":row["account_number"],
+                    "account_name":row["account_name"],
+                    "status":"pending",
+                    "note":row["note"],
+                    "admin_note":"",
+                    "requested_at":now,
+                }
+                created = supabase.table("payouts").insert(fallback).execute().data
+                row.update(fallback)
+                print("PAYOUT RICH INSERT FALLBACK:", insert_error)
+        except Exception as insert_failure:
+            # No payout liability exists if both inserts fail. Restore only the
+            # payout-request lock; cap-locked accounts remain cap-locked.
+            try:
+                _release_funded_payout_trade_lock(
+                    trader_row, account,
+                    reason="Payout insert failed; submission lock released.",
+                )
+            except Exception as unlock_error:
+                print("PAYOUT INSERT FAILURE UNLOCK WARNING:", unlock_error, flush=True)
+            raise insert_failure
 
         created_payout = (created or [None])[0] or {}
         payout_id = created_payout.get("id")
+
+        # The account was locked before insert. Record the exact payout id in the
+        # trader mirror note without touching trader_accounts schema.
         try:
-            _set_funded_payout_trade_lock(
-                trader_row,
-                account,
-                payout_id=payout_id,
-                reason=f"Payout request {payout_id or ''} pending. Trading locked until cycle completion, rejection, or cancellation.",
-            )
-        except Exception as lock_error:
-            print("CRITICAL PAYOUT LOCK FAILURE:", lock_error)
-            if payout_id:
-                try:
-                    supabase.table("payouts").update({
-                        "status": "cancelled",
-                        "admin_note": f"Auto-cancelled because trade lock failed: {lock_error}",
-                        "updated_at": now_iso(),
-                    }).eq("id", payout_id).execute()
-                except Exception as cancel_error:
-                    print("CRITICAL PAYOUT AUTO-CANCEL FAILURE:", cancel_error)
-            return bad("Payout was not opened because the funded account could not be locked safely.", 503)
+            db = _staff_db()
+            db.table("traders").update({
+                "admin_note": f"Payout request {payout_id or ''} pending. Trading locked until cycle completion, rejection, or cancellation.",
+                "updated_at": now_iso(),
+            }).eq("id", str(trader_row.get("id") or "")).execute()
+        except Exception as mirror_note_error:
+            print("PAYOUT LOCK MIRROR NOTE WARNING:", mirror_note_error, flush=True)
 
         send_email_safe(
             row.get("email"),
