@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V119_MONITORING_REGISTRY_SHADOW_2026_10_02"
+NAIRAPIPS_RELEASE = "V120_MONITORING_EXCHANGE_AUTHORITY_2026_10_02"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -83,7 +83,7 @@ supabase_admin = (
 
 
 # ============================================================
-# V119 MONITORING REGISTRY — additive assignment/lifecycle bridge
+# V120 MONITORING EXCHANGE AUTHORITY — old OUT / new IN
 # ============================================================
 # The registry is NOT the lifecycle authority. Assignment/lifecycle remains authoritative.
 # This is the durable list of exact MT5 account instances that require monitoring now.
@@ -128,6 +128,29 @@ def _np_monitoring_registry_activate(account, predecessor_account_id=None, reaso
     row = rows[0]
     if str(row.get("mt5_login") or "").strip() != str(account.get("mt5_login") or "").strip():
         raise RuntimeError("Monitoring Registry MT5 verification mismatch")
+
+    # V120 EXCHANGE INVARIANT:
+    # Once NEW is live, no OLD sibling for the same purchase may remain live.
+    # The database RPC performs the atomic exchange; this post-flight check makes
+    # assignment fail closed if the invariant is ever broken.
+    purchase_id = str(account.get("purchase_id") or "").strip()
+    if purchase_id:
+        siblings = (
+            supabase.table("monitoring_registry")
+            .select("trader_account_id,mt5_login,active,monitoring_state,successor_account_id")
+            .eq("purchase_id", purchase_id)
+            .eq("active", True)
+            .execute().data or []
+        )
+        wrong = [
+            s for s in siblings
+            if str(s.get("trader_account_id") or "") != str(account.get("id") or "")
+        ]
+        if wrong:
+            raise RuntimeError(
+                "Monitoring exchange invariant failed: predecessor MT5 still live "
+                f"for purchase {purchase_id}: {[x.get('mt5_login') for x in wrong]}"
+            )
     return row
 
 
@@ -3315,7 +3338,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
             pass
         raise RuntimeError(f"MT5 assignment stopped: dashboard current-account sync failed: {_pointer_err}")
 
-    # V119 MONITORING HANDOVER:
+    # V120 MONITORING EXCHANGE HANDOVER:
     # The fresh MT5 must enter the exact monitoring roster BEFORE credentials are released.
     # If there is a known predecessor, the database RPC retires old + activates new atomically.
     try:
