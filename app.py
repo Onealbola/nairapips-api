@@ -53562,3 +53562,321 @@ NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V125 = "V125_FINAL_V63_PAID_PAYOUT_HANDOFF_2026
 # ============================================================================
 NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V126 = "V126_EXACT_PAID_MT5_V63_HANDOFF_2026_10_02"
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V126
+
+
+# ============================================================================
+# NAIRAPIPS V127 — FORENSIC PAYOUT-RENEWAL HANDOFF / UI-COMPAT BACKEND
+# 02 OCT 2026
+#
+# ROOT CAUSE PROVEN FROM LIVE ADMIN + BACKEND:
+# - Admin "Reset Paid Account" was wired to the generic Operational MT5 Recovery
+#   flow, so valid paid-payout sources could be archived with ADMIN_RECOVERY
+#   evidence instead of POST_PAYOUT_RENEWAL evidence.
+# - The manual assignment firewall then correctly rejected those rows because
+#   they were not genuine technical-recovery cases.
+#
+# V127 DOES NOT loosen admin recovery. It reclassifies ONLY an archived Funded
+# reset source when an exact PAID payout can be proven by payout id marker,
+# exact source account, exact MT5 login, or a tightly constrained newest-source
+# legacy correlation. Existing replacement/consumption evidence always wins.
+# ============================================================================
+NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V127 = "V127_FORENSIC_PAID_PAYOUT_HANDOFF_2026_10_02"
+
+_np_reset_entitlement_for_source_v127_core = _np_reset_entitlement_for_source
+_np_v122_load_source_v127_core = _np_v122_load_source
+
+
+def _np_v127_s(v):
+    return str(v or "").strip()
+
+
+def _np_v127_l(v):
+    return _np_v127_s(v).lower().replace("-", "_").replace(" ", "_")
+
+
+def _np_v127_dt(v):
+    try:
+        return _dt_score(v)
+    except Exception:
+        return 0
+
+
+def _np_v127_exact_paid_payout_for_source(source, trader=None):
+    """Return one safely correlated PAID payout for this archived Funded source.
+
+    Authority order:
+      1) exact payout-id marker already on the source;
+      2) payout.trader_account_id == source.id;
+      3) payout.mt5_login == source.mt5_login;
+      4) legacy repair only when this is the NEWEST unresolved archived_reset_funded
+         source, trader is waiting for Funded MT5, there is no active Funded child,
+         and one recent same-size PAID payout is unambiguously closest to reset time.
+    """
+    s = source or {}
+    t = trader or {}
+    sid = _np_v127_s(s.get("id"))
+    tid = _np_v127_s(s.get("trader_id") or t.get("id"))
+    stage = _normalize_lifecycle_stage(s.get("stage") or s.get("phase"))
+    status = _np_v127_l(s.get("account_status") or s.get("status"))
+    slogin = _np_v127_s(s.get("mt5_login"))
+    ssize = clean(s.get("account_size") or s.get("start_balance") or 0)
+    if not sid or not tid or stage != "funded" or not status.startswith("archived_reset_funded"):
+        return None, "not_archived_reset_funded"
+
+    # Never replay a source that already has a genuine successor/consumption proof.
+    try:
+        child = _np_v63_source_replacement(s)
+    except Exception:
+        child = None
+    if child:
+        return None, "replacement_already_exists"
+    if s.get("reset_consumed_at") or s.get("reset_replacement_account_id") or s.get("payout_replacement_account_id"):
+        return None, "source_already_consumed"
+    blob = " ".join(_np_v127_s(s.get(k)) for k in (
+        "archive_reason", "reset_reason", "admin_note", "message", "account_status", "status"
+    ))
+    low = blob.lower()
+    if "np_payout_renewal_completed" in low or "np_payout_renewal_done" in low:
+        return None, "payout_renewal_already_completed"
+
+    marker_ids = []
+    for pat in (
+        r"\[NP_ENTITLEMENT:post_payout_renewal:([^\]]+)\]",
+        r"\[NP_PAYOUT_PAID:([^\]]+)\]",
+        r"\[NP_PAYOUT_CLAIM:([^\]]+)\]",
+        r"\[NP_PAYOUT_RENEWAL_V122:([^\]]+)\]",
+    ):
+        for m in re.finditer(pat, blob, re.I):
+            pid = _np_v127_s(m.group(1))
+            if pid and pid not in marker_ids:
+                marker_ids.append(pid)
+
+    try:
+        payouts = (
+            supabase.table("payouts").select("*")
+            .eq("trader_id", tid)
+            .order("created_at", desc=True)
+            .limit(200).execute().data or []
+        )
+    except Exception as exc:
+        print("V127 PAYOUT FORENSIC QUERY ERROR:", exc, flush=True)
+        return None, "payout_query_failed"
+
+    paid = [p for p in payouts if _np_v127_l(p.get("status")) == "paid"]
+    open_states = {
+        "pending", "requested", "submitted", "approved", "processing",
+        "payment_processing", "pending_review", "awaiting_review", "under_review",
+    }
+
+    def p_id(p): return _np_v127_s(p.get("id"))
+    def p_sid(p): return _np_v127_s(p.get("trader_account_id") or p.get("account_id"))
+    def p_login(p): return _np_v127_s(p.get("mt5_login"))
+    def p_size(p): return clean(p.get("account_size") or p.get("start_balance") or 0)
+    def p_time(p): return _np_v127_dt(p.get("paid_at") or p.get("updated_at") or p.get("created_at"))
+
+    # 1) Exact durable marker id.
+    for mid in marker_ids:
+        row = next((p for p in paid if p_id(p) == mid), None)
+        if row:
+            return row, "marker_id"
+
+    # 2) Exact source-account link.
+    exact_source = [p for p in paid if p_sid(p) == sid]
+    if exact_source:
+        exact_source.sort(key=p_time, reverse=True)
+        return exact_source[0], "trader_account_id"
+
+    # 3) Exact historical MT5 login.
+    if slogin:
+        exact_mt5 = [p for p in paid if p_login(p) == slogin]
+        if exact_mt5:
+            exact_mt5.sort(key=p_time, reverse=True)
+            return exact_mt5[0], "mt5_login"
+
+    # 4) Narrow legacy repair for the bad generic-reset handoff only.
+    # Require the current trader to be waiting for Funded MT5 and this source to be
+    # the newest unresolved archived_reset_funded source. Never guess across histories.
+    waiting_state = _np_v127_l(t.get("challenge_state") or t.get("status"))
+    if waiting_state not in {"funded_waiting_mt5", "waiting_for_funded", "funded_waiting"}:
+        return None, "no_exact_link_and_not_funded_waiting"
+
+    try:
+        accounts = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", tid).order("updated_at", desc=True).limit(500).execute().data or []
+        )
+    except Exception as exc:
+        print("V127 ACCOUNT FORENSIC QUERY ERROR:", exc, flush=True)
+        return None, "account_query_failed"
+
+    # Any active/current Funded child means there is nothing left to issue.
+    for a in accounts:
+        if _np_v127_s(a.get("id")) == sid:
+            continue
+        if _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) != "funded":
+            continue
+        ast = _np_v127_l(a.get("account_status") or a.get("status"))
+        if ast in ACTIVE_ACCOUNT_STATUSES and _np_v127_s(a.get("mt5_login")):
+            return None, "active_funded_account_already_exists"
+
+    reset_sources = [
+        a for a in accounts
+        if _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == "funded"
+        and _np_v127_l(a.get("account_status") or a.get("status")).startswith("archived_reset_funded")
+        and not a.get("reset_replacement_account_id")
+    ]
+    reset_sources.sort(key=lambda a: _np_v127_dt(
+        a.get("archived_at") or a.get("reset_at") or a.get("updated_at") or a.get("created_at")
+    ), reverse=True)
+    if not reset_sources or _np_v127_s(reset_sources[0].get("id")) != sid:
+        return None, "not_newest_unresolved_funded_reset_source"
+
+    # Do not legacy-correlate while ANY payout remains open for this trader.
+    if any(_np_v127_l(p.get("status")) in open_states for p in payouts):
+        return None, "open_payout_exists"
+
+    reset_time = _np_v127_dt(s.get("archived_at") or s.get("reset_at") or s.get("updated_at") or s.get("created_at"))
+    candidates = []
+    for p in paid:
+        ps = p_size(p)
+        if ssize and ps and int(ssize) != int(ps):
+            continue
+        pt = p_time(p)
+        if reset_time and pt:
+            # Generic payout-reset is normally immediate. 14 days is deliberately
+            # generous for staff delay but narrow enough not to replay old cycles.
+            if pt > reset_time + 3600:
+                continue
+            if reset_time - pt > 14 * 24 * 3600:
+                continue
+        candidates.append(p)
+    if not candidates:
+        return None, "no_recent_paid_payout_candidate"
+    candidates.sort(key=p_time, reverse=True)
+    return candidates[0], "newest_waiting_legacy_correlation"
+
+
+def _np_reset_entitlement_for_source(source, trader=None):
+    """V127 wrapper: payout renewal outranks accidental admin-recovery tagging."""
+    core = _np_reset_entitlement_for_source_v127_core(source, trader) or {}
+    reason = _np_v127_l(core.get("reason"))
+    if reason.startswith("post_payout_renewal"):
+        return core
+
+    s = source or {}
+    status = _np_v127_l(s.get("account_status") or s.get("status"))
+    stage = _normalize_lifecycle_stage(s.get("stage") or s.get("phase"))
+    if not (stage == "funded" and status.startswith("archived_reset_funded")):
+        return core
+
+    payout, proof = _np_v127_exact_paid_payout_for_source(s, trader or {})
+    if not payout:
+        return core
+
+    pid = _np_v127_s(payout.get("id"))
+    if not pid:
+        return core
+
+    # Stamp the correct financial authority for all future retries/audit.
+    try:
+        marker = f"[NP_ENTITLEMENT:post_payout_renewal:{pid}]"
+        old = _np_v127_s(s.get("archive_reason"))
+        repair = f"[NP_V127_FORENSIC_PAYOUT_REPAIR:{proof}]"
+        new = old
+        if marker.lower() not in new.lower():
+            new = (new + " | " + marker).strip(" |")
+        if repair.lower() not in new.lower():
+            new = (new + " | " + repair).strip(" |")
+        if new != old:
+            supabase.table("trader_accounts").update({
+                "archive_reason": new,
+                "updated_at": now_iso(),
+            }).eq("id", s.get("id")).eq("trader_id", s.get("trader_id")).execute()
+    except Exception as exc:
+        print("V127 PAYOUT AUTHORITY STAMP WARNING:", exc, flush=True)
+
+    return {
+        "eligible": True,
+        "reason": "post_payout_renewal",
+        "label": "PAYOUT PAID · RENEW FUNDED",
+        "target_stage": "funded",
+        "evidence_id": pid,
+        "forensic_proof": proof,
+        "v127": True,
+    }
+
+
+def _np_v122_load_source(payout):
+    """V127 compatibility: keep exact linkage first, then recover old payout linkage safely."""
+    p = payout or {}
+    try:
+        source, why = _np_v122_load_source_v127_core(p)
+        if source:
+            return source, why
+    except Exception as exc:
+        print("V127 V122 EXACT SOURCE LOOKUP WARNING:", exc, flush=True)
+
+    tid = _np_v127_s(p.get("trader_id"))
+    pid = _np_v127_s(p.get("id"))
+    plog = _np_v127_s(p.get("mt5_login"))
+    if not tid:
+        return None, "missing_trader_id"
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", tid).order("updated_at", desc=True).limit(500).execute().data or []
+        )
+    except Exception as exc:
+        return None, "source_query_failed:" + str(exc)[:120]
+
+    # Historical exact MT5 is strongest when the payout account-id mirror is stale.
+    if plog:
+        matches = [
+            a for a in rows
+            if _np_v127_s(a.get("mt5_login")) == plog
+            and _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == "funded"
+        ]
+        if len(matches) == 1:
+            return matches[0], "recovered_by_exact_mt5"
+
+    # Durable paid marker / entitlement marker by exact payout id.
+    if pid:
+        needle1 = f"[np_payout_paid:{pid.lower()}]"
+        needle2 = f"[np_entitlement:post_payout_renewal:{pid.lower()}]"
+        marked = []
+        for a in rows:
+            if _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) != "funded":
+                continue
+            blob = " ".join(_np_v127_s(a.get(k)) for k in ("archive_reason", "admin_note", "reset_reason")).lower()
+            if needle1 in blob or needle2 in blob:
+                marked.append(a)
+        if len(marked) == 1:
+            return marked[0], "recovered_by_payout_marker"
+
+    return None, "missing_exact_payout_linkage"
+
+
+@app.route("/admin/payout_forensic_v127/status", methods=["GET", "OPTIONS"])
+def admin_payout_forensic_v127_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V127,
+        "assign_phase_handler": getattr(app.view_functions.get("assign_phase_mt5"), "__name__", ""),
+        "mark_paid_handler": getattr(app.view_functions.get("mark_paid"), "__name__", ""),
+        "retry_handler": getattr(app.view_functions.get("admin_retry_exact_payout_renewal_v30"), "__name__", ""),
+        "payout_renewal_entitlement_runtime_override": True,
+        "admin_recovery_protection_preserved": True,
+        "phase_to_funded_changed": False,
+        "second_life_changed": False,
+        "breach_changed": False,
+        "dd_police_changed": False,
+    })
+
+
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V127
