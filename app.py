@@ -3942,10 +3942,16 @@ def admin_reset_trader_account():
             "payout_renewal_waiting_mt5",
             "payout_renewal_assigning",
         }
+        # V124 — PAID payout authority must be detected BEFORE an operational
+        # recovery label can reclassify the same Funded cycle.  The account may
+        # still be assigned_active/funded_active when Admin presses Reset Paid
+        # Account.  We do NOT add any of these states to global lifecycle sets;
+        # this is an exact-account + exact-PAID-payout check local to this route.
+        payout_paid_source_states = set(payout_paid_recovery_states) | set(ACTIVE_ACCOUNT_STATUSES)
         paid_payout_reset_ok = False
         paid_payout_reset_id = ""
         _paid_reset_source_stage = _normalize_lifecycle_stage(account.get("stage") or account.get("phase"))
-        if _paid_reset_source_stage == "funded" and account_status_before in payout_paid_recovery_states:
+        if _paid_reset_source_stage == "funded" and account_status_before in payout_paid_source_states:
             try:
                 exact_payouts = (
                     supabase.table("payouts")
@@ -38257,6 +38263,98 @@ def _np_reset_entitlement_for_source(source, trader=None):
     ).strip().lower()
     stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
 
+    # V124 — PAYOUT RENEWAL MUST WIN OVER AN ACCIDENTAL ADMIN-RECOVERY LABEL.
+    #
+    # Some PAID Funded payout sources were reset through the Operational Recovery
+    # modal while the payout-renewal compatibility bug was present.  Those rows
+    # became archived_reset_funded with [NP_ENTITLEMENT:admin_recovery], even
+    # though the exact same source account has a PAID payout and no replacement.
+    # V54 previously returned admin_recovery before the payout authority could
+    # inspect the exact payout, causing the false "independent operational-
+    # recovery evidence" error shown in Admin.
+    #
+    # Repair is deliberately narrow:
+    #   * exact archived_reset FUNDED source only;
+    #   * exact payout.trader_account_id == source.id;
+    #   * payout status PAID;
+    #   * no open payout remains on that exact source;
+    #   * source is not already consumed/replaced (kill switches above);
+    #   * reset/archive time is not before the paid event when both timestamps exist.
+    #
+    # Genuine Phase/Admin recovery remains untouched.
+    if status.startswith("archived_reset") and stage == "funded":
+        # First allow the existing exact payout marker authority to win normally.
+        try:
+            _v124_core_ent = _np_reset_entitlement_for_source_v54_core(source, trader) or {}
+        except Exception:
+            _v124_core_ent = {}
+        if str(_v124_core_ent.get("reason") or "").startswith("post_payout_renewal"):
+            return _v124_core_ent
+
+        # Compatibility repair only for rows that were accidentally tagged as
+        # admin recovery during a completed payout cycle.
+        if "[np_entitlement:admin_recovery]" in blob:
+            try:
+                _v124_tid = str(source.get("trader_id") or trader.get("id") or "").strip()
+                _v124_sid = str(source.get("id") or "").strip()
+                _v124_payouts = (
+                    supabase.table("payouts")
+                    .select("id,status,trader_id,trader_account_id,paid_at,created_at,updated_at")
+                    .eq("trader_id", _v124_tid)
+                    .eq("trader_account_id", _v124_sid)
+                    .order("created_at", desc=True)
+                    .limit(30)
+                    .execute().data or []
+                )
+                _v124_open_states = {
+                    "pending", "requested", "submitted", "approved", "processing",
+                    "payment_processing", "pending_review", "awaiting_review", "under_review"
+                }
+                _v124_paid = [
+                    p for p in _v124_payouts
+                    if str(p.get("status") or "").strip().lower() == "paid"
+                ]
+                _v124_open = [
+                    p for p in _v124_payouts
+                    if str(p.get("status") or "").strip().lower() in _v124_open_states
+                ]
+                if _v124_paid and not _v124_open:
+                    _v124_p = _v124_paid[0]
+                    _v124_pid = str(_v124_p.get("id") or "").strip()
+                    _v124_paid_time = _dt_score(
+                        _v124_p.get("paid_at") or _v124_p.get("updated_at") or _v124_p.get("created_at")
+                    )
+                    _v124_reset_time = _dt_score(
+                        source.get("reset_at") or source.get("archived_at")
+                        or source.get("updated_at") or source.get("created_at")
+                    )
+                    if _v124_pid and (
+                        not _v124_paid_time or not _v124_reset_time
+                        or _v124_reset_time >= _v124_paid_time
+                    ):
+                        _v124_marker = f"[NP_ENTITLEMENT:post_payout_renewal:{_v124_pid}]"
+                        _v124_reason = str(source.get("archive_reason") or "")
+                        if _v124_marker.lower() not in _v124_reason.lower():
+                            try:
+                                supabase.table("trader_accounts").update({
+                                    "archive_reason": (
+                                        _v124_reason + " | " + _v124_marker
+                                    ).strip(" |"),
+                                    "updated_at": now_iso(),
+                                }).eq("id", _v124_sid).eq("trader_id", _v124_tid).execute()
+                            except Exception as _v124_stamp_exc:
+                                print("V124 PAYOUT ENTITLEMENT STAMP WARNING:", _v124_stamp_exc, flush=True)
+                        return {
+                            "eligible": True,
+                            "reason": "post_payout_renewal",
+                            "label": "PAYOUT PAID · RENEW FUNDED",
+                            "target_stage": "funded",
+                            "evidence_id": _v124_pid,
+                            "compat_repaired": True,
+                        }
+            except Exception as _v124_exc:
+                print("V124 PAYOUT ENTITLEMENT COMPAT CHECK ERROR:", _v124_exc, flush=True)
+
     # Explicit staff-recovery authority. This is NEVER inferred from breach.
     if (
         status.startswith("archived_reset")
@@ -53347,3 +53445,11 @@ NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V122
 # No Phase/Funded/Second-Life/breach/reset automation worker or assignment logic changed.
 # ============================================================================
 NAIRAPIPS_PAYOUT_STATE_COMPAT_RELEASE_V123 = "V123_PAYOUT_STATE_COMPAT_2026_10_02"
+
+
+# ============================================================================
+# NAIRAPIPS V124 — PAYOUT RENEWAL ENTITLEMENT CLASSIFICATION FIX — 02 OCT 2026
+# Narrow compatibility repair only. No Phase/Funded/Second-Life automation
+# worker, picker, progression rule or DD logic is rebound here.
+# ============================================================================
+NAIRAPIPS_PAYOUT_RENEWAL_ENTITLEMENT_RELEASE_V124 = "V124_PAYOUT_RENEWAL_ENTITLEMENT_CLASSIFICATION_2026_10_02"
