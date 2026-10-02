@@ -41438,63 +41438,91 @@ def _np_assign_phase_v63():
                     )
 
             if reason == "admin_recovery":
-                # V125 — FINAL PAID-PAYOUT HANDOFF AT THE ACTUAL V63 FIREWALL.
-                #
-                # Some Funded payout sources were historically tagged with the
-                # generic admin_recovery entitlement while the payout/reset
-                # compatibility path was being repaired.  Do NOT weaken genuine
-                # staff-recovery protection.  Before requiring operational-recovery
-                # evidence, verify whether THIS exact archived_reset_funded source
-                # is actually an unconsumed PAID payout renewal.
-                _v125_paid_payout_renewal = False
-                _v125_paid_payout_id = ""
-                _v125_stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
-                _v125_status = str(source.get("account_status") or source.get("status") or "").strip().lower()
-                if _v125_stage == "funded" and _v125_status.startswith("archived_reset_funded"):
+                # V126 — FINAL EXACT PAID-PAYOUT HANDOFF.
+                # Some historical payout/reset repairs lost or moved payout.trader_account_id,
+                # while the immutable PAID payout still carries the same trader + MT5 login.
+                # Do NOT weaken admin recovery generally. Reclassify ONLY an exact
+                # archived_reset_funded source that can prove an unconsumed PAID payout
+                # by payout marker id, exact source account id, or exact MT5 login.
+                _v126_paid_payout_renewal = False
+                _v126_paid_payout_id = ""
+                _v126_stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+                _v126_status = str(source.get("account_status") or source.get("status") or "").strip().lower()
+                _v126_source_mt5 = str(source.get("mt5_login") or "").strip()
+                _v126_blob = " ".join(str(source.get(k) or "") for k in (
+                    "archive_reason", "reset_reason", "admin_note", "message", "account_status"
+                ))
+                _v126_marker_ids = set()
+                for _v126_pat in (
+                    r"\[NP_ENTITLEMENT:post_payout_renewal:([^\]]+)\]",
+                    r"\[NP_PAYOUT_PAID:([^\]]+)\]",
+                    r"\[NP_PAYOUT_CLAIM:([^\]]+)\]",
+                ):
+                    for _v126_m in re.finditer(_v126_pat, _v126_blob, re.I):
+                        _v126_mid = str(_v126_m.group(1) or "").strip()
+                        if _v126_mid:
+                            _v126_marker_ids.add(_v126_mid)
+
+                if _v126_stage == "funded" and _v126_status.startswith("archived_reset_funded"):
                     try:
-                        _v125_payout_rows = (
+                        _v126_payout_rows = (
                             supabase.table("payouts")
-                            .select("id,status,trader_id,trader_account_id,paid_at,created_at,updated_at")
+                            .select("id,status,trader_id,trader_account_id,mt5_login,paid_at,created_at,updated_at")
                             .eq("trader_id", tid)
-                            .eq("trader_account_id", raw_source)
                             .order("created_at", desc=True)
-                            .limit(30)
+                            .limit(100)
                             .execute().data or []
                         )
-                        _v125_open_states = {
+                        _v126_open_states = {
                             "pending", "requested", "submitted", "approved", "processing",
                             "payment_processing", "pending_review", "awaiting_review", "under_review"
                         }
-                        _v125_paid_rows = [
-                            p for p in _v125_payout_rows
+
+                        def _v126_same_cycle(p):
+                            _pid = str(p.get("id") or "").strip()
+                            _paid_source = str(p.get("trader_account_id") or "").strip()
+                            _pmt5 = str(p.get("mt5_login") or "").strip()
+                            return bool(
+                                (_pid and _pid in _v126_marker_ids)
+                                or (_paid_source and _paid_source == raw_source)
+                                or (_v126_source_mt5 and _pmt5 and _pmt5 == _v126_source_mt5)
+                            )
+
+                        _v126_cycle_rows = [p for p in _v126_payout_rows if _v126_same_cycle(p)]
+                        _v126_paid_rows = [
+                            p for p in _v126_cycle_rows
                             if str(p.get("status") or "").strip().lower() == "paid"
                         ]
-                        _v125_has_open = any(
-                            str(p.get("status") or "").strip().lower() in _v125_open_states
-                            for p in _v125_payout_rows
+                        _v126_has_open = any(
+                            str(p.get("status") or "").strip().lower() in _v126_open_states
+                            for p in _v126_cycle_rows
                         )
-                        if _v125_paid_rows and not _v125_has_open:
-                            _v125_paid_payout_id = str(_v125_paid_rows[0].get("id") or "").strip()
-                            _v125_paid_payout_renewal = bool(_v125_paid_payout_id)
-                    except Exception as _v125_exc:
-                        print("V125 V63 PAID PAYOUT HANDOFF VERIFY ERROR:", _v125_exc, flush=True)
-                        _v125_paid_payout_renewal = False
+                        if _v126_paid_rows and not _v126_has_open:
+                            _v126_marked_paid = next(
+                                (p for p in _v126_paid_rows if str(p.get("id") or "").strip() in _v126_marker_ids),
+                                None,
+                            )
+                            _v126_chosen = _v126_marked_paid or _v126_paid_rows[0]
+                            _v126_paid_payout_id = str(_v126_chosen.get("id") or "").strip()
+                            _v126_paid_payout_renewal = bool(_v126_paid_payout_id)
+                    except Exception as _v126_exc:
+                        print("V126 V63 PAID PAYOUT HANDOFF VERIFY ERROR:", _v126_exc, flush=True)
+                        _v126_paid_payout_renewal = False
 
-                if _v125_paid_payout_renewal:
-                    # Repair only the entitlement label for future retries/audit.
-                    # V63 already checked above that this exact source has not
-                    # produced a replacement, so replay protection remains intact.
+                if _v126_paid_payout_renewal:
+                    # Replay protection already ran above: this exact source must have no child.
+                    # Stamp the correct payout-renewal entitlement for stable future retries/audit.
                     try:
-                        _v125_marker = f"[NP_ENTITLEMENT:post_payout_renewal:{_v125_paid_payout_id}]"
-                        _v125_reason = str(source.get("archive_reason") or "")
-                        if _v125_marker.lower() not in _v125_reason.lower():
+                        _v126_marker = f"[NP_ENTITLEMENT:post_payout_renewal:{_v126_paid_payout_id}]"
+                        _v126_reason = str(source.get("archive_reason") or "")
+                        if _v126_marker.lower() not in _v126_reason.lower():
                             supabase.table("trader_accounts").update({
-                                "archive_reason": (_v125_reason + " | " + _v125_marker).strip(" |"),
+                                "archive_reason": (_v126_reason + " | " + _v126_marker).strip(" |"),
                                 "updated_at": now_iso(),
                             }).eq("id", raw_source).eq("trader_id", tid).execute()
                         reason = "post_payout_renewal"
-                    except Exception as _v125_stamp_exc:
-                        print("V125 V63 PAYOUT ENTITLEMENT STAMP WARNING:", _v125_stamp_exc, flush=True)
+                    except Exception as _v126_stamp_exc:
+                        print("V126 V63 PAYOUT ENTITLEMENT STAMP WARNING:", _v126_stamp_exc, flush=True)
                 else:
                     qualified, _ = _np_v63_recovery_source_qualified(source)
                     if not qualified:
@@ -41529,12 +41557,17 @@ def _np_assign_phase_v63():
                 except Exception:
                     pass
             else:
-                _np_v63_mark_reset_consumed(
-                    refreshed,
-                    child,
-                    order=order,
-                    reason="assign_phase_mt5",
-                )
+                # V126: a paid payout renewal is not a breach/reset consumption.
+                # Use the dedicated unlimited-payout completion stamp.
+                if reason == "post_payout_renewal":
+                    _np_stamp_exact_payout_consumed_20260908(refreshed, child, tid)
+                else:
+                    _np_v63_mark_reset_consumed(
+                        refreshed,
+                        child,
+                        order=order,
+                        reason="assign_phase_mt5",
+                    )
         except Exception as exc:
             print("V63 POST-ASSIGN RESET CONSUMPTION ERROR:", exc, flush=True)
 
@@ -53520,3 +53553,12 @@ NAIRAPIPS_PAYOUT_RENEWAL_ENTITLEMENT_RELEASE_V124 = "V124_PAYOUT_RENEWAL_ENTITLE
 # Funded payout sources can be reclassified as post_payout_renewal.
 # ============================================================================
 NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V125 = "V125_FINAL_V63_PAID_PAYOUT_HANDOFF_2026_10_02"
+
+
+# ============================================================================
+# NAIRAPIPS V126 — EXACT PAID PAYOUT / MT5 MANUAL HANDOFF — 02 OCT 2026
+# Narrow V63 payout-renewal compatibility only. Existing working automation
+# workers and generic assignment rules are not rebound or redesigned.
+# ============================================================================
+NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V126 = "V126_EXACT_PAID_MT5_V63_HANDOFF_2026_10_02"
+NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V126
