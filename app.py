@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V118_SCHEMA_SAFE_PAYOUT_LOCK_NO_CANCEL_SPAM_2026_10_01"
+NAIRAPIPS_RELEASE = "V119_MONITORING_REGISTRY_SHADOW_2026_10_02"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -80,6 +80,76 @@ supabase_admin = (
     if SUPABASE_SERVICE_ROLE_KEY
     else None
 )
+
+
+# ============================================================
+# V119 MONITORING REGISTRY — additive assignment/lifecycle bridge
+# ============================================================
+# The registry is NOT the lifecycle authority. Assignment/lifecycle remains authoritative.
+# This is the durable list of exact MT5 account instances that require monitoring now.
+# New assignments are activated before credentials are released. Retirements are
+# best-effort/idempotent and are also guarded by the Monitoring API against stale rows.
+def _np_registry_predecessor_id(purchase=None):
+    p = purchase or {}
+    for key in (
+        "trader_account_id",
+        "previous_trader_account_id",
+        "replaces_trader_account_id",
+        "reset_trader_account_id",
+        "source_trader_account_id",
+    ):
+        value = str(p.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _np_monitoring_registry_activate(account, predecessor_account_id=None, reason="assignment_exchange"):
+    if not account or not account.get("id"):
+        raise RuntimeError("Monitoring Registry activation requires exact trader_account_id")
+    args = {
+        "p_trader_account_id": str(account.get("id")),
+        "p_predecessor_account_id": str(predecessor_account_id) if predecessor_account_id else None,
+        "p_reason": str(reason or "assignment_exchange")[:500],
+    }
+    result = supabase.rpc("np_monitoring_activate", args).execute()
+    # Post-flight verification: do not release credentials for an account that
+    # failed to enter the exact live-monitoring roster.
+    rows = (
+        supabase.table("monitoring_registry").select("*")
+        .eq("trader_account_id", account.get("id"))
+        .eq("active", True)
+        .limit(1).execute().data or []
+    )
+    if not rows:
+        raise RuntimeError(
+            f"Monitoring Registry activation was not verified for MT5 {account.get('mt5_login')}"
+        )
+    row = rows[0]
+    if str(row.get("mt5_login") or "").strip() != str(account.get("mt5_login") or "").strip():
+        raise RuntimeError("Monitoring Registry MT5 verification mismatch")
+    return row
+
+
+def _np_monitoring_registry_retire(account_id, reason, successor_account_id=None):
+    """Idempotent. Never blocks the primary lifecycle terminal write."""
+    if not account_id:
+        return False
+    try:
+        supabase.rpc("np_monitoring_retire", {
+            "p_trader_account_id": str(account_id),
+            "p_reason": str(reason or "lifecycle_terminal")[:500],
+            "p_successor_account_id": str(successor_account_id) if successor_account_id else None,
+        }).execute()
+        return True
+    except Exception as exc:
+        print(
+            "MONITORING REGISTRY RETIRE RETRY REQUIRED:",
+            {"account_id": account_id, "successor": successor_account_id, "error": str(exc)},
+            flush=True,
+        )
+        return False
+
 
 def _staff_db():
     if not supabase_admin:
@@ -3101,6 +3171,7 @@ def _np_update_trader_current_pointer_v59(trader_id, account, stage):
 
 
 def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="MT5 assigned"):
+    _np_registry_predecessor = _np_registry_predecessor_id(purchase)
     stage = str(stage or "").lower()
     if stage not in ACCOUNT_STAGES:
         raise ValueError("Invalid account stage")
@@ -3243,6 +3314,39 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         except Exception:
             pass
         raise RuntimeError(f"MT5 assignment stopped: dashboard current-account sync failed: {_pointer_err}")
+
+    # V119 MONITORING HANDOVER:
+    # The fresh MT5 must enter the exact monitoring roster BEFORE credentials are released.
+    # If there is a known predecessor, the database RPC retires old + activates new atomically.
+    try:
+        _np_monitoring_registry_activate(
+            account,
+            predecessor_account_id=(
+                _np_registry_predecessor
+                if _np_registry_predecessor and str(_np_registry_predecessor) != str(account.get("id"))
+                else None
+            ),
+            reason=f"assignment_exchange:{stage}",
+        )
+    except Exception as _registry_err:
+        try:
+            supabase.table("trader_accounts").update({
+                "monitoring_enabled": False,
+                "account_status": "assignment_sync_error",
+                "updated_at": now_iso(),
+                "archive_reason": f"MONITORING_REGISTRY_ACTIVATION_FAILED: {str(_registry_err)[:300]}",
+            }).eq("id", account.get("id")).execute()
+            supabase.table("mt5_pool").update({
+                "status": "assigned_sync_error",
+                "admin_note": f"DO NOT TRADE: monitoring registry activation failed: {_registry_err}",
+                "updated_at": now_iso(),
+            }).eq("id", mt5.get("id")).execute()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"MT5 assignment stopped: monitoring registry activation failed: {_registry_err}"
+        )
+
     # CRITICAL: Email trader their new MT5 credentials (production must notify)
     try:
         stage_label = stage.upper().replace('_', ' ')
@@ -3488,6 +3592,11 @@ def _archive_specific_account(account, reason, staff=None, breached=False, archi
             print("SPECIFIC MT5 POOL ARCHIVE ERROR:", e)
     archived = dict(account)
     archived.update(update_payload)
+    _np_monitoring_registry_retire(
+        account.get("id"),
+        reason or status,
+        successor_account_id=None,
+    )
     return archived
 
 
@@ -26164,6 +26273,11 @@ def _np_stamp_exact_payout_consumed_20260908(source, replacement, trader_id):
             "archive_reason": (old_reason + " | " + marker).strip(" |"),
             "updated_at": now,
         }).eq("id", source.get("id")).eq("trader_id", trader_id).execute()
+        _np_monitoring_registry_retire(
+            source.get("id"),
+            "payout_renewal_replaced",
+            successor_account_id=replacement.get("id"),
+        )
     except Exception as exc:
         print("POST PAYOUT RENEWAL COMPLETION STAMP SKIPPED:", exc)
 
