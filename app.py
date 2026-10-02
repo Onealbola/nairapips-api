@@ -41438,13 +41438,71 @@ def _np_assign_phase_v63():
                     )
 
             if reason == "admin_recovery":
-                qualified, _ = _np_v63_recovery_source_qualified(source)
-                if not qualified:
-                    return _np_fail(
-                        "Admin recovery assignment blocked: the original source does "
-                        "not carry independent operational-recovery evidence.",
-                        409,
-                    )
+                # V125 — FINAL PAID-PAYOUT HANDOFF AT THE ACTUAL V63 FIREWALL.
+                #
+                # Some Funded payout sources were historically tagged with the
+                # generic admin_recovery entitlement while the payout/reset
+                # compatibility path was being repaired.  Do NOT weaken genuine
+                # staff-recovery protection.  Before requiring operational-recovery
+                # evidence, verify whether THIS exact archived_reset_funded source
+                # is actually an unconsumed PAID payout renewal.
+                _v125_paid_payout_renewal = False
+                _v125_paid_payout_id = ""
+                _v125_stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+                _v125_status = str(source.get("account_status") or source.get("status") or "").strip().lower()
+                if _v125_stage == "funded" and _v125_status.startswith("archived_reset_funded"):
+                    try:
+                        _v125_payout_rows = (
+                            supabase.table("payouts")
+                            .select("id,status,trader_id,trader_account_id,paid_at,created_at,updated_at")
+                            .eq("trader_id", tid)
+                            .eq("trader_account_id", raw_source)
+                            .order("created_at", desc=True)
+                            .limit(30)
+                            .execute().data or []
+                        )
+                        _v125_open_states = {
+                            "pending", "requested", "submitted", "approved", "processing",
+                            "payment_processing", "pending_review", "awaiting_review", "under_review"
+                        }
+                        _v125_paid_rows = [
+                            p for p in _v125_payout_rows
+                            if str(p.get("status") or "").strip().lower() == "paid"
+                        ]
+                        _v125_has_open = any(
+                            str(p.get("status") or "").strip().lower() in _v125_open_states
+                            for p in _v125_payout_rows
+                        )
+                        if _v125_paid_rows and not _v125_has_open:
+                            _v125_paid_payout_id = str(_v125_paid_rows[0].get("id") or "").strip()
+                            _v125_paid_payout_renewal = bool(_v125_paid_payout_id)
+                    except Exception as _v125_exc:
+                        print("V125 V63 PAID PAYOUT HANDOFF VERIFY ERROR:", _v125_exc, flush=True)
+                        _v125_paid_payout_renewal = False
+
+                if _v125_paid_payout_renewal:
+                    # Repair only the entitlement label for future retries/audit.
+                    # V63 already checked above that this exact source has not
+                    # produced a replacement, so replay protection remains intact.
+                    try:
+                        _v125_marker = f"[NP_ENTITLEMENT:post_payout_renewal:{_v125_paid_payout_id}]"
+                        _v125_reason = str(source.get("archive_reason") or "")
+                        if _v125_marker.lower() not in _v125_reason.lower():
+                            supabase.table("trader_accounts").update({
+                                "archive_reason": (_v125_reason + " | " + _v125_marker).strip(" |"),
+                                "updated_at": now_iso(),
+                            }).eq("id", raw_source).eq("trader_id", tid).execute()
+                        reason = "post_payout_renewal"
+                    except Exception as _v125_stamp_exc:
+                        print("V125 V63 PAYOUT ENTITLEMENT STAMP WARNING:", _v125_stamp_exc, flush=True)
+                else:
+                    qualified, _ = _np_v63_recovery_source_qualified(source)
+                    if not qualified:
+                        return _np_fail(
+                            "Admin recovery assignment blocked: the original source does "
+                            "not carry independent operational-recovery evidence.",
+                            409,
+                        )
 
     resp = _np_assign_phase_v63_core()
     status_code = _np_v63_response_status(resp)
@@ -53453,3 +53511,12 @@ NAIRAPIPS_PAYOUT_STATE_COMPAT_RELEASE_V123 = "V123_PAYOUT_STATE_COMPAT_2026_10_0
 # worker, picker, progression rule or DD logic is rebound here.
 # ============================================================================
 NAIRAPIPS_PAYOUT_RENEWAL_ENTITLEMENT_RELEASE_V124 = "V124_PAYOUT_RENEWAL_ENTITLEMENT_CLASSIFICATION_2026_10_02"
+
+
+# ============================================================================
+# NAIRAPIPS V125 — FINAL V63 PAID-PAYOUT HANDOFF FIX — 02 OCT 2026
+# Narrow repair at the actual manual-assignment firewall.
+# Genuine admin recovery remains evidence-gated; only exact unconsumed PAID
+# Funded payout sources can be reclassified as post_payout_renewal.
+# ============================================================================
+NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V125 = "V125_FINAL_V63_PAID_PAYOUT_HANDOFF_2026_10_02"
