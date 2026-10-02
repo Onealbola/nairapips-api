@@ -3932,9 +3932,20 @@ def admin_reset_trader_account():
             "profit_protected", "payout_pending", "approved_payout_pending",
             "payment_processing", "payout_processing", "pending_payout"
         }
+        # V123 - PAID PAYOUT SOURCE COMPATIBILITY ONLY.
+        # Previous payout-renewal attempts may have left the exact Funded source in
+        # one of these non-active states before a replacement MT5 was delivered.
+        # Do NOT make them globally active. They are accepted here only when the
+        # exact source has a PAID payout and no open payout remains.
+        payout_paid_recovery_states = payout_protected_states | {
+            "funded_profit_cap_reached",
+            "payout_renewal_waiting_mt5",
+            "payout_renewal_assigning",
+        }
         paid_payout_reset_ok = False
         paid_payout_reset_id = ""
-        if account_status_before in payout_protected_states:
+        _paid_reset_source_stage = _normalize_lifecycle_stage(account.get("stage") or account.get("phase"))
+        if _paid_reset_source_stage == "funded" and account_status_before in payout_paid_recovery_states:
             try:
                 exact_payouts = (
                     supabase.table("payouts")
@@ -11849,7 +11860,7 @@ def approve_payout():
         funded_stage = stage in {"funded", "live", "funded_live"}
         allowed_locked_states = {
             "profit_protected", "funded_active", "assigned_active",
-            "active", "current_active"
+            "active", "current_active", "funded_profit_cap_reached"
         }
         if not funded_stage:
             return bad("Payout is not attached to a funded account.", 403)
@@ -11872,8 +11883,15 @@ def approve_payout():
         # while payment is being processed. This state is already accepted by the
         # trader_accounts constraint and recognized by the MT5 watchdog.
         try:
+            # Preserve the 15% cap lock while the payout is processed. A cap-locked
+            # Funded account is payout-approvable but must never be reopened to trade.
+            _approved_lock_status = (
+                "funded_profit_cap_reached"
+                if account_status == "funded_profit_cap_reached"
+                else "profit_protected"
+            )
             _staff_db().table("trader_accounts").update({
-                "account_status": "profit_protected",
+                "account_status": _approved_lock_status,
                 "monitoring_enabled": True,
                 "updated_at": now_iso()
             }).eq("id", account_id).eq("trader_id", payout.get("trader_id")).execute()
@@ -53321,3 +53339,11 @@ def admin_payout_renewal_v122_health():
 
 _np_v122_start_worker()
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V122
+
+
+# ============================================================================
+# NAIRAPIPS V123 - PAYOUT STATE COMPATIBILITY - 02 OCT 2026
+# Narrow repair only: paid-payout reset eligibility + capped payout approval.
+# No Phase/Funded/Second-Life/breach/reset automation worker or assignment logic changed.
+# ============================================================================
+NAIRAPIPS_PAYOUT_STATE_COMPAT_RELEASE_V123 = "V123_PAYOUT_STATE_COMPAT_2026_10_02"
