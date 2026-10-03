@@ -54017,3 +54017,356 @@ def admin_payout_forensic_v127_status():
 
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_PAYOUT_RENEWAL_RELEASE_V127
+
+
+# ============================================================================
+# NAIRAPIPS V121 — MONITORING ASSIGNMENT INTEGRITY GATE — 03 OCT 2026
+#
+# PURPOSE
+# -------
+# Prevent any account from looking ASSIGNED/ACTIVE while being outside DD policing.
+# This is additive protection only. It does NOT change challenge progression,
+# payout, reset, Second Life, recall, or assignment decision rules.
+#
+# Laws:
+# 1) A successful live assignment must have exact trader ownership + MT5 login.
+# 2) Its exact trader_account must have an ACTIVE monitoring_registry row.
+# 3) Admin MT5 edits cannot create a fake "assigned" inventory row with no owner.
+# 4) Editing credentials/login of an already-assigned MT5 synchronises the exact
+#    trader_account and re-verifies monitoring before success is returned.
+# 5) Existing exact accounts can be checked/repaired through an admin-only endpoint.
+# ============================================================================
+NAIRAPIPS_MONITORING_ASSIGNMENT_INTEGRITY_RELEASE_V121 = "V121_MONITORING_ASSIGNMENT_INTEGRITY_2026_10_03"
+
+_NP_V121_ACTIVE_ACCOUNT_STATUSES = {
+    "assigned_active", "active", "current_active", "phase1_active",
+    "phase2_active", "funded_active", "profit_protected",
+    "funded_profit_cap_reached",
+}
+
+def _np_v121_s(v):
+    return str(v or "").strip()
+
+def _np_v121_account_by_id(aid):
+    aid = _np_v121_s(aid)
+    if not aid:
+        return None
+    rows = (
+        supabase.table("trader_accounts").select("*")
+        .eq("id", aid).limit(1).execute().data or []
+    )
+    return rows[0] if rows else None
+
+def _np_v121_registry_row(account_id):
+    account_id = _np_v121_s(account_id)
+    if not account_id:
+        return None
+    try:
+        rows = (
+            supabase.table("monitoring_registry").select("*")
+            .eq("trader_account_id", account_id)
+            .eq("active", True)
+            .limit(1).execute().data or []
+        )
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+def _np_v121_quarantine(account, reason):
+    """Fail closed without touching unrelated journeys/accounts."""
+    if not account or not account.get("id"):
+        return
+    now = now_iso()
+    try:
+        supabase.table("trader_accounts").update({
+            "account_status": "assignment_sync_error",
+            "monitoring_enabled": False,
+            "updated_at": now,
+            "archive_reason": ("MONITORING_INTEGRITY: " + str(reason))[:1000],
+        }).eq("id", account.get("id")).execute()
+    except Exception:
+        pass
+    try:
+        if account.get("mt5_pool_id"):
+            supabase.table("mt5_pool").update({
+                "status": "assigned_sync_error",
+                "updated_at": now,
+                "admin_note": ("DO NOT TRADE: monitoring integrity failed: " + str(reason))[:1000],
+            }).eq("id", account.get("mt5_pool_id")).execute()
+    except Exception:
+        pass
+    try:
+        np_invalidate_admin_bootstrap("traders")
+    except Exception:
+        pass
+    try:
+        _invalidate_trader_bootstrap_cache(account.get("trader_id"))
+    except Exception:
+        pass
+
+def _np_v121_ensure_monitoring(account, reason="assignment_integrity", allow_repair=True):
+    """Return (ok, message, registry_row). Exact-account only."""
+    account = account or {}
+    aid = _np_v121_s(account.get("id"))
+    tid = _np_v121_s(account.get("trader_id"))
+    login = _np_v121_s(account.get("mt5_login"))
+    status = _np_v121_s(account.get("account_status") or account.get("status")).lower()
+
+    if not aid:
+        return False, "missing trader_account_id", None
+    if not tid:
+        return False, "assigned account has no trader_id", None
+    if not login:
+        return False, "assigned account has no MT5 login", None
+
+    # Ownership must resolve to a real trader before an account is allowed to look live.
+    try:
+        trows = supabase.table("traders").select("id,current_account_id").eq("id", tid).limit(1).execute().data or []
+    except Exception as exc:
+        return False, "trader ownership verification failed: " + str(exc), None
+    if not trows:
+        return False, "trader_id does not resolve to a trader", None
+
+    reg = _np_v121_registry_row(aid)
+    if reg and _np_v121_s(reg.get("mt5_login")) == login:
+        return True, "monitoring registry verified", reg
+
+    if not allow_repair:
+        return False, "monitoring registry missing or MT5 mismatch", reg
+
+    try:
+        reg = _np_monitoring_registry_activate(
+            account,
+            predecessor_account_id=None,
+            reason=str(reason or "assignment_integrity")[:500],
+        )
+    except Exception as exc:
+        return False, "monitoring registry activation failed: " + str(exc), None
+
+    if not reg or _np_v121_s(reg.get("mt5_login")) != login:
+        return False, "monitoring registry post-flight mismatch", reg
+    return True, "monitoring registry repaired and verified", reg
+
+
+# ---- A) FINAL /assign_phase_mt5 SUCCESS GATE -------------------------------
+_np_v121_assign_phase_core = app.view_functions.get("assign_phase_mt5")
+
+def _np_v121_assign_phase_gate():
+    if not _np_v121_assign_phase_core:
+        return _np_fail("Assignment route unavailable", 500)
+    resp = _np_v121_assign_phase_core()
+    if request.method == "OPTIONS":
+        return resp
+    try:
+        code = int(getattr(resp, "status_code", 200) or 200)
+        obj = resp.get_json(silent=True) if hasattr(resp, "get_json") else None
+        if code >= 400 or not isinstance(obj, dict) or obj.get("success") is not True:
+            return resp
+
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        account = data.get("account") if isinstance(data.get("account"), dict) else None
+        if not account:
+            return resp
+
+        # Re-read exact persisted row; never trust response mirrors.
+        account = _np_v121_account_by_id(account.get("id")) or account
+        ok_gate, message, _reg = _np_v121_ensure_monitoring(
+            account, reason="v121_post_assignment_gate", allow_repair=True
+        )
+        if not ok_gate:
+            _np_v121_quarantine(account, message)
+            return _np_fail(
+                "Assignment stopped for safety: account did not enter DD monitoring. "
+                + message,
+                500,
+            )
+    except Exception as exc:
+        return _np_fail(
+            "Assignment integrity verification failed closed: " + str(exc),
+            500,
+        )
+    return resp
+
+if _np_v121_assign_phase_core:
+    app.view_functions["assign_phase_mt5"] = _np_v121_assign_phase_gate
+
+
+# ---- B) MT5 POOL EDIT SAFETY ----------------------------------------------
+# Editing pool credentials is allowed, but an assigned MT5 may never drift away
+# from its exact trader_account / monitoring_registry identity.
+_np_v121_update_mt5_core = app.view_functions.get("update_mt5")
+
+def _np_v121_update_mt5_gate():
+    if request.method == "OPTIONS" or not _np_v121_update_mt5_core:
+        return _np_v121_update_mt5_core()
+
+    d = request.get_json(silent=True) or {}
+    mid = _np_v121_s(d.get("id"))
+    if not mid:
+        return _np_fail("Missing MT5 account id", 400)
+
+    rows = supabase.table("mt5_pool").select("*").eq("id", mid).limit(1).execute().data or []
+    if not rows:
+        return _np_fail("MT5 account not found", 404)
+    old = rows[0]
+
+    requested_status = _np_v121_s(d.get("status") if "status" in d else old.get("status")).lower()
+    owner_tid = _np_v121_s(old.get("assigned_trader_id") or old.get("trader_id"))
+    linked_aid = _np_v121_s(old.get("trader_account_id"))
+
+    # Never allow Edit MT5 to manufacture an "assigned" state without ownership.
+    if requested_status == "assigned" and not (owner_tid and linked_aid):
+        return _np_fail(
+            "Cannot mark this MT5 as assigned from Edit MT5. "
+            "Use the normal assignment flow so trader ownership and DD monitoring are created together.",
+            409,
+        )
+
+    identity_fields = {
+        "mt5_login", "mt5_server", "mt5_master_password", "mt5_investor_password"
+    }
+    identity_change = any(
+        k in d and _np_v121_s(d.get(k)) != _np_v121_s(old.get(k))
+        for k in identity_fields
+    )
+
+    # For an assigned account, synchronise exact lifecycle row FIRST.
+    if identity_change and linked_aid:
+        account = _np_v121_account_by_id(linked_aid)
+        if not account:
+            return _np_fail(
+                "Assigned MT5 edit blocked: linked trader_account does not exist.",
+                409,
+            )
+        if owner_tid and _np_v121_s(account.get("trader_id")) != owner_tid:
+            return _np_fail(
+                "Assigned MT5 edit blocked: trader ownership mismatch.",
+                409,
+            )
+
+        au = {"updated_at": now_iso()}
+        for k in identity_fields:
+            if k in d:
+                au[k] = d.get(k)
+        supabase.table("trader_accounts").update(au).eq("id", linked_aid).execute()
+        account = _np_v121_account_by_id(linked_aid) or dict(account, **au)
+
+        # Current trader mirror follows the same exact account only.
+        try:
+            trows = (
+                supabase.table("traders").select("id,current_account_id")
+                .eq("id", account.get("trader_id")).limit(1).execute().data or []
+            )
+            if trows and _np_v121_s(trows[0].get("current_account_id")) == linked_aid:
+                tu = {"updated_at": now_iso()}
+                if "mt5_login" in d: tu["mt5_login"] = d.get("mt5_login")
+                if "mt5_server" in d: tu["mt5_server"] = d.get("mt5_server")
+                if "mt5_master_password" in d:
+                    tu["mt5_master_password"] = d.get("mt5_master_password")
+                    tu["mt5_password"] = d.get("mt5_master_password")
+                    tu["master_password"] = d.get("mt5_master_password")
+                if "mt5_investor_password" in d:
+                    tu["mt5_investor_password"] = d.get("mt5_investor_password")
+                    tu["investor_password"] = d.get("mt5_investor_password")
+                _np_ur_v87_update_compat(
+                    "traders", tu, "id", account.get("trader_id"),
+                    optional_keys={
+                        "mt5_master_password", "mt5_password", "master_password",
+                        "mt5_investor_password", "investor_password",
+                    },
+                )
+        except Exception:
+            pass
+
+        ok_gate, message, _reg = _np_v121_ensure_monitoring(
+            account, reason="v121_mt5_credential_edit", allow_repair=True
+        )
+        if not ok_gate:
+            _np_v121_quarantine(account, message)
+            return _np_fail(
+                "MT5 edit stopped for safety: DD monitoring could not be re-verified. "
+                + message,
+                500,
+            )
+
+    resp = _np_v121_update_mt5_core()
+
+    try:
+        np_invalidate_admin_bootstrap("mt5")
+        np_invalidate_admin_bootstrap("traders")
+    except Exception:
+        pass
+    return resp
+
+if _np_v121_update_mt5_core:
+    app.view_functions["update_mt5"] = _np_v121_update_mt5_gate
+
+
+# ---- C) ADMIN-ONLY EXACT INTEGRITY CHECK / REPAIR -------------------------
+@app.route("/admin/monitoring_assignment_integrity_v121", methods=["GET", "OPTIONS"])
+def admin_monitoring_assignment_integrity_v121():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    login = _np_v121_s(request.args.get("mt5_login"))
+    aid = _np_v121_s(request.args.get("trader_account_id"))
+    repair = str(request.args.get("repair") or "").strip().lower() in {"1","true","yes"}
+
+    account = None
+    if aid:
+        account = _np_v121_account_by_id(aid)
+    elif login:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("mt5_login", login)
+            .order("updated_at", desc=True).limit(5).execute().data or []
+        )
+        active = [
+            r for r in rows
+            if _np_v121_s(r.get("account_status") or r.get("status")).lower()
+            in _NP_V121_ACTIVE_ACCOUNT_STATUSES
+        ]
+        account = active[0] if active else (rows[0] if rows else None)
+    else:
+        return _np_fail("mt5_login or trader_account_id is required", 400)
+
+    if not account:
+        return _np_fail("Trader account not found", 404)
+
+    ok_gate, message, reg = _np_v121_ensure_monitoring(
+        account,
+        reason="v121_admin_integrity_repair",
+        allow_repair=repair,
+    )
+
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_MONITORING_ASSIGNMENT_INTEGRITY_RELEASE_V121,
+        "integrity_ok": bool(ok_gate),
+        "message": message,
+        "repair_requested": repair,
+        "account": {
+            "id": account.get("id"),
+            "trader_id": account.get("trader_id"),
+            "purchase_id": account.get("purchase_id"),
+            "mt5_login": account.get("mt5_login"),
+            "stage": account.get("stage") or account.get("phase"),
+            "account_status": account.get("account_status") or account.get("status"),
+            "monitoring_enabled": account.get("monitoring_enabled"),
+        },
+        "registry": ({
+            "trader_account_id": reg.get("trader_account_id"),
+            "mt5_login": reg.get("mt5_login"),
+            "active": reg.get("active"),
+            "monitoring_state": reg.get("monitoring_state"),
+        } if isinstance(reg, dict) else None),
+    })
+
+try:
+    NAIRAPIPS_RELEASE = NAIRAPIPS_MONITORING_ASSIGNMENT_INTEGRITY_RELEASE_V121
+except Exception:
+    pass
+
