@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V129_FUNDED_REPLACEMENT_AUTHORITY_2026_10_04"
+NAIRAPIPS_RELEASE = "V130_TRADER_ACCOUNT_LINEAGE_REPAIR_2026_10_04"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -8177,6 +8177,40 @@ def trader_bootstrap():
                 )
                 account_rows = account_future.result() or []
                 purchase_rows = purchase_future.result() or []
+
+                # V130 COMPLETE TRADER-ACCOUNT SAFETY:
+                # 150 is only the fast first page. If it is full, the trader may have
+                # older/replacement rows beyond that boundary. Page the SAME trader
+                # only so no valid replacement/current account is dropped by a row cap.
+                if len(account_rows) >= 150:
+                    try:
+                        seen_ids = {
+                            str(r.get("id") or "").strip()
+                            for r in account_rows
+                            if str(r.get("id") or "").strip()
+                        }
+                        start = 150
+                        page_size = 250
+                        while start < 5000:
+                            batch = (
+                                supabase.table("trader_accounts").select("*")
+                                .eq("trader_id", trader.get("id"))
+                                .order("updated_at", desc=True)
+                                .order("started_at", desc=True)
+                                .order("created_at", desc=True)
+                                .range(start, min(start + page_size - 1, 4999))
+                                .execute().data or []
+                            )
+                            for r in batch:
+                                rid = str(r.get("id") or "").strip()
+                                if rid and rid not in seen_ids:
+                                    seen_ids.add(rid)
+                                    account_rows.append(r)
+                            if len(batch) < page_size:
+                                break
+                            start += page_size
+                    except Exception as _v130_page_exc:
+                        print("V130 COMPLETE TRADER ACCOUNT PAGE WARNING:", _v130_page_exc, flush=True)
         except Exception as e:
             print("TRADER BOOTSTRAP CORE PARALLEL ERROR:", e)
 
@@ -8291,6 +8325,69 @@ def trader_bootstrap():
         pending_replacements = _pending_reset_replacements_from_accounts(
             account_rows, trader
         )
+
+        # V130 TARGETED SELF-HEAL:
+        # If WAITING still exists, prove the exact replacement from full lineage
+        # evidence and repair the source/current pointer once. This runs only for
+        # unresolved reset rows, never for normal trader accounts.
+        if pending_replacements and not replacement_takeover:
+            source_ids = {
+                str(r.get("replaces_trader_account_id") or r.get("source_account_id") or "").strip()
+                for r in pending_replacements
+            }
+            source_ids.discard("")
+            by_id_raw = {
+                str(r.get("id") or "").strip(): r
+                for r in account_rows
+                if str(r.get("id") or "").strip()
+            }
+            for source_id in list(source_ids):
+                source_row = by_id_raw.get(source_id)
+                if not source_row:
+                    try:
+                        _rows = (
+                            supabase.table("trader_accounts").select("*")
+                            .eq("id", source_id).eq("trader_id", trader.get("id"))
+                            .limit(1).execute().data or []
+                        )
+                        source_row = _rows[0] if _rows else None
+                    except Exception:
+                        source_row = None
+                if not source_row:
+                    continue
+
+                repaired = _np_self_heal_waiting_reset_v130(source_row)
+                if not repaired:
+                    continue
+
+                # Put the repaired replacement into this response immediately.
+                rid = str(repaired.get("id") or "").strip()
+                decorated_repaired = _decorate_account_for_api(repaired)
+                all_accounts = [
+                    a for a in all_accounts
+                    if str(a.get("id") or "").strip() != rid
+                ] + [decorated_repaired]
+                active_accounts = list(all_accounts)
+                replacement_takeover = decorated_repaired
+                trader = dict(trader or {})
+                trader["current_account_id"] = rid
+                trader["phase"] = _normalize_lifecycle_stage(repaired.get("stage") or repaired.get("phase"))
+                trader["challenge_state"] = repaired.get("account_status") or repaired.get("status")
+                account = decorated_repaired
+
+                # Recompute waiting against the repaired source marker.
+                for i, raw in enumerate(account_rows):
+                    if str(raw.get("id") or "").strip() == source_id:
+                        raw2 = dict(raw)
+                        raw2["account_status"] = "archived"
+                        raw2["status"] = "archived"
+                        raw2["reset_replacement_account_id"] = rid
+                        raw2["reset_consumed_at"] = now_iso()
+                        account_rows[i] = raw2
+                        break
+                pending_replacements = _pending_reset_replacements_from_accounts(account_rows, trader)
+                break
+
         if replacement_takeover:
             fulfilled_source_ids = {
                 str(replacement_takeover.get("_np_replacement_source_account_id") or "").strip()
@@ -30331,6 +30428,129 @@ def _np_find_exact_reset_replacement_v8(source, order=None):
         if (order_id and order_id.lower() in ablob) or source_id.lower() in ablob:
             strong.append(a)
     return strong[0] if len(strong)==1 else None
+
+
+
+def _np_self_heal_waiting_reset_v130(source):
+    """Repair ONE stale reset lineage only when a unique replacement can be proven.
+
+    This is intentionally narrow:
+      - exact source trader_account required
+      - replacement must belong to same trader
+      - replacement must have a real MT5 login
+      - replacement stage must match source stage
+      - replacement must be later than source
+    It updates the source consumption marker, trader current pointer and, only when
+    the replacement has no hard terminal evidence, restores its active stage status.
+    """
+    source = source or {}
+    source_id = str(source.get("id") or "").strip()
+    trader_id = str(source.get("trader_id") or "").strip()
+    if not source_id or not trader_id:
+        return None
+
+    replacement = _np_find_exact_reset_replacement_v8(source, None)
+    if not replacement:
+        return None
+
+    if str(replacement.get("trader_id") or "").strip() != trader_id:
+        return None
+    replacement_id = str(replacement.get("id") or "").strip()
+    replacement_mt5 = str(replacement.get("mt5_login") or "").strip()
+    if not replacement_id or not replacement_mt5:
+        return None
+
+    source_stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+    replacement_stage = _normalize_lifecycle_stage(replacement.get("stage") or replacement.get("phase"))
+    if source_stage != replacement_stage:
+        return None
+
+    source_time = _dt_score(
+        source.get("reset_at") or source.get("archived_at")
+        or source.get("updated_at") or source.get("created_at")
+    )
+    replacement_time = _dt_score(
+        replacement.get("assigned_at") or replacement.get("started_at")
+        or replacement.get("created_at") or replacement.get("updated_at")
+    )
+    if source_time and replacement_time and replacement_time <= source_time:
+        return None
+
+    now = now_iso()
+
+    # Permanently mark the old reset obligation consumed.
+    try:
+        source_payload = {
+            "account_status": "archived",
+            "status": "archived",
+            "reset_consumed_at": source.get("reset_consumed_at") or now,
+            "reset_replacement_account_id": replacement_id,
+            "archive_reason": (
+                str(source.get("archive_reason") or "")
+                + f" | V130 reset_consumed replacement_account_id={replacement_id} replacement_mt5={replacement_mt5}"
+            ).strip(" |"),
+            "updated_at": now,
+        }
+        try:
+            supabase.table("trader_accounts").update(source_payload).eq("id", source_id).eq("trader_id", trader_id).execute()
+        except Exception:
+            # Compatibility with schemas missing the newer lineage columns.
+            source_payload.pop("reset_consumed_at", None)
+            source_payload.pop("reset_replacement_account_id", None)
+            supabase.table("trader_accounts").update(source_payload).eq("id", source_id).eq("trader_id", trader_id).execute()
+    except Exception as exc:
+        print("V130 SOURCE REPAIR ERROR:", exc, flush=True)
+        return None
+
+    # If the real replacement is non-terminal but carries a stale waiting/reset
+    # mirror, restore the exact stage-active status.
+    blob = " ".join(str(replacement.get(k) or "") for k in (
+        "account_status","status","risk_zone","display_risk_zone",
+        "archive_reason","breach_reason","lifecycle_state","challenge_state"
+    )).lower()
+    hard_terminal = bool(
+        replacement.get("breached_at")
+        or replacement.get("breach_at")
+        or "breach" in blob
+        or "closed" in blob
+        or "disabled" in blob
+    )
+
+    repaired_replacement = dict(replacement)
+    if not hard_terminal:
+        active_status = (
+            "funded_active" if replacement_stage == "funded"
+            else ("phase2_active" if replacement_stage == "phase2" else "phase1_active")
+        )
+        try:
+            payload = {
+                "stage": replacement_stage,
+                "account_status": active_status,
+                "status": active_status,
+                "updated_at": now,
+            }
+            supabase.table("trader_accounts").update(payload).eq("id", replacement_id).eq("trader_id", trader_id).execute()
+            repaired_replacement.update(payload)
+        except Exception as exc:
+            print("V130 REPLACEMENT STATUS REPAIR WARNING:", exc, flush=True)
+
+        # Fix the trader pointer so future logins select the real replacement.
+        try:
+            supabase.table("traders").update({
+                "current_account_id": replacement_id,
+                "phase": replacement_stage,
+                "challenge_state": active_status,
+                "updated_at": now,
+            }).eq("id", trader_id).execute()
+        except Exception as exc:
+            print("V130 TRADER POINTER REPAIR WARNING:", exc, flush=True)
+
+    try:
+        _invalidate_trader_bootstrap_cache(trader_id)
+    except Exception:
+        pass
+
+    return repaired_replacement
 
 
 def _np_reconcile_consumed_reset_bridge_v8(bridge, source, journey):
