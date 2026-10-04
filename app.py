@@ -50494,22 +50494,27 @@ def _np_submit_notification_v97(fn, *args, **kwargs):
 _np_send_email_safe_v97_core = globals().get("send_email_safe")
 _np_send_assignment_email_v97_core = globals().get("send_assignment_email_with_owner_copy")
 
+# V124 EMAIL DELIVERY RESTORE
+# ---------------------------
+# V97 previously changed email delivery to a background thread specifically on
+# critical Admin actions such as approve_payment, approve_challenge_purchase,
+# assign_phase_mt5, lifecycle assignments and payout actions. Registration and
+# payment-proof emails remained synchronous, which explains why those continued
+# arriving while assignment/admin-copy emails could disappear.
+#
+# Critical transactional email is now synchronous again. A completed Admin action
+# waits for Brevo's accept/reject response, so assignment/admin copies cannot be
+# silently abandoned by an async worker/thread. We keep V97 action-priority
+# protection, but email delivery itself is reliable and directly observable.
 if callable(_np_send_email_safe_v97_core):
     def send_email_safe(to_email, subject, message):
-        if _np_fast_action_context_v97():
-            return _np_submit_notification_v97(
-                _np_send_email_safe_v97_core, to_email, subject, message
-            )
         return _np_send_email_safe_v97_core(to_email, subject, message)
 
 if callable(_np_send_assignment_email_v97_core):
     def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
-        if _np_fast_action_context_v97():
-            return _np_submit_notification_v97(
-                _np_send_assignment_email_v97_core,
-                dict(trader or {}), subject, title, details
-            )
-        return _np_send_assignment_email_v97_core(trader, subject, title, details)
+        return _np_send_assignment_email_v97_core(
+            dict(trader or {}), subject, title, details
+        )
 
 
 @app.before_request
