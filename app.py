@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V126_RESET_WAITING_FORENSIC_FIX_2026_10_04"
+NAIRAPIPS_RELEASE = "V127_DASHBOARD_HYDRATION_RECOVERY_2026_10_04"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1627,41 +1627,6 @@ def _pending_reset_replacements_from_accounts(account_rows, trader=None):
     """
     rows = list(account_rows or [])
 
-    # V126 FORENSIC FIX:
-    # A stale WAITING row must never survive because the caller supplied only a
-    # partial account slice. If a reset source is present, pull this trader's
-    # complete trader_accounts history directly and merge by immutable account ID.
-    # This is read-only reconciliation; it does not modify lifecycle state.
-    trader_ids = {
-        str(r.get("trader_id") or "").strip()
-        for r in rows
-        if str(r.get("trader_id") or "").strip()
-    }
-    if trader and str((trader or {}).get("id") or "").strip():
-        trader_ids.add(str((trader or {}).get("id") or "").strip())
-
-    if trader_ids:
-        by_id = {
-            str(r.get("id") or "").strip(): r
-            for r in rows
-            if str(r.get("id") or "").strip()
-        }
-        for tid in trader_ids:
-            try:
-                db_rows = (
-                    supabase.table("trader_accounts").select("*")
-                    .eq("trader_id", tid)
-                    .order("created_at", desc=False)
-                    .limit(1000).execute().data or []
-                )
-                for r in db_rows:
-                    rid = str(r.get("id") or "").strip()
-                    if rid:
-                        by_id[rid] = r
-            except Exception as exc:
-                print("V126 RESET FULL-HISTORY RECONCILIATION WARNING:", exc, flush=True)
-        rows = list(by_id.values())
-
     active_statuses = set(ACTIVE_ACCOUNT_STATUSES) | {
         "assigned_active", "active", "current_active",
         "phase1_active", "phase2_active", "funded_active",
@@ -1746,64 +1711,18 @@ def _pending_reset_replacements_from_accounts(account_rows, trader=None):
         if consumed:
             continue
 
-        # V126 ORDER-LEVEL COMPLETION EVIDENCE:
-        # Older assignment paths may have attached the replacement to the exact
-        # reset payment/order while leaving the archived_reset source fields stale.
-        # A completed exact reset order with replacement evidence means the wait
-        # was fulfilled and must not be recreated.
-        try:
-            for order in _np_v63_reset_orders_for_source(old):
-                oblob = _np_kill_blob(order)
-                replacement_id = str(
-                    order.get("reset_replacement_account_id")
-                    or order.get("replacement_account_id")
-                    or order.get("assigned_account_id")
-                    or order.get("trader_account_id")
-                    or ""
-                ).strip()
-                replacement_mt5 = str(
-                    order.get("replacement_mt5")
-                    or order.get("replacement_mt5_login")
-                    or order.get("mt5_login")
-                    or ""
-                ).strip()
-                completed = (
-                    "np_consumed:paid_reset:" in oblob
-                    or "reset_consumed replacement_account_id=" in oblob
-                    or "[np_reset_consumed:" in oblob
-                    or (
-                        str(order.get("status") or "").strip().lower() in {"completed", "assigned"}
-                        and (replacement_id or replacement_mt5)
-                    )
-                )
-                if not completed:
-                    continue
-
-                if replacement_id:
-                    child = next(
-                        (r for r in rows if str(r.get("id") or "").strip() == replacement_id),
-                        None
-                    )
-                    if child and str(child.get("mt5_login") or "").strip():
-                        consumed = True
-                        break
-                elif replacement_mt5:
-                    child = next(
-                        (r for r in rows if str(r.get("mt5_login") or "").strip() == replacement_mt5),
-                        None
-                    )
-                    if child:
-                        consumed = True
-                        break
-                else:
-                    # A permanent consumed marker is sufficient even if the child
-                    # later moved to history or was omitted from an old schema.
-                    consumed = True
-                    break
-        except Exception as exc:
-            print("V126 RESET ORDER COMPLETION CHECK WARNING:", exc, flush=True)
-
-        if consumed:
+        # V127 FAST PERMANENT COMPLETION MARKERS.
+        # Use only evidence already loaded in account_rows. No extra Supabase
+        # calls are allowed inside the fast trader bootstrap.
+        old_blob = _np_kill_blob(old)
+        if (
+            old.get("reset_consumed_at")
+            or old.get("reset_replacement_account_id")
+            or old.get("replacement_account_id")
+            or "np_consumed:paid_reset:" in old_blob
+            or "reset_consumed replacement_account_id=" in old_blob
+            or "[np_reset_consumed:" in old_blob
+        ):
             continue
 
         for candidate in rows:
