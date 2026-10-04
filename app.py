@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V123_COMMERCIAL_PLAN_CONTROL_2026_10_04"
+NAIRAPIPS_RELEASE = "V125_RESET_REPLACEMENT_TAKEOVER_2026_10_04"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1677,6 +1677,39 @@ def _pending_reset_replacements_from_accounts(account_rows, trader=None):
         )
 
         consumed = False
+
+        # V125 EXACT REPLACEMENT TAKEOVER:
+        # A reset source can already have the replacement attached directly
+        # (replacement_account_id / reset_replacement_account_id).  Do not keep
+        # manufacturing WAITING merely because that child was omitted from this
+        # particular bootstrap row collection. Verify the exact child directly.
+        explicit_child_ids = {
+            str(old.get("reset_replacement_account_id") or "").strip(),
+            str(old.get("replacement_account_id") or "").strip(),
+            str(old.get("successor_account_id") or "").strip(),
+        }
+        explicit_child_ids.discard("")
+        for child_id in explicit_child_ids:
+            try:
+                child_rows = (
+                    supabase.table("trader_accounts").select("*")
+                    .eq("id", child_id).limit(1).execute().data or []
+                )
+                child = child_rows[0] if child_rows else None
+                if not child:
+                    continue
+                # Exact owner protection: never let another trader's row consume this wait.
+                if str(child.get("trader_id") or "") != str(old.get("trader_id") or ""):
+                    continue
+                if str(child.get("mt5_login") or "").strip():
+                    consumed = True
+                    break
+            except Exception as exc:
+                print("RESET REPLACEMENT DIRECT CHILD VERIFY WARNING:", exc, flush=True)
+
+        if consumed:
+            continue
+
         for candidate in rows:
             if str(candidate.get("id") or "").strip() == old_id:
                 continue
