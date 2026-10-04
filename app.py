@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V120_MONITORING_EXCHANGE_AUTHORITY_2026_10_02"
+NAIRAPIPS_RELEASE = "V123_COMMERCIAL_PLAN_CONTROL_2026_10_04"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -183,16 +183,74 @@ def _staff_db():
 
 
 # NairaPips payout safety cap. Keep server-side because frontend/admin values can be stale.
-PAYOUT_PROFIT_SHARE_PERCENT = 60
-FUNDED_MAX_GROSS_PROFIT_PERCENT = 50.0  # absolute payout-liability ceiling; 60/40 split remains unchanged
+# Profit split is NOT globally hard-coded. Each Challenge Plan may choose its own
+# trader payout percentage. 60 is only a legacy fallback when no saved value exists.
+DEFAULT_PAYOUT_PROFIT_SHARE_PERCENT = 60.0
+FUNDED_MAX_GROSS_PROFIT_PERCENT = 50.0  # absolute payout-liability ceiling; independent of the plan's profit split
 
 def _effective_payout_split(*values):
-    """Enforce the global funded payout policy: 60% trader / 40% NairaPips.
+    """Return the first explicitly stored valid profit split (0..100).
 
-    Older trader/account/database rows may still contain 50. Those legacy values
-    must not override the current global policy.
+    This is deliberately configuration-driven. Challenge Plans can use 50/50,
+    60/40, 70/30, 80/20, 100/0, etc. without a code change.
     """
-    return PAYOUT_PROFIT_SHARE_PERCENT
+    for raw in values:
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(str(raw).replace("%", "").strip())
+        except Exception:
+            continue
+        if 0.0 <= value <= 100.0:
+            return value
+    return DEFAULT_PAYOUT_PROFIT_SHARE_PERCENT
+
+def _np_plan_payout_split_for_account(account, trader=None, request_payload=None):
+    """Resolve the exact Challenge Plan payout split for a funded account.
+
+    Authority order:
+      1) linked Challenge Plan (admin-controlled commercial rule)
+      2) account snapshot
+      3) trader snapshot
+      4) request payload (compatibility only)
+      5) legacy fallback 60
+    """
+    account = account or {}
+    trader = trader or {}
+    request_payload = request_payload or {}
+    plan_split = None
+    try:
+        purchase_id = str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip()
+        purchase = {}
+        if purchase_id:
+            rows = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
+            purchase = rows[0] if rows else {}
+        plan_id = str(
+            purchase.get("plan_id")
+            or purchase.get("challenge_plan_id")
+            or account.get("plan_id")
+            or ""
+        ).strip()
+        plan = {}
+        if plan_id:
+            rows = supabase.table("challenge_plans").select("*").eq("id", plan_id).limit(1).execute().data or []
+            plan = rows[0] if rows else {}
+        if not plan and purchase.get("plan_name"):
+            rows = (
+                supabase.table("challenge_plans").select("*")
+                .eq("name", purchase.get("plan_name")).limit(1).execute().data or []
+            )
+            plan = rows[0] if rows else {}
+        plan_split = plan.get("payout_split") if plan else None
+    except Exception as exc:
+        print("PLAN PAYOUT SPLIT RESOLUTION WARNING:", exc, flush=True)
+
+    return _effective_payout_split(
+        plan_split,
+        account.get("payout_split"),
+        trader.get("payout_split"),
+        request_payload.get("payout_split"),
+    )
 
 # ================================
 # STABILITY 2026-08-24 — Layer 4: in-memory read cache.
@@ -9312,8 +9370,11 @@ def create_plan():
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
              "challenge_journey": challenge_journey, "journey_source": "plan_create",
              "payout_split":_effective_payout_split(d.get("payout_split")),"description":d.get("description",""),
-             "second_life_enabled":_second_life_bool(d.get("second_life_enabled")),
-             "lives_total":2 if _second_life_bool(d.get("second_life_enabled")) else 1,
+             # V123 commercial controls: new/current plans do not create a free
+             # Second Life. Phase and Funded reset prices are explicit plan prices.
+             "second_life_enabled":False,"lives_total":1,
+             "reset_fee":clean(d.get("reset_fee")),
+             "funded_reset_fee":clean(d.get("funded_reset_fee")),
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
              "status":d.get("status","active"),"created_at":now_iso(),"updated_at":now_iso()}
         result = supabase.table("challenge_plans").insert(row).execute().data
@@ -9331,9 +9392,15 @@ def update_plan():
             if k in d: upd[k]=(_np_normalize_pool_class(d[k]) if k=="pool_class" else d[k])
         if "payout_split" in d:
             upd["payout_split"] = _effective_payout_split(d.get("payout_split"))
-        if "second_life_enabled" in d:
-            upd["second_life_enabled"] = _second_life_bool(d.get("second_life_enabled"))
-            upd["lives_total"] = 2 if upd["second_life_enabled"] else 1
+        # V123: Challenge Plans now use paid, admin-priced resets.
+        # Existing historical purchase snapshots keep any old Second-Life entitlement,
+        # but updating a current plan does not create new free reset entitlement.
+        upd["second_life_enabled"] = False
+        upd["lives_total"] = 1
+        if "reset_fee" in d:
+            upd["reset_fee"] = clean(d.get("reset_fee"))
+        if "funded_reset_fee" in d:
+            upd["funded_reset_fee"] = clean(d.get("funded_reset_fee"))
         upd["daily_drawdown"] = "None"
         if "mt5_server" in d and "default_server" not in d:
             upd["default_server"] = d.get("mt5_server")
@@ -11699,9 +11766,9 @@ def create_payout():
         funded_profit_ceiling = max(0, round(start_balance * (FUNDED_MAX_GROSS_PROFIT_PERCENT / 100.0), 2))
         # Business liability rule: payout calculations can never recognise more than
         # 50% gross profit on the exact funded plan/start balance, even if MT5 overshoots
-        # between scans. This does NOT change the existing 60/40 split.
+        # between scans. Profit split itself comes from the exact Challenge Plan.
         verified_profit = min(actual_verified_profit, funded_profit_ceiling)
-        split_pct = _effective_payout_split(account.get("payout_split"), trader_row.get("payout_split"), d.get("payout_split"))
+        split_pct = _np_plan_payout_split_for_account(account, trader_row, d)
         max_payout = max(0, round((verified_profit * split_pct) / 100, 2))
         if max_payout <= 0:
             return bad("No verified withdrawable profit yet.", 403)
@@ -24963,7 +25030,7 @@ def _np_ops_build():
                 required="Review/complete the payout against the exact funded account and verified profit.",
                 evidence={
                     "amount": p.get("amount"), "available_payout": p.get("available_payout"),
-                    "verified_profit": p.get("verified_profit"), "payout_split": p.get("payout_split") or 60,
+                    "verified_profit": p.get("verified_profit"), "payout_split": _effective_payout_split(p.get("payout_split")),
                 },
                 occurred_at=p.get("requested_at") or p.get("created_at")
             ))
@@ -25155,7 +25222,7 @@ def admin_trader_360():
             if p.get("approved_at"):
                 timeline.append({"type":"PAYOUT_APPROVED","at":p.get("approved_at"),"journey_id":pid,"journey_label":jlabel,"account_id":p.get("trader_account_id"),"mt5_login":mt5,"amount":p.get("amount"),"status":p.get("status"),"detail":"Payout approved"})
             if p.get("paid_at"):
-                timeline.append({"type":"PAYOUT_PAID","at":p.get("paid_at"),"journey_id":pid,"journey_label":jlabel,"account_id":p.get("trader_account_id"),"mt5_login":mt5,"amount":p.get("amount"),"status":p.get("status"),"detail":f"Payout paid · trader share {p.get('payout_split') or 60}%"})
+                timeline.append({"type":"PAYOUT_PAID","at":p.get("paid_at"),"journey_id":pid,"journey_label":jlabel,"account_id":p.get("trader_account_id"),"mt5_login":mt5,"amount":p.get("amount"),"status":p.get("status"),"detail":f"Payout paid · trader share {_effective_payout_split(p.get('payout_split'))}%"})
             if p.get("rejected_at"):
                 timeline.append({"type":"PAYOUT_REJECTED","at":p.get("rejected_at"),"journey_id":pid,"journey_label":jlabel,"account_id":p.get("trader_account_id"),"mt5_login":mt5,"amount":p.get("amount"),"status":p.get("status"),"detail":"Payout rejected"})
 
@@ -25252,10 +25319,18 @@ def _np_reset_current_plan_for(account, purchase=None):
     return rows[0]
 
 
-def _np_reset_price(plan):
+def _np_reset_price(plan, stage=None):
+    """Plan-controlled reset price.
+
+    Phase 1 / Phase 2 use challenge_plans.reset_fee.
+    Funded uses challenge_plans.funded_reset_fee.
+    No percentage, challenge-fee multiple, or free-price rule is hard-coded here.
+    """
     if not plan:
         return 0.0
-    for key in ("fee", "price", "challenge_fee", "amount"):
+    stage = _normalize_lifecycle_stage(stage or "phase1")
+    keys = ("funded_reset_fee",) if stage == "funded" else ("reset_fee",)
+    for key in keys:
         value = clean(plan.get(key))
         if value and value > 0:
             return value
@@ -25411,7 +25486,7 @@ def _np_reset_policy(account, trader=None):
     purchase = _np_reset_purchase_for_account(account) or {}
     plan = _np_reset_current_plan_for(account, purchase) or {}
     size = clean(account.get("account_size") or account.get("start_balance") or purchase.get("account_size") or 0)
-    price = _np_reset_price(plan)
+    price = _np_reset_price(plan, stage)
     second_enabled = _second_life_bool(purchase.get("second_life_enabled")) if purchase else False
     second_used = _second_life_bool(purchase.get("second_life_used")) if purchase else False
     life_number = int(purchase.get("life_number") or 1) if purchase else 1
@@ -25477,7 +25552,7 @@ def _np_reset_policy(account, trader=None):
         return {
             "eligible": True, "kind": "paid_challenge", "reason": "challenge_reset_payment_required",
             "title": "Continue This Challenge Journey",
-            "subtitle": "You have one paid reset available on this Challenge journey. Reset stays at the same stage and costs the current price of this account-size Challenge.",
+            "subtitle": "You have one paid reset available on this Challenge journey. Reset stays at the same stage and uses the Phase Reset Price configured on this Challenge Plan.",
             "stage": stage, "account_size": size, "source_account_id": source_id,
             "source_mt5_login": account.get("mt5_login"), "purchase_id": purchase.get("id"),
             "plan_id": plan.get("id"), "plan_name": plan.get("name") or plan.get("plan_name") or purchase.get("plan_name"), "price": price,
@@ -25517,7 +25592,7 @@ def _np_reset_policy(account, trader=None):
         return {
             "eligible": True, "kind": "paid_funded", "reason": "funded_reset_payment_required",
             "title": "Your Funded Journey Can Continue",
-            "subtitle": "You have one Funded reset available on this journey. The reset costs the current price of this account-size Challenge and returns you to Funded after payment approval.",
+            "subtitle": "You have one Funded reset available on this journey. It uses the Funded Reset Price configured on this Challenge Plan and returns you to Funded after payment approval.",
             "stage": "funded", "account_size": size, "source_account_id": source_id,
             "source_mt5_login": account.get("mt5_login"), "purchase_id": purchase.get("id"),
             "plan_id": plan.get("id"), "plan_name": plan.get("name") or plan.get("plan_name") or purchase.get("plan_name"), "price": price,
@@ -27924,7 +27999,7 @@ def _np_ja_journey_authority(trader_id, journey_id):
         if p.get("approved_at"):
             ledger.append({"type":"PAYOUT_APPROVED","at":p.get("approved_at"),"journey_id":journey_id,"account_id":aid,"mt5_login":mt5,"amount":p.get("amount"),"detail":"PAYOUT APPROVED"})
         if p.get("paid_at") or str(p.get("status") or "").lower() == "paid":
-            ledger.append({"type":"PAYOUT_PAID","at":p.get("paid_at") or p.get("updated_at"),"journey_id":journey_id,"account_id":aid,"mt5_login":mt5,"amount":p.get("amount"),"detail":f"PAYOUT PAID · trader share {p.get('payout_split') or 60}%"})
+            ledger.append({"type":"PAYOUT_PAID","at":p.get("paid_at") or p.get("updated_at"),"journey_id":journey_id,"account_id":aid,"mt5_login":mt5,"amount":p.get("amount"),"detail":f"PAYOUT PAID · trader share {_effective_payout_split(p.get('payout_split'))}%"})
         if p.get("rejected_at"):
             ledger.append({"type":"PAYOUT_REJECTED","at":p.get("rejected_at"),"journey_id":journey_id,"account_id":aid,"mt5_login":mt5,"amount":p.get("amount"),"detail":"PAYOUT REJECTED"})
 
@@ -41777,16 +41852,10 @@ def _np_v64_positive_money(row, keys):
 
 
 def _np_v61_reset_price(account, purchase):
-    """Final reset-price authority used by V61/V62/V63 Funded-reset decisions.
+    """Final Funded-reset price authority for V61/V62/V63.
 
-    Priority:
-    1) explicit reset-price fields on current matching plan
-    2) standard fee/price fields on current plan
-    3) exact root purchase transaction amount
-
-    The last fallback is safe because this business model uses the paid challenge
-    amount as the reset amount when no separate reset fee is stored. It never
-    returns zero as an eligible paid reset.
+    Funded reset price is whatever Admin saved in challenge_plans.funded_reset_fee.
+    It is intentionally NOT calculated from challenge fee and is NOT hard-coded.
     """
     account = account or {}
     purchase = purchase or {}
@@ -41797,61 +41866,12 @@ def _np_v61_reset_price(account, purchase):
     except Exception:
         plan = {}
 
-    # Prefer an explicitly stored reset fee if production plans contain one.
-    price, key = _np_v64_positive_money(
-        plan,
-        (
-            "funded_reset_fee",
-            "reset_fee",
-            "reset_price",
-            "reset_amount",
-            "replacement_fee",
-        ),
-    )
+    price, key = _np_v64_positive_money(plan, ("funded_reset_fee",))
     if price > 0:
         return price, plan, f"current_plan_{key}"
 
-    # Normal plan/challenge fee fields.
-    price, key = _np_v64_positive_money(
-        plan,
-        (
-            "fee",
-            "price",
-            "challenge_fee",
-            "plan_fee",
-            "amount",
-            "final_fee",
-            "amount_due",
-        ),
-    )
-    if price > 0:
-        return price, plan, f"current_plan_{key}"
+    return 0.0, plan or purchase or {}, "funded_reset_fee_unresolved"
 
-    # Exact root purchase transaction. These are the same fields used by the
-    # production Admin purchase screen, including amount_paid/payment_amount.
-    price, key = _np_v64_positive_money(
-        purchase,
-        (
-            "reset_fee",
-            "funded_reset_fee",
-            "final_fee",
-            "amount_due",
-            "amount_paid",
-            "payment_amount",
-            "plan_fee",
-            "challenge_fee",
-            "challenge_price",
-            "fee",
-            "price",
-            "original_fee",
-            "paid_amount",
-            "amount",
-        ),
-    )
-    if price > 0:
-        return price, purchase, f"root_purchase_{key}"
-
-    return 0.0, plan or purchase or {}, "unresolved"
 
 
 @app.route("/admin/automation_v64/reset_price_diagnostic", methods=["GET", "OPTIONS"])
@@ -54369,4 +54389,265 @@ try:
     NAIRAPIPS_RELEASE = NAIRAPIPS_MONITORING_ASSIGNMENT_INTEGRITY_RELEASE_V121
 except Exception:
     pass
+
+
+# ============================================================================
+# NAIRAPIPS HISTORIC TRUTH V122 — PERMANENT WORST-DD EVIDENCE — 04 OCT 2026
+# ============================================================================
+# PURPOSE
+# -------
+# Read-only historic evidence for one immutable trader_account / MT5 cycle.
+# This does NOT alter assignment, lifecycle, payout, reset, pass or breach logic.
+#
+# Authority:
+#   - trader_accounts.lowest_equity / highest_equity are the durable extrema
+#   - sparse monitoring_events record new historic lows/highs with timestamps
+#   - monitoring_snapshots are used as fallback evidence for older accounts
+#
+# Invariant:
+#   A recovery can never raise/erase the stored historic low. Therefore an
+#   account that reached 9% static DD and later recovered still reports 9%.
+# ============================================================================
+
+NAIRAPIPS_HISTORIC_TRUTH_RELEASE_V122 = "HISTORIC_TRUTH_V122_2026_10_04"
+
+def _np_ht_num_v122(value, default=0.0):
+    try:
+        if value in (None, ""):
+            return float(default)
+        return float(str(value).replace("₦", "").replace(",", "").strip())
+    except Exception:
+        return float(default)
+
+def _np_ht_equity_v122(row):
+    row = row or {}
+    for key in ("equity", "current_equity", "lowest_equity", "balance", "current_balance"):
+        value = _np_ht_num_v122(row.get(key), 0.0)
+        if value > 0:
+            return value
+    return 0.0
+
+def _np_ht_exact_account_v122(account_id, trader_id="", mt5_login=""):
+    account_id = str(account_id or "").strip()
+    trader_id = str(trader_id or "").strip()
+    mt5_login = str(mt5_login or "").strip()
+
+    rows = []
+    if account_id:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", account_id).limit(1).execute().data or []
+        )
+    elif mt5_login:
+        q = supabase.table("trader_accounts").select("*").eq("mt5_login", mt5_login)
+        if trader_id:
+            q = q.eq("trader_id", trader_id)
+        rows = q.order("created_at", desc=True).limit(10).execute().data or []
+
+    if not rows:
+        return None
+
+    if account_id:
+        row = rows[0]
+        if trader_id and str(row.get("trader_id") or "") != trader_id:
+            return None
+        if mt5_login and str(row.get("mt5_login") or "").strip() != mt5_login:
+            return None
+        return row
+
+    # MT5-only lookup must resolve unambiguously to the requested trader/cycle.
+    exact = [r for r in rows if (not trader_id or str(r.get("trader_id") or "") == trader_id)]
+    return exact[0] if len(exact) == 1 else None
+
+def _np_ht_event_rows_v122(account_id, event_type):
+    try:
+        return (
+            supabase.table("monitoring_events").select("*")
+            .eq("trader_account_id", account_id)
+            .eq("event_type", event_type)
+            .order("created_at", desc=False)
+            .limit(5000).execute().data or []
+        )
+    except Exception:
+        return []
+
+def _np_ht_snapshot_rows_v122(account_id, mt5_login):
+    # Fallback for accounts that pre-date V122 sparse record-low events.
+    try:
+        rows = (
+            supabase.table("monitoring_snapshots").select("*")
+            .eq("trader_account_id", account_id)
+            .order("created_at", desc=False)
+            .limit(5000).execute().data or []
+        )
+        if rows:
+            return rows
+    except Exception:
+        pass
+    if mt5_login:
+        try:
+            return (
+                supabase.table("monitoring_snapshots").select("*")
+                .eq("mt5_login", mt5_login)
+                .order("created_at", desc=False)
+                .limit(5000).execute().data or []
+            )
+        except Exception:
+            pass
+    return []
+
+@app.route("/account_truth_v116", methods=["GET", "OPTIONS"])
+def account_truth_v122_compat():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    requested_trader = str(request.args.get("trader_id") or "").strip()
+    account_id = str(request.args.get("account_id") or "").strip()
+    mt5_login = str(request.args.get("mt5_login") or "").strip()
+
+    admin = _request_admin_auth()
+    if admin:
+        trader_id = requested_trader
+    else:
+        trader_id, auth_error = _authenticated_trader_id_for_request(requested_trader or None)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+
+    try:
+        account = _np_ht_exact_account_v122(account_id, trader_id, mt5_login)
+        if not account:
+            return _np_fail("Trading account not found", 404)
+
+        if not admin and str(account.get("trader_id") or "") != str(trader_id or ""):
+            return _np_fail("This account does not belong to the authenticated trader", 403)
+
+        account_id = str(account.get("id") or "")
+        trader_id = str(account.get("trader_id") or "")
+        mt5_login = str(account.get("mt5_login") or "").strip()
+        start = _np_ht_num_v122(
+            account.get("start_balance"),
+            _np_ht_num_v122(account.get("account_size"), 0.0),
+        )
+        current = _np_ht_num_v122(
+            account.get("current_equity"),
+            _np_ht_num_v122(account.get("equity"), start),
+        )
+        stored_low = _np_ht_num_v122(account.get("lowest_equity"), 0.0)
+        stored_high = _np_ht_num_v122(account.get("highest_equity"), 0.0)
+        dd_limit = _np_ht_num_v122(account.get("dd_limit_percent"), 20.0) or 20.0
+
+        low_events = _np_ht_event_rows_v122(account_id, "historic_equity_low")
+        high_events = _np_ht_event_rows_v122(account_id, "historic_equity_high")
+
+        low_event = None
+        if low_events:
+            low_event = min(
+                low_events,
+                key=lambda r: _np_ht_num_v122(
+                    r.get("equity"),
+                    _np_ht_num_v122(r.get("lowest_equity"), 10**30),
+                )
+            )
+        high_event = None
+        if high_events:
+            high_event = max(
+                high_events,
+                key=lambda r: _np_ht_num_v122(
+                    r.get("equity"),
+                    _np_ht_num_v122(r.get("highest_equity"), 0.0),
+                )
+            )
+
+        snapshots = []
+        # Only fetch the heavier historical snapshot set when sparse V122 evidence
+        # does not yet provide both extrema/timestamps.
+        if not low_event or not high_event:
+            snapshots = _np_ht_snapshot_rows_v122(account_id, mt5_login)
+
+        valid = [(r, _np_ht_equity_v122(r)) for r in snapshots]
+        valid = [(r, eq) for r, eq in valid if eq > 0]
+
+        snap_low_row = min(valid, key=lambda p: p[1]) if valid else (None, 0.0)
+        snap_high_row = max(valid, key=lambda p: p[1]) if valid else (None, 0.0)
+
+        low_candidates = [x for x in (stored_low, snap_low_row[1], current, start) if x and x > 0]
+        high_candidates = [x for x in (stored_high, snap_high_row[1], current, start) if x and x > 0]
+        lowest = min(low_candidates) if low_candidates else 0.0
+        highest = max(high_candidates) if high_candidates else 0.0
+
+        if low_event:
+            event_low = _np_ht_num_v122(
+                low_event.get("equity"),
+                _np_ht_num_v122(low_event.get("lowest_equity"), 0.0),
+            )
+            if event_low > 0:
+                lowest = min(lowest or event_low, event_low)
+
+        if high_event:
+            event_high = _np_ht_num_v122(
+                high_event.get("equity"),
+                _np_ht_num_v122(high_event.get("highest_equity"), 0.0),
+            )
+            if event_high > 0:
+                highest = max(highest, event_high)
+
+        max_dd = max(0.0, ((start - lowest) / start) * 100.0) if start and lowest else 0.0
+        breach_level = start * (1.0 - dd_limit / 100.0) if start else 0.0
+        ever_crossed = bool(breach_level and lowest and lowest <= breach_level + 0.0001)
+
+        lowest_at = (
+            (low_event or {}).get("created_at")
+            or (snap_low_row[0] or {}).get("created_at")
+            or account.get("last_sync_at")
+        )
+        highest_at = (
+            (high_event or {}).get("created_at")
+            or (snap_high_row[0] or {}).get("created_at")
+            or account.get("last_sync_at")
+        )
+
+        first_cross_at = None
+        if ever_crossed:
+            # Prefer sparse low events, otherwise locate the earliest snapshot
+            # actually at/below the account's DD threshold.
+            for row in low_events:
+                eq = _np_ht_num_v122(row.get("equity"), _np_ht_num_v122(row.get("lowest_equity"), 0.0))
+                if eq > 0 and eq <= breach_level + 0.0001:
+                    first_cross_at = row.get("created_at")
+                    break
+            if first_cross_at is None:
+                for row, eq in valid:
+                    if eq <= breach_level + 0.0001:
+                        first_cross_at = row.get("created_at")
+                        break
+            if first_cross_at is None:
+                first_cross_at = account.get("breach_at") or account.get("breached_at")
+
+        return _np_ok({
+            "success": True,
+            "release": NAIRAPIPS_HISTORIC_TRUTH_RELEASE_V122,
+            "truth": {
+                "trader_id": trader_id,
+                "trader_account_id": account_id,
+                "mt5_login": mt5_login,
+                "stage": account.get("stage") or account.get("phase"),
+                "account_status": account.get("account_status") or account.get("status"),
+                "start_balance": start,
+                "current_equity": current,
+                "lowest_equity": lowest,
+                "lowest_equity_at": lowest_at,
+                "highest_equity": highest,
+                "highest_equity_at": highest_at,
+                "max_historic_dd_percent": round(max_dd, 4),
+                "dd_limit_percent": dd_limit,
+                "breach_equity_level": breach_level,
+                "ever_crossed_dd_limit": ever_crossed,
+                "first_crossed_dd_limit_at": first_cross_at,
+                "recovery_never_erases_low": True,
+            }
+        })
+    except Exception as exc:
+        print("HISTORIC TRUTH V122 QUERY ERROR:", exc, flush=True)
+        return _np_fail("Historic Truth query failed: " + str(exc), 500)
+
 
