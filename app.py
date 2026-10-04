@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V127_DASHBOARD_HYDRATION_RECOVERY_2026_10_04"
+NAIRAPIPS_RELEASE = "V129_FUNDED_REPLACEMENT_AUTHORITY_2026_10_04"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1336,6 +1336,100 @@ def _get_active_account(trader_id, trader=None):
     except Exception as e:
         print("ACTIVE ACCOUNT FETCH ERROR:", e)
         return None
+
+
+
+def _np_bootstrap_replacement_takeover_v129(account_rows):
+    """Resolve a concrete assigned replacement before exposing WAITING.
+
+    This is DISPLAY/BOOTSTRAP reconciliation only. It never changes Supabase.
+    If an old reset/source row explicitly points to a child account and that child
+    already has a real MT5 login, the child owns the dashboard slot. Stale
+    waiting/archive words on the child do not beat the explicit replacement
+    relationship unless the child has concrete breach/closed/disabled evidence.
+    """
+    rows = [dict(r or {}) for r in (account_rows or [])]
+    by_id = {
+        str(r.get("id") or "").strip(): r
+        for r in rows
+        if str(r.get("id") or "").strip()
+    }
+    preferred = None
+
+    for source in rows:
+        child_ids = [
+            str(source.get("reset_replacement_account_id") or "").strip(),
+            str(source.get("replacement_account_id") or "").strip(),
+            str(source.get("successor_account_id") or "").strip(),
+        ]
+        child_ids = [x for x in child_ids if x]
+        if not child_ids:
+            continue
+
+        for child_id in child_ids:
+            child = by_id.get(child_id)
+            if not child:
+                continue
+            if str(child.get("trader_id") or "").strip() != str(source.get("trader_id") or "").strip():
+                continue
+
+            login = str(child.get("mt5_login") or "").strip()
+            if not login:
+                continue
+
+            blob = " ".join(str(child.get(k) or "") for k in (
+                "account_status", "status", "lifecycle_state", "challenge_state",
+                "archive_reason", "breach_reason", "admin_note", "message"
+            )).lower()
+
+            hard_terminal = bool(
+                child.get("breached_at")
+                or child.get("breach_at")
+                or child.get("mt5_access_disabled")
+                or "breach" in blob
+                or "closed" in blob
+                or "disabled" in blob
+            )
+            if hard_terminal:
+                continue
+
+            stage = _normalize_lifecycle_stage(
+                child.get("stage") or child.get("phase") or source.get("stage") or source.get("phase")
+            )
+            normalized = dict(child)
+            normalized["_np_original_account_status"] = child.get("account_status") or child.get("status")
+            normalized["_np_replacement_takeover"] = True
+            normalized["_np_replacement_source_account_id"] = source.get("id")
+            normalized["stage"] = stage
+
+            # A real assigned replacement is active for dashboard purposes even
+            # when an old status mirror was never cleaned after assignment.
+            if stage == "funded":
+                normalized["account_status"] = "funded_active"
+                normalized["status"] = "funded_active"
+                normalized["lifecycle_state"] = "funded_active"
+            elif stage == "phase2":
+                normalized["account_status"] = "phase2_active"
+                normalized["status"] = "phase2_active"
+                normalized["lifecycle_state"] = "phase2_active"
+            else:
+                normalized["account_status"] = "phase1_active"
+                normalized["status"] = "phase1_active"
+                normalized["lifecycle_state"] = "phase1_active"
+
+            by_id[child_id] = normalized
+            # Newest explicit replacement wins if there are several old sources.
+            if preferred is None or _dt_score(
+                normalized.get("assigned_at") or normalized.get("started_at")
+                or normalized.get("updated_at") or normalized.get("created_at")
+            ) >= _dt_score(
+                preferred.get("assigned_at") or preferred.get("started_at")
+                or preferred.get("updated_at") or preferred.get("created_at")
+            ):
+                preferred = normalized
+
+    normalized_rows = [by_id.get(str(r.get("id") or "").strip(), r) for r in rows]
+    return normalized_rows, preferred
 
 
 
@@ -8140,10 +8234,27 @@ def trader_bootstrap():
                 decorated = _decorate_account_for_api(row)
             all_accounts.append(decorated)
 
+        # V129 explicit replacement authority.
+        # If an archived/reset source already points to a child that has a real MT5,
+        # the child is the current display account. This is response-only normalization.
+        all_accounts, replacement_takeover = _np_bootstrap_replacement_takeover_v129(all_accounts)
+        if replacement_takeover:
+            trader = dict(trader or {})
+            trader["current_account_id"] = replacement_takeover.get("id")
+            takeover_stage = _normalize_lifecycle_stage(
+                replacement_takeover.get("stage") or replacement_takeover.get("phase")
+            )
+            trader["phase"] = takeover_stage
+            trader["challenge_state"] = (
+                "funded_active" if takeover_stage == "funded"
+                else ("phase2_active" if takeover_stage == "phase2" else "phase1_active")
+            )
+
         # Preserve account history. Frontend decides which records are selectable.
         active_accounts = list(all_accounts)
 
-        # Current trading pointer: explicit trader pointer wins, then genuine live/funded,
+        # Current trading pointer: explicit replacement/current trader pointer wins,
+        # then genuine live/funded, then latest account.
         # then latest account. This is display authority only.
         current_account_id = str(trader.get("current_account_id") or "").strip()
         account = None
@@ -8167,7 +8278,9 @@ def trader_bootstrap():
                 ),
                 None,
             )
-        if not account and all_accounts:
+        if replacement_takeover:
+            account = replacement_takeover
+        elif not account and all_accounts:
             account = all_accounts[0]
 
         purchase = purchases[0] if purchases else None
@@ -8178,6 +8291,16 @@ def trader_bootstrap():
         pending_replacements = _pending_reset_replacements_from_accounts(
             account_rows, trader
         )
+        if replacement_takeover:
+            fulfilled_source_ids = {
+                str(replacement_takeover.get("_np_replacement_source_account_id") or "").strip()
+            }
+            fulfilled_source_ids.discard("")
+            pending_replacements = [
+                r for r in pending_replacements
+                if str(r.get("replaces_trader_account_id") or r.get("source_account_id") or "").strip()
+                not in fulfilled_source_ids
+            ]
 
         # EXPLICIT DUAL-JOURNEY AUTHORITY:
         # The frontend must not infer Second Life from archived/reset/funded history.
