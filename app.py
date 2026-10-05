@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V138_EXACT_COUNT_AUTH_FIX_2026_10_05"
+NAIRAPIPS_RELEASE = "V140_FUNDED_WAITING_SELF_HEAL_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -8788,6 +8788,8 @@ def trader_bootstrap():
                     continue
 
                 repaired = _np_self_heal_waiting_reset_v130(source_row)
+                if not repaired:
+                    repaired = _np_repair_unique_funded_successor_v140(source_row)
                 if not repaired:
                     continue
 
@@ -30849,6 +30851,162 @@ def _np_find_exact_reset_replacement_v8(source, order=None):
 
 
 
+
+def _np_find_unique_funded_successor_v140(source):
+    """Conservative fallback for old funded-reset lineages with missing link columns.
+
+    Return a child only when exactly one later, non-terminal Funded MT5 exists
+    for the same trader and same account size.
+    """
+    source = source or {}
+    trader_id = str(source.get("trader_id") or "").strip()
+    source_id = str(source.get("id") or "").strip()
+    if not trader_id or not source_id:
+        return None
+
+    if _normalize_lifecycle_stage(source.get("stage") or source.get("phase")) != "funded":
+        return None
+
+    source_size = float(clean(source.get("account_size") or source.get("start_balance") or 0) or 0)
+    if source_size <= 0:
+        return None
+
+    source_time = _dt_score(
+        source.get("reset_at") or source.get("archived_at")
+        or source.get("updated_at") or source.get("created_at")
+    )
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("trader_id", trader_id)
+            .limit(5000).execute().data or []
+        )
+    except Exception as exc:
+        print("V140 FUNDED SUCCESSOR LOAD WARNING:", exc, flush=True)
+        return None
+
+    candidates = []
+    for row in rows:
+        if str(row.get("id") or "").strip() == source_id:
+            continue
+        login = str(row.get("mt5_login") or "").strip()
+        if not login:
+            continue
+
+        row_size = float(clean(row.get("account_size") or row.get("start_balance") or 0) or 0)
+        if abs(row_size - source_size) > 0.01:
+            continue
+
+        stage = _normalize_lifecycle_stage(row.get("stage") or row.get("phase"))
+        blob = " ".join(str(row.get(k) or "") for k in (
+            "account_status","status","lifecycle_state","challenge_state",
+            "archive_reason","breach_reason","admin_note"
+        )).lower()
+        funded_signal = (
+            stage == "funded"
+            or "funded_active" in blob
+            or str(row.get("account_status") or "").strip().lower() in {"funded","funded_active"}
+            or str(row.get("status") or "").strip().lower() in {"funded","funded_active"}
+        )
+        if not funded_signal:
+            continue
+
+        hard_terminal = bool(
+            row.get("breached_at")
+            or row.get("breach_at")
+            or row.get("mt5_access_disabled")
+            or "breach" in blob
+            or "closed" in blob
+            or "disabled" in blob
+        )
+        if hard_terminal:
+            continue
+
+        row_time = _dt_score(
+            row.get("assigned_at") or row.get("started_at")
+            or row.get("created_at") or row.get("updated_at")
+        )
+        if source_time and row_time and row_time <= source_time:
+            continue
+
+        candidates.append(row)
+
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _np_repair_unique_funded_successor_v140(source):
+    replacement = _np_find_unique_funded_successor_v140(source)
+    if not replacement:
+        return None
+
+    trader_id = str(source.get("trader_id") or "").strip()
+    source_id = str(source.get("id") or "").strip()
+    replacement_id = str(replacement.get("id") or "").strip()
+    replacement_mt5 = str(replacement.get("mt5_login") or "").strip()
+    if not trader_id or not source_id or not replacement_id or not replacement_mt5:
+        return None
+
+    now = now_iso()
+
+    try:
+        payload = {
+            "account_status": "archived",
+            "status": "archived",
+            "reset_consumed_at": source.get("reset_consumed_at") or now,
+            "reset_replacement_account_id": replacement_id,
+            "archive_reason": (
+                str(source.get("archive_reason") or "")
+                + f" | V140 funded_successor_consumed replacement_account_id={replacement_id} replacement_mt5={replacement_mt5}"
+            ).strip(" |"),
+            "updated_at": now,
+        }
+        try:
+            supabase.table("trader_accounts").update(payload).eq("id", source_id).eq("trader_id", trader_id).execute()
+        except Exception:
+            payload.pop("reset_consumed_at", None)
+            payload.pop("reset_replacement_account_id", None)
+            supabase.table("trader_accounts").update(payload).eq("id", source_id).eq("trader_id", trader_id).execute()
+    except Exception as exc:
+        print("V140 FUNDED SOURCE REPAIR ERROR:", exc, flush=True)
+        return None
+
+    try:
+        supabase.table("trader_accounts").update({
+            "stage": "funded",
+            "account_status": "funded_active",
+            "status": "funded_active",
+            "updated_at": now,
+        }).eq("id", replacement_id).eq("trader_id", trader_id).execute()
+    except Exception as exc:
+        print("V140 FUNDED CHILD STATUS WARNING:", exc, flush=True)
+
+    try:
+        supabase.table("traders").update({
+            "current_account_id": replacement_id,
+            "phase": "funded",
+            "challenge_state": "funded_active",
+            "updated_at": now,
+        }).eq("id", trader_id).execute()
+    except Exception as exc:
+        print("V140 FUNDED TRADER POINTER WARNING:", exc, flush=True)
+
+    repaired = dict(replacement)
+    repaired.update({
+        "stage": "funded",
+        "account_status": "funded_active",
+        "status": "funded_active",
+        "lifecycle_state": "funded_active",
+        "_np_replacement_takeover": True,
+        "_np_replacement_source_account_id": source_id,
+    })
+    try:
+        _invalidate_trader_bootstrap_cache(trader_id)
+    except Exception:
+        pass
+    return repaired
+
+
 def _np_self_heal_waiting_reset_v130(source):
     """Repair ONE stale reset lineage only when a unique replacement can be proven.
 
@@ -30868,6 +31026,8 @@ def _np_self_heal_waiting_reset_v130(source):
         return None
 
     replacement = _np_find_exact_reset_replacement_v8(source, None)
+    if not replacement:
+        replacement = _np_find_unique_funded_successor_v140(source)
     if not replacement:
         return None
 
