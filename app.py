@@ -5556,6 +5556,111 @@ def _np_exact_registered_trader_count_v134(force=False):
         raise
 
 
+
+# ---------------------------------------------------------------------------
+# V135 FAST ADMIN DATA PLANE
+# One compact read path for the Traders screen. The existing transactional
+# endpoints remain unchanged and authoritative for writes.
+# ---------------------------------------------------------------------------
+_NP_ADMIN_TRADERS_FAST_CACHE_V135 = {"ts": 0.0, "payload": None}
+_NP_ADMIN_TRADERS_FAST_LOCK_V135 = threading.Lock()
+
+def _np_admin_traders_fast_payload_v135(force=False):
+    now = time.time()
+    cached = _NP_ADMIN_TRADERS_FAST_CACHE_V135.get("payload")
+    cached_ts = float(_NP_ADMIN_TRADERS_FAST_CACHE_V135.get("ts") or 0)
+
+    if cached is not None and not force and now - cached_ts < 8:
+        out = dict(cached)
+        out["cache"] = "hit"
+        out["age_ms"] = int((now - cached_ts) * 1000)
+        return out
+
+    with _NP_ADMIN_TRADERS_FAST_LOCK_V135:
+        now = time.time()
+        cached = _NP_ADMIN_TRADERS_FAST_CACHE_V135.get("payload")
+        cached_ts = float(_NP_ADMIN_TRADERS_FAST_CACHE_V135.get("ts") or 0)
+        if cached is not None and not force and now - cached_ts < 8:
+            out = dict(cached)
+            out["cache"] = "hit"
+            out["age_ms"] = int((now - cached_ts) * 1000)
+            return out
+
+        started = time.time()
+
+        # Two independent Supabase reads run concurrently.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            trader_future = pool.submit(
+                lambda: (
+                    supabase.table("traders")
+                    .select("*")
+                    .order("created_at", desc=True)
+                    .limit(10000)
+                    .execute().data or []
+                )
+            )
+            account_future = pool.submit(
+                lambda: (
+                    supabase.table("trader_accounts")
+                    .select("*")
+                    .order("updated_at", desc=True)
+                    .limit(10000)
+                    .execute().data or []
+                )
+            )
+            traders = trader_future.result()
+            accounts = account_future.result()
+
+        # Do not run lifecycle decoration / plan lookup here. This endpoint exists
+        # specifically to make the list screen fast. Exact lifecycle actions keep
+        # using their existing protected endpoints.
+        payload = {
+            "success": True,
+            "traders": _dedupe_traders(traders),
+            "accounts": accounts,
+            "trader_count": len(_dedupe_traders(traders)),
+            "account_count": len(accounts),
+            "generated_at": now_iso(),
+            "server_ms": int((time.time() - started) * 1000),
+            "cache": "miss",
+            "age_ms": 0,
+        }
+
+        _NP_ADMIN_TRADERS_FAST_CACHE_V135["ts"] = time.time()
+        _NP_ADMIN_TRADERS_FAST_CACHE_V135["payload"] = payload
+        return dict(payload)
+
+
+@app.route("/admin/traders_fast_v135", methods=["GET", "OPTIONS"])
+def admin_traders_fast_v135():
+    if request.method == "OPTIONS":
+        return jsonify({"success": True})
+
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    try:
+        force = str(request.args.get("fresh") or "").lower() in {"1", "true", "yes"}
+        return jsonify(_np_admin_traders_fast_payload_v135(force=force))
+    except Exception as exc:
+        # If Supabase has a transient slow moment, return the last good snapshot
+        # instead of making the Admin stare at an empty loading screen.
+        cached = _NP_ADMIN_TRADERS_FAST_CACHE_V135.get("payload")
+        if cached is not None:
+            out = dict(cached)
+            out["success"] = True
+            out["stale"] = True
+            out["warning"] = str(exc)
+            out["cache"] = "stale-fallback"
+            return jsonify(out)
+        return jsonify({
+            "success": False,
+            "error": "Fast trader feed is temporarily unavailable.",
+            "detail": str(exc),
+        }), 500
+
+
 @app.route("/admin/traders_count", methods=["GET", "OPTIONS"])
 def admin_traders_count_v134():
     if request.method == "OPTIONS":
