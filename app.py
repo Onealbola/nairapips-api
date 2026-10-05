@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V148_ASSIGNMENT_ADMIN_EMAIL_RESTORE_2026_10_05"
+NAIRAPIPS_RELEASE = "V150_EXISTING_MT5_RECONCILE_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -11232,6 +11232,181 @@ def admin_repair_purchase_assignment_v146():
         if not size:
             return bad("Purchase account size is missing.", 409)
 
+        # V150 EXISTING ACCOUNT RECONCILIATION:
+        # A successful assignment can exist in trader_accounts even when an older
+        # purchase mirror failed to receive mt5_login / trader_account_id.
+        # NEVER allocate another MT5 until we have checked for exactly one safe,
+        # unlinked same-trader, same-size Phase 1 account.
+        try:
+            candidate_rows = (
+                supabase.table("trader_accounts").select("*")
+                .eq("trader_id", tid)
+                .eq("account_size", size)
+                .order("created_at", desc=True)
+                .limit(200).execute().data or []
+            )
+        except Exception as _v150_candidate_exc:
+            print("V150 EXISTING MT5 CANDIDATE LOAD WARNING:", _v150_candidate_exc, flush=True)
+            candidate_rows = []
+
+        def _v150_time_score(value):
+            try:
+                if not value:
+                    return 0.0
+                return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+            except Exception:
+                return 0.0
+
+        purchase_time = _v150_time_score(
+            p.get("transaction_date")
+            or p.get("created_at")
+            or p.get("submitted_at")
+            or p.get("approved_at")
+        )
+
+        safe_existing = []
+        for _a in candidate_rows:
+            _login = str(_a.get("mt5_login") or "").strip()
+            if not _login:
+                continue
+
+            _stage = str(_a.get("stage") or _a.get("phase") or "").strip().lower()
+            if _stage not in {"phase1", "phase_1", "phase 1"}:
+                continue
+
+            _blob = " ".join(str(_a.get(k) or "") for k in (
+                "account_status", "status", "lifecycle_state",
+                "archive_reason", "breach_reason"
+            )).lower()
+            if (
+                _a.get("breached_at")
+                or _a.get("breach_at")
+                or "breach" in _blob
+                or "closed" in _blob
+                or "disabled" in _blob
+                or "archived" in _blob
+                or "assignment_sync_error" in _blob
+            ):
+                continue
+
+            # Do not steal an account already owned by a different purchase.
+            _existing_pid = str(_a.get("purchase_id") or "").strip()
+            if _existing_pid and _existing_pid != pid:
+                continue
+
+            # Do not reuse an account mirrored on another purchase.
+            try:
+                _other_purchase = (
+                    supabase.table("challenge_purchases")
+                    .select("id")
+                    .or_(
+                        f"trader_account_id.eq.{_a.get('id')},"
+                        f"mt5_login.eq.{_login}"
+                    )
+                    .neq("id", pid)
+                    .limit(1).execute().data or []
+                )
+            except Exception:
+                _other_purchase = []
+            if _other_purchase:
+                continue
+
+            _account_time = _v150_time_score(
+                _a.get("assigned_at")
+                or _a.get("started_at")
+                or _a.get("created_at")
+            )
+
+            # The replacement assignment must not predate this purchase.
+            if purchase_time and _account_time and _account_time < purchase_time:
+                continue
+
+            safe_existing.append(_a)
+
+        if len(safe_existing) == 1:
+            account = safe_existing[0]
+            now = now_iso()
+
+            # Attach the already-existing account to this exact purchase.
+            try:
+                supabase.table("trader_accounts").update({
+                    "purchase_id": pid,
+                    "updated_at": now,
+                }).eq("id", account.get("id")).eq("trader_id", tid).execute()
+            except Exception as _v150_account_link_exc:
+                print("V150 ACCOUNT LINK WARNING:", _v150_account_link_exc, flush=True)
+
+            sync_payload = {
+                "payment_status": "approved",
+                "status": "approved_active",
+                "lifecycle_state": _active_state_for_stage("phase1"),
+                "trader_account_id": account.get("id"),
+                "mt5_login": account.get("mt5_login"),
+                "mt5_server": account.get("mt5_server"),
+                "assigned_at": (
+                    account.get("assigned_at")
+                    or account.get("started_at")
+                    or account.get("created_at")
+                    or now
+                ),
+                "updated_at": now,
+                "admin_note": (
+                    f"V150 reconciled existing Phase 1 MT5 {account.get('mt5_login')} "
+                    f"to approved purchase {pid}"
+                ),
+            }
+            if account.get("mt5_pool_id"):
+                sync_payload["assigned_mt5_id"] = account.get("mt5_pool_id")
+
+            updated = (
+                supabase.table("challenge_purchases")
+                .update(sync_payload)
+                .eq("id", pid).execute().data or []
+            )
+
+            # Restore the owner/admin email that was missed when the mirror failed.
+            try:
+                send_admin_alert(
+                    "ADMIN COPY — NairaPips — Existing PHASE 1 MT5 assignment reconciled",
+                    (
+                        f"NAIRAPIPS MT5 ASSIGNMENT — ADMIN COPY\n\n"
+                        f"Trader: {(trader or {}).get('name') or (trader or {}).get('full_name') or p.get('trader_name') or 'Trader'}\n"
+                        f"Trader Email: {(trader or {}).get('email') or p.get('email') or '—'}\n"
+                        f"Purchase ID: {pid}\n"
+                        f"Account Size: ₦{float(size):,.0f}\n"
+                        f"MT5 Login: {account.get('mt5_login') or '—'}\n"
+                        f"MT5 Server: {account.get('mt5_server') or '—'}\n"
+                        f"Trader Account ID: {account.get('id') or '—'}\n\n"
+                        f"The MT5 already existed in trader_accounts. V150 linked it to the waiting purchase; no new MT5 was allocated."
+                    )
+                )
+            except Exception as _v150_mail_exc:
+                print("V150 RECONCILE ADMIN EMAIL WARNING:", _v150_mail_exc, flush=True)
+
+            try:
+                np_invalidate_admin_bootstrap("purchases")
+                np_invalidate_admin_bootstrap("mt5")
+                _invalidate_trader_bootstrap_cache(tid)
+            except Exception:
+                pass
+
+            return ok({
+                "purchase": updated[0] if updated else {**p, **sync_payload},
+                "account": account,
+                "already_assigned": True,
+                "reconciled_existing_unlinked_account": True,
+                "waiting_for_mt5": False,
+            }, f"Existing MT5 {account.get('mt5_login')} linked to this purchase. No new MT5 allocated.")
+
+        if len(safe_existing) > 1:
+            return bad(
+                "Multiple possible existing Phase 1 MT5 accounts match this purchase. "
+                "Automatic assignment stopped to prevent a duplicate or wrong link.",
+                409
+            )
+
+        # Only now, after proving that no existing account can be reconciled,
+        # is a new fresh MT5 allowed to be selected.
         mt5 = _np_pick_fresh_mt5(size, "phase1")
         if not mt5:
             waiting = _np_mark_purchase_approved_waiting_v60(
