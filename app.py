@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V146_PURCHASE_ASSIGNMENT_RECONCILE_2026_10_05"
+NAIRAPIPS_RELEASE = "V147_PURCHASE_ASSIGNMENT_NONBLOCKING_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -11031,6 +11031,70 @@ def approve_purchase():
             pass
         return ok(approved_rows, "Challenge purchase approved and MT5 assigned")
     except Exception as e: return bad(e)
+
+
+
+@app.route("/admin/purchase_assignment_status_v147", methods=["GET", "OPTIONS"])
+def admin_purchase_assignment_status_v147():
+    if request.method == "OPTIONS":
+        return jsonify({"success": True})
+
+    admin_actor, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    pid = str(request.args.get("id") or request.args.get("purchase_id") or "").strip()
+    if not pid:
+        return bad("Missing purchase id", 400)
+
+    try:
+        rows = (
+            supabase.table("challenge_purchases").select(
+                "id,trader_id,account_size,payment_status,status,mt5_login,"
+                "trader_account_id,assigned_mt5_id,assigned_at,updated_at"
+            )
+            .eq("id", pid).limit(1).execute().data or []
+        )
+        if not rows:
+            return bad("Purchase not found", 404)
+
+        p = rows[0]
+        linked = (
+            supabase.table("trader_accounts").select(
+                "id,trader_id,purchase_id,stage,account_status,status,mt5_login,"
+                "mt5_server,account_size,assigned_at,started_at,updated_at"
+            )
+            .eq("purchase_id", pid)
+            .order("created_at", desc=True)
+            .limit(10).execute().data or []
+        )
+        real = [a for a in linked if str(a.get("mt5_login") or "").strip()]
+        account = real[0] if real else None
+
+        assigned = bool(
+            account
+            or str(p.get("mt5_login") or "").strip()
+            or str(p.get("trader_account_id") or "").strip()
+            or str(p.get("assigned_mt5_id") or "").strip()
+        )
+
+        return ok({
+            "purchase": p,
+            "assigned": assigned,
+            "account": account,
+            "mt5_login": (
+                (account or {}).get("mt5_login")
+                or p.get("mt5_login")
+                or None
+            ),
+            "waiting_for_mt5": (
+                not assigned and
+                str(p.get("status") or "").strip().lower()
+                in {"approved_waiting_mt5", "waiting_mt5", "phase1_waiting_mt5"}
+            ),
+        })
+    except Exception as exc:
+        return bad(exc, 500)
 
 
 @app.route("/admin/repair_purchase_assignment_v146", methods=["POST", "OPTIONS"])
