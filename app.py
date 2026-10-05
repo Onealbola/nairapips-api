@@ -5492,6 +5492,97 @@ def _quick_available_mt5(rows):
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# V134 EXACT REGISTERED TRADER COUNT
+# The Admin bootstrap intentionally carries a bounded trader list for speed.
+# That list MUST NOT be used as the business's registered-customer total.
+# ---------------------------------------------------------------------------
+_NP_TRADER_COUNT_CACHE_V134 = {"ts": 0.0, "count": None}
+
+def _np_exact_registered_trader_count_v134(force=False):
+    now = time.time()
+    cached = _NP_TRADER_COUNT_CACHE_V134.get("count")
+    if (
+        not force
+        and isinstance(cached, int)
+        and cached >= 0
+        and now - float(_NP_TRADER_COUNT_CACHE_V134.get("ts") or 0) < 15
+    ):
+        return cached
+
+    # Preferred: PostgREST exact count; returns no full trader payload.
+    try:
+        res = supabase.table("traders").select("id", count="exact").limit(1).execute()
+        count = getattr(res, "count", None)
+        if count is not None:
+            count = int(count)
+            _NP_TRADER_COUNT_CACHE_V134.update({"ts": now, "count": count})
+            return count
+    except Exception as exc:
+        print("V134 EXACT TRADER COUNT primary warning:", exc, flush=True)
+
+    # Fallback: stable pagination. This is still exact up to the generous safety cap.
+    try:
+        page_size = 1000
+        max_rows = 50000
+        total = 0
+        offset = 0
+        while offset < max_rows:
+            rows = (
+                supabase.table("traders")
+                .select("id")
+                .order("id", desc=False)
+                .range(offset, min(offset + page_size - 1, max_rows - 1))
+                .execute().data or []
+            )
+            total += len(rows)
+            if len(rows) < page_size:
+                _NP_TRADER_COUNT_CACHE_V134.update({"ts": now, "count": total})
+                return total
+            offset += page_size
+
+        print(
+            "V134 TRADER COUNT SAFETY CAP REACHED:",
+            {"max_rows": max_rows, "counted": total},
+            flush=True,
+        )
+        _NP_TRADER_COUNT_CACHE_V134.update({"ts": now, "count": total})
+        return total
+    except Exception as exc:
+        print("V134 EXACT TRADER COUNT fallback error:", exc, flush=True)
+        if isinstance(cached, int) and cached >= 0:
+            return cached
+        raise
+
+
+@app.route("/admin/traders_count", methods=["GET", "OPTIONS"])
+def admin_traders_count_v134():
+    if request.method == "OPTIONS":
+        return jsonify({"success": True})
+
+    admin, auth_response = require_admin()
+    if auth_response:
+        return auth_response
+
+    try:
+        count = _np_exact_registered_trader_count_v134(
+            force=str(request.args.get("fresh") or "").lower() in {"1", "true", "yes"}
+        )
+        return jsonify({
+            "success": True,
+            "count": int(count),
+            "source": "exact_traders_table_count_v134",
+            "generated_at": now_iso(),
+        })
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error": "Unable to read exact registered trader count.",
+            "detail": str(exc),
+        }), 500
+
+
 @app.route("/admin_bootstrap", methods=["GET", "OPTIONS"])
 def admin_bootstrap():
     if request.method == "OPTIONS":
@@ -5782,7 +5873,10 @@ def _build_admin_bootstrap_payload(admin):
         "business_settings": {},
 
         "counts": {
-            "traders": len(traders_rows),
+            # V134: exact registered customers total. `traders_rows` remains a
+            # bounded display/bootstrap slice for speed and must never define this KPI.
+            "traders": _np_exact_registered_trader_count_v134(),
+            "traders_loaded": len(traders_rows),
             "plans": len(plan_rows),
             "purchases": len(purchase_rows),
             "payouts": len(payout_rows),
