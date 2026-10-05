@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V137_FAST_DATA_PLANE_LIFECYCLE_PAGINATION_2026_10_05"
+NAIRAPIPS_RELEASE = "V138_EXACT_COUNT_AUTH_FIX_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -5668,7 +5668,7 @@ def admin_traders_count_v134():
     if request.method == "OPTIONS":
         return jsonify({"success": True})
 
-    admin, auth_response = require_admin()
+    admin, auth_response = _require_admin()
     if auth_response:
         return auth_response
 
