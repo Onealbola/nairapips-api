@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V140_FUNDED_WAITING_SELF_HEAL_2026_10_05"
+NAIRAPIPS_RELEASE = "V144_MOBILE_COMMERCE_FAST_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -10042,6 +10042,97 @@ def public_plan_snapshot():
         return response
     except Exception as e:
         return bad(e)
+
+
+
+# ---------------------------------------------------------------------------
+# V144 MOBILE COMMERCE FAST PATH
+# One small read combines the data needed to open Plans / Purchase Challenge.
+# It avoids three sequential/parallel browser requests on mobile just to paint
+# the buying screen. Purchase history remains trader-private and loads later.
+# ---------------------------------------------------------------------------
+_NP_COMMERCE_CACHE_V144 = {"ts": 0.0, "payload": None}
+_NP_COMMERCE_LOCK_V144 = threading.Lock()
+
+def _np_mobile_commerce_snapshot_v144(force=False):
+    now = time.time()
+    cached = _NP_COMMERCE_CACHE_V144.get("payload")
+    cached_ts = float(_NP_COMMERCE_CACHE_V144.get("ts") or 0)
+
+    if cached is not None and not force and now - cached_ts < 15:
+        out = dict(cached)
+        out["cache"] = "hit"
+        out["age_ms"] = int((now - cached_ts) * 1000)
+        return out
+
+    with _NP_COMMERCE_LOCK_V144:
+        now = time.time()
+        cached = _NP_COMMERCE_CACHE_V144.get("payload")
+        cached_ts = float(_NP_COMMERCE_CACHE_V144.get("ts") or 0)
+        if cached is not None and not force and now - cached_ts < 15:
+            out = dict(cached)
+            out["cache"] = "hit"
+            out["age_ms"] = int((now - cached_ts) * 1000)
+            return out
+
+        started = time.time()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            plans_future = pool.submit(_np_public_plan_snapshot_rows)
+            payments_future = pool.submit(
+                lambda: (
+                    supabase.table("payment_accounts")
+                    .select("*")
+                    .order("display_order", desc=False)
+                    .execute().data or []
+                )
+            )
+
+            plans = plans_future.result() or []
+            payments = payments_future.result() or []
+
+        # Public purchase screen should not surface disabled payment accounts.
+        active_payments = [
+            row for row in payments
+            if str((row or {}).get("status") or "active").strip().lower()
+            not in {"inactive", "disabled", "hidden", "archived"}
+        ]
+
+        payload = {
+            "success": True,
+            "plans": plans,
+            "payment_accounts": active_payments,
+            "generated_at": now_iso(),
+            "server_ms": int((time.time() - started) * 1000),
+            "cache": "miss",
+            "age_ms": 0,
+        }
+        _NP_COMMERCE_CACHE_V144["ts"] = time.time()
+        _NP_COMMERCE_CACHE_V144["payload"] = payload
+        return dict(payload)
+
+
+@app.route("/trader_commerce_bootstrap_v144", methods=["GET", "OPTIONS"])
+def trader_commerce_bootstrap_v144():
+    if request.method == "OPTIONS":
+        return jsonify({"success": True})
+    try:
+        force = str(request.args.get("fresh") or "").lower() in {"1", "true", "yes"}
+        return jsonify(_np_mobile_commerce_snapshot_v144(force=force))
+    except Exception as exc:
+        cached = _NP_COMMERCE_CACHE_V144.get("payload")
+        if cached is not None:
+            out = dict(cached)
+            out["success"] = True
+            out["stale"] = True
+            out["cache"] = "stale-fallback"
+            out["warning"] = str(exc)
+            return jsonify(out)
+        return jsonify({
+            "success": False,
+            "error": "Plans are temporarily unavailable.",
+            "detail": str(exc),
+        }), 500
 
 
 @app.route("/challenge_plans", methods=["GET"])
