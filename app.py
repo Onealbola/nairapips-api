@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V153_RESET_PRICE_LIVE_AUTHORITY_2026_10_05"
+NAIRAPIPS_RELEASE = "V154_REJECTED_PURCHASE_ASSIGNMENT_GUARD_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -3466,7 +3466,38 @@ def _np_update_trader_current_pointer_v59(trader_id, account, stage):
     )
 
 
+
+def _np_purchase_is_rejected_v154(purchase, refresh=True):
+    """True when this exact purchase is currently rejected."""
+    p = dict(purchase or {})
+    pid = str(p.get("id") or "").strip()
+
+    if refresh and pid:
+        try:
+            rows = (
+                supabase.table("challenge_purchases")
+                .select("id,payment_status,status,rejected_at")
+                .eq("id", pid).limit(1).execute().data or []
+            )
+            if rows:
+                p.update(rows[0] or {})
+        except Exception as exc:
+            print("V154 REJECTION GUARD REFRESH WARNING:", exc, flush=True)
+
+    return bool(
+        str(p.get("payment_status") or "").strip().lower() == "rejected"
+        or str(p.get("status") or "").strip().lower() == "rejected"
+        or str(p.get("rejected_at") or "").strip()
+    )
+
+
 def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="MT5 assigned"):
+
+    # V154: rejected purchase can never receive an MT5, even from a stale
+    # Admin tab, delayed request, retry worker, or race with Reject.
+    if purchase and _np_purchase_is_rejected_v154(purchase, refresh=True):
+        raise ValueError("This purchase is REJECTED. MT5 assignment is blocked.")
+
     _np_registry_predecessor = _np_registry_predecessor_id(purchase)
     stage = str(stage or "").lower()
     if stage not in ACCOUNT_STAGES:
@@ -10937,6 +10968,13 @@ def approve_purchase():
         pres=supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute()
         if not pres.data: return bad("Purchase not found",404)
         p=pres.data[0]
+
+        if _np_purchase_is_rejected_v154(p, refresh=False):
+            return bad(
+                "This purchase is REJECTED. Assignment is blocked. Use a dedicated restore action before any future approval.",
+                409
+            )
+
         if p.get("trader_account_id") or p.get("assigned_mt5_id") or str(p.get("mt5_login") or "").strip():
             return bad("This purchase is already approved/assigned. Refresh the purchases page.", 409)
 
@@ -11499,8 +11537,33 @@ def reject_purchase():
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing purchase id")
         purchase = get_purchase_by_id(pid)
+        if not purchase:
+            return bad("Purchase not found", 404)
+
+        linked = (
+            supabase.table("trader_accounts")
+            .select("id,mt5_login,account_status,status")
+            .eq("purchase_id", pid).limit(20).execute().data or []
+        )
+        real_linked = [a for a in linked if str(a.get("mt5_login") or "").strip()]
+        if (
+            str(purchase.get("mt5_login") or "").strip()
+            or real_linked
+        ):
+            return bad(
+                "This purchase already has a real MT5 assignment. Do not reject it from Purchases; use the appropriate lifecycle/recall action.",
+                409
+            )
+
         note = d.get("admin_note","Challenge purchase rejected")
-        result = supabase.table("challenge_purchases").update({"payment_status":"rejected","status":"rejected","rejected_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
+        result = supabase.table("challenge_purchases").update({
+            "payment_status":"rejected",
+            "status":"rejected",
+            "lifecycle_state":"payment_rejected",
+            "rejected_at":now_iso(),
+            "admin_note":note,
+            "updated_at":now_iso()
+        }).eq("id",pid).execute().data
         try:
             trader_id = purchase.get("trader_id")
             if trader_id:
@@ -41240,6 +41303,9 @@ def _np_mark_purchase_approved_waiting_v60(purchase, admin_payload=None, reason=
     if marker.lower() not in old_note.lower():
         note = (old_note + " | " + marker + " " + str(reason or "")).strip(" |")
 
+    if _np_purchase_is_rejected_v154(p, refresh=True):
+        raise ValueError("This purchase is REJECTED. WAITING FOR MT5 cannot be created.")
+
     rows = (
         supabase.table("challenge_purchases").update({
             "payment_status": "approved",
@@ -41250,10 +41316,12 @@ def _np_mark_purchase_approved_waiting_v60(purchase, admin_payload=None, reason=
             "admin_note": note,
         })
         .eq("id", pid)
+        .neq("payment_status", "rejected")
+        .neq("status", "rejected")
         .execute().data or []
     )
     if not rows:
-        raise RuntimeError("Payment approval could not be persisted in WAITING FOR MT5 state")
+        raise RuntimeError("Purchase was rejected or changed before WAITING FOR MT5 could be persisted.")
 
     # Referral earnings depend on approved payment, not MT5 inventory.
     try:
