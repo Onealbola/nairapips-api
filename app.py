@@ -10,7 +10,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V130_TRADER_ACCOUNT_LINEAGE_REPAIR_2026_10_04"
+NAIRAPIPS_RELEASE = "V132_ASSIGNMENT_EMAIL_RESTORE_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1355,6 +1355,77 @@ def _np_bootstrap_replacement_takeover_v129(account_rows):
         if str(r.get("id") or "").strip()
     }
     preferred = None
+
+    # V131 CHILD->SOURCE AUTHORITY:
+    # The normal assignment path records replacement lineage on the NEW child row:
+    #   child.replaces_trader_account_id = old reset source id
+    #   child.previous_trader_account_id = old source id
+    # Therefore this relation must be checked before relying on optional
+    # source.reset_replacement_account_id mirrors.
+    for child in rows:
+        child_id = str(child.get("id") or "").strip()
+        login = str(child.get("mt5_login") or "").strip()
+        if not child_id or not login:
+            continue
+
+        source_refs = {
+            str(child.get("replaces_trader_account_id") or "").strip(),
+            str(child.get("previous_trader_account_id") or "").strip(),
+            str(child.get("reset_source_account_id") or "").strip(),
+            str(child.get("source_account_id") or "").strip(),
+            str(child.get("replaces_account_id") or "").strip(),
+        }
+        source_refs.discard("")
+        if not source_refs:
+            continue
+
+        for source_id in source_refs:
+            source = by_id.get(source_id)
+            if not source:
+                continue
+            if str(source.get("trader_id") or "").strip() != str(child.get("trader_id") or "").strip():
+                continue
+
+            blob = " ".join(str(child.get(k) or "") for k in (
+                "account_status", "status", "lifecycle_state", "challenge_state",
+                "archive_reason", "breach_reason", "admin_note", "message"
+            )).lower()
+            hard_terminal = bool(
+                child.get("breached_at")
+                or child.get("breach_at")
+                or child.get("mt5_access_disabled")
+                or "breach" in blob
+                or "closed" in blob
+                or "disabled" in blob
+            )
+            if hard_terminal:
+                continue
+
+            stage = _normalize_lifecycle_stage(
+                child.get("stage") or child.get("phase") or source.get("stage") or source.get("phase")
+            )
+            normalized = dict(child)
+            normalized["_np_original_account_status"] = child.get("account_status") or child.get("status")
+            normalized["_np_replacement_takeover"] = True
+            normalized["_np_replacement_source_account_id"] = source_id
+            normalized["stage"] = stage
+            active_status = (
+                "funded_active" if stage == "funded"
+                else ("phase2_active" if stage == "phase2" else "phase1_active")
+            )
+            normalized["account_status"] = active_status
+            normalized["status"] = active_status
+            normalized["lifecycle_state"] = active_status
+            by_id[child_id] = normalized
+
+            if preferred is None or _dt_score(
+                normalized.get("assigned_at") or normalized.get("started_at")
+                or normalized.get("updated_at") or normalized.get("created_at")
+            ) >= _dt_score(
+                preferred.get("assigned_at") or preferred.get("started_at")
+                or preferred.get("updated_at") or preferred.get("created_at")
+            ):
+                preferred = normalized
 
     for source in rows:
         child_ids = [
@@ -3570,57 +3641,73 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
             f"MT5 assignment stopped: monitoring registry activation failed: {_registry_err}"
         )
 
-    # CRITICAL: Email trader their new MT5 credentials (production must notify)
+    # CRITICAL: Email trader credentials + independent owner/admin copy.
+    # V132: never gate the owner copy on a partial worker object containing email.
     try:
         stage_label = stage.upper().replace('_', ' ')
-        trader_email = trader.get('email')
-        trader_name = trader.get('name') or 'Trader'
-        if trader_email:
-            # Traders League V1: detect League assignments and use a League-styled
-            # email body so the trader doesn't think they got a paid Phase 1 slot.
-            is_league_assignment = _is_league_assignment_note(note)
-            if is_league_assignment:
-                assignment_label = "TRADERS LEAGUE"
-                subject = f'NairaPips — Your {assignment_label} MT5 credentials'
-                intro = f'Hello {trader_name}, your Traders League competition MT5 account has been assigned by NairaPips.'
-                dashboard_url = 'https://nairapips.com/?utm_source=league_email#league-leaderboard'
-                closing = (
-                    '\n\nThis is a NairaPips Traders League competition account. '
-                    'It is NOT a paid Phase 1 account and is not eligible for paid payouts. '
-                    'Top 3 traders at the end of the season will be rewarded through the League reward system. '
-                    'Climb the live leaderboard and good luck.\n\n'
-                )
-            else:
-                assignment_label = stage_label
-                subject = f'NairaPips — Your {stage_label} MT5 credentials'
-                intro = f'Hello {trader_name}, your {stage_label} MT5 account has been assigned by NairaPips.'
-                dashboard_url = 'https://nairapips.com/dashboard/trader_clean.html'
-                closing = '\n\nYou can now download MT5, log in with these credentials, and start trading.\n\n'
-            details = (
-                f'Your {assignment_label} MT5 account has been assigned:\n\n'
-                f'MT5 Login: {mt5.get("mt5_login")}\n'
-                f'MT5 Server: {mt5.get("mt5_server")}\n'
-                f'Master Password: {mt5.get("mt5_master_password")}\n'
-                f'Investor Password: {mt5.get("mt5_investor_password")}\n'
-                f'Account Size: {account_size:,.0f}\n\n'
-                f'{closing}'
-                f'Your dashboard: {dashboard_url}'
+        trader_name = (
+            trader.get('name')
+            or trader.get('full_name')
+            or trader_row.get('name')
+            or trader_row.get('full_name')
+            or 'Trader'
+        )
+
+        is_league_assignment = _is_league_assignment_note(note)
+        if is_league_assignment:
+            assignment_label = "TRADERS LEAGUE"
+            subject = f'NairaPips — Your {assignment_label} MT5 credentials'
+            intro = f'Hello {trader_name}, your Traders League competition MT5 account has been assigned by NairaPips.'
+            dashboard_url = 'https://nairapips.com/?utm_source=league_email#league-leaderboard'
+            closing = (
+                '\n\nThis is a NairaPips Traders League competition account. '
+                'It is NOT a paid Phase 1 account and is not eligible for paid payouts. '
+                'Top 3 traders at the end of the season will be rewarded through the League reward system. '
+                'Climb the live leaderboard and good luck.\n\n'
             )
-            _assignment_mail_ok = send_assignment_email_with_owner_copy(
-                trader,
-                subject,
-                intro,
-                details
-            )
-            print(
-                "MT5 ASSIGN EMAIL+BCC:",
-                "SENT" if _assignment_mail_ok else "FAILED",
-                trader_email,
-                "owner_copy=", OWNER_ALERT_EMAIL,
-                "mt5=", mt5.get("mt5_login")
-            )
+        else:
+            assignment_label = stage_label
+            subject = f'NairaPips — Your {stage_label} MT5 credentials'
+            intro = f'Hello {trader_name}, your {stage_label} MT5 account has been assigned by NairaPips.'
+            dashboard_url = 'https://nairapips.com/dashboard/trader_clean.html'
+            closing = '\n\nYou can now download MT5, log in with these credentials, and start trading.\n\n'
+
+        details = (
+            f'Your {assignment_label} MT5 account has been assigned:\n\n'
+            f'MT5 Login: {mt5.get("mt5_login")}\n'
+            f'MT5 Server: {mt5.get("mt5_server")}\n'
+            f'Master Password: {mt5.get("mt5_master_password")}\n'
+            f'Investor Password: {mt5.get("mt5_investor_password")}\n'
+            f'Account Size: {account_size:,.0f}\n\n'
+            f'{closing}'
+            f'Your dashboard: {dashboard_url}'
+        )
+
+        # Pass IDs even when the worker used a lightweight trader projection.
+        notify_trader = dict(trader_row or {})
+        notify_trader.update({
+            "id": trader.get("id") or trader_row.get("id"),
+            "name": trader_name,
+            "email": trader.get("email") or trader_row.get("email"),
+        })
+
+        _assignment_mail_ok = send_assignment_email_with_owner_copy(
+            notify_trader,
+            subject,
+            intro,
+            details
+        )
+        print(
+            "V132 MT5 ASSIGN NOTIFICATION:",
+            "SENT" if _assignment_mail_ok else "FAILED",
+            "trader_id=", notify_trader.get("id"),
+            "email=", notify_trader.get("email") or "resolve-from-db",
+            "owner_copy=", OWNER_ALERT_EMAIL,
+            "mt5=", mt5.get("mt5_login"),
+            flush=True,
+        )
     except Exception as _email_err:
-        print('MT5 ASSIGN EMAIL ERROR:', str(_email_err))
+        print('V132 MT5 ASSIGN EMAIL ERROR:', str(_email_err), flush=True)
     return account, trader_row
 
 
@@ -6350,19 +6437,69 @@ def send_email_safe(to_email, subject, message):
         print("BREVO EMAIL ERROR:", str(e))
         return False
 
-def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
-    """Send trader credentials and a separate explicit owner copy.
-
-    Do not rely on BCC or Render OWNER_ALERT_EMAIL. The owner copy is a second
-    Brevo transaction addressed directly to the fixed owner inbox so delivery is
-    independently visible in provider logs and Gmail.
-    """
-    if not trader:
-        return False
-    to_email = str(trader.get("email") or "").strip()
+def _np_assignment_email_send_v132(to_email, subject, html_content, attempts=3):
+    """Small synchronous retry wrapper for transactional assignment mail."""
+    to_email = str(to_email or "").strip()
     if not to_email:
         return False
-    name = trader.get("name") or trader.get("trader_name") or "Trader"
+    last = False
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            last = bool(send_email_brevo(to_email, subject, html_content))
+            if last:
+                return True
+        except Exception as exc:
+            print(
+                "V132 ASSIGNMENT EMAIL ATTEMPT ERROR:",
+                to_email, "attempt=", attempt, str(exc), flush=True
+            )
+        if attempt < attempts:
+            time.sleep(0.6 * attempt)
+    return bool(last)
+
+
+def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
+    """Guaranteed assignment notification path.
+
+    Fixes a production failure mode where automation passed a lightweight/partial
+    trader object without `email`, causing the old `if trader_email:` gate to skip
+    BOTH the trader email and the NairaPips owner/admin copy.
+
+    Rules:
+      * Resolve the full trader row by trader_id when possible.
+      * Send trader credentials when an email exists.
+      * ALWAYS attempt the owner/admin copy independently.
+      * Use synchronous Brevo calls with short retries.
+      * Never let email failure roll back a successful MT5 assignment.
+    """
+    supplied = dict(trader or {})
+    trader_id = str(supplied.get("id") or supplied.get("trader_id") or "").strip()
+    full = dict(supplied)
+
+    if trader_id:
+        try:
+            rows = (
+                supabase.table("traders").select("*")
+                .eq("id", trader_id).limit(1).execute().data or []
+            )
+            if rows:
+                # Database row is authoritative for contact details while keeping
+                # any newer in-memory fields from the assignment worker.
+                merged = dict(rows[0] or {})
+                merged.update({k: v for k, v in supplied.items() if v not in (None, "")})
+                full = merged
+        except Exception as exc:
+            print("V132 ASSIGNMENT TRADER RESOLVE WARNING:", str(exc), flush=True)
+
+    to_email = str(full.get("email") or supplied.get("email") or "").strip()
+    name = (
+        full.get("name")
+        or full.get("full_name")
+        or full.get("trader_name")
+        or supplied.get("name")
+        or "Trader"
+    )
+
     body = f"""Hello {name},
 
 {title}
@@ -6370,30 +6507,50 @@ def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
 {details}
 
 NairaPips Team"""
-    trader_ok = bool(send_email_brevo(
-        to_email,
-        subject,
-        text_to_html_content(body),
-    ))
 
+    trader_ok = False
+    if to_email:
+        trader_ok = _np_assignment_email_send_v132(
+            to_email,
+            subject,
+            text_to_html_content(body),
+            attempts=3,
+        )
+    else:
+        print(
+            "V132 ASSIGNMENT EMAIL WARNING: trader email missing after full-row resolve",
+            "trader_id=", trader_id,
+            flush=True,
+        )
+
+    # OWNER COPY MUST NEVER DEPEND ON trader email.
     owner_subject = f"ADMIN COPY — {subject}"
     owner_body = (
         f"Assignment copy for NairaPips owner.\n\n"
+        f"Trader ID: {trader_id or '—'}\n"
         f"Trader: {name}\n"
-        f"Trader Email: {to_email}\n\n"
+        f"Trader Email: {to_email or 'MISSING'}\n\n"
         f"{title}\n\n{details}"
     )
-    owner_ok = False
-    try:
-        owner_ok = bool(send_email_brevo(
-            OWNER_ALERT_EMAIL,
-            owner_subject,
-            text_to_html_content(owner_body),
-        ))
-    except Exception as exc:
-        print("OWNER ASSIGN COPY ERROR:", str(exc))
-    print("MT5 ASSIGN OWNER COPY:", "SENT" if owner_ok else "FAILED", OWNER_ALERT_EMAIL)
-    return trader_ok
+    owner_ok = _np_assignment_email_send_v132(
+        OWNER_ALERT_EMAIL,
+        owner_subject,
+        text_to_html_content(owner_body),
+        attempts=3,
+    )
+
+    print(
+        "V132 MT5 ASSIGN EMAIL RESULT:",
+        "trader=", ("SENT" if trader_ok else ("MISSING_EMAIL" if not to_email else "FAILED")),
+        "owner=", ("SENT" if owner_ok else "FAILED"),
+        "owner_email=", OWNER_ALERT_EMAIL,
+        "trader_id=", trader_id,
+        flush=True,
+    )
+
+    # Preserve historical behavior: email failure does not reverse assignment.
+    return bool(trader_ok or owner_ok)
+
 
 def send_admin_alert(subject, message):
     """Send operational alerts to Admin and always preserve the owner copy.
@@ -8283,6 +8440,56 @@ def trader_bootstrap():
                 "funded_active" if takeover_stage == "funded"
                 else ("phase2_active" if takeover_stage == "phase2" else "phase1_active")
             )
+
+        # V131 persist an exact direct replacement link when bootstrap proved it.
+        if replacement_takeover:
+            try:
+                source_id = str(replacement_takeover.get("_np_replacement_source_account_id") or "").strip()
+                replacement_id = str(replacement_takeover.get("id") or "").strip()
+                replacement_mt5 = str(replacement_takeover.get("mt5_login") or "").strip()
+                takeover_stage = _normalize_lifecycle_stage(
+                    replacement_takeover.get("stage") or replacement_takeover.get("phase")
+                )
+                if source_id and replacement_id and replacement_mt5:
+                    now = now_iso()
+                    src_rows = (
+                        supabase.table("trader_accounts").select("*")
+                        .eq("id", source_id).eq("trader_id", trader.get("id"))
+                        .limit(1).execute().data or []
+                    )
+                    src = src_rows[0] if src_rows else {}
+                    src_blob = _np_kill_blob(src)
+                    if not src.get("reset_replacement_account_id") and "replacement_account_id=" not in src_blob:
+                        payload = {
+                            "account_status": "archived",
+                            "status": "archived",
+                            "reset_consumed_at": src.get("reset_consumed_at") or now,
+                            "reset_replacement_account_id": replacement_id,
+                            "archive_reason": (
+                                str(src.get("archive_reason") or "")
+                                + f" | V131 exact_child_link reset_consumed replacement_account_id={replacement_id} replacement_mt5={replacement_mt5}"
+                            ).strip(" |"),
+                            "updated_at": now,
+                        }
+                        try:
+                            supabase.table("trader_accounts").update(payload).eq("id", source_id).eq("trader_id", trader.get("id")).execute()
+                        except Exception:
+                            payload.pop("reset_consumed_at", None)
+                            payload.pop("reset_replacement_account_id", None)
+                            supabase.table("trader_accounts").update(payload).eq("id", source_id).eq("trader_id", trader.get("id")).execute()
+
+                    active_status = (
+                        "funded_active" if takeover_stage == "funded"
+                        else ("phase2_active" if takeover_stage == "phase2" else "phase1_active")
+                    )
+                    supabase.table("traders").update({
+                        "current_account_id": replacement_id,
+                        "phase": takeover_stage,
+                        "challenge_state": active_status,
+                        "updated_at": now,
+                    }).eq("id", trader.get("id")).execute()
+            except Exception as _v131_persist_exc:
+                print("V131 EXACT REPLACEMENT PERSIST WARNING:", _v131_persist_exc, flush=True)
 
         # Preserve account history. Frontend decides which records are selectable.
         active_accounts = list(all_accounts)
@@ -30400,6 +30607,9 @@ def _np_find_exact_reset_replacement_v8(source, order=None):
             str(a.get("source_account_id") or "").strip(),
             str(a.get("replaces_account_id") or "").strip(),
             str(a.get("reset_source_account_id") or "").strip(),
+            # These are the fields the production assignment path actually writes.
+            str(a.get("replaces_trader_account_id") or "").strip(),
+            str(a.get("previous_trader_account_id") or "").strip(),
         }
         if source_id in parent_refs:
             return a
