@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V150_EXISTING_MT5_RECONCILE_2026_10_05"
+NAIRAPIPS_RELEASE = "V151_CURRENT_RESET_PRICE_REGIME_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -26543,36 +26543,79 @@ def _np_reset_purchase_for_account(account):
 
 
 def _np_reset_current_plan_for(account, purchase=None):
-    """Resolve today's sell price for this account size without hard-coding reset fees."""
+    """Resolve the CURRENT active commercial plan for reset pricing.
+
+    V151 price-regime rule:
+      * old purchase snapshots / old plan IDs are history, not today's reset price
+      * reset rights, lifecycle, reset-count and lineage logic are NOT changed
+      * pricing comes only from a CURRENT ACTIVE challenge_plans row
+      * prefer same product name + same account size
+      * otherwise use the newest active plan for the same account size
+      * never fall back to an inactive/archived historical plan just to obtain a price
+
+    This lets an old N1m/N2m account keep its exact journey while paying the
+    current reset price configured by Admin today.
+    """
+    account = account or {}
     purchase = purchase or {}
-    size = clean((account or {}).get("account_size") or (account or {}).get("start_balance") or purchase.get("account_size") or 0)
-    plan_id = str(purchase.get("plan_id") or purchase.get("challenge_plan_id") or "").strip()
-    candidates = []
-    if plan_id:
-        try:
-            candidates += supabase.table("challenge_plans").select("*").eq("id", plan_id).limit(1).execute().data or []
-        except Exception:
-            pass
-    if size:
-        try:
-            rows = supabase.table("challenge_plans").select("*").eq("account_size", size).execute().data or []
-            candidates += rows
-        except Exception:
-            pass
-    seen = set(); clean_rows = []
-    for row in candidates:
-        rid = str(row.get("id") or "")
-        if rid and rid in seen:
-            continue
-        if rid: seen.add(rid)
-        clean_rows.append(row)
-    active = [r for r in clean_rows if str(r.get("status") or "active").strip().lower() not in {"inactive","disabled","archived","deleted"}]
-    rows = active or clean_rows
-    if not rows:
+
+    size = clean(
+        account.get("account_size")
+        or account.get("start_balance")
+        or purchase.get("account_size")
+        or 0
+    )
+
+    purchase_name = str(
+        purchase.get("plan_name")
+        or purchase.get("selected_plan")
+        or purchase.get("plan")
+        or ""
+    ).strip().lower()
+
+    if not size:
         return None
-    # Prefer same plan id, otherwise current matching account size. Highest recency wins.
-    rows.sort(key=lambda r: (1 if plan_id and str(r.get("id")) == plan_id else 0, str(r.get("updated_at") or r.get("created_at") or "")), reverse=True)
+
+    try:
+        candidates = (
+            supabase.table("challenge_plans")
+            .select("*")
+            .eq("account_size", size)
+            .execute().data or []
+        )
+    except Exception as exc:
+        print("V151 CURRENT RESET PLAN LOAD WARNING:", exc, flush=True)
+        return None
+
+    def _active(row):
+        status = str((row or {}).get("status") or "active").strip().lower()
+        return status not in {"inactive", "disabled", "archived", "deleted"}
+
+    active = [r for r in candidates if _active(r)]
+    if not active:
+        # Fail closed. Do not resurrect an old/inactive price.
+        return None
+
+    def _row_name(row):
+        return str(
+            (row or {}).get("name")
+            or (row or {}).get("plan_name")
+            or ""
+        ).strip().lower()
+
+    def _recency(row):
+        return str(
+            (row or {}).get("updated_at")
+            or (row or {}).get("created_at")
+            or ""
+        )
+
+    # Strongest commercial match: current active row of same product + size.
+    same_name = [r for r in active if purchase_name and _row_name(r) == purchase_name]
+    rows = same_name or active
+    rows.sort(key=_recency, reverse=True)
     return rows[0]
+
 
 
 def _np_reset_price(plan, stage=None):
@@ -43412,9 +43455,11 @@ def _np_v61_reset_price(account, purchase):
 
     price, key = _np_v64_positive_money(plan, ("funded_reset_fee",))
     if price > 0:
-        return price, plan, f"current_plan_{key}"
+        return price, plan, f"v151_current_active_plan_{key}"
 
-    return 0.0, plan or purchase or {}, "funded_reset_fee_unresolved"
+    # No historical-price fallback. Missing current commercial price must fail
+    # closed for review rather than revive ₦9,999/₦14,999 from an old purchase.
+    return 0.0, plan or {}, "v151_current_funded_reset_fee_unresolved"
 
 
 
