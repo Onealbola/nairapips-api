@@ -1,4 +1,6 @@
 import urllib.parse
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -10,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V132_ASSIGNMENT_EMAIL_RESTORE_2026_10_05"
+NAIRAPIPS_RELEASE = "V137_FAST_DATA_PLANE_LIFECYCLE_PAGINATION_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -45212,7 +45214,20 @@ def _np_retry_waiting_second_lives_v19(limit=100):
     global _NP_V74_LAST_SECOND_LIFE_SUMMARY
 
     process_limit = max(10, min(int(limit or 100), 100))
-    scan_limit = max(100, min(process_limit * 4, 400))
+
+    # V137 FAIR PAGINATED DISCOVERY:
+    # The old worker only looked at the first 400 matching purchases. If stale,
+    # fulfilled or quarantined rows occupied that window, valid entitlements
+    # farther down the table could wait indefinitely.
+    #
+    # We now page in small bounded chunks and stop as soon as enough fresh
+    # candidates have been found for this cycle. This removes first-400
+    # starvation without turning the lifecycle worker into a 20,000-row hammer.
+    page_size = 250
+    scan_safety_cap = 5000
+    rows = []
+    offset = 0
+    candidate_budget = 0
 
     summary = {
         "checked": 0,
@@ -45224,27 +45239,62 @@ def _np_retry_waiting_second_lives_v19(limit=100):
         "ineligible": 0,
         "quarantined_skip": 0,
         "errors": 0,
-        "scan_limit": scan_limit,
+        "scan_limit": None,
+        "scan_mode": "paged_v137",
+        "page_size": page_size,
+        "scan_safety_cap": scan_safety_cap,
+        "pages_read": 0,
+        "rows_read": 0,
         "process_limit": process_limit,
-        "release": NAIRAPIPS_AUTOMATION_STABILITY_RELEASE_V74,
+        "release": "V137_LIFECYCLE_PAGINATION_2026_10_05",
     }
 
     try:
-        rows = (
-            supabase.table("challenge_purchases").select("*")
-            .in_(
-                "second_life_status",
-                ["life2_waiting_mt5", "waiting_mt5", "activated"],
+        while offset < scan_safety_cap and candidate_budget < process_limit:
+            upper = min(offset + page_size - 1, scan_safety_cap - 1)
+            batch = (
+                supabase.table("challenge_purchases").select("*")
+                .in_(
+                    "second_life_status",
+                    ["life2_waiting_mt5", "waiting_mt5", "activated"],
+                )
+                .eq("second_life_used", True)
+                .order("updated_at", desc=False)
+                .order("id", desc=False)
+                .range(offset, upper)
+                .execute().data or []
             )
-            .eq("second_life_used", True)
-            .order("updated_at", desc=False)
-            .limit(scan_limit).execute().data or []
-        )
+
+            summary["pages_read"] += 1
+            summary["rows_read"] += len(batch)
+
+            if not batch:
+                break
+
+            rows.extend(batch)
+
+            # Only non-quarantined rows can consume this cycle's process budget.
+            # Keep paging past stale/quarantined rows instead of letting them
+            # permanently block records beyond the old 400-row window.
+            for _row in batch:
+                _pid = str((_row or {}).get("id") or "").strip()
+                if _pid and not _np_v74_quarantined(_pid):
+                    candidate_budget += 1
+                    if candidate_budget >= process_limit:
+                        break
+
+            if len(batch) < page_size:
+                break
+
+            offset += page_size
+
+        summary["scan_limit"] = summary["rows_read"]
+
     except Exception as exc:
         summary["errors"] += 1
         summary["error"] = "load_failed: " + str(exc)
         _NP_V74_LAST_SECOND_LIFE_SUMMARY = summary
-        print("V74 SECOND LIFE RETRY LOAD DEFERRED:", exc, flush=True)
+        print("V137 SECOND LIFE PAGED RETRY LOAD DEFERRED:", exc, flush=True)
         return summary
 
     actor = {
@@ -51733,6 +51783,8 @@ def _np_v100_retry_second_life_server_only(limit=100):
         result["server_only"] = True
         result["web_resource_protection_preserved"] = True
         result["release_v100"] = NAIRAPIPS_SERVER_LIFECYCLE_RECOVERY_RELEASE_V100
+        result["fair_pagination_v137"] = True
+        result["legacy_first_400_cap_removed"] = True
     return result
 
 
