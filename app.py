@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V152_FUNDED_RESET_DOUBLE_CURRENT_FEE_2026_10_05"
+NAIRAPIPS_RELEASE = "V153_RESET_PRICE_LIVE_AUTHORITY_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -43490,6 +43490,83 @@ def _np_v61_reset_price(account, purchase):
     # fail closed rather than resurrect an old ₦9,999/₦14,999 reset price.
     return 0.0, plan or {}, "v152_current_challenge_fee_unresolved"
 
+
+
+
+@app.route("/trader/reset_price_v153", methods=["GET", "OPTIONS"])
+def trader_reset_price_v153():
+    if request.method == "OPTIONS":
+        return jsonify({"success": True})
+
+    account_id = str(request.args.get("account_id") or "").strip()
+    requested_trader_id = str(request.args.get("trader_id") or "").strip()
+
+    if not account_id:
+        return bad("account_id is required", 400)
+
+    authed_trader_id, auth_error = _authenticated_trader_id_for_request(
+        requested_trader_id or None
+    )
+    if auth_error:
+        return bad(auth_error, 401)
+
+    try:
+        rows = (
+            supabase.table("trader_accounts").select("*")
+            .eq("id", account_id)
+            .eq("trader_id", authed_trader_id)
+            .limit(1).execute().data or []
+        )
+        if not rows:
+            return bad("Account not found", 404)
+
+        account = rows[0]
+        purchase = _np_reset_purchase_for_account(account) or {}
+        stage = _normalize_lifecycle_stage(
+            account.get("stage") or account.get("phase") or "phase1"
+        )
+
+        current_plan = _np_reset_current_plan_for(account, purchase) or {}
+        price = _np_reset_price(current_plan, stage)
+
+        if not price or price <= 0:
+            return bad(
+                "Current reset price is not configured for this account size.",
+                409
+            )
+
+        return ok({
+            "account_id": account_id,
+            "trader_id": authed_trader_id,
+            "stage": stage,
+            "account_size": clean(
+                account.get("account_size")
+                or account.get("start_balance")
+                or purchase.get("account_size")
+                or 0
+            ),
+            "price": float(price),
+            "current_challenge_fee": clean(
+                current_plan.get("fee")
+                or current_plan.get("price")
+                or current_plan.get("challenge_fee")
+                or 0
+            ),
+            "pricing_rule": (
+                "funded_reset_equals_2x_current_challenge_fee"
+                if stage == "funded"
+                else "phase_reset_uses_current_reset_fee"
+            ),
+            "plan_id": current_plan.get("id"),
+            "plan_name": (
+                current_plan.get("name")
+                or current_plan.get("plan_name")
+            ),
+            "release": "V153_RESET_PRICE_LIVE_AUTHORITY_2026_10_05",
+        })
+    except Exception as exc:
+        print("V153 TRADER RESET PRICE ERROR:", exc, flush=True)
+        return bad("Could not resolve current reset price", 500)
 
 
 @app.route("/admin/automation_v64/reset_price_diagnostic", methods=["GET", "OPTIONS"])
