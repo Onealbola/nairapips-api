@@ -6508,22 +6508,9 @@ def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
 
 NairaPips Team"""
 
-    trader_ok = False
-    if to_email:
-        trader_ok = _np_assignment_email_send_v132(
-            to_email,
-            subject,
-            text_to_html_content(body),
-            attempts=3,
-        )
-    else:
-        print(
-            "V132 ASSIGNMENT EMAIL WARNING: trader email missing after full-row resolve",
-            "trader_id=", trader_id,
-            flush=True,
-        )
-
-    # OWNER COPY MUST NEVER DEPEND ON trader email.
+    # V133 SPEED + RELIABILITY:
+    # Trader mail and owner copy are independent. Send both concurrently but
+    # still wait for both Brevo results before the assignment request returns.
     owner_subject = f"ADMIN COPY — {subject}"
     owner_body = (
         f"Assignment copy for NairaPips owner.\n\n"
@@ -6532,12 +6519,48 @@ NairaPips Team"""
         f"Trader Email: {to_email or 'MISSING'}\n\n"
         f"{title}\n\n{details}"
     )
-    owner_ok = _np_assignment_email_send_v132(
-        OWNER_ALERT_EMAIL,
-        owner_subject,
-        text_to_html_content(owner_body),
-        attempts=3,
-    )
+
+    trader_ok = False
+    owner_ok = False
+    try:
+        from concurrent.futures import ThreadPoolExecutor as _NPEmailPool
+        with _NPEmailPool(max_workers=2) as _mail_pool:
+            owner_future = _mail_pool.submit(
+                _np_assignment_email_send_v132,
+                OWNER_ALERT_EMAIL,
+                owner_subject,
+                text_to_html_content(owner_body),
+                3,
+            )
+            trader_future = None
+            if to_email:
+                trader_future = _mail_pool.submit(
+                    _np_assignment_email_send_v132,
+                    to_email,
+                    subject,
+                    text_to_html_content(body),
+                    3,
+                )
+            else:
+                print(
+                    "V133 ASSIGNMENT EMAIL WARNING: trader email missing after full-row resolve",
+                    "trader_id=", trader_id,
+                    flush=True,
+                )
+
+            if trader_future is not None:
+                trader_ok = bool(trader_future.result())
+            owner_ok = bool(owner_future.result())
+    except Exception as _parallel_mail_exc:
+        print("V133 PARALLEL ASSIGNMENT EMAIL ERROR:", _parallel_mail_exc, flush=True)
+        # Safe fallback: owner copy remains independent from trader delivery.
+        if to_email:
+            trader_ok = _np_assignment_email_send_v132(
+                to_email, subject, text_to_html_content(body), attempts=2
+            )
+        owner_ok = _np_assignment_email_send_v132(
+            OWNER_ALERT_EMAIL, owner_subject, text_to_html_content(owner_body), attempts=2
+        )
 
     print(
         "V132 MT5 ASSIGN EMAIL RESULT:",
@@ -10667,25 +10690,9 @@ def approve_purchase():
         approved_rows = supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute().data
         _affiliate_create_commission_from_purchase(approved_rows[0] if approved_rows else p, d)
 
-        send_email_safe(
-            p.get("email"),
-            "NairaPips challenge approved - MT5 details",
-            f"""Hello {p.get("trader_name") or "Trader"},
-
-Your NairaPips challenge has been approved and your MT5 account has been assigned.
-
-Plan: {p.get("plan_name", "Challenge")}
-Account Size: {email_money(p.get("account_size"))}
-
-MT5 Login: {m.get("mt5_login", "")}
-Server: {m.get("mt5_server", "")}
-Master Password: {master_password}
-Investor Password: {investor_password}
-
-Please log in to your trader dashboard to view your account details and begin your challenge.
-
-NairaPips Team"""
-        )
+        # V133: no duplicate email here. _assign_mt5_to_trader already sent
+        # the authoritative credential email and independent Admin owner copy.
+        # Removing this duplicate keeps purchase approval responsive.
 
         _audit_safe("challenge_purchases", "challenge_purchase_approved", f"Purchase {pid} approved", staff)
         _audit_safe("mt5", "phase1_mt5_assignment", f"Purchase {pid} assigned MT5 {m.get('mt5_login','')} to trader account {account.get('id')}", staff)
