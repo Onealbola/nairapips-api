@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V151_CURRENT_RESET_PRICE_REGIME_2026_10_05"
+NAIRAPIPS_RELEASE = "V152_FUNDED_RESET_DOUBLE_CURRENT_FEE_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -10192,7 +10192,8 @@ def create_plan():
              # Second Life. Phase and Funded reset prices are explicit plan prices.
              "second_life_enabled":False,"lives_total":1,
              "reset_fee":clean(d.get("reset_fee")),
-             "funded_reset_fee":clean(d.get("funded_reset_fee")),
+             # V152: Funded reset price follows the commercial rule automatically.
+             "funded_reset_fee":(clean(d.get("fee")) * 2 if clean(d.get("fee")) else 0),
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
              "status":d.get("status","active"),"created_at":now_iso(),"updated_at":now_iso()}
         result = supabase.table("challenge_plans").insert(row).execute().data
@@ -10217,8 +10218,22 @@ def update_plan():
         upd["lives_total"] = 1
         if "reset_fee" in d:
             upd["reset_fee"] = clean(d.get("reset_fee"))
-        if "funded_reset_fee" in d:
-            upd["funded_reset_fee"] = clean(d.get("funded_reset_fee"))
+
+        # V152: Funded reset is always double the CURRENT challenge fee.
+        # Use the submitted fee when present; otherwise resolve the current row.
+        _v152_fee = clean(d.get("fee")) if "fee" in d else 0
+        if not _v152_fee:
+            try:
+                _v152_rows = (
+                    supabase.table("challenge_plans").select("fee")
+                    .eq("id", pid).limit(1).execute().data or []
+                )
+                _v152_fee = clean((_v152_rows[0] if _v152_rows else {}).get("fee"))
+            except Exception:
+                _v152_fee = 0
+        if _v152_fee and _v152_fee > 0:
+            upd["funded_reset_fee"] = float(_v152_fee) * 2
+
         upd["daily_drawdown"] = "None"
         if "mt5_server" in d and "default_server" not in d:
             upd["default_server"] = d.get("mt5_server")
@@ -26619,21 +26634,32 @@ def _np_reset_current_plan_for(account, purchase=None):
 
 
 def _np_reset_price(plan, stage=None):
-    """Plan-controlled reset price.
+    """Current reset-price authority.
 
-    Phase 1 / Phase 2 use challenge_plans.reset_fee.
-    Funded uses challenge_plans.funded_reset_fee.
-    No percentage, challenge-fee multiple, or free-price rule is hard-coded here.
+    V152 business rule:
+      * Phase 1 / Phase 2 reset price remains Admin-configurable via reset_fee.
+      * Funded reset price is ALWAYS 2 x the CURRENT challenge plan fee.
+
+    This function changes PRICE ONLY. It does not alter reset entitlement,
+    reset usage count, lineage, payment approval, or replacement assignment.
     """
     if not plan:
         return 0.0
+
     stage = _normalize_lifecycle_stage(stage or "phase1")
-    keys = ("funded_reset_fee",) if stage == "funded" else ("reset_fee",)
-    for key in keys:
-        value = clean(plan.get(key))
-        if value and value > 0:
-            return value
-    return 0.0
+
+    if stage == "funded":
+        fee = clean(
+            plan.get("fee")
+            or plan.get("price")
+            or plan.get("challenge_fee")
+            or plan.get("plan_fee")
+            or 0
+        )
+        return float(fee) * 2 if fee and fee > 0 else 0.0
+
+    value = clean(plan.get("reset_fee"))
+    return float(value) if value and value > 0 else 0.0
 
 
 def _np_reset_account_is_breached(account):
@@ -43453,13 +43479,16 @@ def _np_v61_reset_price(account, purchase):
     except Exception:
         plan = {}
 
-    price, key = _np_v64_positive_money(plan, ("funded_reset_fee",))
-    if price > 0:
-        return price, plan, f"v151_current_active_plan_{key}"
+    current_fee, key = _np_v64_positive_money(
+        plan,
+        ("fee", "price", "challenge_fee", "plan_fee"),
+    )
+    if current_fee > 0:
+        return current_fee * 2, plan, f"v152_double_current_plan_{key}"
 
-    # No historical-price fallback. Missing current commercial price must fail
-    # closed for review rather than revive ₦9,999/₦14,999 from an old purchase.
-    return 0.0, plan or {}, "v151_current_funded_reset_fee_unresolved"
+    # No historical-price fallback. If today's challenge fee cannot be proven,
+    # fail closed rather than resurrect an old ₦9,999/₦14,999 reset price.
+    return 0.0, plan or {}, "v152_current_challenge_fee_unresolved"
 
 
 
