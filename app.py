@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V144_MOBILE_COMMERCE_FAST_2026_10_05"
+NAIRAPIPS_RELEASE = "V146_PURCHASE_ASSIGNMENT_RECONCILE_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -6150,36 +6150,70 @@ def _admin_view_request_ok(data):
 
 @app.route("/admin_view_trader_token", methods=["POST", "OPTIONS"])
 def admin_view_trader_token():
-    """Create a short-lived trader auth token for admin support viewing.
+    """Create a short-lived trader auth token for Admin View.
 
-    This does NOT reveal, reset, or use the trader's password. It simply creates
-    the same signed dashboard auth token normal login creates, after verifying
-    a private ADMIN_VIEW_SECRET configured in Render.
+    V145:
+    - When Admin already supplies an exact trader_id, resolve by that id directly.
+    - Avoid the legacy multi-column lookup path (email/phone/reference/MT5) unless
+      no exact id was supplied.
+    - This keeps View Dashboard off the slow multi-query path.
     """
     if request.method == "OPTIONS":
         return _np_ok({})
+
+    started = time.time()
     try:
         data = request.get_json(silent=True) or {}
         if not _admin_view_request_ok(data):
             return bad("Unauthorized admin view", 401)
 
-        lookup = str(data.get("lookup") or data.get("trader_id") or data.get("email") or "").strip()
-        if not lookup:
-            return bad("Trader lookup is required", 400)
+        exact_id = str(data.get("trader_id") or "").strip()
+        lookup = str(data.get("lookup") or data.get("email") or exact_id or "").strip()
 
-        trader = _latest_trader_for_lookup(lookup)
+        trader = None
+
+        # FAST PATH: Admin cards already know the exact trader UUID.
+        if exact_id:
+            try:
+                rows = (
+                    supabase.table("traders")
+                    .select("*")
+                    .eq("id", exact_id)
+                    .limit(1)
+                    .execute().data or []
+                )
+                trader = rows[0] if rows else None
+            except Exception as exc:
+                print("V145 ADMIN VIEW DIRECT-ID LOOKUP WARNING:", exc, flush=True)
+
+        # Compatibility fallback for older callers without a trader_id.
+        if trader is None and lookup:
+            trader = _latest_trader_for_lookup(lookup)
+
         if not trader:
             return bad("Trader not found", 404)
 
-        token = _make_trader_auth_token(trader.get("id"))
-        safe_lookup = trader.get("email") or trader.get("phone") or trader.get("id") or lookup
+        trader_id = str(trader.get("id") or exact_id or "").strip()
+        if not trader_id:
+            return bad("Trader identity is incomplete", 400)
+
+        token = _make_trader_auth_token(trader_id)
+        safe_lookup = (
+            trader.get("email")
+            or trader.get("phone")
+            or trader.get("account_reference")
+            or trader_id
+        )
+
         return ok({
-            "trader_id": trader.get("id"),
+            "trader_id": trader_id,
             "lookup": safe_lookup,
             "email": trader.get("email"),
             "name": trader.get("name") or trader.get("full_name") or "Trader",
             "auth_token": token,
             "admin_view": True,
+            "token_path": "direct_trader_id_v145" if exact_id else "legacy_lookup",
+            "server_ms": int((time.time() - started) * 1000),
         }, "Admin dashboard view token created")
     except Exception as e:
         return bad(e, 500)
@@ -10997,6 +11031,192 @@ def approve_purchase():
             pass
         return ok(approved_rows, "Challenge purchase approved and MT5 assigned")
     except Exception as e: return bad(e)
+
+
+@app.route("/admin/repair_purchase_assignment_v146", methods=["POST", "OPTIONS"])
+def admin_repair_purchase_assignment_v146():
+    """Repair an approved challenge purchase that is missing its Phase 1 MT5.
+
+    Safety:
+      * ordinary challenge purchases only (never paid reset rows)
+      * exact purchase id
+      * exact trader owner
+      * exact account size
+      * if a real trader_account already exists, only repair purchase mirror fields
+      * otherwise assign one genuinely fresh Phase 1 MT5 through the existing
+        protected _assign_mt5_to_trader() contract
+      * idempotent: never creates a second account for the same purchase
+    """
+    if request.method == "OPTIONS":
+        return jsonify({"success": True})
+
+    admin_actor, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    d = request.get_json(silent=True) or {}
+    pid = str(d.get("id") or d.get("purchase_id") or "").strip()
+    if not pid:
+        return bad("Missing purchase id", 400)
+
+    try:
+        rows = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("id", pid).limit(1).execute().data or []
+        )
+        if not rows:
+            return bad("Purchase not found", 404)
+        p = rows[0]
+
+        purchase_blob = " ".join(str(p.get(k) or "") for k in (
+            "purchase_type", "journey_source", "status", "admin_note"
+        )).lower()
+        if (
+            str(p.get("purchase_type") or "challenge").strip().lower() == "reset"
+            or "[np_reset_request:" in purchase_blob
+            or "reset_payment_proof_exact_account" in purchase_blob
+        ):
+            return bad("This is a reset purchase. Use the reset lifecycle flow.", 409)
+
+        pay_status = str(p.get("payment_status") or "").strip().lower()
+        row_status = str(p.get("status") or "").strip().lower()
+        if pay_status not in {"approved", "paid"} and row_status not in {
+            "approved", "approved_active", "approved_waiting_mt5", "assigned", "completed"
+        }:
+            return bad("Payment is not approved yet.", 409)
+
+        tid = str(p.get("trader_id") or "").strip()
+        if not tid:
+            trader = _ensure_trader_for_purchase(p)
+            tid = str((trader or {}).get("id") or "").strip()
+        else:
+            trader = get_trader_by_id(tid)
+
+        if not trader or not tid:
+            return bad("Could not resolve trader for this purchase.", 500)
+
+        # First authority: a real linked account already exists.
+        existing = (
+            supabase.table("trader_accounts").select("*")
+            .eq("purchase_id", pid)
+            .order("created_at", desc=True)
+            .limit(20).execute().data or []
+        )
+        real = [
+            a for a in existing
+            if str(a.get("mt5_login") or "").strip()
+            and str(a.get("account_status") or a.get("status") or "").strip().lower()
+            not in {"assignment_sync_error"}
+        ]
+
+        if real:
+            account = real[0]
+            # Repair only the purchase mirror. Never create another MT5.
+            sync_payload = {
+                "payment_status": "approved",
+                "status": "approved_active",
+                "lifecycle_state": _active_state_for_stage(
+                    account.get("stage") or account.get("phase") or "phase1"
+                ),
+                "trader_account_id": account.get("id"),
+                "mt5_login": account.get("mt5_login"),
+                "mt5_server": account.get("mt5_server"),
+                "assigned_at": account.get("assigned_at") or account.get("started_at") or now_iso(),
+                "updated_at": now_iso(),
+            }
+            if account.get("mt5_pool_id"):
+                sync_payload["assigned_mt5_id"] = account.get("mt5_pool_id")
+
+            updated = (
+                supabase.table("challenge_purchases").update(sync_payload)
+                .eq("id", pid).execute().data or []
+            )
+            try:
+                np_invalidate_admin_bootstrap("purchases")
+                np_invalidate_admin_bootstrap("mt5")
+            except Exception:
+                pass
+            return ok({
+                "purchase": updated[0] if updated else {**p, **sync_payload},
+                "account": account,
+                "already_assigned": True,
+                "repaired_mirror": True,
+            }, f"Purchase already owns MT5 {account.get('mt5_login')}; purchase row repaired.")
+
+        size = clean(p.get("account_size") or 0)
+        if not size:
+            return bad("Purchase account size is missing.", 409)
+
+        mt5 = _np_pick_fresh_mt5(size, "phase1")
+        if not mt5:
+            waiting = _np_mark_purchase_approved_waiting_v60(
+                p, d, "Approved purchase waiting for fresh Phase 1 MT5"
+            )
+            return ok({
+                "purchase": waiting,
+                "waiting_for_mt5": True,
+                "target_stage": "phase1",
+            }, f"Payment is approved, but no fresh ₦{int(size):,} Phase 1 MT5 is available yet.")
+
+        eligible, reason = _np_mt5_auto_eligible(mt5, size, "phase1")
+        if not eligible:
+            # Ask the authoritative picker once more after the rejection.
+            mt5 = _np_pick_fresh_mt5(size, "phase1")
+            if not mt5:
+                waiting = _np_mark_purchase_approved_waiting_v60(
+                    p, d, "Approved purchase waiting for genuinely fresh Phase 1 MT5"
+                )
+                return ok({
+                    "purchase": waiting,
+                    "waiting_for_mt5": True,
+                    "target_stage": "phase1",
+                    "candidate_rejected": reason,
+                }, f"Payment is approved, but no safe fresh ₦{int(size):,} Phase 1 MT5 is available yet.")
+
+        staff = _admin_from_payload(d) or admin_actor or {
+            "name": "admin",
+            "username": "admin",
+            "role": "admin",
+        }
+
+        account, trader_row = _assign_mt5_to_trader(
+            trader,
+            mt5,
+            "phase1",
+            p,
+            staff,
+            f"V146 REPAIR APPROVED PURCHASE · purchase={pid}"
+        )
+
+        fresh_purchase = (
+            supabase.table("challenge_purchases").select("*")
+            .eq("id", pid).limit(1).execute().data or []
+        )
+
+        _audit_safe(
+            "challenge_purchases",
+            "approved_purchase_assignment_repaired",
+            f"Purchase {pid} repaired -> Phase 1 MT5 {account.get('mt5_login')}",
+            staff,
+            pid,
+        )
+
+        try:
+            np_invalidate_admin_bootstrap("purchases")
+            np_invalidate_admin_bootstrap("mt5")
+        except Exception:
+            pass
+
+        return ok({
+            "purchase": fresh_purchase[0] if fresh_purchase else p,
+            "account": account,
+            "trader": trader_row,
+            "waiting_for_mt5": False,
+        }, f"Missing assignment repaired. MT5 {account.get('mt5_login')} assigned.")
+
+    except Exception as exc:
+        return bad(exc, 500)
+
 
 @app.route("/reject_challenge_purchase", methods=["POST"])
 def reject_purchase():
