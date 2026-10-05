@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V147_PURCHASE_ASSIGNMENT_NONBLOCKING_2026_10_05"
+NAIRAPIPS_RELEASE = "V148_ASSIGNMENT_ADMIN_EMAIL_RESTORE_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -6694,18 +6694,16 @@ def _np_assignment_email_send_v132(to_email, subject, html_content, attempts=3):
 
 
 def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
-    """Guaranteed assignment notification path.
+    """Send trader assignment mail + guaranteed Admin/owner copy.
 
-    Fixes a production failure mode where automation passed a lightweight/partial
-    trader object without `email`, causing the old `if trader_email:` gate to skip
-    BOTH the trader email and the NairaPips owner/admin copy.
-
-    Rules:
-      * Resolve the full trader row by trader_id when possible.
-      * Send trader credentials when an email exists.
-      * ALWAYS attempt the owner/admin copy independently.
-      * Use synchronous Brevo calls with short retries.
-      * Never let email failure roll back a successful MT5 assignment.
+    V148:
+      * Trader email and Admin copy are independent.
+      * Admin copy uses the SAME proven send_admin_alert()/send_email_safe path
+        that is currently delivering registration, purchase, payout and inventory
+        notifications to the owner inbox.
+      * No threaded/concurrent Brevo send for the owner copy.
+      * Direct Brevo fallback remains if the normal admin-alert path reports failure.
+      * Email failure never reverses a completed MT5 assignment.
     """
     supplied = dict(trader or {})
     trader_id = str(supplied.get("id") or supplied.get("trader_id") or "").strip()
@@ -6718,13 +6716,11 @@ def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
                 .eq("id", trader_id).limit(1).execute().data or []
             )
             if rows:
-                # Database row is authoritative for contact details while keeping
-                # any newer in-memory fields from the assignment worker.
                 merged = dict(rows[0] or {})
                 merged.update({k: v for k, v in supplied.items() if v not in (None, "")})
                 full = merged
         except Exception as exc:
-            print("V132 ASSIGNMENT TRADER RESOLVE WARNING:", str(exc), flush=True)
+            print("V148 ASSIGNMENT TRADER RESOLVE WARNING:", str(exc), flush=True)
 
     to_email = str(full.get("email") or supplied.get("email") or "").strip()
     name = (
@@ -6735,7 +6731,7 @@ def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
         or "Trader"
     )
 
-    body = f"""Hello {name},
+    trader_body = f"""Hello {name},
 
 {title}
 
@@ -6743,12 +6739,9 @@ def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
 
 NairaPips Team"""
 
-    # V133 SPEED + RELIABILITY:
-    # Trader mail and owner copy are independent. Send both concurrently but
-    # still wait for both Brevo results before the assignment request returns.
     owner_subject = f"ADMIN COPY — {subject}"
     owner_body = (
-        f"Assignment copy for NairaPips owner.\n\n"
+        f"NAIRAPIPS MT5 ASSIGNMENT — ADMIN COPY\n\n"
         f"Trader ID: {trader_id or '—'}\n"
         f"Trader: {name}\n"
         f"Trader Email: {to_email or 'MISSING'}\n\n"
@@ -6757,57 +6750,56 @@ NairaPips Team"""
 
     trader_ok = False
     owner_ok = False
+
+    # 1) Trader delivery stays on the transactional Brevo path.
+    if to_email:
+        try:
+            trader_ok = _np_assignment_email_send_v132(
+                to_email,
+                subject,
+                text_to_html_content(trader_body),
+                attempts=3,
+            )
+        except Exception as exc:
+            print("V148 TRADER ASSIGNMENT EMAIL ERROR:", str(exc), flush=True)
+    else:
+        print(
+            "V148 ASSIGNMENT EMAIL WARNING: trader email missing after full-row resolve",
+            "trader_id=", trader_id,
+            flush=True,
+        )
+
+    # 2) Admin copy uses the proven operational-alert path.
+    # This is intentionally NOT conditional on trader_ok / trader email.
     try:
-        from concurrent.futures import ThreadPoolExecutor as _NPEmailPool
-        with _NPEmailPool(max_workers=2) as _mail_pool:
-            owner_future = _mail_pool.submit(
-                _np_assignment_email_send_v132,
+        owner_ok = bool(send_admin_alert(owner_subject, owner_body))
+    except Exception as exc:
+        print("V148 ADMIN ASSIGNMENT COPY PRIMARY ERROR:", str(exc), flush=True)
+        owner_ok = False
+
+    # 3) Belt-and-braces fallback directly to the fixed owner inbox.
+    if not owner_ok:
+        try:
+            owner_ok = _np_assignment_email_send_v132(
                 OWNER_ALERT_EMAIL,
                 owner_subject,
                 text_to_html_content(owner_body),
-                3,
+                attempts=3,
             )
-            trader_future = None
-            if to_email:
-                trader_future = _mail_pool.submit(
-                    _np_assignment_email_send_v132,
-                    to_email,
-                    subject,
-                    text_to_html_content(body),
-                    3,
-                )
-            else:
-                print(
-                    "V133 ASSIGNMENT EMAIL WARNING: trader email missing after full-row resolve",
-                    "trader_id=", trader_id,
-                    flush=True,
-                )
-
-            if trader_future is not None:
-                trader_ok = bool(trader_future.result())
-            owner_ok = bool(owner_future.result())
-    except Exception as _parallel_mail_exc:
-        print("V133 PARALLEL ASSIGNMENT EMAIL ERROR:", _parallel_mail_exc, flush=True)
-        # Safe fallback: owner copy remains independent from trader delivery.
-        if to_email:
-            trader_ok = _np_assignment_email_send_v132(
-                to_email, subject, text_to_html_content(body), attempts=2
-            )
-        owner_ok = _np_assignment_email_send_v132(
-            OWNER_ALERT_EMAIL, owner_subject, text_to_html_content(owner_body), attempts=2
-        )
+        except Exception as exc:
+            print("V148 ADMIN ASSIGNMENT COPY FALLBACK ERROR:", str(exc), flush=True)
 
     print(
-        "V132 MT5 ASSIGN EMAIL RESULT:",
+        "V148 MT5 ASSIGN EMAIL RESULT:",
         "trader=", ("SENT" if trader_ok else ("MISSING_EMAIL" if not to_email else "FAILED")),
-        "owner=", ("SENT" if owner_ok else "FAILED"),
-        "owner_email=", OWNER_ALERT_EMAIL,
+        "admin=", ("SENT" if owner_ok else "FAILED"),
+        "admin_email=", OWNER_ALERT_EMAIL,
         "trader_id=", trader_id,
         flush=True,
     )
 
-    # Preserve historical behavior: email failure does not reverse assignment.
     return bool(trader_ok or owner_ok)
+
 
 
 def send_admin_alert(subject, message):
@@ -11175,6 +11167,35 @@ def admin_repair_purchase_assignment_v146():
 
         if real:
             account = real[0]
+            # V148: if this assignment already existed but its purchase mirror/email
+            # was missed, restore the owner notification while repairing the mirror.
+            try:
+                _stage_label = str(account.get("stage") or "phase1").upper().replace("_", " ")
+                _name = (
+                    (trader or {}).get("name")
+                    or (trader or {}).get("full_name")
+                    or p.get("trader_name")
+                    or "Trader"
+                )
+                _details = (
+                    f"Existing {_stage_label} MT5 assignment reconciled:\n\n"
+                    f"MT5 Login: {account.get('mt5_login') or ''}\n"
+                    f"MT5 Server: {account.get('mt5_server') or ''}\n"
+                    f"Account Size: {float(account.get('account_size') or p.get('account_size') or 0):,.0f}\n"
+                    f"Purchase ID: {pid}\n"
+                    f"Trader Account ID: {account.get('id') or ''}"
+                )
+                # Admin copy is guaranteed independently; trader may also receive
+                # the reconciled credentials if their email is present.
+                send_assignment_email_with_owner_copy(
+                    trader or {"id": tid, "email": p.get("email"), "name": _name},
+                    f"NairaPips — Your {_stage_label} MT5 credentials",
+                    f"Hello {_name}, your {_stage_label} MT5 account assignment has been confirmed by NairaPips.",
+                    _details,
+                )
+            except Exception as _v148_reconcile_mail_exc:
+                print("V148 RECONCILED ASSIGNMENT EMAIL WARNING:", _v148_reconcile_mail_exc, flush=True)
+
             # Repair only the purchase mirror. Never create another MT5.
             sync_payload = {
                 "payment_status": "approved",
