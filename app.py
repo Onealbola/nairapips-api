@@ -5717,28 +5717,21 @@ def _np_admin_traders_fast_payload_v135(force=False):
 
         started = time.time()
 
-        # Two independent Supabase reads run concurrently.
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            trader_future = pool.submit(
-                lambda: (
-                    supabase.table("traders")
-                    .select("*")
-                    .order("created_at", desc=True)
-                    .limit(10000)
-                    .execute().data or []
-                )
-            )
-            account_future = pool.submit(
-                lambda: (
-                    supabase.table("trader_accounts")
-                    .select("*")
-                    .order("updated_at", desc=True)
-                    .limit(10000)
-                    .execute().data or []
-                )
-            )
-            traders = trader_future.result()
-            accounts = account_future.result()
+        # V174: no extra per-request worker threads on cache miss.
+        traders = (
+            supabase.table("traders")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(10000)
+            .execute().data or []
+        )
+        accounts = (
+            supabase.table("trader_accounts")
+            .select("*")
+            .order("updated_at", desc=True)
+            .limit(10000)
+            .execute().data or []
+        )
 
         # Do not run lifecycle decoration / plan lookup here. This endpoint exists
         # specifically to make the list screen fast. Exact lifecycle actions keep
@@ -8692,61 +8685,55 @@ def trader_bootstrap():
         account_rows = []
         purchase_rows = []
         try:
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="np-trader-bootstrap") as pool:
-                account_future = pool.submit(
-                    _critical_rest_rows,
-                    "trader_accounts",
-                    [("trader_id", trader.get("id"))],
-                    "updated_at",
-                    True,
-                    150,
-                )
-                purchase_future = pool.submit(
-                    _critical_rest_rows,
-                    "challenge_purchases",
-                    [("trader_id", trader.get("id"))],
-                    "created_at",
-                    True,
-                    100,
-                )
-                account_rows = account_future.result() or []
-                purchase_rows = purchase_future.result() or []
+            # V174: two bounded reads, no per-request ThreadPoolExecutor.
+            account_rows = _critical_rest_rows(
+                "trader_accounts",
+                [("trader_id", trader.get("id"))],
+                "updated_at",
+                True,
+                150,
+            ) or []
+            purchase_rows = _critical_rest_rows(
+                "challenge_purchases",
+                [("trader_id", trader.get("id"))],
+                "created_at",
+                True,
+                100,
+            ) or []
 
-                # V130 COMPLETE TRADER-ACCOUNT SAFETY:
-                # 150 is only the fast first page. If it is full, the trader may have
-                # older/replacement rows beyond that boundary. Page the SAME trader
-                # only so no valid replacement/current account is dropped by a row cap.
-                if len(account_rows) >= 150:
-                    try:
-                        seen_ids = {
-                            str(r.get("id") or "").strip()
-                            for r in account_rows
-                            if str(r.get("id") or "").strip()
-                        }
-                        start = 150
-                        page_size = 250
-                        while start < 5000:
-                            batch = (
-                                supabase.table("trader_accounts").select("*")
-                                .eq("trader_id", trader.get("id"))
-                                .order("updated_at", desc=True)
-                                .order("started_at", desc=True)
-                                .order("created_at", desc=True)
-                                .range(start, min(start + page_size - 1, 4999))
-                                .execute().data or []
-                            )
-                            for r in batch:
-                                rid = str(r.get("id") or "").strip()
-                                if rid and rid not in seen_ids:
-                                    seen_ids.add(rid)
-                                    account_rows.append(r)
-                            if len(batch) < page_size:
-                                break
-                            start += page_size
-                    except Exception as _v130_page_exc:
-                        print("V130 COMPLETE TRADER ACCOUNT PAGE WARNING:", _v130_page_exc, flush=True)
+            # V130 COMPLETE TRADER-ACCOUNT SAFETY:
+            # 150 is only the fast first page. Page only when actually needed.
+            if len(account_rows) >= 150:
+                try:
+                    seen_ids = {
+                        str(r.get("id") or "").strip()
+                        for r in account_rows
+                        if str(r.get("id") or "").strip()
+                    }
+                    start = 150
+                    page_size = 250
+                    while start < 5000:
+                        batch = (
+                            supabase.table("trader_accounts").select("*")
+                            .eq("trader_id", trader.get("id"))
+                            .order("updated_at", desc=True)
+                            .order("started_at", desc=True)
+                            .order("created_at", desc=True)
+                            .range(start, min(start + page_size - 1, 4999))
+                            .execute().data or []
+                        )
+                        for r in batch:
+                            rid = str(r.get("id") or "").strip()
+                            if rid and rid not in seen_ids:
+                                seen_ids.add(rid)
+                                account_rows.append(r)
+                        if len(batch) < page_size:
+                            break
+                        start += page_size
+                except Exception as _v130_page_exc:
+                    print("V130 COMPLETE TRADER ACCOUNT PAGE WARNING:", _v130_page_exc, flush=True)
         except Exception as e:
-            print("TRADER BOOTSTRAP CORE PARALLEL ERROR:", e)
+            print("V174 TRADER BOOTSTRAP CORE LOAD ERROR:", e, flush=True)
 
         # V113B: repair only exact funded cap rows wrongly archived before payout.
         account_rows = _np_restore_wrongly_archived_unpaid_funded_cap(trader, account_rows)
@@ -9659,18 +9646,20 @@ def login_trader():
         # the password_hash copy, which is corrected on the next login.
         if str(canonical.get("id") or "") != str(credential_row.get("id") or ""):
             try:
-                threading.Thread(
-                    target=_reconcile_verified_login_credential,
-                    args=(dict(canonical), dict(credential_row)),
-                    daemon=True,
-                ).start()
+                ex = globals().get("_NP_NOTIFICATION_EXECUTOR_V97")
+                if ex is not None:
+                    ex.submit(
+                        _reconcile_verified_login_credential,
+                        dict(canonical),
+                        dict(credential_row),
+                    )
+                else:
+                    print("V174 LOGIN RECONCILIATION DEFERRED: executor unavailable", flush=True)
             except Exception as e:
-                print("LOGIN RECONCILIATION BACKGROUND START SKIPPED:", e)
+                print("V174 LOGIN RECONCILIATION QUEUE SKIPPED:", e, flush=True)
 
         login_time = now_iso()
 
-        # Authentication must not wait for a non-essential last-login write.
-        # The timestamp is returned immediately; persistence is best-effort.
         def _persist_trader_last_login(trader_id, timestamp):
             try:
                 supabase.table("traders").update(
@@ -9680,13 +9669,13 @@ def login_trader():
                 print("LOGIN LAST_LOGIN UPDATE SKIPPED:", e)
 
         try:
-            threading.Thread(
-                target=_persist_trader_last_login,
-                args=(canonical["id"], login_time),
-                daemon=True,
-            ).start()
+            ex = globals().get("_NP_NOTIFICATION_EXECUTOR_V97")
+            if ex is not None:
+                ex.submit(_persist_trader_last_login, canonical["id"], login_time)
+            else:
+                print("V174 LAST_LOGIN WRITE DEFERRED: executor unavailable", flush=True)
         except Exception as e:
-            print("LOGIN LAST_LOGIN BACKGROUND START SKIPPED:", e)
+            print("V174 LAST_LOGIN QUEUE SKIPPED:", e, flush=True)
 
         t_token_start = time.time()
         public = _public_trader_payload(canonical)
@@ -9704,24 +9693,8 @@ def login_trader():
         # call is a cache hit (sub-50ms instead of 250-500ms).
         # Net effect: the trader's "time to interactive dashboard"
         # drops by 200-450ms per cold login.
-        try:
-            def _prewarm_trader_bootstrap(tid, atok):
-                try:
-                    with app.test_request_context(
-                        f"/trader_bootstrap?trader_id={tid}",
-                        headers={"Authorization": f"Bearer {atok}"},
-                    ):
-                        trader_bootstrap()
-                except Exception as pw_exc:
-                    print("LOGIN PREWARM failed (non-fatal):", pw_exc)
-            threading.Thread(
-                target=_prewarm_trader_bootstrap,
-                args=(canonical.get("id"), public["auth_token"]),
-                daemon=True,
-                name="np-login-prewarm",
-            ).start()
-        except Exception as pw_outer:
-            print("LOGIN PREWARM start skipped:", pw_outer)
+        # V174: do not create a duplicate background bootstrap request.
+        # The browser requests trader_bootstrap immediately after login.
 
         total_ms = int((time.time() - started) * 1000)
         print(f"PERF trader_login total_ms={total_ms} lookup_ms={t_lookup_ms} pwd_ms={t_pwd_ms} token_ms={t_token_ms} candidates={len(candidates)} result=ok")
@@ -10260,19 +10233,14 @@ def _np_mobile_commerce_snapshot_v144(force=False):
 
         started = time.time()
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            plans_future = pool.submit(_np_public_plan_snapshot_rows)
-            payments_future = pool.submit(
-                lambda: (
-                    supabase.table("payment_accounts")
-                    .select("*")
-                    .order("display_order", desc=False)
-                    .execute().data or []
-                )
-            )
-
-            plans = plans_future.result() or []
-            payments = payments_future.result() or []
+        # V174: avoid extra threads on mobile commerce cache misses.
+        plans = _np_public_plan_snapshot_rows() or []
+        payments = (
+            supabase.table("payment_accounts")
+            .select("*")
+            .order("display_order", desc=False)
+            .execute().data or []
+        )
 
         # Public purchase screen should not surface disabled payment accounts.
         active_payments = [
@@ -24498,7 +24466,7 @@ def _assert_mt5_never_used(mt5):
     return True
 
 
-NAIRAPIPS_RELEASE = NAIRAPIPS_ASSIGNMENT_FINAL_GUARD_RELEASE_V173
+NAIRAPIPS_RELEASE = "V174_THREAD_PRESSURE_FIX_2026_10_06"
 
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
