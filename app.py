@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V167_SURGICAL_PLAN_LOOKUP_FIX_2026_10_06"
+NAIRAPIPS_RELEASE = "V153_RESET_PRICE_LIVE_AUTHORITY_2026_10_05"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -82,64 +82,6 @@ supabase_admin = (
     if SUPABASE_SERVICE_ROLE_KEY
     else None
 )
-
-
-# V170 — MT5 PICKER TRUTH / RELIABLE REST FALLBACK
-# Keep one picker diagnosis per thread so callers can distinguish:
-# real empty inventory vs eligibility rejection vs temporary verification failure.
-_NP_MT5_PICK_DIAG_V170 = threading.local()
-
-def _np_set_mt5_pick_diag_v170(code, **detail):
-    try:
-        _NP_MT5_PICK_DIAG_V170.value = {"code": str(code or ""), **detail}
-    except Exception:
-        pass
-
-def _np_get_mt5_pick_diag_v170():
-    try:
-        return dict(getattr(_NP_MT5_PICK_DIAG_V170, "value", {}) or {})
-    except Exception:
-        return {}
-
-def _np_rest_rows_v170(table, select="*", filters=None, limit=1000, order=None):
-    """Direct PostgREST reader with hard timeouts.
-    Used only as a fallback when the shared Supabase client is temporarily unavailable.
-    """
-    base = str(SUPABASE_URL or "").rstrip("/")
-    key = str(SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY or "").strip()
-    if not base or not key:
-        raise RuntimeError("Supabase REST configuration unavailable")
-    headers = {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Accept": "application/json",
-    }
-    params = {"select": select, "limit": str(max(1, min(int(limit or 1000), 10000)))}
-    for col, expr in (filters or []):
-        params[str(col)] = str(expr)
-    if order:
-        params["order"] = str(order)
-    last = None
-    for delay in (0.0, 0.20, 0.60):
-        if delay:
-            time.sleep(delay)
-        try:
-            r = requests.get(
-                f"{base}/rest/v1/{table}",
-                headers=headers,
-                params=params,
-                timeout=(2.5, 6.0),
-            )
-            last = r
-            if r.status_code < 500:
-                if r.status_code >= 400:
-                    raise RuntimeError(f"{table} REST {r.status_code}: {r.text[:180]}")
-                data = r.json()
-                return data if isinstance(data, list) else []
-        except Exception as exc:
-            last = exc
-            continue
-    raise RuntimeError(f"{table} REST unavailable: {last}")
 
 
 # ============================================================
@@ -806,10 +748,9 @@ def _safe_plan_for_purchase(purchase):
             rows = supabase.table("challenge_plans").select("*").eq("name", plan_name).limit(1).execute().data or []
             if rows:
                 return rows[0]
-            # V167 SURGICAL FIX:
-            # Current challenge_plans schema has no "plan_name" column.
-            # Do not query a non-existent column; preserve all existing lifecycle
-            # behavior by simply returning no plan match here.
+            rows = supabase.table("challenge_plans").select("*").eq("plan_name", plan_name).limit(1).execute().data or []
+            if rows:
+                return rows[0]
     except Exception as e:
         print("LIFECYCLE PLAN LOOKUP ERROR:", e)
     return None
@@ -902,16 +843,17 @@ def _target_for_stage(stage):
 
 
 def _effective_target_percent(stage, account=None, purchase=None, plan=None):
-    """Resolve the profit target for one account.
+    """Resolve the live profit target for one lifecycle account.
 
-    V156 authority:
-      1. immutable purchase snapshot
-      2. exact trader_account snapshot
-      3. current plan (fallback for old records)
-      4. legacy stage default
+    Authority order for purchase-linked challenges:
+      1. linked challenge plan (current Admin plan setting)
+      2. purchase snapshot fields, when present
+      3. stored trader_accounts target_percent
+      4. legacy stage defaults (10 / 8 / 0)
 
-    Editing a plan changes NEW purchases. It does not silently rewrite the rule
-    of an already-started MT5 account.
+    This lets an Admin plan change (for example Phase 1 10% -> 15%) propagate
+    globally to existing purchase-linked active accounts instead of leaving
+    stale 10% values on trader dashboards.
     """
     stage = _normalize_lifecycle_stage(stage)
     account = account or {}
@@ -923,20 +865,20 @@ def _effective_target_percent(stage, account=None, purchase=None, plan=None):
 
     if stage == "phase2":
         candidates = [
+            resolved_plan.get("phase2_target"),
             purchase.get("phase2_target"),
             account.get("target_percent"),
             account.get("profit_target"),
-            resolved_plan.get("phase2_target"),
             8,
         ]
     else:
         candidates = [
+            resolved_plan.get("phase1_target"),
+            resolved_plan.get("profit_target"),
             purchase.get("phase1_target"),
             purchase.get("profit_target"),
             account.get("target_percent"),
             account.get("profit_target"),
-            resolved_plan.get("phase1_target"),
-            resolved_plan.get("profit_target"),
             10,
         ]
 
@@ -948,7 +890,6 @@ def _effective_target_percent(stage, account=None, purchase=None, plan=None):
         except Exception:
             continue
     return float(_target_for_stage(stage) or 0)
-
 
 
 def _active_state_for_stage(stage):
@@ -1135,7 +1076,7 @@ def _decorate_account_for_api(account):
 
 
 _TRADER_ACCOUNT_RESPONSE_FIELDS = {
-    "id", "trader_id", "purchase_id", "challenge_purchase_id", "mt5_pool_id", "product_category",
+    "id", "trader_id", "purchase_id", "challenge_purchase_id", "mt5_pool_id",
     "stage", "phase", "account_status", "status", "challenge_state",
     "account_size", "start_balance", "current_balance", "current_equity",
     "balance", "equity", "profit", "profit_percent", "current_profit_percent",
@@ -1154,8 +1095,7 @@ _TRADER_ACCOUNT_RESPONSE_FIELDS = {
 }
 
 _TRADER_PURCHASE_RESPONSE_FIELDS = {
-    "id", "trader_id", "trader_account_id", "plan_id", "plan_name", "product_category", "drawdown_type", "payout_frequency",
-    "phase1_target", "phase2_target", "max_drawdown", "payout_split", "reset_fee", "funded_reset_fee", "plan_snapshot_at",
+    "id", "trader_id", "trader_account_id", "plan_id", "plan_name",
     "account_size", "fee", "original_fee", "discount_percent",
     "discount_amount", "final_fee", "amount_due", "payment_status",
     "status", "lifecycle_state", "stage", "phase", "active_stage",
@@ -3202,33 +3142,9 @@ def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=N
 
     mt5 = _np_pick_fresh_mt5(size, stage)
     if not mt5:
-        _pick_diag = _np_get_mt5_pick_diag_v170()
-        _pick_code = str(_pick_diag.get("code") or "UNKNOWN").upper()
-        _audit_safe(
-            "mt5_pool",
-            "auto_assignment_waiting",
-            f"{reason}: MT5_PICK={_pick_code}; detail={json.dumps(_pick_diag, default=str)[:1200]}",
-            {"name":"system","username":"system","role":"system"},
-            trader_id,
-        )
-
-        # Only call it an inventory shortage when the picker actually proved
-        # there is no matching/eligible inventory.  Resource/history failures
-        # are reported as verification failures instead.
-        if _pick_code in {"NO_MATCHING_INVENTORY", "NO_ELIGIBLE_INVENTORY"}:
-            _np_inventory_wait_alert(stage, size, reason, trader)
-        else:
-            try:
-                send_admin_alert(
-                    f"NairaPips MT5 verification waiting — {str(stage).upper()} {email_money(size)}",
-                    "Automation found/queried the MT5 category but could not safely complete "
-                    "eligibility verification. This is NOT being reported as empty inventory.\n\n"
-                    f"Stage: {str(stage).upper()}\nAccount Size: {email_money(size)}\n"
-                    f"Reason: {reason}\nTrader: {(trader or {}).get('name') or (trader or {}).get('email') or trader_id}\n"
-                    f"Picker status: {_pick_code}\nDetail: {json.dumps(_pick_diag, default=str)[:1200]}"
-                )
-            except Exception:
-                pass
+        _audit_safe("mt5_pool", "auto_assignment_waiting", f"{reason}: WAITING_FOR_MT5_INVENTORY; no fresh <=7-day MT5 for {stage} size {size}",
+                    {"name":"system","username":"system","role":"system"}, trader_id)
+        _np_inventory_wait_alert(stage, size, reason, trader)
         return None
     account, updated = _assign_mt5_to_trader(
         trader, mt5, stage, purchase,
@@ -3550,38 +3466,7 @@ def _np_update_trader_current_pointer_v59(trader_id, account, stage):
     )
 
 
-
-def _np_purchase_is_rejected_v154(purchase, refresh=True):
-    """True when this exact purchase is currently rejected."""
-    p = dict(purchase or {})
-    pid = str(p.get("id") or "").strip()
-
-    if refresh and pid:
-        try:
-            rows = (
-                supabase.table("challenge_purchases")
-                .select("id,payment_status,status,rejected_at")
-                .eq("id", pid).limit(1).execute().data or []
-            )
-            if rows:
-                p.update(rows[0] or {})
-        except Exception as exc:
-            print("V154 REJECTION GUARD REFRESH WARNING:", exc, flush=True)
-
-    return bool(
-        str(p.get("payment_status") or "").strip().lower() == "rejected"
-        or str(p.get("status") or "").strip().lower() == "rejected"
-        or str(p.get("rejected_at") or "").strip()
-    )
-
-
 def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="MT5 assigned"):
-
-    # V154: rejected purchase can never receive an MT5, even from a stale
-    # Admin tab, delayed request, retry worker, or race with Reject.
-    if purchase and _np_purchase_is_rejected_v154(purchase, refresh=True):
-        raise ValueError("This purchase is REJECTED. MT5 assignment is blocked.")
-
     _np_registry_predecessor = _np_registry_predecessor_id(purchase)
     stage = str(stage or "").lower()
     if stage not in ACCOUNT_STAGES:
@@ -3628,10 +3513,6 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         "mt5_master_password": mt5.get("mt5_master_password"),
         "mt5_investor_password": mt5.get("mt5_investor_password"),
         "account_size": account_size,
-        "product_category": _np_plan_category_v156(
-            (purchase or {}).get("product_category")
-            or (plan or {}).get("product_category")
-        ),
         "start_balance": account_size,
         "current_balance": account_size,
         "current_equity": account_size,
@@ -3640,17 +3521,9 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         "absolute_drawdown_percent": 0,
         # PLAN-SPECIFIC DD AUTHORITY 2026-08-30: freeze this plan's DD on the exact account.
         # Normal/legacy plans stay 20%; 2 Lives plans use their configured 10% rule.
-        "dd_limit_percent": float(
-            (purchase or {}).get("max_drawdown")
-            or (plan or {}).get("max_drawdown")
-            or 20
-        ),
+        "dd_limit_percent": float((plan or {}).get("max_drawdown") or 20),
         "dd_used_percent": 0,
         "target_percent": _effective_target_percent(stage, {}, purchase, plan),
-        "payout_split": _effective_payout_split(
-            (purchase or {}).get("payout_split")
-            or (plan or {}).get("payout_split")
-        ),
         "monitoring_enabled": True,
         "started_at": now,
         "created_at": now,
@@ -10152,30 +10025,6 @@ def _np_second_life_used_but_unfulfilled(purchase, trader_id):
         pass
     return source
 
-
-def _np_plan_category_v156(value):
-    value = str(value or "standard").strip().lower()
-    if value in {"premium", "pro", "elite"}:
-        return "premium"
-    return "standard"
-
-
-def _np_plan_rule_snapshot_v156(plan):
-    plan = plan or {}
-    return {
-        "product_category": _np_plan_category_v156(plan.get("product_category")),
-        "drawdown_type": str(plan.get("drawdown_type") or "STATIC").strip().upper(),
-        "payout_frequency": str(plan.get("payout_frequency") or "Daily").strip(),
-        "phase1_target": float(plan.get("phase1_target") or plan.get("profit_target") or 10),
-        "phase2_target": float(plan.get("phase2_target") or 0),
-        "max_drawdown": float(plan.get("max_drawdown") or plan.get("total_dd") or 20),
-        "payout_split": _effective_payout_split(plan.get("payout_split")),
-        "reset_fee": clean(plan.get("reset_fee")),
-        "funded_reset_fee": clean(plan.get("funded_reset_fee")),
-        "plan_snapshot_at": now_iso(),
-    }
-
-
 def _np_public_plan_snapshot_rows():
     """Published public commercial plan snapshot.
 
@@ -10193,17 +10042,11 @@ def _np_public_plan_snapshot_rows():
         out = []
         for raw in rows:
             row = dict(raw or {})
-            row["product_category"] = _np_plan_category_v156(row.get("product_category"))
             if "payout_split" in row:
                 row["payout_split"] = _effective_payout_split(row.get("payout_split"))
             row["second_life_enabled"] = _second_life_bool(row.get("second_life_enabled"))
             row["lives_total"] = int(row.get("lives_total") or (2 if row["second_life_enabled"] else 1))
             out.append(row)
-        out.sort(key=lambda r: (
-            0 if _np_plan_category_v156(r.get("product_category")) == "standard" else 1,
-            int(r.get("category_sort") or 10),
-            float(r.get("account_size") or 0),
-        ))
         return out
     return np_cached_read("public_plans_snapshot", 300, _fetch)
 
@@ -10341,10 +10184,6 @@ def create_plan():
             d.get("progression_route"), "one_phase" if phase2_target <= 0 else "two_phase"
         )
         row={"name":name,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
-             "product_category":_np_plan_category_v156(d.get("product_category")),
-             "category_sort":int(d.get("category_sort") or 10),
-             "drawdown_type":str(d.get("drawdown_type") or "STATIC").strip().upper(),
-             "payout_frequency":str(d.get("payout_frequency") or "Daily").strip(),
              "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":phase2_target,
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
              "challenge_journey": challenge_journey, "journey_source": "plan_create",
@@ -10370,14 +10209,6 @@ def update_plan():
         upd={"updated_at":now_iso()}
         for k in ["name","daily_drawdown","description","status","mt5_server","default_server"]:
             if k in d: upd[k]=(_np_normalize_pool_class(d[k]) if k=="pool_class" else d[k])
-        if "product_category" in d:
-            upd["product_category"] = _np_plan_category_v156(d.get("product_category"))
-        if "category_sort" in d:
-            upd["category_sort"] = int(d.get("category_sort") or 10)
-        if "drawdown_type" in d:
-            upd["drawdown_type"] = str(d.get("drawdown_type") or "STATIC").strip().upper()
-        if "payout_frequency" in d:
-            upd["payout_frequency"] = str(d.get("payout_frequency") or "Daily").strip()
         if "payout_split" in d:
             upd["payout_split"] = _effective_payout_split(d.get("payout_split"))
         # V123: Challenge Plans now use paid, admin-priced resets.
@@ -10513,7 +10344,6 @@ def create_purchase():
         plan_row = _safe_plan_for_purchase({"plan_id": d.get("plan_id"), "plan_name": plan})
         challenge_journey = _journey_source_value(_journey_for_lifecycle({}, {}, plan_row, None))
         second_life_snapshot = _second_life_plan_snapshot(plan_row)
-        plan_rule_snapshot = _np_plan_rule_snapshot_v156(plan_row)
         row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
              "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":quote.get("final_fee", original_fee),
              "original_fee":quote.get("original_fee", original_fee),"discount_percent":quote.get("discount_percent",0),"discount_amount":quote.get("discount_amount",0),
@@ -10522,7 +10352,6 @@ def create_purchase():
              "challenge_journey": challenge_journey, "journey_source": "purchase_plan_snapshot",
              "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
         row.update(second_life_snapshot)
-        row.update(plan_rule_snapshot)
         row.update(_affiliate_purchase_fields(d, original_fee))
         created = supabase.table("challenge_purchases").insert(row).execute().data or []
         if not created:
@@ -11108,13 +10937,6 @@ def approve_purchase():
         pres=supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute()
         if not pres.data: return bad("Purchase not found",404)
         p=pres.data[0]
-
-        if _np_purchase_is_rejected_v154(p, refresh=False):
-            return bad(
-                "This purchase is REJECTED. Assignment is blocked. Use a dedicated restore action before any future approval.",
-                409
-            )
-
         if p.get("trader_account_id") or p.get("assigned_mt5_id") or str(p.get("mt5_login") or "").strip():
             return bad("This purchase is already approved/assigned. Refresh the purchases page.", 409)
 
@@ -11677,33 +11499,8 @@ def reject_purchase():
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing purchase id")
         purchase = get_purchase_by_id(pid)
-        if not purchase:
-            return bad("Purchase not found", 404)
-
-        linked = (
-            supabase.table("trader_accounts")
-            .select("id,mt5_login,account_status,status")
-            .eq("purchase_id", pid).limit(20).execute().data or []
-        )
-        real_linked = [a for a in linked if str(a.get("mt5_login") or "").strip()]
-        if (
-            str(purchase.get("mt5_login") or "").strip()
-            or real_linked
-        ):
-            return bad(
-                "This purchase already has a real MT5 assignment. Do not reject it from Purchases; use the appropriate lifecycle/recall action.",
-                409
-            )
-
         note = d.get("admin_note","Challenge purchase rejected")
-        result = supabase.table("challenge_purchases").update({
-            "payment_status":"rejected",
-            "status":"rejected",
-            "lifecycle_state":"payment_rejected",
-            "rejected_at":now_iso(),
-            "admin_note":note,
-            "updated_at":now_iso()
-        }).eq("id",pid).execute().data
+        result = supabase.table("challenge_purchases").update({"payment_status":"rejected","status":"rejected","rejected_at":now_iso(),"admin_note":note}).eq("id",pid).execute().data
         try:
             trader_id = purchase.get("trader_id")
             if trader_id:
@@ -24023,246 +23820,6 @@ if _NP_PREVIOUS_TRADER_RESET_OPPORTUNITIES_VIEW:
     app.view_functions["trader_reset_opportunities"] = _np_final_trader_reset_opportunities_20260911
 
 
-
-# ============================================================================
-# NAIRAPIPS V169 — COORDINATED ASSIGNMENT RECOVERY — 06 OCT 2026
-#
-# Scope ONLY:
-#   A) New purchase Approve + Auto Assign must not die because an optional
-#      historical reconciliation helper temporarily fails.
-#   B) PASS -> FUNDED recovery must start from the exact PASSED trader_account,
-#      not from a broad purchase-history scan.
-#
-# Business law is unchanged:
-#   root Phase account -> PASSED -> one Funded child
-#   exact purchase_id required
-#   exact trader ownership required
-#   existing duplicate/replay guards remain active
-#   existing Funded-pool / size / freshness rules remain active
-#   no reset / payout / Second Life / breach / recall rule is changed
-# ============================================================================
-
-NAIRAPIPS_ASSIGNMENT_RECOVERY_RELEASE_V169 = "V169_COORDINATED_ASSIGNMENT_RECOVERY_2026_10_06"
-_NP_PASS_FUNDED_V169_LOCK = threading.Lock()
-
-
-def _np_retry_clean_pass_funded_v19(limit=120):
-    """Lean exact PASS->FUNDED recovery.
-
-    The source PASSED account is the root/parent.  It does not need a parent.
-    The existing protected assigner creates one Funded child for the same
-    purchase journey.
-    """
-    summary = {
-        "release": NAIRAPIPS_ASSIGNMENT_RECOVERY_RELEASE_V169,
-        "checked": 0,
-        "due": 0,
-        "assigned": 0,
-        "already_fulfilled": 0,
-        "waiting_inventory": 0,
-        "blocked": 0,
-        "errors": 0,
-    }
-
-    if not _NP_PASS_FUNDED_V169_LOCK.acquire(blocking=False):
-        summary["busy"] = True
-        return summary
-
-    try:
-        # Pull only completed/pass source accounts.  This avoids the old broad
-        # challenge_purchases sweep and immediately includes newly-created plans.
-        try:
-            sources = (
-                supabase.table("trader_accounts").select("*")
-                .in_("account_status", [
-                    "archived_phase1", "archived_phase2",
-                    "passed", "archived_passed"
-                ])
-                .order("updated_at", desc=True)
-                .limit(max(20, min(int(limit or 120), 250)))
-                .execute().data or []
-            )
-        except Exception as exc:
-            print("V169 PASS->FUNDED SOURCE LOAD ERROR:", exc, flush=True)
-            summary["errors"] += 1
-            return summary
-
-        seen_purchase_ids = set()
-
-        for source in sources:
-            try:
-                source_id = str(source.get("id") or "").strip()
-                trader_id = str(source.get("trader_id") or "").strip()
-                purchase_id = str(
-                    source.get("purchase_id")
-                    or source.get("challenge_purchase_id")
-                    or ""
-                ).strip()
-
-                if not source_id or not trader_id or not purchase_id:
-                    continue
-                if purchase_id in seen_purchase_ids:
-                    continue
-                seen_purchase_ids.add(purchase_id)
-
-                source_stage = _normalize_lifecycle_stage(
-                    source.get("stage") or source.get("phase")
-                )
-                source_status = str(
-                    source.get("account_status") or source.get("status") or ""
-                ).strip().lower()
-                pass_status = str(source.get("phase_pass_status") or "").strip().lower()
-                risk_zone = str(source.get("risk_zone") or "").strip().lower()
-
-                passed = bool(
-                    source_status in {
-                        "archived_phase1", "archived_phase2",
-                        "passed", "archived_passed"
-                    }
-                    or pass_status in {"phase1_passed", "phase2_passed"}
-                    or risk_zone == "passed"
-                )
-                if not passed:
-                    continue
-
-                summary["checked"] += 1
-
-                # Exact immutable root purchase only.
-                prows = (
-                    supabase.table("challenge_purchases").select("*")
-                    .eq("id", purchase_id)
-                    .eq("trader_id", trader_id)
-                    .limit(1).execute().data or []
-                )
-                if not prows:
-                    summary["blocked"] += 1
-                    print(
-                        "V169 PASS->FUNDED BLOCKED: exact purchase missing",
-                        purchase_id, source.get("mt5_login"), flush=True
-                    )
-                    continue
-
-                purchase = prows[0]
-
-                # Preserve the existing clean-automation cutover/business rule.
-                if "_np_is_clean_root_v43" in globals() and not _np_is_clean_root_v43(purchase):
-                    continue
-
-                trader = get_trader_by_id(trader_id)
-                if not trader:
-                    summary["errors"] += 1
-                    continue
-
-                target_stage = (
-                    str(source.get("next_stage") or "").strip().lower()
-                    or _next_stage_for_lifecycle(
-                        source_stage, source, purchase, None, trader
-                    )
-                )
-                target_stage = _normalize_lifecycle_stage(target_stage) if target_stage else None
-
-                if target_stage != "funded":
-                    continue
-
-                # Exact same purchase already has any genuine Funded child:
-                # entitlement is consumed even if that child later changed status.
-                existing_rows = (
-                    supabase.table("trader_accounts").select(
-                        "id,trader_id,purchase_id,stage,phase,account_status,mt5_login,created_at,assigned_at"
-                    )
-                    .eq("trader_id", trader_id)
-                    .eq("purchase_id", purchase_id)
-                    .limit(200).execute().data or []
-                )
-                existing_funded = [
-                    a for a in existing_rows
-                    if str(a.get("id") or "").strip() != source_id
-                    and _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == "funded"
-                    and str(a.get("mt5_login") or "").strip()
-                ]
-                if existing_funded:
-                    summary["already_fulfilled"] += 1
-                    continue
-
-                summary["due"] += 1
-
-                # IMPORTANT: source is the passed ROOT/PARENT.  We do not ask it
-                # to have a parent.  Existing assignment authority creates child.
-                result = _np_auto_assign_waiting_stage(
-                    trader,
-                    "funded",
-                    purchase,
-                    source,
-                    "lifecycle_progression",
-                )
-
-                if result:
-                    if result.get("already_fulfilled"):
-                        summary["already_fulfilled"] += 1
-                    else:
-                        summary["assigned"] += 1
-                        try:
-                            _audit_safe(
-                                "automation",
-                                "v169_pass_funded_fulfilled",
-                                (
-                                    f"ROOT_PASS_TO_FUNDED purchase={purchase_id}; "
-                                    f"source_account={source_id}; "
-                                    f"source_mt5={source.get('mt5_login')}; "
-                                    f"funded_mt5={(result.get('account') or {}).get('mt5_login')}"
-                                ),
-                                {
-                                    "name": "automation_v169",
-                                    "username": "automation_v169",
-                                    "role": "system",
-                                },
-                                source_id,
-                            )
-                        except Exception:
-                            pass
-                else:
-                    # Do not invent a different reason.  Existing protected
-                    # assignment authority remains the final gate.
-                    summary["waiting_inventory"] += 1
-
-            except Exception as exc:
-                summary["errors"] += 1
-                print(
-                    "V169 PASS->FUNDED ITEM ERROR:",
-                    source.get("mt5_login"),
-                    exc,
-                    flush=True,
-                )
-
-        return summary
-    finally:
-        _NP_PASS_FUNDED_V169_LOCK.release()
-
-
-@app.route("/admin/assignment_recovery_v169/status", methods=["GET", "OPTIONS"])
-def admin_assignment_recovery_v169_status():
-    if request.method == "OPTIONS":
-        return _np_ok({"success": True})
-    admin_user, auth_response = _require_admin()
-    if auth_response:
-        return auth_response
-    return _np_ok({
-        "success": True,
-        "release": NAIRAPIPS_ASSIGNMENT_RECOVERY_RELEASE_V169,
-        "pass_to_funded_source": "exact_passed_trader_account",
-        "root_account_requires_parent": False,
-        "funded_child_created_by_existing_protected_assigner": True,
-        "purchase_approval_pre_reconcile": "best_effort_non_blocking",
-        "reset_logic_changed": False,
-        "payout_logic_changed": False,
-        "second_life_logic_changed": False,
-        "breach_logic_changed": False,
-        "recall_logic_changed": False,
-    })
-
-
-NAIRAPIPS_RELEASE = NAIRAPIPS_ASSIGNMENT_RECOVERY_RELEASE_V169
-
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
@@ -30538,16 +30095,9 @@ def _np_post9_approve_purchase_route():
             if _np_post9_root_purchase(p):
                 tid = str(p.get("trader_id") or "").strip()
 
-                # V169 ASSIGNMENT RECOVERY:
-                # Historical reconciliation is best-effort only.  A temporary
-                # Supabase/resource failure here must not crash a brand-new exact
-                # purchase approval.  The exact-purchase duplicate/ownership guards
-                # below and inside _assign_mt5_to_trader remain authoritative.
+                # Repair exact historical ownership before making a new decision.
                 if tid:
-                    try:
-                        _np_post9_reconcile_trader_journeys(tid, apply=True)
-                    except Exception as _rec_exc:
-                        print("V169 APPROVAL PRE-RECONCILE DEFERRED:", _rec_exc, flush=True)
+                    _np_post9_reconcile_trader_journeys(tid, apply=True)
 
                 # NEW PURCHASE = NEW JOURNEY.  Existing accounts on OTHER purchases
                 # belonging to this trader are irrelevant and must never block or be
@@ -39378,31 +38928,20 @@ NAIRAPIPS_MT5_HISTORY_RELEASE_V48 = "V48_FRESH_MT5_HISTORY_GUARD_2026_09_15"
 # Mandatory history source: trader_accounts is the operational ownership ledger.
 # Do not fail-open if this query is temporarily unavailable.
 _np_mt5_login_has_any_history_v48_core = _mt5_login_has_any_history
+
 def _mt5_login_has_any_history(mt5_login, exclude_mt5_pool_id=None):
     login = str(mt5_login or "").strip()
     if not login:
         return True, "MT5 login is empty"
 
-    # Mandatory ownership ledger. First use the normal client; if the shared
-    # client is resource-starved, fall back to direct REST instead of
-    # incorrectly treating inventory as unavailable.
     try:
         rows = (
             supabase.table("trader_accounts").select("id,mt5_login")
             .eq("mt5_login", login).limit(1).execute().data or []
         )
     except Exception as exc:
-        print("V170 MT5 HISTORY CLIENT FALLBACK:", login, exc, flush=True)
-        try:
-            rows = _np_rest_rows_v170(
-                "trader_accounts",
-                select="id,mt5_login",
-                filters=[("mt5_login", f"eq.{login}")],
-                limit=1,
-            )
-        except Exception as rest_exc:
-            print("V170 MANDATORY MT5 HISTORY CHECK FAILED CLOSED:", login, rest_exc, flush=True)
-            return True, "MT5 history verification is temporarily unavailable; retry later"
+        print("V48 MANDATORY MT5 HISTORY CHECK FAILED:", login, exc)
+        return True, "MT5 history verification is temporarily unavailable; retry later"
 
     if rows:
         return True, f"MT5 {login} already exists in trader_accounts.mt5_login"
@@ -39411,6 +38950,7 @@ def _mt5_login_has_any_history(mt5_login, exclude_mt5_pool_id=None):
     return _np_mt5_login_has_any_history_v48_core(
         login, exclude_mt5_pool_id=exclude_mt5_pool_id
     )
+
 
 def _np_chunks_v48(values, size=80):
     vals = [str(v or "").strip() for v in values if str(v or "").strip()]
@@ -41700,9 +41240,6 @@ def _np_mark_purchase_approved_waiting_v60(purchase, admin_payload=None, reason=
     if marker.lower() not in old_note.lower():
         note = (old_note + " | " + marker + " " + str(reason or "")).strip(" |")
 
-    if _np_purchase_is_rejected_v154(p, refresh=True):
-        raise ValueError("This purchase is REJECTED. WAITING FOR MT5 cannot be created.")
-
     rows = (
         supabase.table("challenge_purchases").update({
             "payment_status": "approved",
@@ -41713,12 +41250,10 @@ def _np_mark_purchase_approved_waiting_v60(purchase, admin_payload=None, reason=
             "admin_note": note,
         })
         .eq("id", pid)
-        .neq("payment_status", "rejected")
-        .neq("status", "rejected")
         .execute().data or []
     )
     if not rows:
-        raise RuntimeError("Purchase was rejected or changed before WAITING FOR MT5 could be persisted.")
+        raise RuntimeError("Payment approval could not be persisted in WAITING FOR MT5 state")
 
     # Referral earnings depend on approved payment, not MT5 inventory.
     try:
@@ -48747,19 +48282,10 @@ def _np_v80_candidate_ok(m, size, target_stage):
 
 
 def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
-    """V170 single production picker.
-
-    Safety remains fail-closed, but a temporary Supabase-client failure no
-    longer masquerades as "no inventory": direct REST fallback verifies the
-    same inventory/history before giving up.
-    """
+    """Global picker: complete exact category scan, FRESHEST SAFE credential first."""
     expected_pool = _np_expected_pool_class(target_stage)
     size = clean(account_size)
-    _np_set_mt5_pick_diag_v170(
-        "START", pool=expected_pool, size=size, stage=str(target_stage or "")
-    )
     if not size:
-        _np_set_mt5_pick_diag_v170("INVALID_SIZE", pool=expected_pool, size=size)
         return None
 
     statuses = ["available", "unused", "new", "ready", "open"]
@@ -48770,7 +48296,6 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
     rejected_structure = 0
     rejected_marker = 0
     total_candidates = 0
-    history_fallbacks = 0
 
     while start < max_candidates:
         try:
@@ -48784,30 +48309,21 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
                 .execute().data or []
             )
         except Exception as exc:
-            print("V170 MT5 POOL CLIENT FALLBACK:", expected_pool, size, exc, flush=True)
+            # Preserve existing migration compatibility only for PHASE inventory.
+            if expected_pool == "funded":
+                print("V80 FUNDED FRESHEST MT5 PAGE QUERY ERROR:", exc, flush=True)
+                return None
             try:
-                status_expr = "in.(" + ",".join(statuses) + ")"
-                rows = _np_rest_rows_v170(
-                    "mt5_pool",
-                    select="*",
-                    filters=[
-                        ("account_size", f"eq.{size}"),
-                        ("pool_class", f"eq.{expected_pool}"),
-                        ("status", status_expr),
-                    ],
-                    limit=page_size,
-                    order="created_at.desc",
+                rows = (
+                    supabase.table("mt5_pool").select("*")
+                    .eq("account_size", size)
+                    .in_("status", statuses)
+                    .order("created_at", desc=True)
+                    .range(start, min(start + page_size - 1, max_candidates - 1))
+                    .execute().data or []
                 )
-                # REST fallback is intentionally one bounded category page.
-                # 200 is already far above the live category size shown in Admin.
-                start = max_candidates
-            except Exception as rest_exc:
-                _np_set_mt5_pick_diag_v170(
-                    "INVENTORY_QUERY_FAILED",
-                    pool=expected_pool, size=size,
-                    error=str(rest_exc)[:300],
-                )
-                print("V170 MT5 INVENTORY QUERY FAILED:", rest_exc, flush=True)
+            except Exception as exc2:
+                print("V80 PHASE FRESHEST MT5 PAGE QUERY ERROR:", exc2, flush=True)
                 return None
 
         if not rows:
@@ -48826,41 +48342,12 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
             else:
                 rejected_structure += 1
 
-        # Mandatory used-history batch. If the shared client is unavailable,
-        # verify the same trader_accounts ledger through direct REST.
         try:
             used = _np_used_mt5_logins_batch_v48(structural)
         except Exception as exc:
-            history_fallbacks += 1
-            print("V170 BATCH HISTORY CLIENT FALLBACK:", exc, flush=True)
-            logins = sorted({
-                str(m.get("mt5_login") or "").strip()
-                for m in structural if str(m.get("mt5_login") or "").strip()
-            })
-            try:
-                used = set()
-                for chunk in _np_chunks_v48(logins):
-                    expr = "in.(" + ",".join(chunk) + ")"
-                    hist = _np_rest_rows_v170(
-                        "trader_accounts",
-                        select="mt5_login",
-                        filters=[("mt5_login", expr)],
-                        limit=10000,
-                    )
-                    for h in hist:
-                        lg = str(h.get("mt5_login") or "").strip()
-                        if lg:
-                            used.add(lg)
-            except Exception as rest_exc:
-                _np_set_mt5_pick_diag_v170(
-                    "HISTORY_CHECK_FAILED",
-                    pool=expected_pool, size=size,
-                    candidates=total_candidates,
-                    structural=len(structural),
-                    error=str(rest_exc)[:300],
-                )
-                print("V170 MT5 HISTORY VERIFY FAILED CLOSED:", rest_exc, flush=True)
-                return None
+            # Never assign if history verification itself cannot be trusted.
+            print("V80 MT5 HISTORY CHECK FAILED CLOSED:", exc, flush=True)
+            return None
 
         for m in structural:
             login = str(m.get("mt5_login") or "").strip()
@@ -48868,65 +48355,31 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
                 rejected_history += 1
                 continue
 
-            used_one, reason = _mt5_login_has_any_history(
+            used_one, _reason = _mt5_login_has_any_history(
                 login, exclude_mt5_pool_id=m.get("id")
             )
             if used_one:
                 rejected_history += 1
-                # If mandatory verification itself is unavailable, this is not
-                # an empty-inventory condition.
-                if "verification is temporarily unavailable" in str(reason or "").lower():
-                    _np_set_mt5_pick_diag_v170(
-                        "HISTORY_CHECK_FAILED",
-                        pool=expected_pool, size=size,
-                        candidates=total_candidates,
-                        login=login,
-                        error=str(reason)[:300],
-                    )
-                    return None
                 continue
 
-            _np_set_mt5_pick_diag_v170(
-                "ELIGIBLE_MT5_FOUND",
-                pool=expected_pool, size=size,
-                candidates=total_candidates,
-                login=login,
-                history_fallbacks=history_fallbacks,
-            )
-            print(
-                "V170 ELIGIBLE MT5 FOUND:",
-                "pool=", expected_pool, "size=", size, "login=", login,
-                "candidates=", total_candidates, "history_fallbacks=", history_fallbacks,
-                flush=True,
-            )
             return m
 
-        if len(rows) < page_size or start >= max_candidates:
+        if len(rows) < page_size:
             break
         start += page_size
 
-    code = "NO_MATCHING_INVENTORY" if total_candidates == 0 else "NO_ELIGIBLE_INVENTORY"
-    _np_set_mt5_pick_diag_v170(
-        code,
-        pool=expected_pool, size=size,
-        candidates=total_candidates,
-        marker_rejected=rejected_marker,
-        structural_rejected=rejected_structure,
-        history_rejected=rejected_history,
-        history_fallbacks=history_fallbacks,
-        max_age_days=NP_MT5_AUTO_MAX_AGE_DAYS,
-    )
-    print(
-        "V170 MT5 PICK RESULT:", code,
-        "pool=", expected_pool,
-        "size=", size,
-        "candidates=", total_candidates,
-        "marker_rejected=", rejected_marker,
-        "structural_rejected=", rejected_structure,
-        "history_rejected=", rejected_history,
-        "history_fallbacks=", history_fallbacks,
-        flush=True,
-    )
+    if total_candidates:
+        print(
+            "V80 NO SAFE MT5 — ENTITLEMENT REMAINS WAITING:",
+            "pool=", expected_pool,
+            "size=", size,
+            "candidates=", total_candidates,
+            "marker_rejected=", rejected_marker,
+            "structural_rejected=", rejected_structure,
+            "history_rejected=", rejected_history,
+            "max_age_days=", NP_MT5_AUTO_MAX_AGE_DAYS,
+            flush=True,
+        )
     return None
 
 
