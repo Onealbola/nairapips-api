@@ -792,28 +792,106 @@ def _journey_from_plan(plan):
     return None
 
 
+_NP_PLAN_CACHE_V180 = {}
+_NP_PLAN_CACHE_LOCK_V180 = threading.Lock()
+_NP_PLAN_CACHE_TTL_V180 = 15.0
+
+def _np_plan_cache_get_v180(key):
+    try:
+        with _NP_PLAN_CACHE_LOCK_V180:
+            hit = _NP_PLAN_CACHE_V180.get(key)
+            if not hit:
+                return None
+            ts, value = hit
+            if (time.time() - ts) > _NP_PLAN_CACHE_TTL_V180:
+                _NP_PLAN_CACHE_V180.pop(key, None)
+                return None
+            return dict(value) if isinstance(value, dict) else value
+    except Exception:
+        return None
+
+def _np_plan_cache_put_v180(key, value):
+    try:
+        with _NP_PLAN_CACHE_LOCK_V180:
+            _NP_PLAN_CACHE_V180[key] = (time.time(), dict(value) if isinstance(value, dict) else value)
+            # tiny bounded cache; plans are few, but never let this grow forever
+            if len(_NP_PLAN_CACHE_V180) > 200:
+                oldest = sorted(_NP_PLAN_CACHE_V180.items(), key=lambda kv: kv[1][0])[:50]
+                for k, _ in oldest:
+                    _NP_PLAN_CACHE_V180.pop(k, None)
+    except Exception:
+        pass
+
 def _safe_plan_for_purchase(purchase):
+    """V180 lifecycle plan authority.
+
+    This function is called from many hot paths (bootstrap, pass detection,
+    assignment, breach decoration, lifecycle retry).  The previous version
+    hit the shared Supabase client on every call.  When that client became
+    resource-starved, hundreds of identical plan lookups emitted Errno 11.
+
+    V180:
+      * 15-second in-process cache by plan id/name;
+      * resilient client->REST fallback via V173 helper;
+      * no query to nonexistent challenge_plans.plan_name.
+    """
     if not purchase:
         return None
-    try:
-        plan_id = str(purchase.get("plan_id") or purchase.get("challenge_plan_id") or "").strip()
-        if plan_id:
-            rows = supabase.table("challenge_plans").select("*").eq("id", plan_id).limit(1).execute().data or []
-            if rows:
-                return rows[0]
-        plan_name = str(purchase.get("plan_name") or purchase.get("selected_plan") or "").strip()
-        if plan_name:
-            rows = supabase.table("challenge_plans").select("*").eq("name", plan_name).limit(1).execute().data or []
-            if rows:
-                return rows[0]
-            # V167 SURGICAL FIX:
-            # Current challenge_plans schema has no "plan_name" column.
-            # Do not query a non-existent column; preserve all existing lifecycle
-            # behavior by simply returning no plan match here.
-    except Exception as e:
-        print("LIFECYCLE PLAN LOOKUP ERROR:", e)
-    return None
 
+    plan_id = str(
+        purchase.get("plan_id") or purchase.get("challenge_plan_id") or ""
+    ).strip()
+    plan_name = str(
+        purchase.get("plan_name") or purchase.get("selected_plan") or ""
+    ).strip()
+
+    # Prefer immutable plan id.
+    if plan_id:
+        key = ("id", plan_id)
+        cached = _np_plan_cache_get_v180(key)
+        if cached is not None:
+            return cached
+        try:
+            rows = _np_query_rows_v173(
+                "challenge_plans",
+                select="*",
+                filters=[("eq", "id", plan_id)],
+                limit=1,
+            ) or []
+            if rows:
+                row = rows[0]
+                _np_plan_cache_put_v180(key, row)
+                nm = str(row.get("name") or "").strip()
+                if nm:
+                    _np_plan_cache_put_v180(("name", nm.lower()), row)
+                return row
+        except Exception as e:
+            print("V180 PLAN LOOKUP BY ID FAILED:", plan_id, e, flush=True)
+
+    # Fallback only to the real current schema column: challenge_plans.name.
+    if plan_name:
+        key = ("name", plan_name.lower())
+        cached = _np_plan_cache_get_v180(key)
+        if cached is not None:
+            return cached
+        try:
+            rows = _np_query_rows_v173(
+                "challenge_plans",
+                select="*",
+                filters=[("eq", "name", plan_name)],
+                limit=1,
+            ) or []
+            if rows:
+                row = rows[0]
+                _np_plan_cache_put_v180(key, row)
+                rid = str(row.get("id") or "").strip()
+                if rid:
+                    _np_plan_cache_put_v180(("id", rid), row)
+                return row
+        except Exception as e:
+            print("V180 PLAN LOOKUP BY NAME FAILED:", plan_name, e, flush=True)
+
+    return None
 
 def _safe_purchase_for_account(account):
     if not account:
@@ -850,7 +928,9 @@ def _journey_for_lifecycle(account=None, purchase=None, plan=None, trader=None):
     purchase_hint = _journey_from_text(purchase.get("challenge_type"), purchase.get("route"), purchase.get("progression_route"))
     if purchase_hint:
         return purchase_hint
-    plan_journey = _journey_from_plan(plan) or _journey_from_plan(_safe_plan_for_purchase(purchase))
+    # V180: when caller already supplied the plan, never fetch the same plan again.
+    resolved_plan = plan if plan is not None else _safe_plan_for_purchase(purchase)
+    plan_journey = _journey_from_plan(resolved_plan)
     if plan_journey:
         return plan_journey
     trader_hint = _journey_from_text((trader or {}).get("challenge_type"), (trader or {}).get("progression_route"))
@@ -8789,12 +8869,12 @@ def trader_bootstrap():
         plan_by_id = {}
         if plan_ids:
             try:
-                plan_rows = (
-                    supabase.table("challenge_plans")
-                    .select("*")
-                    .in_("id", plan_ids)
-                    .execute().data or []
-                )
+                plan_rows = _np_query_rows_v173(
+                    "challenge_plans",
+                    select="*",
+                    filters=[("in", "id", plan_ids)],
+                    limit=max(100, len(plan_ids) + 10),
+                ) or []
                 plan_by_id = {
                     str(p.get("id") or "").strip(): p
                     for p in plan_rows
@@ -57442,4 +57522,26 @@ print(
 # ============================================================================
 NAIRAPIPS_RELEASE = "V179_FORENSIC_ASSIGNMENT_BLOCKER_FIX_2026_10_06"
 print("V179 LOADED: forensic pre-assignment blocker removed", flush=True)
+
+# ============================================================================
+# NAIRAPIPS V180 — LIFECYCLE PLAN LOOKUP FIX — 06 OCT 2026
+#
+# Production evidence showed the same failure hundreds of times:
+#   LIFECYCLE PLAN LOOKUP ERROR: [Errno 11] Resource temporarily unavailable
+#
+# _safe_plan_for_purchase() was a shared hot-path function used by assignment,
+# pass/funded progression, bootstrap, breach metrics and lifecycle retries.
+# It performed a fresh shared-client query on every call.
+#
+# V180 makes that authority bounded + resilient instead of repeatedly hammering
+# the shared client:
+#   - 15s plan cache
+#   - client->REST fallback
+#   - duplicate journey plan refetch removed
+#   - trader bootstrap plan batch uses resilient reader
+#
+# Plan editability is preserved: cache expires after 15 seconds.
+# ============================================================================
+NAIRAPIPS_RELEASE = "V180_LIFECYCLE_PLAN_LOOKUP_FIX_2026_10_06"
+print("V180 LOADED: lifecycle plan lookup pressure fixed", flush=True)
 
