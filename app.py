@@ -84,6 +84,64 @@ supabase_admin = (
 )
 
 
+# V170 — MT5 PICKER TRUTH / RELIABLE REST FALLBACK
+# Keep one picker diagnosis per thread so callers can distinguish:
+# real empty inventory vs eligibility rejection vs temporary verification failure.
+_NP_MT5_PICK_DIAG_V170 = threading.local()
+
+def _np_set_mt5_pick_diag_v170(code, **detail):
+    try:
+        _NP_MT5_PICK_DIAG_V170.value = {"code": str(code or ""), **detail}
+    except Exception:
+        pass
+
+def _np_get_mt5_pick_diag_v170():
+    try:
+        return dict(getattr(_NP_MT5_PICK_DIAG_V170, "value", {}) or {})
+    except Exception:
+        return {}
+
+def _np_rest_rows_v170(table, select="*", filters=None, limit=1000, order=None):
+    """Direct PostgREST reader with hard timeouts.
+    Used only as a fallback when the shared Supabase client is temporarily unavailable.
+    """
+    base = str(SUPABASE_URL or "").rstrip("/")
+    key = str(SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY or "").strip()
+    if not base or not key:
+        raise RuntimeError("Supabase REST configuration unavailable")
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+    }
+    params = {"select": select, "limit": str(max(1, min(int(limit or 1000), 10000)))}
+    for col, expr in (filters or []):
+        params[str(col)] = str(expr)
+    if order:
+        params["order"] = str(order)
+    last = None
+    for delay in (0.0, 0.20, 0.60):
+        if delay:
+            time.sleep(delay)
+        try:
+            r = requests.get(
+                f"{base}/rest/v1/{table}",
+                headers=headers,
+                params=params,
+                timeout=(2.5, 6.0),
+            )
+            last = r
+            if r.status_code < 500:
+                if r.status_code >= 400:
+                    raise RuntimeError(f"{table} REST {r.status_code}: {r.text[:180]}")
+                data = r.json()
+                return data if isinstance(data, list) else []
+        except Exception as exc:
+            last = exc
+            continue
+    raise RuntimeError(f"{table} REST unavailable: {last}")
+
+
 # ============================================================
 # V120 MONITORING EXCHANGE AUTHORITY — old OUT / new IN
 # ============================================================
@@ -3144,9 +3202,33 @@ def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=N
 
     mt5 = _np_pick_fresh_mt5(size, stage)
     if not mt5:
-        _audit_safe("mt5_pool", "auto_assignment_waiting", f"{reason}: WAITING_FOR_MT5_INVENTORY; no fresh <=7-day MT5 for {stage} size {size}",
-                    {"name":"system","username":"system","role":"system"}, trader_id)
-        _np_inventory_wait_alert(stage, size, reason, trader)
+        _pick_diag = _np_get_mt5_pick_diag_v170()
+        _pick_code = str(_pick_diag.get("code") or "UNKNOWN").upper()
+        _audit_safe(
+            "mt5_pool",
+            "auto_assignment_waiting",
+            f"{reason}: MT5_PICK={_pick_code}; detail={json.dumps(_pick_diag, default=str)[:1200]}",
+            {"name":"system","username":"system","role":"system"},
+            trader_id,
+        )
+
+        # Only call it an inventory shortage when the picker actually proved
+        # there is no matching/eligible inventory.  Resource/history failures
+        # are reported as verification failures instead.
+        if _pick_code in {"NO_MATCHING_INVENTORY", "NO_ELIGIBLE_INVENTORY"}:
+            _np_inventory_wait_alert(stage, size, reason, trader)
+        else:
+            try:
+                send_admin_alert(
+                    f"NairaPips MT5 verification waiting — {str(stage).upper()} {email_money(size)}",
+                    "Automation found/queried the MT5 category but could not safely complete "
+                    "eligibility verification. This is NOT being reported as empty inventory.\n\n"
+                    f"Stage: {str(stage).upper()}\nAccount Size: {email_money(size)}\n"
+                    f"Reason: {reason}\nTrader: {(trader or {}).get('name') or (trader or {}).get('email') or trader_id}\n"
+                    f"Picker status: {_pick_code}\nDetail: {json.dumps(_pick_diag, default=str)[:1200]}"
+                )
+            except Exception:
+                pass
         return None
     account, updated = _assign_mt5_to_trader(
         trader, mt5, stage, purchase,
@@ -39296,20 +39378,31 @@ NAIRAPIPS_MT5_HISTORY_RELEASE_V48 = "V48_FRESH_MT5_HISTORY_GUARD_2026_09_15"
 # Mandatory history source: trader_accounts is the operational ownership ledger.
 # Do not fail-open if this query is temporarily unavailable.
 _np_mt5_login_has_any_history_v48_core = _mt5_login_has_any_history
-
 def _mt5_login_has_any_history(mt5_login, exclude_mt5_pool_id=None):
     login = str(mt5_login or "").strip()
     if not login:
         return True, "MT5 login is empty"
 
+    # Mandatory ownership ledger. First use the normal client; if the shared
+    # client is resource-starved, fall back to direct REST instead of
+    # incorrectly treating inventory as unavailable.
     try:
         rows = (
             supabase.table("trader_accounts").select("id,mt5_login")
             .eq("mt5_login", login).limit(1).execute().data or []
         )
     except Exception as exc:
-        print("V48 MANDATORY MT5 HISTORY CHECK FAILED:", login, exc)
-        return True, "MT5 history verification is temporarily unavailable; retry later"
+        print("V170 MT5 HISTORY CLIENT FALLBACK:", login, exc, flush=True)
+        try:
+            rows = _np_rest_rows_v170(
+                "trader_accounts",
+                select="id,mt5_login",
+                filters=[("mt5_login", f"eq.{login}")],
+                limit=1,
+            )
+        except Exception as rest_exc:
+            print("V170 MANDATORY MT5 HISTORY CHECK FAILED CLOSED:", login, rest_exc, flush=True)
+            return True, "MT5 history verification is temporarily unavailable; retry later"
 
     if rows:
         return True, f"MT5 {login} already exists in trader_accounts.mt5_login"
@@ -39318,7 +39411,6 @@ def _mt5_login_has_any_history(mt5_login, exclude_mt5_pool_id=None):
     return _np_mt5_login_has_any_history_v48_core(
         login, exclude_mt5_pool_id=exclude_mt5_pool_id
     )
-
 
 def _np_chunks_v48(values, size=80):
     vals = [str(v or "").strip() for v in values if str(v or "").strip()]
@@ -48655,10 +48747,19 @@ def _np_v80_candidate_ok(m, size, target_stage):
 
 
 def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
-    """Global picker: complete exact category scan, FRESHEST SAFE credential first."""
+    """V170 single production picker.
+
+    Safety remains fail-closed, but a temporary Supabase-client failure no
+    longer masquerades as "no inventory": direct REST fallback verifies the
+    same inventory/history before giving up.
+    """
     expected_pool = _np_expected_pool_class(target_stage)
     size = clean(account_size)
+    _np_set_mt5_pick_diag_v170(
+        "START", pool=expected_pool, size=size, stage=str(target_stage or "")
+    )
     if not size:
+        _np_set_mt5_pick_diag_v170("INVALID_SIZE", pool=expected_pool, size=size)
         return None
 
     statuses = ["available", "unused", "new", "ready", "open"]
@@ -48669,6 +48770,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
     rejected_structure = 0
     rejected_marker = 0
     total_candidates = 0
+    history_fallbacks = 0
 
     while start < max_candidates:
         try:
@@ -48682,21 +48784,30 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
                 .execute().data or []
             )
         except Exception as exc:
-            # Preserve existing migration compatibility only for PHASE inventory.
-            if expected_pool == "funded":
-                print("V80 FUNDED FRESHEST MT5 PAGE QUERY ERROR:", exc, flush=True)
-                return None
+            print("V170 MT5 POOL CLIENT FALLBACK:", expected_pool, size, exc, flush=True)
             try:
-                rows = (
-                    supabase.table("mt5_pool").select("*")
-                    .eq("account_size", size)
-                    .in_("status", statuses)
-                    .order("created_at", desc=True)
-                    .range(start, min(start + page_size - 1, max_candidates - 1))
-                    .execute().data or []
+                status_expr = "in.(" + ",".join(statuses) + ")"
+                rows = _np_rest_rows_v170(
+                    "mt5_pool",
+                    select="*",
+                    filters=[
+                        ("account_size", f"eq.{size}"),
+                        ("pool_class", f"eq.{expected_pool}"),
+                        ("status", status_expr),
+                    ],
+                    limit=page_size,
+                    order="created_at.desc",
                 )
-            except Exception as exc2:
-                print("V80 PHASE FRESHEST MT5 PAGE QUERY ERROR:", exc2, flush=True)
+                # REST fallback is intentionally one bounded category page.
+                # 200 is already far above the live category size shown in Admin.
+                start = max_candidates
+            except Exception as rest_exc:
+                _np_set_mt5_pick_diag_v170(
+                    "INVENTORY_QUERY_FAILED",
+                    pool=expected_pool, size=size,
+                    error=str(rest_exc)[:300],
+                )
+                print("V170 MT5 INVENTORY QUERY FAILED:", rest_exc, flush=True)
                 return None
 
         if not rows:
@@ -48715,12 +48826,41 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
             else:
                 rejected_structure += 1
 
+        # Mandatory used-history batch. If the shared client is unavailable,
+        # verify the same trader_accounts ledger through direct REST.
         try:
             used = _np_used_mt5_logins_batch_v48(structural)
         except Exception as exc:
-            # Never assign if history verification itself cannot be trusted.
-            print("V80 MT5 HISTORY CHECK FAILED CLOSED:", exc, flush=True)
-            return None
+            history_fallbacks += 1
+            print("V170 BATCH HISTORY CLIENT FALLBACK:", exc, flush=True)
+            logins = sorted({
+                str(m.get("mt5_login") or "").strip()
+                for m in structural if str(m.get("mt5_login") or "").strip()
+            })
+            try:
+                used = set()
+                for chunk in _np_chunks_v48(logins):
+                    expr = "in.(" + ",".join(chunk) + ")"
+                    hist = _np_rest_rows_v170(
+                        "trader_accounts",
+                        select="mt5_login",
+                        filters=[("mt5_login", expr)],
+                        limit=10000,
+                    )
+                    for h in hist:
+                        lg = str(h.get("mt5_login") or "").strip()
+                        if lg:
+                            used.add(lg)
+            except Exception as rest_exc:
+                _np_set_mt5_pick_diag_v170(
+                    "HISTORY_CHECK_FAILED",
+                    pool=expected_pool, size=size,
+                    candidates=total_candidates,
+                    structural=len(structural),
+                    error=str(rest_exc)[:300],
+                )
+                print("V170 MT5 HISTORY VERIFY FAILED CLOSED:", rest_exc, flush=True)
+                return None
 
         for m in structural:
             login = str(m.get("mt5_login") or "").strip()
@@ -48728,31 +48868,65 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
                 rejected_history += 1
                 continue
 
-            used_one, _reason = _mt5_login_has_any_history(
+            used_one, reason = _mt5_login_has_any_history(
                 login, exclude_mt5_pool_id=m.get("id")
             )
             if used_one:
                 rejected_history += 1
+                # If mandatory verification itself is unavailable, this is not
+                # an empty-inventory condition.
+                if "verification is temporarily unavailable" in str(reason or "").lower():
+                    _np_set_mt5_pick_diag_v170(
+                        "HISTORY_CHECK_FAILED",
+                        pool=expected_pool, size=size,
+                        candidates=total_candidates,
+                        login=login,
+                        error=str(reason)[:300],
+                    )
+                    return None
                 continue
 
+            _np_set_mt5_pick_diag_v170(
+                "ELIGIBLE_MT5_FOUND",
+                pool=expected_pool, size=size,
+                candidates=total_candidates,
+                login=login,
+                history_fallbacks=history_fallbacks,
+            )
+            print(
+                "V170 ELIGIBLE MT5 FOUND:",
+                "pool=", expected_pool, "size=", size, "login=", login,
+                "candidates=", total_candidates, "history_fallbacks=", history_fallbacks,
+                flush=True,
+            )
             return m
 
-        if len(rows) < page_size:
+        if len(rows) < page_size or start >= max_candidates:
             break
         start += page_size
 
-    if total_candidates:
-        print(
-            "V80 NO SAFE MT5 — ENTITLEMENT REMAINS WAITING:",
-            "pool=", expected_pool,
-            "size=", size,
-            "candidates=", total_candidates,
-            "marker_rejected=", rejected_marker,
-            "structural_rejected=", rejected_structure,
-            "history_rejected=", rejected_history,
-            "max_age_days=", NP_MT5_AUTO_MAX_AGE_DAYS,
-            flush=True,
-        )
+    code = "NO_MATCHING_INVENTORY" if total_candidates == 0 else "NO_ELIGIBLE_INVENTORY"
+    _np_set_mt5_pick_diag_v170(
+        code,
+        pool=expected_pool, size=size,
+        candidates=total_candidates,
+        marker_rejected=rejected_marker,
+        structural_rejected=rejected_structure,
+        history_rejected=rejected_history,
+        history_fallbacks=history_fallbacks,
+        max_age_days=NP_MT5_AUTO_MAX_AGE_DAYS,
+    )
+    print(
+        "V170 MT5 PICK RESULT:", code,
+        "pool=", expected_pool,
+        "size=", size,
+        "candidates=", total_candidates,
+        "marker_rejected=", rejected_marker,
+        "structural_rejected=", rejected_structure,
+        "history_rejected=", rejected_history,
+        "history_fallbacks=", history_fallbacks,
+        flush=True,
+    )
     return None
 
 
