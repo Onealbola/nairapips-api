@@ -24623,7 +24623,7 @@ def _np_admin_assignable_mt5_v176():
 
 # Replace only the read-only Admin picker feed.
 # All real assignment endpoints keep the V173 hard freshness/history guard.
-app.view_functions["admin_assignable_mt5_v46"] = _np_admin_assignable_mt5_v176
+# V178: final V176 binding intentionally deferred until EOF, after all route declarations.
 
 NAIRAPIPS_RELEASE = NAIRAPIPS_ASSIGNABLE_FEED_RELEASE_V176
 
@@ -57370,4 +57370,25 @@ def account_truth_v122_compat():
         print("HISTORIC TRUTH V122 QUERY ERROR:", exc, flush=True)
         return _np_fail("Historic Truth query failed: " + str(exc), 500)
 
+# ============================================================================
+# NAIRAPIPS V178 — DEPLOY ORDER CORRECTION — 06 OCT 2026
+#
+# V177 deploy failure was not a business-logic failure.
+# The V176 replacement was bound to endpoint "admin_assignable_mt5_v46"
+# BEFORE the original @app.route("/admin/assignable_mt5") declaration later
+# in this very large cumulative app.py. Flask therefore refused startup with:
+#
+#   AssertionError: View function mapping is overwriting an existing endpoint
+#                   function: admin_assignable_mt5_v46
+#
+# Bind the lightweight feed here, at TRUE EOF, after all historical route
+# declarations and later V48/V77/V80 overrides have loaded.
+# ============================================================================
+app.view_functions["admin_assignable_mt5_v46"] = _np_admin_assignable_mt5_v176
+NAIRAPIPS_RELEASE = "V178_FORENSIC_ASSIGNMENT_ROOT_FIX_DEPLOY_CORRECTED_2026_10_06"
+
+print(
+    "V178 LOADED: forensic assignment root fix + final lightweight assignable feed binding",
+    flush=True,
+)
 
