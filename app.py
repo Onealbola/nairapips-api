@@ -3551,7 +3551,7 @@ def _np_update_trader_current_pointer_v59(trader_id, account, stage):
 
 
 
-def _np_purchase_is_rejected_v154(purchase, refresh=True):
+def _np_purchase_is_rejected_v154(purchase, refresh=False):
     """True when this exact purchase is currently rejected."""
     p = dict(purchase or {})
     pid = str(p.get("id") or "").strip()
@@ -3579,7 +3579,12 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
 
     # V154: rejected purchase can never receive an MT5, even from a stale
     # Admin tab, delayed request, retry worker, or race with Reject.
-    if purchase and _np_purchase_is_rejected_v154(purchase, refresh=True):
+    if purchase and _np_purchase_is_rejected_v154(purchase, refresh=False):
+        # V177 forensic repair:
+        # Every legitimate caller already supplies a freshly loaded purchase:
+        # - Purchase Approval loads the exact purchase immediately before assignment.
+        # - Lifecycle retry workers load the exact purchase in the same cycle.
+        # Do NOT issue a second shared-client DB read here.
         raise ValueError("This purchase is REJECTED. MT5 assignment is blocked.")
 
     _np_registry_predecessor = _np_registry_predecessor_id(purchase)
@@ -24622,6 +24627,32 @@ app.view_functions["admin_assignable_mt5_v46"] = _np_admin_assignable_mt5_v176
 
 NAIRAPIPS_RELEASE = NAIRAPIPS_ASSIGNABLE_FEED_RELEASE_V176
 
+# ============================================================================
+# NAIRAPIPS V177 — FORENSIC ASSIGNMENT ROOT FIX — 06 OCT 2026
+#
+# PROVEN BY V153 -> V154 DIFF:
+# V154 added a fresh challenge_purchases DB read inside the shared
+# _assign_mt5_to_trader() function and another fresh read in WAITING FOR MT5.
+#
+# Both manual Purchase Approval and automatic Phase->Funded assignment pass
+# through the shared assigner. Background lifecycle workers retry on fixed
+# intervals, so those new reads multiplied across every retry and every user.
+# Under the single Render web process this amplified shared Supabase-client
+# pressure until unrelated reads began failing together with Errno 11.
+#
+# V177 restores V153's hot-path query profile while KEEPING the V154 business
+# rule: rejected purchases remain blocked.
+#
+# Safety proof:
+# - approve_purchase already loads the exact purchase immediately before the
+#   local reject check;
+# - lifecycle workers load the exact purchase in the same retry cycle;
+# - WAITING persistence still has .neq("payment_status","rejected") and
+#   .neq("status","rejected") atomic guards;
+# - no reset/payout/breach/recall/monitoring rule is changed.
+# ============================================================================
+NAIRAPIPS_RELEASE = "V177_FORENSIC_ASSIGNMENT_ROOT_FIX_2026_10_06"
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
@@ -42092,7 +42123,7 @@ def _np_mark_purchase_approved_waiting_v60(purchase, admin_payload=None, reason=
     if marker.lower() not in old_note.lower():
         note = (old_note + " | " + marker + " " + str(reason or "")).strip(" |")
 
-    if _np_purchase_is_rejected_v154(p, refresh=True):
+    if _np_purchase_is_rejected_v154(p, refresh=False):
         raise ValueError("This purchase is REJECTED. WAITING FOR MT5 cannot be created.")
 
     rows = (
