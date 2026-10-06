@@ -35790,7 +35790,10 @@ def admin_payout_renewal_v31_status():
     })
 
 
-_np_start_payout_renewal_worker_v31()
+# V172 RESOURCE COORDINATION:
+# Legacy V31 payout-renewal loop is not started because the newer V122
+# payout-renewal worker is the active authority.
+# _np_start_payout_renewal_worker_v31()
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "SERVER_SIDE_PAYOUT_RENEWAL_WORKER_V31_2026_09_14"
 
@@ -36396,7 +36399,9 @@ def admin_payout_renewal_v33_status():
     })
 
 
-_np_start_payout_renewal_worker_v33()
+# V172 RESOURCE COORDINATION:
+# Legacy V33 payout-renewal loop is not started because V122 remains active.
+# _np_start_payout_renewal_worker_v33()
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PAYOUT_RENEWAL_STALE_CLAIM_RECOVERY_V33_2026_09_14"
 
@@ -38113,7 +38118,10 @@ def admin_automation_v41_status():
                    "last_summary":_NP_SECOND_LIFE_RECOVERY_LAST_V41})
 
 
-_np_start_second_life_recovery_v41()
+# V172 RESOURCE COORDINATION:
+# Do not start the duplicate broad V41 Second-Life scanner.
+# The verified lifecycle worker remains the authority.
+# _np_start_second_life_recovery_v41()
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_SECOND_LIFE_RECOVERY_RELEASE_V41
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "V42_FUNDED_RESET_AFTER_PAYOUT_RENEWAL_2026_09_15"
@@ -52753,7 +52761,7 @@ except Exception:
 try:
     from concurrent.futures import ThreadPoolExecutor
     _NP_NOTIFICATION_EXECUTOR_V97 = ThreadPoolExecutor(
-        max_workers=max(2, min(4, int(os.getenv("NAIRAPIPS_NOTIFICATION_WORKERS", "3")))) ,
+        max_workers=max(1, min(2, int(os.getenv("NAIRAPIPS_NOTIFICATION_WORKERS", "1")))) ,
         thread_name_prefix="np-notify-v97",
     )
 except Exception:
