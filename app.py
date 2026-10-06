@@ -24493,6 +24493,135 @@ def _assert_mt5_never_used(mt5):
 
 NAIRAPIPS_RELEASE = "V175_ASSIGNMENT_POST_GUARD_FIX_2026_10_06"
 
+
+# ============================================================================
+# NAIRAPIPS V176 — LIGHTWEIGHT ASSIGNABLE MT5 FEED — 06 OCT 2026
+#
+# Root cause fixed here:
+#   /admin/assignable_mt5 is a READ-ONLY picker feed, but later V48/V77/V80
+#   versions re-ran full never-used/history verification for every candidate
+#   on every Admin refresh. The Admin page calls this feed repeatedly.
+#
+#   That multiplied Supabase calls and was visible in production logs as
+#   repeated V48/V170/V173 history checks + Errno 11.
+#
+# Safety:
+#   This feed is now STRUCTURAL ONLY.
+#   The actual mutation path still performs the authoritative V173 final
+#   never-used guard immediately before consuming the MT5.
+# ============================================================================
+
+NAIRAPIPS_ASSIGNABLE_FEED_RELEASE_V176 = "V176_LIGHTWEIGHT_ASSIGNABLE_FEED_2026_10_06"
+
+
+def _np_admin_assignable_mt5_v176():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+
+    try:
+        stage = _normalize_lifecycle_stage(request.args.get("stage") or "phase1")
+        expected_pool = _np_expected_pool_class(stage)
+        statuses = ["available", "unused", "new", "ready", "open"]
+
+        # One bounded read only. No trader/history mirror scans here.
+        try:
+            rows = _np_query_rows_v173(
+                "mt5_pool",
+                select="*",
+                filters=[("in", "status", statuses)],
+                limit=2500,
+            ) or []
+        except Exception as exc:
+            print("V176 ASSIGNABLE FEED READ FAILED:", exc, flush=True)
+            return _np_fail("MT5 vault is temporarily unavailable. Retry shortly.", 503)
+
+        out = []
+        seen = set()
+        for m in rows:
+            try:
+                if _np_mt5_pool_class(m) != expected_pool:
+                    continue
+
+                if (
+                    m.get("assigned_trader_id")
+                    or m.get("trader_id")
+                    or m.get("trader_account_id")
+                ):
+                    continue
+
+                if _np_v80_bad_inventory_marker(m):
+                    continue
+
+                age = _np_mt5_age_days(m)
+                if age is None or age > NP_MT5_AUTO_MAX_AGE_DAYS:
+                    continue
+
+                login = str(m.get("mt5_login") or "").strip()
+                mid = str(m.get("id") or login).strip()
+                if not login or not mid or mid in seen:
+                    continue
+                seen.add(mid)
+
+                out.append({
+                    "id": m.get("id"),
+                    "mt5_login": login,
+                    "mt5_server": m.get("mt5_server"),
+                    "account_size": m.get("account_size"),
+                    "pool_class": _np_mt5_pool_class(m),
+                    "plan_name": m.get("plan_name"),
+                    "status": m.get("status"),
+                    "created_at": m.get("created_at"),
+                    "updated_at": m.get("updated_at"),
+                    "age_days": round(float(age or 0), 2),
+                    "assigned_trader_id": None,
+                    "trader_id": None,
+                    "trader_account_id": None,
+                })
+            except Exception:
+                continue
+
+        # Keep the production freshest-safe ordering from V80.
+        out = _np_v80_fresh_sort(out)
+
+        print(
+            "V176 ASSIGNABLE FEED:",
+            "stage=", stage,
+            "pool=", expected_pool,
+            "structural_candidates=", len(out),
+            "history_check=", "deferred_to_mutation",
+            flush=True,
+        )
+
+        return _np_ok({
+            "success": True,
+            "stage": stage,
+            "pool_class": expected_pool,
+            "count": len(out),
+            "mt5_pool": out,
+            "data": out,
+            "complete_category_scan": True,
+            "structural_feed_only": True,
+            "history_verified_on_assignment": True,
+            "freshest_safe_first": True,
+            "max_age_days": NP_MT5_AUTO_MAX_AGE_DAYS,
+            "release": NAIRAPIPS_ASSIGNABLE_FEED_RELEASE_V176,
+        })
+
+    except Exception as exc:
+        print("V176 ASSIGNABLE FEED ERROR:", exc, flush=True)
+        return _np_fail(str(exc), 500)
+
+
+# Replace only the read-only Admin picker feed.
+# All real assignment endpoints keep the V173 hard freshness/history guard.
+app.view_functions["admin_assignable_mt5_v46"] = _np_admin_assignable_mt5_v176
+
+NAIRAPIPS_RELEASE = NAIRAPIPS_ASSIGNABLE_FEED_RELEASE_V176
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
