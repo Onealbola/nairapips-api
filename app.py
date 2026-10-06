@@ -3765,8 +3765,15 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         "created_at": now,
         "updated_at": now,
     }
-    print("V175 ASSIGN STEP: create_trader_account", mt5.get("mt5_login"), flush=True)
-    account = (supabase.table("trader_accounts").insert(account_row).execute().data or [None])[0]
+    print("V182 ASSIGN STEP: create_trader_account", mt5.get("mt5_login"), flush=True)
+
+    # V182 FORENSIC SCHEMA-COMPAT FIX:
+    # Production proved the insert reaches this exact line and fails because
+    # trader_accounts does not currently have payout_split in PostgREST schema.
+    # Reuse the already-existing compatibility inserter used by recall/replacement.
+    # It removes only explicitly optional columns when PostgREST reports that
+    # exact column is absent, then retries the same insert.
+    account = _np_ur_v87_insert_account(account_row)
     if not account:
         raise RuntimeError("Could not create trader account")
     supabase.table("mt5_pool").update({
@@ -57550,179 +57557,28 @@ print("V180 LOADED: lifecycle plan lookup pressure fixed", flush=True)
 NAIRAPIPS_RELEASE = "V181_PLAN_SNAPSHOT_ROOT_FIX_2026_10_06"
 print("V181 LOADED: challenge_plans removed from shared-client hot path", flush=True)
 
-
-
 # ============================================================================
-# NAIRAPIPS V182 — SHARED ASSIGNMENT PATH REPAIR — 06 OCT 2026
+# NAIRAPIPS V182 — ASSIGNMENT SCHEMA COMPATIBILITY FIX — 06 OCT 2026
 #
-# FORENSIC ROOT CAUSE
-# -------------------
-# The production file contains several generations of _np_pick_fresh_mt5().
-# V173 wrapped the then-current picker and marked a server-selected MT5 with
-# _np_v173_picker_verified so approval would not repeat the same expensive
-# history scan.  A later V170 picker definition replaced that wrapper, so the
-# FINAL live picker no longer added the marker.  V179 therefore re-ran the
-# history scan, and _assign_mt5_to_trader() ran it again via
-# _assert_mt5_never_used().  Manual approval and lifecycle auto-assignment both
-# converge on that shared assigner, so client/resource pressure could block both.
+# Live proof:
+#   V173 FINAL MT5 GUARD PASSED
+#   V175 ASSIGN STEP: duplicate_purchase_guard
+#   V175 ASSIGN STEP: duplicate_mt5_guard
+#   V175 ASSIGN STEP: plan_snapshot
+#   V181 PLAN SNAPSHOT REFRESH
+#   V175 ASSIGN STEP: create_trader_account
+#   then PostgREST 400:
+#     "Could not find the 'payout_split' column of 'trader_accounts'
+#      in the schema cache" (PGRST204)
 #
-# SURGICAL REPAIR
-# ---------------
-# 1) Assignment safety reads are REST-first, avoiding the already-overloaded
-#    shared Supabase client for read-only verification.
-# 2) The FINAL live picker once again stamps a short-lived verification proof.
-# 3) The final assigner does NOT blindly trust that proof: within 10 seconds it
-#    performs one last ownership-ledger race check.  Browser/manual MT5 choices
-#    still receive the complete never-used verification.
+# Therefore the assignment logic itself reached the CREATE ACCOUNT write.
+# The concrete blocker is a database-schema mismatch in account_row.
 #
-# No lifecycle, reset, payout, breach, recall, entitlement, pool-class,
-# account-size, age, monitoring, or single-use business rule is changed.
+# V182 uses the existing schema-compatible account inserter already present
+# in production for recall/replacement. It preserves all mandatory fields and
+# strips only known optional fields if PostgREST explicitly says that exact
+# optional column is absent.
 # ============================================================================
+NAIRAPIPS_RELEASE = "V182_ASSIGNMENT_SCHEMA_COMPAT_FIX_2026_10_06"
+print("V182 LOADED: main assignment uses schema-compatible trader_accounts insert", flush=True)
 
-NAIRAPIPS_ASSIGNMENT_SHARED_PATH_RELEASE_V182 = "V182_ASSIGNMENT_SHARED_PATH_REPAIR_2026_10_06"
-_NP_V182_PICK_PROOF_TTL_SECONDS = 10.0
-
-
-def _np_query_rows_v173(table, select="*", filters=None, limit=1000):
-    """V182: REST-first assignment safety read.
-
-    This helper is used only for read-only assignment verification.  Going
-    REST-first prevents the shared Supabase client from becoming the common
-    failure point for both Approve Assignment and lifecycle Auto Assignment.
-    """
-    rest_filters = []
-    for kind, col, val in (filters or []):
-        if kind == "eq":
-            rest_filters.append((col, f"eq.{val}"))
-        elif kind == "in":
-            vals = [str(x) for x in (val or []) if str(x)]
-            if not vals:
-                return []
-            rest_filters.append((col, "in.(" + ",".join(vals) + ")"))
-
-    try:
-        return _np_rest_rows_v170(
-            table,
-            select=select,
-            filters=rest_filters,
-            limit=limit,
-        ) or []
-    except Exception as rest_exc:
-        # One bounded compatibility fallback.  We never turn a failed safety
-        # read into "unused"; if this also fails the caller fails closed.
-        print("V182 REST READ FALLBACK TO CLIENT:", table, rest_exc, flush=True)
-        q = supabase.table(table).select(select)
-        for kind, col, val in (filters or []):
-            if kind == "eq":
-                q = q.eq(col, val)
-            elif kind == "in":
-                q = q.in_(col, list(val or []))
-        return q.limit(limit).execute().data or []
-
-
-# Restore the picker-proof wrapper around the ACTUAL final picker (V170), not
-# the older picker that existed when V173 was first declared.
-_np_pick_fresh_mt5_v182_core = _np_pick_fresh_mt5
-
-def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
-    m = _np_pick_fresh_mt5_v182_core(account_size, target_stage)
-    if not m:
-        return None
-    out = dict(m)
-    out["_np_v173_picker_verified"] = True  # retained for V179 compatibility
-    out["_np_v182_picker_verified_at"] = time.time()
-    out["_np_v182_picker_stage"] = _normalize_lifecycle_stage(target_stage)
-    out["_np_v182_picker_size"] = clean(account_size)
-    return out
-
-
-def _np_v182_recent_picker_proof(mt5):
-    try:
-        proof_at = float((mt5 or {}).get("_np_v182_picker_verified_at") or 0)
-        age = time.time() - proof_at
-        return bool(
-            (mt5 or {}).get("_np_v173_picker_verified")
-            and proof_at > 0
-            and 0 <= age <= _NP_V182_PICK_PROOF_TTL_SECONDS
-        )
-    except Exception:
-        return False
-
-
-def _assert_mt5_never_used(mt5):
-    """V182 final single-use gate with picker-proof reuse + race protection."""
-    if not mt5:
-        raise ValueError("Fresh MT5 account not found")
-
-    login = str(mt5.get("mt5_login") or "").strip()
-    mid = str(mt5.get("id") or "").strip()
-    status = str(mt5.get("status") or "available").strip().lower()
-    if not login:
-        raise ValueError("Selected MT5 login is empty")
-    if status not in {"available", "", "unused", "new", "ready", "open"}:
-        raise ValueError(f"Selected MT5 {login} is not available")
-
-    if _np_v182_recent_picker_proof(mt5):
-        # The picker already verified trader_accounts + archive + vault history.
-        # Immediately before mutation, re-check the authoritative ownership
-        # ledger to close the only meaningful race window without repeating all
-        # three history scans.
-        rows = _np_query_rows_v173(
-            "trader_accounts",
-            select="id,mt5_login,account_status",
-            filters=[("eq", "mt5_login", login)],
-            limit=1,
-        ) or []
-        if rows:
-            raise ValueError(f"MT5 {login} already exists in trader_accounts")
-
-        # Also prove the exact vault row still looks unconsumed.  This catches
-        # a concurrent pool mutation even before its trader_account becomes
-        # visible to this worker.
-        if mid:
-            pool_rows = _np_query_rows_v173(
-                "mt5_pool",
-                select=(
-                    "id,mt5_login,status,assigned_trader_id,assigned_trader_name,"
-                    "assigned_email,trader_account_id,assigned_at,archived_at,archive_reason"
-                ),
-                filters=[("eq", "id", mid)],
-                limit=1,
-            ) or []
-            if not pool_rows:
-                raise ValueError(f"Selected MT5 {login} no longer exists in the MT5 pool")
-            row = pool_rows[0]
-            if str(row.get("mt5_login") or "").strip() != login:
-                raise ValueError("Selected MT5 pool identity changed before assignment")
-            evidence = any(str(row.get(k) or "").strip() for k in (
-                "assigned_trader_id", "assigned_trader_name", "assigned_email",
-                "trader_account_id", "assigned_at", "archived_at", "archive_reason"
-            ))
-            live_status = str(row.get("status") or "").strip().lower()
-            if evidence or live_status not in {"available", "", "unused", "new", "ready", "open"}:
-                raise ValueError(f"Selected MT5 {login} was consumed before assignment")
-
-        print(
-            "V182 FINAL MT5 GUARD PASSED USING PICKER PROOF:",
-            "login=", login,
-            "proof_age_seconds=", round(time.time() - float(mt5.get("_np_v182_picker_verified_at") or 0), 3),
-            flush=True,
-        )
-        return True
-
-    # Manual/browser-selected credentials and expired proofs still receive the
-    # complete authoritative never-used check.
-    used, reason = _mt5_login_has_any_history(login, exclude_mt5_pool_id=mid or None)
-    if used:
-        raise ValueError(reason or f"Selected MT5 {login} has already been used before")
-
-    print(
-        "V182 FINAL MT5 GUARD PASSED FULL VERIFY:",
-        "login=", login,
-        "picker_verified=", False,
-        flush=True,
-    )
-    return True
-
-
-NAIRAPIPS_RELEASE = NAIRAPIPS_ASSIGNMENT_SHARED_PATH_RELEASE_V182
