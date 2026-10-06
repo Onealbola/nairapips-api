@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V157_PLAN_CARD_FIELDS_2026_10_06"
+NAIRAPIPS_RELEASE = "V159_ANNOUNCEMENT_RELIABLE_DELIVERY_2026_10_06"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -14282,6 +14282,75 @@ def close_ticket():
 # Trader dashboard receives only public notices + notices targeted to itself.
 # Opening a private compliance report creates a server-side timestamped audit.
 # ============================================================
+
+@app.route("/trader_announcements_v159", methods=["GET", "OPTIONS"])
+def trader_announcements_v159():
+    """Priority announcement feed for trader dashboards."""
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    try:
+        requested_id = str(request.args.get("trader_id") or "").strip()
+        authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
+        if auth_error:
+            return _np_fail(auth_error, 401)
+
+        rows = (
+            supabase.table("announcements")
+            .select("*")
+            .eq("status", "active")
+            .order("created_at", desc=True)
+            .limit(100)
+            .execute().data or []
+        )
+
+        needs_email = False
+        merged_rows = []
+        for raw in rows:
+            row = _np_offer_merge_meta(raw)
+            merged_rows.append(row)
+            if str(row.get("target_email") or "").strip():
+                needs_email = True
+
+        verified_email = ""
+        if needs_email:
+            trader = _get_trader_by_id(authed_id) or {}
+            verified_email = str(trader.get("email") or "").strip().lower()
+
+        visible = []
+        for row in merged_rows:
+            target_id = str(row.get("target_trader_id") or "").strip()
+            target_email = str(row.get("target_email") or "").strip().lower()
+
+            if target_id or target_email:
+                if target_id and target_id != authed_id:
+                    continue
+                if (not target_id) and target_email and target_email != verified_email:
+                    continue
+            else:
+                flag = row.get("show_on_dashboard", True)
+                if isinstance(flag, str):
+                    flag = flag.strip().lower() not in {"0","false","no","off",""}
+                if not flag:
+                    continue
+
+            visible.append(_trader_safe_offer_row(row))
+
+        response = jsonify({
+            "success": True,
+            "announcements": visible,
+            "count": len(visible),
+            "server_time": now_iso(),
+            "release": "V159_ANNOUNCEMENT_RELIABLE_DELIVERY_2026_10_06",
+        })
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+    except Exception as exc:
+        print("V159 TRADER ANNOUNCEMENTS ERROR:", exc, flush=True)
+        return _np_fail("Could not load trader announcements", 500)
+
+
 @app.route("/trader_announcements", methods=["GET", "OPTIONS"])
 def trader_announcements():
     if request.method == "OPTIONS":
@@ -14374,10 +14443,19 @@ def create_announcement():
     try:
         d=request.json or {}; title=str(d.get("title","")).strip(); msg=str(d.get("message","")).strip()
         if not title or not msg: return bad("Title and message are required")
+        def _v159_bool(value, default=True):
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() not in {"0","false","no","off",""}
+
         row={"title":title,"message":msg,"type":d.get("type","public_notice"),"status":"active",
-             "show_on_landing":d.get("show_on_landing", True),"show_on_dashboard":d.get("show_on_dashboard", True),
+             "show_on_landing":_v159_bool(d.get("show_on_landing", True), True),
+             "show_on_dashboard":_v159_bool(d.get("show_on_dashboard", True), True),
              "created_by":d.get("created_by","admin"),"created_at":now_iso()}
-        return ok(supabase.table("announcements").insert(row).execute().data, "Announcement created")
+        created=supabase.table("announcements").insert(row).execute().data or []
+        return ok(created, "Announcement created")
     except Exception as e: return bad(e)
 
 @app.route("/disable_announcement", methods=["POST"])
