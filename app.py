@@ -3599,14 +3599,38 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
     if clean(mt5.get("account_size")) and clean(mt5.get("account_size")) != account_size:
         raise ValueError("Selected MT5 account size does not match purchase/account size")
     purchase_id = (purchase or {}).get("id")
+    # V175: these are the first DB reads AFTER the final MT5 guard.
+    # They previously used the shared Supabase client directly, so an Errno 11
+    # here aborted an otherwise-valid assignment. Use the resilient V173 read
+    # authority instead; safety remains fail-closed on a genuine duplicate.
     if purchase_id:
-        existing_purchase = supabase.table("trader_accounts").select("id,mt5_login").eq("purchase_id", purchase_id).eq("account_status", "assigned_active").limit(1).execute().data or []
+        print("V175 ASSIGN STEP: duplicate_purchase_guard", purchase_id, flush=True)
+        existing_purchase = _np_query_rows_v173(
+            "trader_accounts",
+            select="id,mt5_login",
+            filters=[
+                ("eq", "purchase_id", purchase_id),
+                ("eq", "account_status", "assigned_active"),
+            ],
+            limit=1,
+        ) or []
         if existing_purchase:
             raise ValueError("This purchase already has an active MT5 account assigned")
-    existing_login = supabase.table("trader_accounts").select("id").eq("mt5_login", mt5.get("mt5_login")).eq("account_status", "assigned_active").limit(1).execute().data or []
+
+    print("V175 ASSIGN STEP: duplicate_mt5_guard", mt5.get("mt5_login"), flush=True)
+    existing_login = _np_query_rows_v173(
+        "trader_accounts",
+        select="id",
+        filters=[
+            ("eq", "mt5_login", mt5.get("mt5_login")),
+            ("eq", "account_status", "assigned_active"),
+        ],
+        limit=1,
+    ) or []
     if existing_login:
         raise ValueError("MT5 login already has an active trader account")
     now = now_iso()
+    print("V175 ASSIGN STEP: plan_snapshot", purchase_id, flush=True)
     plan = _safe_plan_for_purchase(
         purchase or {
             "plan_id": trader.get("plan_id") or trader.get("challenge_plan_id"),
@@ -3656,6 +3680,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         "created_at": now,
         "updated_at": now,
     }
+    print("V175 ASSIGN STEP: create_trader_account", mt5.get("mt5_login"), flush=True)
     account = (supabase.table("trader_accounts").insert(account_row).execute().data or [None])[0]
     if not account:
         raise RuntimeError("Could not create trader account")
@@ -24466,7 +24491,7 @@ def _assert_mt5_never_used(mt5):
     return True
 
 
-NAIRAPIPS_RELEASE = "V174_THREAD_PRESSURE_FIX_2026_10_06"
+NAIRAPIPS_RELEASE = "V175_ASSIGNMENT_POST_GUARD_FIX_2026_10_06"
 
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
