@@ -3756,24 +3756,17 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         ),
         "dd_used_percent": 0,
         "target_percent": _effective_target_percent(stage, {}, purchase, plan),
-        "payout_split": _effective_payout_split(
-            (purchase or {}).get("payout_split")
-            or (plan or {}).get("payout_split")
-        ),
+        # V183 SCHEMA COMPATIBILITY: production trader_accounts does not have
+        # a payout_split column (PostgREST PGRST204). The authoritative split
+        # already lives on the linked challenge purchase/plan and is resolved
+        # by _np_plan_payout_split_for_account(), so do not write it here.
         "monitoring_enabled": True,
         "started_at": now,
         "created_at": now,
         "updated_at": now,
     }
-    print("V182 ASSIGN STEP: create_trader_account", mt5.get("mt5_login"), flush=True)
-
-    # V182 FORENSIC SCHEMA-COMPAT FIX:
-    # Production proved the insert reaches this exact line and fails because
-    # trader_accounts does not currently have payout_split in PostgREST schema.
-    # Reuse the already-existing compatibility inserter used by recall/replacement.
-    # It removes only explicitly optional columns when PostgREST reports that
-    # exact column is absent, then retries the same insert.
-    account = _np_ur_v87_insert_account(account_row)
+    print("V175 ASSIGN STEP: create_trader_account", mt5.get("mt5_login"), flush=True)
+    account = (supabase.table("trader_accounts").insert(account_row).execute().data or [None])[0]
     if not account:
         raise RuntimeError("Could not create trader account")
     supabase.table("mt5_pool").update({
@@ -57557,28 +57550,708 @@ print("V180 LOADED: lifecycle plan lookup pressure fixed", flush=True)
 NAIRAPIPS_RELEASE = "V181_PLAN_SNAPSHOT_ROOT_FIX_2026_10_06"
 print("V181 LOADED: challenge_plans removed from shared-client hot path", flush=True)
 
-# ============================================================================
-# NAIRAPIPS V182 — ASSIGNMENT SCHEMA COMPATIBILITY FIX — 06 OCT 2026
-#
-# Live proof:
-#   V173 FINAL MT5 GUARD PASSED
-#   V175 ASSIGN STEP: duplicate_purchase_guard
-#   V175 ASSIGN STEP: duplicate_mt5_guard
-#   V175 ASSIGN STEP: plan_snapshot
-#   V181 PLAN SNAPSHOT REFRESH
-#   V175 ASSIGN STEP: create_trader_account
-#   then PostgREST 400:
-#     "Could not find the 'payout_split' column of 'trader_accounts'
-#      in the schema cache" (PGRST204)
-#
-# Therefore the assignment logic itself reached the CREATE ACCOUNT write.
-# The concrete blocker is a database-schema mismatch in account_row.
-#
-# V182 uses the existing schema-compatible account inserter already present
-# in production for recall/replacement. It preserves all mandatory fields and
-# strips only known optional fields if PostgREST explicitly says that exact
-# optional column is absent.
-# ============================================================================
-NAIRAPIPS_RELEASE = "V182_ASSIGNMENT_SCHEMA_COMPAT_FIX_2026_10_06"
-print("V182 LOADED: main assignment uses schema-compatible trader_accounts insert", flush=True)
 
+
+# ============================================================================
+# NAIRAPIPS V182 — SHARED ASSIGNMENT PATH REPAIR — 06 OCT 2026
+#
+# FORENSIC ROOT CAUSE
+# -------------------
+# The production file contains several generations of _np_pick_fresh_mt5().
+# V173 wrapped the then-current picker and marked a server-selected MT5 with
+# _np_v173_picker_verified so approval would not repeat the same expensive
+# history scan.  A later V170 picker definition replaced that wrapper, so the
+# FINAL live picker no longer added the marker.  V179 therefore re-ran the
+# history scan, and _assign_mt5_to_trader() ran it again via
+# _assert_mt5_never_used().  Manual approval and lifecycle auto-assignment both
+# converge on that shared assigner, so client/resource pressure could block both.
+#
+# SURGICAL REPAIR
+# ---------------
+# 1) Assignment safety reads are REST-first, avoiding the already-overloaded
+#    shared Supabase client for read-only verification.
+# 2) The FINAL live picker once again stamps a short-lived verification proof.
+# 3) The final assigner does NOT blindly trust that proof: within 10 seconds it
+#    performs one last ownership-ledger race check.  Browser/manual MT5 choices
+#    still receive the complete never-used verification.
+#
+# No lifecycle, reset, payout, breach, recall, entitlement, pool-class,
+# account-size, age, monitoring, or single-use business rule is changed.
+# ============================================================================
+
+NAIRAPIPS_ASSIGNMENT_SHARED_PATH_RELEASE_V182 = "V182_ASSIGNMENT_SHARED_PATH_REPAIR_2026_10_06"
+_NP_V182_PICK_PROOF_TTL_SECONDS = 10.0
+
+
+def _np_query_rows_v173(table, select="*", filters=None, limit=1000):
+    """V182: REST-first assignment safety read.
+
+    This helper is used only for read-only assignment verification.  Going
+    REST-first prevents the shared Supabase client from becoming the common
+    failure point for both Approve Assignment and lifecycle Auto Assignment.
+    """
+    rest_filters = []
+    for kind, col, val in (filters or []):
+        if kind == "eq":
+            rest_filters.append((col, f"eq.{val}"))
+        elif kind == "in":
+            vals = [str(x) for x in (val or []) if str(x)]
+            if not vals:
+                return []
+            rest_filters.append((col, "in.(" + ",".join(vals) + ")"))
+
+    try:
+        return _np_rest_rows_v170(
+            table,
+            select=select,
+            filters=rest_filters,
+            limit=limit,
+        ) or []
+    except Exception as rest_exc:
+        # One bounded compatibility fallback.  We never turn a failed safety
+        # read into "unused"; if this also fails the caller fails closed.
+        print("V182 REST READ FALLBACK TO CLIENT:", table, rest_exc, flush=True)
+        q = supabase.table(table).select(select)
+        for kind, col, val in (filters or []):
+            if kind == "eq":
+                q = q.eq(col, val)
+            elif kind == "in":
+                q = q.in_(col, list(val or []))
+        return q.limit(limit).execute().data or []
+
+
+# Restore the picker-proof wrapper around the ACTUAL final picker (V170), not
+# the older picker that existed when V173 was first declared.
+_np_pick_fresh_mt5_v182_core = _np_pick_fresh_mt5
+
+def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
+    m = _np_pick_fresh_mt5_v182_core(account_size, target_stage)
+    if not m:
+        return None
+    out = dict(m)
+    out["_np_v173_picker_verified"] = True  # retained for V179 compatibility
+    out["_np_v182_picker_verified_at"] = time.time()
+    out["_np_v182_picker_stage"] = _normalize_lifecycle_stage(target_stage)
+    out["_np_v182_picker_size"] = clean(account_size)
+    return out
+
+
+def _np_v182_recent_picker_proof(mt5):
+    try:
+        proof_at = float((mt5 or {}).get("_np_v182_picker_verified_at") or 0)
+        age = time.time() - proof_at
+        return bool(
+            (mt5 or {}).get("_np_v173_picker_verified")
+            and proof_at > 0
+            and 0 <= age <= _NP_V182_PICK_PROOF_TTL_SECONDS
+        )
+    except Exception:
+        return False
+
+
+def _assert_mt5_never_used(mt5):
+    """V182 final single-use gate with picker-proof reuse + race protection."""
+    if not mt5:
+        raise ValueError("Fresh MT5 account not found")
+
+    login = str(mt5.get("mt5_login") or "").strip()
+    mid = str(mt5.get("id") or "").strip()
+    status = str(mt5.get("status") or "available").strip().lower()
+    if not login:
+        raise ValueError("Selected MT5 login is empty")
+    if status not in {"available", "", "unused", "new", "ready", "open"}:
+        raise ValueError(f"Selected MT5 {login} is not available")
+
+    if _np_v182_recent_picker_proof(mt5):
+        # The picker already verified trader_accounts + archive + vault history.
+        # Immediately before mutation, re-check the authoritative ownership
+        # ledger to close the only meaningful race window without repeating all
+        # three history scans.
+        rows = _np_query_rows_v173(
+            "trader_accounts",
+            select="id,mt5_login,account_status",
+            filters=[("eq", "mt5_login", login)],
+            limit=1,
+        ) or []
+        if rows:
+            raise ValueError(f"MT5 {login} already exists in trader_accounts")
+
+        # Also prove the exact vault row still looks unconsumed.  This catches
+        # a concurrent pool mutation even before its trader_account becomes
+        # visible to this worker.
+        if mid:
+            pool_rows = _np_query_rows_v173(
+                "mt5_pool",
+                select=(
+                    "id,mt5_login,status,assigned_trader_id,assigned_trader_name,"
+                    "assigned_email,trader_account_id,assigned_at,archived_at,archive_reason"
+                ),
+                filters=[("eq", "id", mid)],
+                limit=1,
+            ) or []
+            if not pool_rows:
+                raise ValueError(f"Selected MT5 {login} no longer exists in the MT5 pool")
+            row = pool_rows[0]
+            if str(row.get("mt5_login") or "").strip() != login:
+                raise ValueError("Selected MT5 pool identity changed before assignment")
+            evidence = any(str(row.get(k) or "").strip() for k in (
+                "assigned_trader_id", "assigned_trader_name", "assigned_email",
+                "trader_account_id", "assigned_at", "archived_at", "archive_reason"
+            ))
+            live_status = str(row.get("status") or "").strip().lower()
+            if evidence or live_status not in {"available", "", "unused", "new", "ready", "open"}:
+                raise ValueError(f"Selected MT5 {login} was consumed before assignment")
+
+        print(
+            "V182 FINAL MT5 GUARD PASSED USING PICKER PROOF:",
+            "login=", login,
+            "proof_age_seconds=", round(time.time() - float(mt5.get("_np_v182_picker_verified_at") or 0), 3),
+            flush=True,
+        )
+        return True
+
+    # Manual/browser-selected credentials and expired proofs still receive the
+    # complete authoritative never-used check.
+    used, reason = _mt5_login_has_any_history(login, exclude_mt5_pool_id=mid or None)
+    if used:
+        raise ValueError(reason or f"Selected MT5 {login} has already been used before")
+
+    print(
+        "V182 FINAL MT5 GUARD PASSED FULL VERIFY:",
+        "login=", login,
+        "picker_verified=", False,
+        flush=True,
+    )
+    return True
+
+
+NAIRAPIPS_RELEASE = NAIRAPIPS_ASSIGNMENT_SHARED_PATH_RELEASE_V182
+
+
+# ============================================================================
+# NAIRAPIPS V183 — TRADER_ACCOUNTS SCHEMA-COMPAT ASSIGNMENT FIX — 06 OCT 2026
+# Root cause: shared assignment insert attempted to write payout_split into
+# trader_accounts, but production schema has no such column (PGRST204).
+# payout split remains authoritative on purchase/plan; no business rule changed.
+# ============================================================================
+NAIRAPIPS_RELEASE = "V183_SCHEMA_COMPAT_ASSIGNMENT_FIX_2026_10_06"
+
+# ============================================================================
+# NAIRAPIPS V184 — MONITORING HANDOVER + AUTO-PROGRESSION ROOT REPAIR
+# 06 OCT 2026
+#
+# Live production evidence after V183:
+#   assignment creates the trader_account / consumes the MT5 successfully,
+#   but the request then reports:
+#     "monitoring registry activation was not verified"
+# This was a post-commit verification false/late failure: the registry RPC could
+# succeed while the following shared-client SELECT returned no visible row
+# (RLS/client-resource pressure).  The old code then labelled an already-created
+# assignment as assignment_sync_error, producing the exact UI contradiction.
+#
+# V184:
+#   A) performs registry RPC + post-flight verification REST-first with the
+#      service-role key when available, with bounded idempotent retry;
+#   B) repairs only exact technical assignment_sync_error rows created by that
+#      registry handover failure, after ownership/pool verification;
+#   C) gives lifecycle PASS->next-stage automation a REST-first execution path;
+#   D) makes the V40 pass retry candidate scan REST-first so resource pressure
+#      cannot prevent the automation from reaching the assignment engine.
+#
+# No payout/reset/breach/recall/plan/pool-size/single-use rule is relaxed.
+# ============================================================================
+
+NAIRAPIPS_RELEASE = "V184_MONITORING_HANDOVER_AUTO_PROGRESS_REPAIR_2026_10_06"
+_NP_V184_REPAIR_LAST = {"checked": 0, "repaired": 0, "errors": 0}
+
+
+def _np_v184_rest_headers():
+    base = str(SUPABASE_URL or "").rstrip("/")
+    key = str(SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY or "").strip()
+    if not base or not key:
+        raise RuntimeError("Supabase REST configuration unavailable")
+    return base, {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+def _np_v184_rpc(name, args):
+    """REST-first RPC so assignment handover does not depend on shared client state."""
+    base, headers = _np_v184_rest_headers()
+    last = None
+    for delay in (0.0, 0.20, 0.60):
+        if delay:
+            time.sleep(delay)
+        try:
+            r = requests.post(
+                f"{base}/rest/v1/rpc/{name}",
+                headers=headers,
+                json=args or {},
+                timeout=(2.5, 7.0),
+            )
+            last = r
+            if r.status_code < 500:
+                if r.status_code >= 400:
+                    raise RuntimeError(f"RPC {name} REST {r.status_code}: {r.text[:300]}")
+                try:
+                    return r.json()
+                except Exception:
+                    return r.text
+        except Exception as exc:
+            last = exc
+    raise RuntimeError(f"RPC {name} unavailable: {last}")
+
+
+def _np_v184_patch(table, payload, filters):
+    base, headers = _np_v184_rest_headers()
+    params = {}
+    for col, expr in (filters or []):
+        params[str(col)] = str(expr)
+    r = requests.patch(
+        f"{base}/rest/v1/{table}",
+        headers=headers,
+        params=params,
+        json=payload or {},
+        timeout=(2.5, 7.0),
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"{table} PATCH {r.status_code}: {r.text[:300]}")
+    try:
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _np_v184_registry_rows(account_id, active_only=False):
+    filters = [("trader_account_id", f"eq.{str(account_id)}")]
+    if active_only:
+        filters.append(("active", "eq.true"))
+    return _np_rest_rows_v170(
+        "monitoring_registry", select="*", filters=filters, limit=10
+    ) or []
+
+
+def _np_monitoring_registry_activate(account, predecessor_account_id=None, reason="assignment_exchange"):
+    """V184 registry authority: RPC + privileged REST post-flight verification."""
+    if not account or not account.get("id"):
+        raise RuntimeError("Monitoring Registry activation requires exact trader_account_id")
+
+    account_id = str(account.get("id"))
+    login = str(account.get("mt5_login") or "").strip()
+    args = {
+        "p_trader_account_id": account_id,
+        "p_predecessor_account_id": str(predecessor_account_id) if predecessor_account_id else None,
+        "p_reason": str(reason or "assignment_exchange")[:500],
+    }
+
+    # Idempotent retry is safe: the DB RPC is keyed to the exact trader_account.
+    rpc_result = None
+    last_verify_error = None
+    for attempt in (1, 2):
+        rpc_result = _np_v184_rpc("np_monitoring_activate", args)
+        for wait_s in (0.0, 0.15, 0.45):
+            if wait_s:
+                time.sleep(wait_s)
+            try:
+                rows = _np_v184_registry_rows(account_id, active_only=True)
+                if rows:
+                    row = rows[0]
+                    if str(row.get("mt5_login") or "").strip() != login:
+                        raise RuntimeError("Monitoring Registry MT5 verification mismatch")
+
+                    purchase_id = str(account.get("purchase_id") or "").strip()
+                    if purchase_id:
+                        siblings = _np_rest_rows_v170(
+                            "monitoring_registry",
+                            select="trader_account_id,mt5_login,active,monitoring_state,successor_account_id",
+                            filters=[("purchase_id", f"eq.{purchase_id}"), ("active", "eq.true")],
+                            limit=100,
+                        ) or []
+                        wrong = [
+                            s for s in siblings
+                            if str(s.get("trader_account_id") or "") != account_id
+                        ]
+                        if wrong:
+                            raise RuntimeError(
+                                "Monitoring exchange invariant failed: predecessor MT5 still live "
+                                f"for purchase {purchase_id}: {[x.get('mt5_login') for x in wrong]}"
+                            )
+
+                    print(
+                        "V184 MONITORING REGISTRY VERIFIED:",
+                        "account=", account_id,
+                        "mt5=", login,
+                        "attempt=", attempt,
+                        flush=True,
+                    )
+                    return row
+                last_verify_error = RuntimeError(
+                    f"Monitoring Registry activation not yet visible for MT5 {login}"
+                )
+            except Exception as exc:
+                last_verify_error = exc
+
+        # Before retrying RPC, distinguish an inactive row from a visibility miss.
+        try:
+            any_rows = _np_v184_registry_rows(account_id, active_only=False)
+            if any_rows and not any(bool(r.get("active")) for r in any_rows):
+                last_verify_error = RuntimeError(
+                    f"Monitoring Registry row exists but is inactive for MT5 {login}"
+                )
+        except Exception as exc:
+            last_verify_error = exc
+
+    raise RuntimeError(
+        f"Monitoring Registry activation could not be verified for MT5 {login}: {last_verify_error}"
+    )
+
+
+def _np_v184_repair_assignment_sync_errors(limit=100):
+    """Repair only V120 technical registry handover failures; never invent assignment."""
+    global _NP_V184_REPAIR_LAST
+    out = {"checked": 0, "eligible": 0, "repaired": 0, "skipped": 0, "errors": 0, "at": now_iso()}
+    try:
+        rows = _np_rest_rows_v170(
+            "trader_accounts",
+            select="*",
+            filters=[("account_status", "eq.assignment_sync_error")],
+            limit=max(1, min(int(limit or 100), 500)),
+            order="updated_at.desc",
+        ) or []
+    except Exception as exc:
+        out["errors"] += 1
+        out["error"] = str(exc)
+        _NP_V184_REPAIR_LAST = out
+        return out
+
+    for account in rows:
+        out["checked"] += 1
+        try:
+            reason = str(account.get("archive_reason") or "")
+            if "MONITORING_REGISTRY_ACTIVATION_FAILED" not in reason:
+                out["skipped"] += 1
+                continue
+            aid = str(account.get("id") or "").strip()
+            tid = str(account.get("trader_id") or "").strip()
+            login = str(account.get("mt5_login") or "").strip()
+            pool_id = str(account.get("mt5_pool_id") or "").strip()
+            if not aid or not tid or not login or not pool_id:
+                out["skipped"] += 1
+                continue
+
+            trows = _np_rest_rows_v170(
+                "traders", select="id,current_account_id",
+                filters=[("id", f"eq.{tid}")], limit=1
+            ) or []
+            prows = _np_rest_rows_v170(
+                "mt5_pool", select="*", filters=[("id", f"eq.{pool_id}")], limit=1
+            ) or []
+            if not trows or not prows:
+                out["skipped"] += 1
+                continue
+            pool = prows[0]
+            if str(pool.get("mt5_login") or "").strip() != login:
+                out["skipped"] += 1
+                continue
+            if str(pool.get("assigned_trader_id") or "").strip() != tid:
+                out["skipped"] += 1
+                continue
+            linked_aid = str(pool.get("trader_account_id") or "").strip()
+            if linked_aid and linked_aid != aid:
+                out["skipped"] += 1
+                continue
+
+            out["eligible"] += 1
+            _np_monitoring_registry_activate(
+                account,
+                predecessor_account_id=None,
+                reason="v184_assignment_sync_repair",
+            )
+
+            stage = _normalize_lifecycle_stage(account.get("stage") or account.get("phase"))
+            _np_v184_patch(
+                "trader_accounts",
+                {
+                    "account_status": _active_state_for_stage(stage),
+                    "monitoring_enabled": True,
+                    "archive_reason": None,
+                    "updated_at": now_iso(),
+                },
+                [("id", f"eq.{aid}")],
+            )
+            _np_v184_patch(
+                "mt5_pool",
+                {"status": "assigned", "updated_at": now_iso()},
+                [("id", f"eq.{pool_id}")],
+            )
+            try:
+                _np_update_trader_current_pointer_v59(tid, account, stage)
+            except Exception as exc:
+                print("V184 POINTER REASSERT WARNING:", aid, exc, flush=True)
+
+            out["repaired"] += 1
+            _audit_safe(
+                "automation", "v184_registry_handover_repaired",
+                f"account={aid}; mt5={login}; stage={stage}; exact_existing_assignment=true",
+                {"name":"system","username":"system","role":"system"}, aid,
+            )
+        except Exception as exc:
+            out["errors"] += 1
+            print("V184 SYNC ERROR REPAIR FAILED:", account.get("id"), exc, flush=True)
+
+    _NP_V184_REPAIR_LAST = out
+    return out
+
+
+# Preserve all special flows (Second Life, Management Hold, etc.) and replace
+# only ordinary lifecycle progression with a bounded REST-first authority.
+_np_auto_assign_waiting_stage_v184_previous = _np_auto_assign_waiting_stage
+
+def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"):
+    why = str(reason or "").strip().lower()
+    if why != "lifecycle_progression":
+        return _np_auto_assign_waiting_stage_v184_previous(
+            trader, stage, purchase, source_account, reason
+        )
+
+    p = purchase or {}
+    source = source_account or {}
+    target = _normalize_lifecycle_stage(stage)
+    tid = str((trader or {}).get("id") or p.get("trader_id") or source.get("trader_id") or "").strip()
+    pid = str(p.get("id") or source.get("purchase_id") or "").strip()
+    if not trader or not tid or not pid or target not in ACCOUNT_STAGES:
+        return None
+
+    # Preserve Management Hold firewall if that subsystem is loaded.
+    try:
+        if globals().get("_np_mh_blocked") and _np_mh_blocked(tid, pid):
+            _audit_safe(
+                "management_recall", "worker_blocked_by_management_hold",
+                f"trader={tid}; purchase={pid}; target={target}; reason={reason}",
+                {"name":"system","username":"system","role":"system"}, pid,
+            )
+            return None
+    except Exception:
+        return None
+
+    if not _np_is_clean_root_v43(p):
+        return None
+    if str(p.get("trader_id") or "").strip() != tid:
+        return None
+    if str(source.get("trader_id") or "").strip() != tid:
+        return None
+    if str(source.get("purchase_id") or "").strip() != pid:
+        return None
+
+    source_stage = _normalize_lifecycle_stage(source.get("stage") or source.get("phase"))
+    source_status = str(source.get("account_status") or source.get("status") or "").strip().lower()
+    pass_status = str(source.get("phase_pass_status") or "").strip().lower()
+    risk_zone = str(source.get("risk_zone") or "").strip().lower()
+    passed = bool(
+        source_status in {"archived_phase1", "archived_phase2", "passed", "archived_passed"}
+        or pass_status in {"phase1_passed", "phase2_passed"}
+        or risk_zone == "passed"
+    )
+    expected = _next_stage_for_lifecycle(source_stage, source, p, None, trader)
+    if not passed or not expected or _normalize_lifecycle_stage(expected) != target:
+        return None
+
+    # One REST read proves whether this exact source entitlement has already
+    # produced any target-stage successor, regardless of later terminal status.
+    try:
+        hist = _np_rest_rows_v170(
+            "trader_accounts", select="*",
+            filters=[("purchase_id", f"eq.{pid}"), ("trader_id", f"eq.{tid}")],
+            limit=500, order="created_at.asc",
+        ) or []
+    except Exception as exc:
+        print("V184 PROGRESSION HISTORY VERIFY FAILED:", pid, exc, flush=True)
+        return None
+
+    source_id = str(source.get("id") or "").strip()
+    source_time = _np_parse_dt_safe(
+        source.get("passed_at") or source.get("archived_at") or source.get("updated_at") or source.get("created_at")
+    )
+    successors = []
+    for row in hist:
+        if str(row.get("id") or "").strip() == source_id:
+            continue
+        if _normalize_lifecycle_stage(row.get("stage") or row.get("phase")) != target:
+            continue
+        if not str(row.get("mt5_login") or "").strip():
+            continue
+        row_time = _np_parse_dt_safe(row.get("created_at") or row.get("started_at") or row.get("updated_at"))
+        if source_time and row_time and row_time <= source_time:
+            continue
+        successors.append(row)
+    if successors:
+        chosen = successors[0]
+        return {"account": chosen, "trader": trader, "already_fulfilled": True}
+
+    size = clean(p.get("account_size") or source.get("account_size") or (trader or {}).get("account_size"))
+    if not size:
+        return None
+    mt5 = _np_pick_fresh_mt5(size, target)
+    if not mt5:
+        return None
+
+    try:
+        account, updated = _assign_mt5_to_trader(
+            trader, mt5, target, p,
+            {"name":"system","username":"system","role":"system"},
+            f"2026 auto assignment: lifecycle_progression; VERIFIED_ENTITLEMENT; V184_REST_FIRST",
+        )
+        _audit_safe(
+            "mt5_pool", "automatic_mt5_assignment",
+            f"V184 lifecycle_progression: purchase={pid}; source={source_id}; target={target}; MT5={account.get('mt5_login')}",
+            {"name":"system","username":"system","role":"system"}, str(account.get("id") or ""),
+        )
+        return {"account": account, "trader": updated, "mt5": mt5}
+    except Exception as exc:
+        print("V184 LIFECYCLE AUTO ASSIGN FAILED:", {"purchase": pid, "target": target, "error": str(exc)}, flush=True)
+        return None
+
+
+# REST-first V40/V44 pass retry. The original worker thread resolves this global
+# function at run time, so no extra worker is created and no duplicate scanner exists.
+_NP_V184_PASS_CURSOR = 0
+
+def _np_retry_clean_pass_funded_v19(limit=250):
+    global _NP_V184_PASS_CURSOR
+    page_size = max(25, min(int(limit or 250), 500))
+    offset = max(0, int(_NP_V184_PASS_CURSOR or 0))
+    summary = {
+        "checked": 0, "due": 0, "assigned": 0, "already_fulfilled": 0,
+        "waiting_inventory": 0, "errors": 0, "page_start": offset,
+        "page_size": page_size, "release": NAIRAPIPS_RELEASE,
+    }
+    try:
+        base, headers = _np_v184_rest_headers()
+        params = {
+            "select": "*",
+            "account_status": "eq.archived_phase1",
+            "order": "updated_at.desc",
+            "limit": str(page_size),
+            "offset": str(offset),
+        }
+        r = requests.get(f"{base}/rest/v1/trader_accounts", headers=headers, params=params, timeout=(2.5, 7.0))
+        if r.status_code >= 400:
+            raise RuntimeError(f"trader_accounts retry feed {r.status_code}: {r.text[:250]}")
+        rows = r.json() if isinstance(r.json(), list) else []
+    except Exception as exc:
+        summary["errors"] = 1
+        summary["error"] = str(exc)
+        print("V184 PASS RETRY FEED FAILED:", exc, flush=True)
+        return summary
+
+    _NP_V184_PASS_CURSOR = 0 if len(rows) < page_size else offset + page_size
+    seen = set()
+    for source in rows:
+        try:
+            pid = str(source.get("purchase_id") or "").strip()
+            tid = str(source.get("trader_id") or "").strip()
+            if not pid or not tid or pid in seen:
+                continue
+            seen.add(pid)
+
+            prows = _np_rest_rows_v170(
+                "challenge_purchases", select="*",
+                filters=[("id", f"eq.{pid}"), ("trader_id", f"eq.{tid}")], limit=1
+            ) or []
+            if not prows:
+                continue
+            purchase = prows[0]
+            if not _np_is_clean_root_v43(purchase):
+                continue
+
+            # Current product route may be Phase1->Funded or Phase1->Phase2.
+            target = _next_stage_for_lifecycle("phase1", source, purchase, None, None)
+            target = _normalize_lifecycle_stage(target, "")
+            if target not in ACCOUNT_STAGES:
+                continue
+
+            summary["checked"] += 1
+            accounts = _np_rest_rows_v170(
+                "trader_accounts", select="*",
+                filters=[("purchase_id", f"eq.{pid}"), ("trader_id", f"eq.{tid}")],
+                limit=500, order="created_at.asc",
+            ) or []
+            source_time = _np_parse_dt_safe(source.get("passed_at") or source.get("archived_at") or source.get("updated_at") or source.get("created_at"))
+            already = []
+            for a in accounts:
+                if str(a.get("id") or "") == str(source.get("id") or ""):
+                    continue
+                if _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) != target:
+                    continue
+                if not str(a.get("mt5_login") or "").strip():
+                    continue
+                at = _np_parse_dt_safe(a.get("created_at") or a.get("started_at") or a.get("updated_at"))
+                if source_time and at and at <= source_time:
+                    continue
+                already.append(a)
+            if already:
+                summary["already_fulfilled"] += 1
+                continue
+
+            trows = _np_rest_rows_v170(
+                "traders", select="*", filters=[("id", f"eq.{tid}")], limit=1
+            ) or []
+            if not trows:
+                summary["errors"] += 1
+                continue
+
+            summary["due"] += 1
+            result = _np_auto_assign_waiting_stage(
+                trows[0], target, purchase, source, "lifecycle_progression"
+            )
+            if result:
+                if result.get("already_fulfilled"):
+                    summary["already_fulfilled"] += 1
+                else:
+                    summary["assigned"] += 1
+            else:
+                summary["waiting_inventory"] += 1
+        except Exception as exc:
+            summary["errors"] += 1
+            print("V184 PASS RETRY ITEM ERROR:", source.get("id"), exc, flush=True)
+
+    summary["next_page_start"] = _NP_V184_PASS_CURSOR
+    return summary
+
+
+def _np_v184_start_repair_once():
+    def _run():
+        time.sleep(10)
+        try:
+            result = _np_v184_repair_assignment_sync_errors(limit=100)
+            print("V184 ONE-SHOT ASSIGNMENT SYNC REPAIR:", result, flush=True)
+        except Exception as exc:
+            print("V184 ONE-SHOT REPAIR ERROR:", exc, flush=True)
+    threading.Thread(target=_run, name="nairapips-v184-sync-repair", daemon=True).start()
+
+
+@app.route("/admin/assignment_v184/status", methods=["GET", "OPTIONS"])
+def admin_assignment_v184_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_RELEASE,
+        "registry_verification": "REST_FIRST_SERVICE_ROLE",
+        "lifecycle_progression": "REST_FIRST_EXACT_LINEAGE",
+        "v40_worker_enabled": _NP_LIFECYCLE_WORKER_STARTED_V40,
+        "v40_last_summary": _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40,
+        "sync_repair_last": _NP_V184_REPAIR_LAST,
+    })
+
+
+_np_v184_start_repair_once()
+print("V184 LOADED: monitoring handover + lifecycle auto-progression repaired", flush=True)
