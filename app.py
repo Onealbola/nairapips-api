@@ -792,49 +792,78 @@ def _journey_from_plan(plan):
     return None
 
 
-_NP_PLAN_CACHE_V180 = {}
-_NP_PLAN_CACHE_LOCK_V180 = threading.Lock()
-_NP_PLAN_CACHE_TTL_V180 = 15.0
+# ============================================================================
+# V181 — ONE PLAN SNAPSHOT, REST-FIRST
+# ============================================================================
+_NP_PLAN_SNAPSHOT_V181 = {"at": 0.0, "by_id": {}, "by_name": {}}
+_NP_PLAN_SNAPSHOT_LOCK_V181 = threading.Lock()
+_NP_PLAN_SNAPSHOT_TTL_V181 = 15.0
 
-def _np_plan_cache_get_v180(key):
-    try:
-        with _NP_PLAN_CACHE_LOCK_V180:
-            hit = _NP_PLAN_CACHE_V180.get(key)
-            if not hit:
-                return None
-            ts, value = hit
-            if (time.time() - ts) > _NP_PLAN_CACHE_TTL_V180:
-                _NP_PLAN_CACHE_V180.pop(key, None)
-                return None
-            return dict(value) if isinstance(value, dict) else value
-    except Exception:
-        return None
+def _np_plan_snapshot_v181(force=False):
+    """Load ALL challenge plans once per TTL through direct PostgREST.
 
-def _np_plan_cache_put_v180(key, value):
-    try:
-        with _NP_PLAN_CACHE_LOCK_V180:
-            _NP_PLAN_CACHE_V180[key] = (time.time(), dict(value) if isinstance(value, dict) else value)
-            # tiny bounded cache; plans are few, but never let this grow forever
-            if len(_NP_PLAN_CACHE_V180) > 200:
-                oldest = sorted(_NP_PLAN_CACHE_V180.items(), key=lambda kv: kv[1][0])[:50]
-                for k, _ in oldest:
-                    _NP_PLAN_CACHE_V180.pop(k, None)
-    except Exception:
-        pass
+    Forensic reason:
+    production proves the shared Supabase client itself is the repeating
+    failure source. V180 still attempted that broken client before falling back,
+    so every concurrent cache miss printed another Errno 11.
+
+    challenge_plans is a very small table. One direct REST snapshot is cheaper
+    and avoids the failing shared client entirely.
+    """
+    now_ts = time.time()
+    snap = _NP_PLAN_SNAPSHOT_V181
+
+    if (
+        not force
+        and snap.get("by_id")
+        and (now_ts - float(snap.get("at") or 0)) < _NP_PLAN_SNAPSHOT_TTL_V181
+    ):
+        return snap
+
+    # Single-flight refresh: only one thread may fetch the plan table.
+    with _NP_PLAN_SNAPSHOT_LOCK_V181:
+        now_ts = time.time()
+        if (
+            not force
+            and _NP_PLAN_SNAPSHOT_V181.get("by_id")
+            and (now_ts - float(_NP_PLAN_SNAPSHOT_V181.get("at") or 0))
+            < _NP_PLAN_SNAPSHOT_TTL_V181
+        ):
+            return _NP_PLAN_SNAPSHOT_V181
+
+        rows = _np_rest_rows_v170(
+            "challenge_plans",
+            select="*",
+            filters=[],
+            limit=500,
+            order="created_at.desc",
+        ) or []
+
+        by_id = {}
+        by_name = {}
+        for row in rows:
+            rid = str(row.get("id") or "").strip()
+            name = str(row.get("name") or "").strip().lower()
+            if rid:
+                by_id[rid] = row
+            if name and name not in by_name:
+                by_name[name] = row
+
+        _NP_PLAN_SNAPSHOT_V181["at"] = now_ts
+        _NP_PLAN_SNAPSHOT_V181["by_id"] = by_id
+        _NP_PLAN_SNAPSHOT_V181["by_name"] = by_name
+
+        print(
+            "V181 PLAN SNAPSHOT REFRESH:",
+            "plans=", len(rows),
+            "source=direct_rest",
+            flush=True,
+        )
+        return _NP_PLAN_SNAPSHOT_V181
+
 
 def _safe_plan_for_purchase(purchase):
-    """V180 lifecycle plan authority.
-
-    This function is called from many hot paths (bootstrap, pass detection,
-    assignment, breach decoration, lifecycle retry).  The previous version
-    hit the shared Supabase client on every call.  When that client became
-    resource-starved, hundreds of identical plan lookups emitted Errno 11.
-
-    V180:
-      * 15-second in-process cache by plan id/name;
-      * resilient client->REST fallback via V173 helper;
-      * no query to nonexistent challenge_plans.plan_name.
-    """
+    """Plan lookup from the small V181 in-memory snapshot only."""
     if not purchase:
         return None
 
@@ -843,55 +872,26 @@ def _safe_plan_for_purchase(purchase):
     ).strip()
     plan_name = str(
         purchase.get("plan_name") or purchase.get("selected_plan") or ""
-    ).strip()
+    ).strip().lower()
 
-    # Prefer immutable plan id.
+    try:
+        snap = _np_plan_snapshot_v181()
+    except Exception as exc:
+        print("V181 PLAN SNAPSHOT UNAVAILABLE:", exc, flush=True)
+        return None
+
     if plan_id:
-        key = ("id", plan_id)
-        cached = _np_plan_cache_get_v180(key)
-        if cached is not None:
-            return cached
-        try:
-            rows = _np_query_rows_v173(
-                "challenge_plans",
-                select="*",
-                filters=[("eq", "id", plan_id)],
-                limit=1,
-            ) or []
-            if rows:
-                row = rows[0]
-                _np_plan_cache_put_v180(key, row)
-                nm = str(row.get("name") or "").strip()
-                if nm:
-                    _np_plan_cache_put_v180(("name", nm.lower()), row)
-                return row
-        except Exception as e:
-            print("V180 PLAN LOOKUP BY ID FAILED:", plan_id, e, flush=True)
+        row = (snap.get("by_id") or {}).get(plan_id)
+        if row:
+            return row
 
-    # Fallback only to the real current schema column: challenge_plans.name.
     if plan_name:
-        key = ("name", plan_name.lower())
-        cached = _np_plan_cache_get_v180(key)
-        if cached is not None:
-            return cached
-        try:
-            rows = _np_query_rows_v173(
-                "challenge_plans",
-                select="*",
-                filters=[("eq", "name", plan_name)],
-                limit=1,
-            ) or []
-            if rows:
-                row = rows[0]
-                _np_plan_cache_put_v180(key, row)
-                rid = str(row.get("id") or "").strip()
-                if rid:
-                    _np_plan_cache_put_v180(("id", rid), row)
-                return row
-        except Exception as e:
-            print("V180 PLAN LOOKUP BY NAME FAILED:", plan_name, e, flush=True)
+        row = (snap.get("by_name") or {}).get(plan_name)
+        if row:
+            return row
 
     return None
+
 
 def _safe_purchase_for_account(account):
     if not account:
@@ -8869,17 +8869,8 @@ def trader_bootstrap():
         plan_by_id = {}
         if plan_ids:
             try:
-                plan_rows = _np_query_rows_v173(
-                    "challenge_plans",
-                    select="*",
-                    filters=[("in", "id", plan_ids)],
-                    limit=max(100, len(plan_ids) + 10),
-                ) or []
-                plan_by_id = {
-                    str(p.get("id") or "").strip(): p
-                    for p in plan_rows
-                    if str(p.get("id") or "").strip()
-                }
+                plan_snap = _np_plan_snapshot_v181()
+                plan_by_id = dict(plan_snap.get("by_id") or {})
             except Exception as e:
                 print("TRADER BOOTSTRAP PLAN TARGET LOOKUP ERROR:", e)
 
@@ -19727,36 +19718,33 @@ def admin_trader_accounts_feed():
         plan_by_id = {}
         if purchase_ids:
             try:
-                purchase_rows = (
-                    supabase.table("challenge_purchases")
-                    .select("*")
-                    .in_("id", purchase_ids)
-                    .execute().data or []
-                )
+                # V181: this response-decoration path must not use the failing
+                # shared Supabase client. Read the exact purchases directly
+                # through PostgREST, then resolve plans from the one cached
+                # challenge_plans snapshot.
+                purchase_rows = []
+                for chunk_start in range(0, len(purchase_ids), 100):
+                    chunk = purchase_ids[chunk_start:chunk_start + 100]
+                    expr = "in.(" + ",".join(chunk) + ")"
+                    purchase_rows.extend(
+                        _np_rest_rows_v170(
+                            "challenge_purchases",
+                            select="*",
+                            filters=[("id", expr)],
+                            limit=max(100, len(chunk) + 10),
+                        ) or []
+                    )
+
                 purchase_by_id = {
                     str(p.get("id") or "").strip(): p
                     for p in purchase_rows
                     if str(p.get("id") or "").strip()
                 }
-                plan_ids = sorted({
-                    str(p.get("plan_id") or p.get("challenge_plan_id") or "").strip()
-                    for p in purchase_rows
-                    if str(p.get("plan_id") or p.get("challenge_plan_id") or "").strip()
-                })
-                if plan_ids:
-                    plan_rows = (
-                        supabase.table("challenge_plans")
-                        .select("*")
-                        .in_("id", plan_ids)
-                        .execute().data or []
-                    )
-                    plan_by_id = {
-                        str(p.get("id") or "").strip(): p
-                        for p in plan_rows
-                        if str(p.get("id") or "").strip()
-                    }
+
+                plan_snap = _np_plan_snapshot_v181()
+                plan_by_id = dict(plan_snap.get("by_id") or {})
             except Exception as e:
-                print("TRADER ACCOUNTS PLAN TARGET LOOKUP ERROR:", e)
+                print("V181 TRADER ACCOUNTS PLAN TARGET LOOKUP ERROR:", e, flush=True)
 
         decorated_rows = []
         for r in rows:
@@ -57544,4 +57532,21 @@ print("V179 LOADED: forensic pre-assignment blocker removed", flush=True)
 # ============================================================================
 NAIRAPIPS_RELEASE = "V180_LIFECYCLE_PLAN_LOOKUP_FIX_2026_10_06"
 print("V180 LOADED: lifecycle plan lookup pressure fixed", flush=True)
+
+# ============================================================================
+# NAIRAPIPS V181 — PLAN SNAPSHOT ROOT FIX — 06 OCT 2026
+#
+# Proven by live logs after V180:
+#   V173 CLIENT READ FALLBACK: challenge_plans [Errno 11] ...
+# repeated many times per second.
+#
+# V180 had fallback, but still attempted the failing shared client first.
+# V181 removes that first failure entirely for challenge_plans:
+#   - one direct REST snapshot for all plans;
+#   - single-flight lock;
+#   - 15-second TTL;
+#   - all lifecycle helpers resolve locally from the snapshot.
+# ============================================================================
+NAIRAPIPS_RELEASE = "V181_PLAN_SNAPSHOT_ROOT_FIX_2026_10_06"
+print("V181 LOADED: challenge_plans removed from shared-client hot path", flush=True)
 
