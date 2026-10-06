@@ -24263,6 +24263,243 @@ def admin_assignment_recovery_v169_status():
 
 NAIRAPIPS_RELEASE = NAIRAPIPS_ASSIGNMENT_RECOVERY_RELEASE_V169
 
+
+# ============================================================================
+# NAIRAPIPS V173 — FINAL ASSIGNMENT GUARD / QUERY COLLAPSE — 06 OCT 2026
+#
+# Evidence:
+#   V170 now finds a genuine eligible Funded MT5, but the final assignment
+#   transaction still repeats the full V48 history scan and hits Errno 11.
+#
+# Scope:
+#   - preserve the "never reuse MT5" law;
+#   - collapse duplicate history verification to authoritative ledgers;
+#   - remove the nonexistent challenge_purchases.current_mt5_login lookup;
+#   - keep exact-purchase rejection, journey, reset, payout, breach and recall
+#     logic unchanged.
+# ============================================================================
+
+NAIRAPIPS_ASSIGNMENT_FINAL_GUARD_RELEASE_V173 = "V173_ASSIGNMENT_FINAL_GUARD_2026_10_06"
+
+
+def _np_query_rows_v173(table, select="*", filters=None, limit=1000):
+    """Small resilient read used only by assignment safety checks."""
+    q = supabase.table(table).select(select)
+    try:
+        for kind, col, val in (filters or []):
+            if kind == "eq":
+                q = q.eq(col, val)
+            elif kind == "in":
+                q = q.in_(col, list(val or []))
+        return q.limit(limit).execute().data or []
+    except Exception as exc:
+        print("V173 CLIENT READ FALLBACK:", table, exc, flush=True)
+
+    # Direct REST fallback.  This is still read-only and fail-closed.
+    rest_filters = []
+    for kind, col, val in (filters or []):
+        if kind == "eq":
+            rest_filters.append((col, f"eq.{val}"))
+        elif kind == "in":
+            vals = [str(x) for x in (val or []) if str(x)]
+            rest_filters.append((col, "in.(" + ",".join(vals) + ")"))
+    return _np_rest_rows_v170(
+        table,
+        select=select,
+        filters=rest_filters,
+        limit=limit,
+    )
+
+
+def _np_used_mt5_logins_batch_v48(pool_rows):
+    """V173 lightweight authoritative batch freshness check.
+
+    The original V48 batch queried many mirror tables for every candidate.
+    trader_accounts + archive ledger + mt5_pool are the assignment authorities.
+    Missing/failed authoritative reads fail closed.
+    """
+    rows = list(pool_rows or [])
+    logins = sorted({
+        str(r.get("mt5_login") or "").strip()
+        for r in rows
+        if str(r.get("mt5_login") or "").strip()
+    })
+    used = set()
+    if not logins:
+        return used
+
+    # 1) Operational ownership ledger — mandatory.
+    for chunk in _np_chunks_v48(logins):
+        hist = _np_query_rows_v173(
+            "trader_accounts",
+            select="mt5_login",
+            filters=[("in", "mt5_login", chunk)],
+            limit=10000,
+        )
+        for h in hist:
+            lg = str(h.get("mt5_login") or "").strip()
+            if lg:
+                used.add(lg)
+
+    # 2) Archive ledger — mandatory for single-use safety.
+    remaining = [x for x in logins if x not in used]
+    for chunk in _np_chunks_v48(remaining):
+        try:
+            hist = _np_query_rows_v173(
+                "mt5_account_archives",
+                select="mt5_login",
+                filters=[("in", "mt5_login", chunk)],
+                limit=10000,
+            )
+        except Exception as exc:
+            # Archive verification is safety-critical: do not authorize reuse
+            # if this ledger cannot be checked.
+            raise RuntimeError("Could not verify MT5 archive history") from exc
+        for h in hist:
+            lg = str(h.get("mt5_login") or "").strip()
+            if lg:
+                used.add(lg)
+
+    # 3) Vault ledger — duplicate row or any assignment evidence means used.
+    for chunk in _np_chunks_v48(logins):
+        pool_hist = _np_query_rows_v173(
+            "mt5_pool",
+            select=(
+                "id,mt5_login,status,assigned_trader_id,assigned_trader_name,"
+                "assigned_email,trader_account_id,assigned_at,archived_at,archive_reason"
+            ),
+            filters=[("in", "mt5_login", chunk)],
+            limit=10000,
+        )
+        by_login = {}
+        for h in pool_hist:
+            lg = str(h.get("mt5_login") or "").strip()
+            if lg:
+                by_login.setdefault(lg, []).append(h)
+
+        for lg, items in by_login.items():
+            if len(items) > 1:
+                used.add(lg)
+                continue
+            h = items[0]
+            evidence = any(str(h.get(k) or "").strip() for k in (
+                "assigned_trader_id", "assigned_trader_name", "assigned_email",
+                "trader_account_id", "assigned_at", "archived_at", "archive_reason"
+            ))
+            st = str(h.get("status") or "").strip().lower()
+            if evidence or st not in {"available", "", "unused", "new", "ready", "open"}:
+                used.add(lg)
+
+    return used
+
+
+def _mt5_login_has_any_history(mt5_login, exclude_mt5_pool_id=None):
+    """V173 final single-login authority.
+
+    No mirror-table storm.  No query to nonexistent
+    challenge_purchases.current_mt5_login.
+    """
+    login = str(mt5_login or "").strip()
+    if not login:
+        return True, "MT5 login is empty"
+
+    # Ownership ledger.
+    try:
+        rows = _np_query_rows_v173(
+            "trader_accounts",
+            select="id,mt5_login",
+            filters=[("eq", "mt5_login", login)],
+            limit=1,
+        )
+    except Exception:
+        return True, "MT5 ownership history verification temporarily unavailable"
+    if rows:
+        return True, f"MT5 {login} already exists in trader_accounts"
+
+    # Archive ledger.
+    try:
+        rows = _np_query_rows_v173(
+            "mt5_account_archives",
+            select="id,mt5_login",
+            filters=[("eq", "mt5_login", login)],
+            limit=1,
+        )
+    except Exception:
+        return True, "MT5 archive history verification temporarily unavailable"
+    if rows:
+        return True, f"MT5 {login} already exists in mt5_account_archives"
+
+    # Exact vault row and duplicate/assignment evidence.
+    try:
+        rows = _np_query_rows_v173(
+            "mt5_pool",
+            select=(
+                "id,mt5_login,status,assigned_trader_id,assigned_trader_name,"
+                "assigned_email,trader_account_id,assigned_at,archived_at,archive_reason"
+            ),
+            filters=[("eq", "mt5_login", login)],
+            limit=20,
+        )
+    except Exception:
+        return True, "MT5 vault history verification temporarily unavailable"
+
+    for row in rows:
+        rid = str(row.get("id") or "")
+        if exclude_mt5_pool_id and rid == str(exclude_mt5_pool_id):
+            evidence = any(str(row.get(k) or "").strip() for k in (
+                "assigned_trader_id", "assigned_trader_name", "assigned_email",
+                "trader_account_id", "assigned_at", "archived_at", "archive_reason"
+            ))
+            st = str(row.get("status") or "").strip().lower()
+            if evidence or st not in {"available", "", "unused", "new", "ready", "open"}:
+                return True, f"MT5 {login} has prior assignment evidence inside mt5_pool"
+            continue
+        return True, f"MT5 {login} appears more than once in mt5_pool"
+
+    return False, ""
+
+
+# Mark the exact V170-selected object so the final assignment guard knows
+# this credential has already passed the category scan.  The final guard still
+# performs the compact authoritative single-login verification above.
+_np_pick_fresh_mt5_v173_core = _np_pick_fresh_mt5
+
+def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
+    m = _np_pick_fresh_mt5_v173_core(account_size, target_stage)
+    if m:
+        try:
+            m = dict(m)
+            m["_np_v173_picker_verified"] = True
+        except Exception:
+            pass
+    return m
+
+
+# Keep _assert_mt5_never_used as the final hard gate, but it now resolves to
+# the compact V173 single-login authority above.
+def _assert_mt5_never_used(mt5):
+    if not mt5:
+        raise ValueError("Fresh MT5 account not found")
+    login = str(mt5.get("mt5_login") or "").strip()
+    status = str(mt5.get("status") or "available").strip().lower()
+    if status not in {"available", "", "unused", "new", "ready", "open"}:
+        raise ValueError(f"Selected MT5 {login or ''} is not available")
+    used, reason = _mt5_login_has_any_history(
+        login, exclude_mt5_pool_id=mt5.get("id")
+    )
+    if used:
+        raise ValueError(reason or f"Selected MT5 {login} has already been used before")
+    print(
+        "V173 FINAL MT5 GUARD PASSED:",
+        "login=", login,
+        "picker_verified=", bool(mt5.get("_np_v173_picker_verified")),
+        flush=True,
+    )
+    return True
+
+
+NAIRAPIPS_RELEASE = NAIRAPIPS_ASSIGNMENT_FINAL_GUARD_RELEASE_V173
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
