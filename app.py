@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V154_REJECTED_PURCHASE_ASSIGNMENT_GUARD_2026_10_05"
+NAIRAPIPS_RELEASE = "V168_RESOURCE_STABILITY_FIX_2026_10_06"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -748,9 +748,10 @@ def _safe_plan_for_purchase(purchase):
             rows = supabase.table("challenge_plans").select("*").eq("name", plan_name).limit(1).execute().data or []
             if rows:
                 return rows[0]
-            rows = supabase.table("challenge_plans").select("*").eq("plan_name", plan_name).limit(1).execute().data or []
-            if rows:
-                return rows[0]
+            # V167 SURGICAL FIX:
+            # Current challenge_plans schema has no "plan_name" column.
+            # Do not query a non-existent column; preserve all existing lifecycle
+            # behavior by simply returning no plan match here.
     except Exception as e:
         print("LIFECYCLE PLAN LOOKUP ERROR:", e)
     return None
@@ -843,17 +844,16 @@ def _target_for_stage(stage):
 
 
 def _effective_target_percent(stage, account=None, purchase=None, plan=None):
-    """Resolve the live profit target for one lifecycle account.
+    """Resolve the profit target for one account.
 
-    Authority order for purchase-linked challenges:
-      1. linked challenge plan (current Admin plan setting)
-      2. purchase snapshot fields, when present
-      3. stored trader_accounts target_percent
-      4. legacy stage defaults (10 / 8 / 0)
+    V156 authority:
+      1. immutable purchase snapshot
+      2. exact trader_account snapshot
+      3. current plan (fallback for old records)
+      4. legacy stage default
 
-    This lets an Admin plan change (for example Phase 1 10% -> 15%) propagate
-    globally to existing purchase-linked active accounts instead of leaving
-    stale 10% values on trader dashboards.
+    Editing a plan changes NEW purchases. It does not silently rewrite the rule
+    of an already-started MT5 account.
     """
     stage = _normalize_lifecycle_stage(stage)
     account = account or {}
@@ -865,20 +865,20 @@ def _effective_target_percent(stage, account=None, purchase=None, plan=None):
 
     if stage == "phase2":
         candidates = [
-            resolved_plan.get("phase2_target"),
             purchase.get("phase2_target"),
             account.get("target_percent"),
             account.get("profit_target"),
+            resolved_plan.get("phase2_target"),
             8,
         ]
     else:
         candidates = [
-            resolved_plan.get("phase1_target"),
-            resolved_plan.get("profit_target"),
             purchase.get("phase1_target"),
             purchase.get("profit_target"),
             account.get("target_percent"),
             account.get("profit_target"),
+            resolved_plan.get("phase1_target"),
+            resolved_plan.get("profit_target"),
             10,
         ]
 
@@ -890,6 +890,7 @@ def _effective_target_percent(stage, account=None, purchase=None, plan=None):
         except Exception:
             continue
     return float(_target_for_stage(stage) or 0)
+
 
 
 def _active_state_for_stage(stage):
@@ -1076,7 +1077,7 @@ def _decorate_account_for_api(account):
 
 
 _TRADER_ACCOUNT_RESPONSE_FIELDS = {
-    "id", "trader_id", "purchase_id", "challenge_purchase_id", "mt5_pool_id",
+    "id", "trader_id", "purchase_id", "challenge_purchase_id", "mt5_pool_id", "product_category",
     "stage", "phase", "account_status", "status", "challenge_state",
     "account_size", "start_balance", "current_balance", "current_equity",
     "balance", "equity", "profit", "profit_percent", "current_profit_percent",
@@ -1095,7 +1096,8 @@ _TRADER_ACCOUNT_RESPONSE_FIELDS = {
 }
 
 _TRADER_PURCHASE_RESPONSE_FIELDS = {
-    "id", "trader_id", "trader_account_id", "plan_id", "plan_name",
+    "id", "trader_id", "trader_account_id", "plan_id", "plan_name", "product_category", "drawdown_type", "payout_frequency",
+    "phase1_target", "phase2_target", "max_drawdown", "payout_split", "reset_fee", "funded_reset_fee", "plan_snapshot_at",
     "account_size", "fee", "original_fee", "discount_percent",
     "discount_amount", "final_fee", "amount_due", "payment_status",
     "status", "lifecycle_state", "stage", "phase", "active_stage",
@@ -3544,6 +3546,10 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         "mt5_master_password": mt5.get("mt5_master_password"),
         "mt5_investor_password": mt5.get("mt5_investor_password"),
         "account_size": account_size,
+        "product_category": _np_plan_category_v156(
+            (purchase or {}).get("product_category")
+            or (plan or {}).get("product_category")
+        ),
         "start_balance": account_size,
         "current_balance": account_size,
         "current_equity": account_size,
@@ -3552,9 +3558,17 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         "absolute_drawdown_percent": 0,
         # PLAN-SPECIFIC DD AUTHORITY 2026-08-30: freeze this plan's DD on the exact account.
         # Normal/legacy plans stay 20%; 2 Lives plans use their configured 10% rule.
-        "dd_limit_percent": float((plan or {}).get("max_drawdown") or 20),
+        "dd_limit_percent": float(
+            (purchase or {}).get("max_drawdown")
+            or (plan or {}).get("max_drawdown")
+            or 20
+        ),
         "dd_used_percent": 0,
         "target_percent": _effective_target_percent(stage, {}, purchase, plan),
+        "payout_split": _effective_payout_split(
+            (purchase or {}).get("payout_split")
+            or (plan or {}).get("payout_split")
+        ),
         "monitoring_enabled": True,
         "started_at": now,
         "created_at": now,
@@ -10056,6 +10070,30 @@ def _np_second_life_used_but_unfulfilled(purchase, trader_id):
         pass
     return source
 
+
+def _np_plan_category_v156(value):
+    value = str(value or "standard").strip().lower()
+    if value in {"premium", "pro", "elite"}:
+        return "premium"
+    return "standard"
+
+
+def _np_plan_rule_snapshot_v156(plan):
+    plan = plan or {}
+    return {
+        "product_category": _np_plan_category_v156(plan.get("product_category")),
+        "drawdown_type": str(plan.get("drawdown_type") or "STATIC").strip().upper(),
+        "payout_frequency": str(plan.get("payout_frequency") or "Daily").strip(),
+        "phase1_target": float(plan.get("phase1_target") or plan.get("profit_target") or 10),
+        "phase2_target": float(plan.get("phase2_target") or 0),
+        "max_drawdown": float(plan.get("max_drawdown") or plan.get("total_dd") or 20),
+        "payout_split": _effective_payout_split(plan.get("payout_split")),
+        "reset_fee": clean(plan.get("reset_fee")),
+        "funded_reset_fee": clean(plan.get("funded_reset_fee")),
+        "plan_snapshot_at": now_iso(),
+    }
+
+
 def _np_public_plan_snapshot_rows():
     """Published public commercial plan snapshot.
 
@@ -10073,11 +10111,17 @@ def _np_public_plan_snapshot_rows():
         out = []
         for raw in rows:
             row = dict(raw or {})
+            row["product_category"] = _np_plan_category_v156(row.get("product_category"))
             if "payout_split" in row:
                 row["payout_split"] = _effective_payout_split(row.get("payout_split"))
             row["second_life_enabled"] = _second_life_bool(row.get("second_life_enabled"))
             row["lives_total"] = int(row.get("lives_total") or (2 if row["second_life_enabled"] else 1))
             out.append(row)
+        out.sort(key=lambda r: (
+            0 if _np_plan_category_v156(r.get("product_category")) == "standard" else 1,
+            int(r.get("category_sort") or 10),
+            float(r.get("account_size") or 0),
+        ))
         return out
     return np_cached_read("public_plans_snapshot", 300, _fetch)
 
@@ -10215,6 +10259,10 @@ def create_plan():
             d.get("progression_route"), "one_phase" if phase2_target <= 0 else "two_phase"
         )
         row={"name":name,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
+             "product_category":_np_plan_category_v156(d.get("product_category")),
+             "category_sort":int(d.get("category_sort") or 10),
+             "drawdown_type":str(d.get("drawdown_type") or "STATIC").strip().upper(),
+             "payout_frequency":str(d.get("payout_frequency") or "Daily").strip(),
              "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":phase2_target,
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
              "challenge_journey": challenge_journey, "journey_source": "plan_create",
@@ -10240,6 +10288,14 @@ def update_plan():
         upd={"updated_at":now_iso()}
         for k in ["name","daily_drawdown","description","status","mt5_server","default_server"]:
             if k in d: upd[k]=(_np_normalize_pool_class(d[k]) if k=="pool_class" else d[k])
+        if "product_category" in d:
+            upd["product_category"] = _np_plan_category_v156(d.get("product_category"))
+        if "category_sort" in d:
+            upd["category_sort"] = int(d.get("category_sort") or 10)
+        if "drawdown_type" in d:
+            upd["drawdown_type"] = str(d.get("drawdown_type") or "STATIC").strip().upper()
+        if "payout_frequency" in d:
+            upd["payout_frequency"] = str(d.get("payout_frequency") or "Daily").strip()
         if "payout_split" in d:
             upd["payout_split"] = _effective_payout_split(d.get("payout_split"))
         # V123: Challenge Plans now use paid, admin-priced resets.
@@ -10375,6 +10431,7 @@ def create_purchase():
         plan_row = _safe_plan_for_purchase({"plan_id": d.get("plan_id"), "plan_name": plan})
         challenge_journey = _journey_source_value(_journey_for_lifecycle({}, {}, plan_row, None))
         second_life_snapshot = _second_life_plan_snapshot(plan_row)
+        plan_rule_snapshot = _np_plan_rule_snapshot_v156(plan_row)
         row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
              "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":quote.get("final_fee", original_fee),
              "original_fee":quote.get("original_fee", original_fee),"discount_percent":quote.get("discount_percent",0),"discount_amount":quote.get("discount_amount",0),
@@ -10383,6 +10440,7 @@ def create_purchase():
              "challenge_journey": challenge_journey, "journey_source": "purchase_plan_snapshot",
              "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
         row.update(second_life_snapshot)
+        row.update(plan_rule_snapshot)
         row.update(_affiliate_purchase_fields(d, original_fee))
         created = supabase.table("challenge_purchases").insert(row).execute().data or []
         if not created:
@@ -35378,7 +35436,10 @@ def admin_payout_renewal_v31_status():
     })
 
 
-_np_start_payout_renewal_worker_v31()
+# V168 RESOURCE STABILITY:
+# Legacy payout-renewal V31 worker is intentionally NOT started.
+# V122 is the current payout-renewal worker and remains active.
+# _np_start_payout_renewal_worker_v31()
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "SERVER_SIDE_PAYOUT_RENEWAL_WORKER_V31_2026_09_14"
 
@@ -35984,7 +36045,10 @@ def admin_payout_renewal_v33_status():
     })
 
 
-_np_start_payout_renewal_worker_v33()
+# V168 RESOURCE STABILITY:
+# Legacy payout-renewal V33 worker is intentionally NOT started.
+# V122 provides the active payout-renewal retry loop.
+# _np_start_payout_renewal_worker_v33()
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PAYOUT_RENEWAL_STALE_CLAIM_RECOVERY_V33_2026_09_14"
 
@@ -37701,7 +37765,10 @@ def admin_automation_v41_status():
                    "last_summary":_NP_SECOND_LIFE_RECOVERY_LAST_V41})
 
 
-_np_start_second_life_recovery_v41()
+# V168 RESOURCE STABILITY:
+# Do not start the duplicate V41 broad recovery scanner.
+# The verified V40 lifecycle worker remains active and continues entitlement handling.
+# _np_start_second_life_recovery_v41()
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_SECOND_LIFE_RECOVERY_RELEASE_V41
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "V42_FUNDED_RESET_AFTER_PAYOUT_RENEWAL_2026_09_15"
@@ -52249,7 +52316,7 @@ except Exception:
 try:
     from concurrent.futures import ThreadPoolExecutor
     _NP_NOTIFICATION_EXECUTOR_V97 = ThreadPoolExecutor(
-        max_workers=max(2, min(4, int(os.getenv("NAIRAPIPS_NOTIFICATION_WORKERS", "3")))) ,
+        max_workers=max(1, min(2, int(os.getenv("NAIRAPIPS_NOTIFICATION_WORKERS", "1")))) ,
         thread_name_prefix="np-notify-v97",
     )
 except Exception:
