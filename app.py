@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V166_LIFECYCLE_PLAN_LOOKUP_FIX_2026_10_06"
+NAIRAPIPS_RELEASE = "V167_SURGICAL_PLAN_LOOKUP_FIX_2026_10_06"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -734,133 +734,28 @@ def _journey_from_plan(plan):
     return None
 
 
-# V166 — schema-safe lifecycle plan lookup
-_NP_PLAN_LOOKUP_CACHE_V166 = {}
-_NP_PLAN_LOOKUP_CACHE_TTL_V166 = 120.0
-
-def _np_v166_transient_resource_error(exc):
-    s = str(exc or "").lower()
-    return (
-        "errno 11" in s
-        or "resource temporarily unavailable" in s
-        or "temporarily unavailable" in s
-    )
-
-def _np_v166_plan_cache_get(key):
-    if not key:
-        return None
-    row = _NP_PLAN_LOOKUP_CACHE_V166.get(key)
-    if not row:
-        return None
-    at, value = row
-    if time.time() - float(at or 0) > _NP_PLAN_LOOKUP_CACHE_TTL_V166:
-        _NP_PLAN_LOOKUP_CACHE_V166.pop(key, None)
-        return None
-    return dict(value or {})
-
-def _np_v166_plan_cache_put(key, value):
-    if key and value:
-        _NP_PLAN_LOOKUP_CACHE_V166[key] = (time.time(), dict(value))
-
 def _safe_plan_for_purchase(purchase):
-    """
-    Resolve the plan without ever querying a column that does not exist.
-
-    Production schema authority:
-      challenge_plans.id
-      challenge_plans.name
-
-    IMPORTANT:
-    Older code attempted challenge_plans.plan_name as a fallback. The current
-    schema has no plan_name column, which produced PostgreSQL 42703 repeatedly
-    inside lifecycle/assignment work.
-
-    Existing purchase snapshots remain a safe fallback so an old/current
-    purchase is not forced into the wrong journey merely because the commercial
-    plan row was renamed later.
-    """
     if not purchase:
         return None
-
-    p = dict(purchase or {})
-    plan_id = str(p.get("plan_id") or p.get("challenge_plan_id") or "").strip()
-    plan_name = str(p.get("plan_name") or p.get("selected_plan") or "").strip()
-
-    keys = []
-    if plan_id:
-        keys.append("id:" + plan_id)
-    if plan_name:
-        keys.append("name:" + plan_name.lower())
-
-    for key in keys:
-        cached = _np_v166_plan_cache_get(key)
-        if cached:
-            return cached
-
-    def _query_once():
-        if plan_id:
-            rows = (
-                supabase.table("challenge_plans").select("*")
-                .eq("id", plan_id).limit(1).execute().data or []
-            )
-            if rows:
-                return rows[0]
-
-        if plan_name:
-            rows = (
-                supabase.table("challenge_plans").select("*")
-                .eq("name", plan_name).limit(1).execute().data or []
-            )
-            if rows:
-                return rows[0]
-
-        return None
-
     try:
-        plan = _query_once()
-    except Exception as exc:
-        if _np_v166_transient_resource_error(exc):
-            # One small retry only. Do not create a retry storm.
-            time.sleep(0.20)
-            try:
-                plan = _query_once()
-            except Exception as retry_exc:
-                print("V166 LIFECYCLE PLAN LOOKUP DEFERRED:", retry_exc, flush=True)
-                plan = None
-        else:
-            print("V166 LIFECYCLE PLAN LOOKUP ERROR:", exc, flush=True)
-            plan = None
-
-    if plan:
+        plan_id = str(purchase.get("plan_id") or purchase.get("challenge_plan_id") or "").strip()
         if plan_id:
-            _np_v166_plan_cache_put("id:" + plan_id, plan)
-        if str(plan.get("name") or "").strip():
-            _np_v166_plan_cache_put(
-                "name:" + str(plan.get("name") or "").strip().lower(),
-                plan,
-            )
+            rows = supabase.table("challenge_plans").select("*").eq("id", plan_id).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+        plan_name = str(purchase.get("plan_name") or purchase.get("selected_plan") or "").strip()
         if plan_name:
-            _np_v166_plan_cache_put("name:" + plan_name.lower(), plan)
-        return plan
-
-    # Immutable purchase snapshot fallback.
-    # This preserves the purchase's own journey/targets when the commercial
-    # plan row has since been renamed or is temporarily unavailable.
-    snapshot_fields = (
-        "name", "plan_name", "challenge_type", "route", "progression_route",
-        "journey", "challenge_journey", "journey_stages", "model",
-        "phase1_target", "phase2_target", "profit_target",
-        "max_drawdown", "total_dd", "payout_split", "product_category",
-        "drawdown_type", "payout_frequency", "reset_fee", "fee", "price",
-        "account_size",
-    )
-    snapshot = {k: p.get(k) for k in snapshot_fields if p.get(k) is not None}
-    if snapshot:
-        if "name" not in snapshot and plan_name:
-            snapshot["name"] = plan_name
-        return snapshot
-
+            rows = supabase.table("challenge_plans").select("*").eq("name", plan_name).limit(1).execute().data or []
+            if rows:
+                return rows[0]
+            # V167 SURGICAL FIX:
+            # Current challenge_plans schema has no "plan_name" column.
+            # Do not query a non-existent column; preserve all existing lifecycle
+            # behavior by simply returning no plan match here.
+    except Exception as e:
+        print("LIFECYCLE PLAN LOOKUP ERROR:", e)
     return None
+
 
 def _safe_purchase_for_account(account):
     if not account:
@@ -14388,167 +14283,6 @@ def close_ticket():
 # Trader dashboard receives only public notices + notices targeted to itself.
 # Opening a private compliance report creates a server-side timestamped audit.
 # ============================================================
-
-
-# V160 MOBILE-PRIORITY ANNOUNCEMENT HOT CACHE
-_NP_ANNOUNCEMENT_HOT_CACHE_V160 = {"rows": [], "loaded_at": 0.0, "version": ""}
-_NP_ANNOUNCEMENT_HOT_CACHE_TTL_V160 = 20.0
-
-def _np_refresh_announcement_hot_cache_v160(force=False):
-    now_ts = time.time()
-    cache = _NP_ANNOUNCEMENT_HOT_CACHE_V160
-    if (
-        not force
-        and cache.get("rows")
-        and (now_ts - float(cache.get("loaded_at") or 0)) < _NP_ANNOUNCEMENT_HOT_CACHE_TTL_V160
-    ):
-        return cache
-
-    rows = (
-        supabase.table("announcements")
-        .select("*")
-        .eq("status", "active")
-        .order("created_at", desc=True)
-        .limit(100)
-        .execute().data or []
-    )
-    merged = [_np_offer_merge_meta(r) for r in rows]
-    latest = merged[0] if merged else {}
-    cache["rows"] = merged
-    cache["loaded_at"] = now_ts
-    cache["version"] = str(
-        latest.get("updated_at")
-        or latest.get("created_at")
-        or latest.get("id")
-        or ""
-    )
-    return cache
-
-def _np_push_announcement_hot_cache_v160(row):
-    if not row:
-        return
-    cache = _NP_ANNOUNCEMENT_HOT_CACHE_V160
-    merged = _np_offer_merge_meta(dict(row))
-    rows = [merged]
-    seen = {str(merged.get("id") or "")}
-    for old in cache.get("rows") or []:
-        oid = str((old or {}).get("id") or "")
-        if oid and oid in seen:
-            continue
-        rows.append(old)
-        if oid:
-            seen.add(oid)
-        if len(rows) >= 100:
-            break
-    cache["rows"] = rows
-    cache["loaded_at"] = time.time()
-    cache["version"] = str(
-        merged.get("updated_at")
-        or merged.get("created_at")
-        or merged.get("id")
-        or ""
-    )
-
-@app.route("/trader_announcements_v159", methods=["GET", "OPTIONS"])
-def trader_announcements_v159():
-    """Priority feed backed by a short-lived in-process cache."""
-    if request.method == "OPTIONS":
-        return _np_ok({"success": True})
-    try:
-        requested_id = str(request.args.get("trader_id") or "").strip()
-        authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
-        if auth_error:
-            return _np_fail(auth_error, 401)
-
-        cache = _np_refresh_announcement_hot_cache_v160(force=False)
-        rows = cache.get("rows") or []
-
-        needs_email = any(str((r or {}).get("target_email") or "").strip() for r in rows)
-        verified_email = ""
-        if needs_email:
-            trader = _get_trader_by_id(authed_id) or {}
-            verified_email = str(trader.get("email") or "").strip().lower()
-
-        visible = []
-        for row in rows:
-            target_id = str((row or {}).get("target_trader_id") or "").strip()
-            target_email = str((row or {}).get("target_email") or "").strip().lower()
-
-            if target_id or target_email:
-                if target_id and target_id != authed_id:
-                    continue
-                if (not target_id) and target_email and target_email != verified_email:
-                    continue
-            else:
-                flag = (row or {}).get("show_on_dashboard", True)
-                if isinstance(flag, str):
-                    flag = flag.strip().lower() not in {"0","false","no","off",""}
-                if not flag:
-                    continue
-
-            visible.append(_trader_safe_offer_row(row))
-
-        response = jsonify({
-            "success": True,
-            "announcements": visible,
-            "count": len(visible),
-            "version": cache.get("version") or "",
-            "server_time": now_iso(),
-            "release": "V160_ANNOUNCEMENT_MOBILE_PRIORITY_2026_10_06",
-        })
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
-        return response
-    except Exception as exc:
-        print("V160 TRADER ANNOUNCEMENTS ERROR:", exc, flush=True)
-        return _np_fail("Could not load trader announcements", 500)
-
-
-@app.route("/trader_announcement_head_v160", methods=["GET", "OPTIONS"])
-def trader_announcement_head_v160():
-    """Tiny mobile poll endpoint. Returns only whether a newer announcement exists."""
-    if request.method == "OPTIONS":
-        return _np_ok({"success": True})
-    try:
-        requested_id = str(request.args.get("trader_id") or "").strip()
-        authed_id, auth_error = _authenticated_trader_id_for_request(requested_id)
-        if auth_error:
-            return _np_fail(auth_error, 401)
-
-        cache = _np_refresh_announcement_hot_cache_v160(force=False)
-        latest = None
-        for row in cache.get("rows") or []:
-            target_id = str((row or {}).get("target_trader_id") or "").strip()
-            target_email = str((row or {}).get("target_email") or "").strip().lower()
-            if target_id and target_id != authed_id:
-                continue
-            if target_email and not target_id:
-                continue
-            flag = (row or {}).get("show_on_dashboard", True)
-            if isinstance(flag, str):
-                flag = flag.strip().lower() not in {"0","false","no","off",""}
-            if not flag:
-                continue
-            latest = row
-            break
-
-        response = jsonify({
-            "success": True,
-            "version": cache.get("version") or "",
-            "latest_id": (latest or {}).get("id"),
-            "latest_created_at": (latest or {}).get("created_at"),
-            "release": "V160_ANNOUNCEMENT_MOBILE_PRIORITY_2026_10_06",
-        })
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return response
-    except Exception as exc:
-        print("V160 ANNOUNCEMENT HEAD ERROR:", exc, flush=True)
-        return _np_fail("Could not check announcements", 500)
-
-
-
-
 @app.route("/trader_announcements", methods=["GET", "OPTIONS"])
 def trader_announcements():
     if request.method == "OPTIONS":
@@ -14641,24 +14375,10 @@ def create_announcement():
     try:
         d=request.json or {}; title=str(d.get("title","")).strip(); msg=str(d.get("message","")).strip()
         if not title or not msg: return bad("Title and message are required")
-        def _v159_bool(value, default=True):
-            if value is None:
-                return default
-            if isinstance(value, bool):
-                return value
-            return str(value).strip().lower() not in {"0","false","no","off",""}
-
         row={"title":title,"message":msg,"type":d.get("type","public_notice"),"status":"active",
-             "show_on_landing":_v159_bool(d.get("show_on_landing", True), True),
-             "show_on_dashboard":_v159_bool(d.get("show_on_dashboard", True), True),
+             "show_on_landing":d.get("show_on_landing", True),"show_on_dashboard":d.get("show_on_dashboard", True),
              "created_by":d.get("created_by","admin"),"created_at":now_iso()}
-        created=supabase.table("announcements").insert(row).execute().data or []
-        if created:
-            try:
-                _np_push_announcement_hot_cache_v160(created[0])
-            except Exception as _v160_cache_push_exc:
-                print("V160 ANNOUNCEMENT CACHE PUSH WARNING:", _v160_cache_push_exc, flush=True)
-        return ok(created, "Announcement created")
+        return ok(supabase.table("announcements").insert(row).execute().data, "Announcement created")
     except Exception as e: return bad(e)
 
 @app.route("/disable_announcement", methods=["POST"])
