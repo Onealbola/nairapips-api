@@ -9750,6 +9750,12 @@ def approve_payment():
         if not mt5:
             return bad("Approve payment now requires an available MT5 pool account. Send mt5_id or use /approve_challenge_purchase.", 400)
 
+        print(
+            "V179 APPROVAL STEP: enter_shared_assigner",
+            pid,
+            str(m.get("mt5_login") or ""),
+            flush=True,
+        )
         account, trader_row = _assign_mt5_to_trader(
             trader_row,
             mt5,
@@ -11124,7 +11130,7 @@ def approve_purchase():
         _seen_linked = set()
         for _col in ("purchase_id",):
             try:
-                _rows = (supabase.table("trader_accounts").select("id,stage,phase,account_status,status,mt5_login")
+                _rows = (supabase.table("trader_accounts").select("id,stage,account_status,status,mt5_login")
                          .eq(_col, pid).limit(100).execute().data or [])
                 for _a in _rows:
                     _aid = str(_a.get("id") or "")
@@ -11156,26 +11162,48 @@ def approve_purchase():
                     "target_stage": "phase1",
                 }, "Payment approved. Waiting for the correct fresh Phase 1 MT5; automation will retry.")
         if auto_mode:
-            auto_ok,auto_reason=_np_mt5_auto_eligible(m,p.get("account_size") or 0,"phase1")
-            if not auto_ok:
-                # Browser/cache may contain an MT5 pool row that looks available
-                # but has already appeared in trader_accounts/history. Automatic
-                # mode must recover by asking the SERVER for the next truly fresh
-                # PHASE1 credential instead of making staff retry manually.
+            # V179 FORENSIC FIX:
+            # If the MT5 came from the server-side fresh picker, it has already
+            # passed the expensive authoritative history scan. Re-running
+            # _np_mt5_auto_eligible() here performs the same history scan again
+            # before _assign_mt5_to_trader() performs its final hard guard.
+            #
+            # That triple-check was visible in production as repeated
+            # V170/V173 history reads and Errno 11 immediately before approval
+            # returned HTTP 400.
+            #
+            # Manual/browser-selected mt5_id rows do NOT have this marker and
+            # still receive the full eligibility check here.
+            if m.get("_np_v173_picker_verified"):
                 print(
-                    "V48 AUTO PURCHASE CANDIDATE REJECTED; SEARCHING NEXT FRESH MT5:",
-                    str(m.get("mt5_login") or ""), auto_reason
+                    "V179 APPROVAL PICKER PROOF REUSED:",
+                    str(m.get("mt5_login") or ""),
+                    "final_guard_still_required=True",
+                    flush=True,
                 )
-                m=_np_pick_fresh_mt5(p.get("account_size") or 0,"phase1")
-                if not m:
-                    waiting=_np_mark_purchase_approved_waiting_v60(
-                        p, d, "Approved purchase waiting for genuinely fresh Phase 1 MT5"
+            else:
+                auto_ok,auto_reason=_np_mt5_auto_eligible(
+                    m,p.get("account_size") or 0,"phase1"
+                )
+                if not auto_ok:
+                    # Browser/cache may contain an MT5 pool row that looks
+                    # available but is no longer genuinely fresh.
+                    print(
+                        "V179 AUTO PURCHASE CANDIDATE REJECTED; SEARCHING NEXT FRESH MT5:",
+                        str(m.get("mt5_login") or ""), auto_reason,
+                        flush=True,
                     )
-                    return ok({
-                        "purchase": waiting,
-                        "waiting_for_mt5": True,
-                        "target_stage": "phase1",
-                    }, "Payment approved. Waiting for the correct fresh Phase 1 MT5; automation will retry.")
+                    m=_np_pick_fresh_mt5(p.get("account_size") or 0,"phase1")
+                    if not m:
+                        waiting=_np_mark_purchase_approved_waiting_v60(
+                            p, d, "Approved purchase waiting for genuinely fresh Phase 1 MT5"
+                        )
+                        return ok({
+                            "purchase": waiting,
+                            "waiting_for_mt5": True,
+                            "target_stage": "phase1",
+                        }, "Payment approved. Waiting for the correct fresh Phase 1 MT5; automation will retry.")
+        print("V179 APPROVAL STEP: pool_stage_guard", str(m.get("mt5_login") or ""), flush=True)
         try:
             _np_assert_mt5_pool_matches_stage(m, "phase1")
         except ValueError as exc:
@@ -11185,6 +11213,7 @@ def approve_purchase():
         if clean(m.get("account_size")) != clean(p.get("account_size")):
             return bad("Selected MT5 account size does not match purchase account size")
         staff = _admin_from_payload(d)
+        print("V179 APPROVAL STEP: resolve_trader", pid, flush=True)
         trader = _ensure_trader_for_purchase(p)
         if not trader:
             return bad("Could not resolve trader for purchase", 500)
@@ -57391,4 +57420,26 @@ print(
     "V178 LOADED: forensic assignment root fix + final lightweight assignable feed binding",
     flush=True,
 )
+
+# ============================================================================
+# NAIRAPIPS V179 — FORENSIC ASSIGNMENT BLOCKER FIX — 06 OCT 2026
+#
+# Cross-reference result:
+# - V176 read-only feed is healthy: structural candidates returned.
+# - Approval still returned HTTP 400 before V175 assignment-step logs.
+# - The approve route re-ran _np_mt5_auto_eligible() after the V170/V173 picker
+#   had already performed full MT5 history verification.
+# - _assign_mt5_to_trader() then performs the final hard history guard again.
+# - Therefore one automatic approval could perform the same history validation
+#   three times in the hottest path.
+# - The same route also queried nonexistent trader_accounts.phase; that schema
+#   mismatch is removed.
+#
+# Safety:
+# - server-picked MT5 only reuses the picker proof;
+# - manual mt5_id still gets full eligibility validation;
+# - final V173 never-used guard remains mandatory before mutation.
+# ============================================================================
+NAIRAPIPS_RELEASE = "V179_FORENSIC_ASSIGNMENT_BLOCKER_FIX_2026_10_06"
+print("V179 LOADED: forensic pre-assignment blocker removed", flush=True)
 
