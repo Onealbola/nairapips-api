@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V167_SURGICAL_PLAN_LOOKUP_FIX_2026_10_06"
+NAIRAPIPS_RELEASE = "V168_RESOURCE_STABILITY_FIX_2026_10_06"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -35436,7 +35436,10 @@ def admin_payout_renewal_v31_status():
     })
 
 
-_np_start_payout_renewal_worker_v31()
+# V168 RESOURCE STABILITY:
+# Legacy payout-renewal V31 worker is intentionally NOT started.
+# V122 is the current payout-renewal worker and remains active.
+# _np_start_payout_renewal_worker_v31()
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "SERVER_SIDE_PAYOUT_RENEWAL_WORKER_V31_2026_09_14"
 
@@ -36042,7 +36045,10 @@ def admin_payout_renewal_v33_status():
     })
 
 
-_np_start_payout_renewal_worker_v33()
+# V168 RESOURCE STABILITY:
+# Legacy payout-renewal V33 worker is intentionally NOT started.
+# V122 provides the active payout-renewal retry loop.
+# _np_start_payout_renewal_worker_v33()
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PAYOUT_RENEWAL_STALE_CLAIM_RECOVERY_V33_2026_09_14"
 
@@ -37759,7 +37765,10 @@ def admin_automation_v41_status():
                    "last_summary":_NP_SECOND_LIFE_RECOVERY_LAST_V41})
 
 
-_np_start_second_life_recovery_v41()
+# V168 RESOURCE STABILITY:
+# Do not start the duplicate V41 broad recovery scanner.
+# The verified V40 lifecycle worker remains active and continues entitlement handling.
+# _np_start_second_life_recovery_v41()
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_SECOND_LIFE_RECOVERY_RELEASE_V41
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "V42_FUNDED_RESET_AFTER_PAYOUT_RENEWAL_2026_09_15"
@@ -52307,7 +52316,7 @@ except Exception:
 try:
     from concurrent.futures import ThreadPoolExecutor
     _NP_NOTIFICATION_EXECUTOR_V97 = ThreadPoolExecutor(
-        max_workers=max(2, min(4, int(os.getenv("NAIRAPIPS_NOTIFICATION_WORKERS", "3")))) ,
+        max_workers=max(1, min(2, int(os.getenv("NAIRAPIPS_NOTIFICATION_WORKERS", "1")))) ,
         thread_name_prefix="np-notify-v97",
     )
 except Exception:
