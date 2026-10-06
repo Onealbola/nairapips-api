@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V168_RESOURCE_STABILITY_FIX_2026_10_06"
+NAIRAPIPS_RELEASE = "V167_SURGICAL_PLAN_LOOKUP_FIX_2026_10_06"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -23941,6 +23941,246 @@ if _NP_PREVIOUS_TRADER_RESET_OPPORTUNITIES_VIEW:
     app.view_functions["trader_reset_opportunities"] = _np_final_trader_reset_opportunities_20260911
 
 
+
+# ============================================================================
+# NAIRAPIPS V169 — COORDINATED ASSIGNMENT RECOVERY — 06 OCT 2026
+#
+# Scope ONLY:
+#   A) New purchase Approve + Auto Assign must not die because an optional
+#      historical reconciliation helper temporarily fails.
+#   B) PASS -> FUNDED recovery must start from the exact PASSED trader_account,
+#      not from a broad purchase-history scan.
+#
+# Business law is unchanged:
+#   root Phase account -> PASSED -> one Funded child
+#   exact purchase_id required
+#   exact trader ownership required
+#   existing duplicate/replay guards remain active
+#   existing Funded-pool / size / freshness rules remain active
+#   no reset / payout / Second Life / breach / recall rule is changed
+# ============================================================================
+
+NAIRAPIPS_ASSIGNMENT_RECOVERY_RELEASE_V169 = "V169_COORDINATED_ASSIGNMENT_RECOVERY_2026_10_06"
+_NP_PASS_FUNDED_V169_LOCK = threading.Lock()
+
+
+def _np_retry_clean_pass_funded_v19(limit=120):
+    """Lean exact PASS->FUNDED recovery.
+
+    The source PASSED account is the root/parent.  It does not need a parent.
+    The existing protected assigner creates one Funded child for the same
+    purchase journey.
+    """
+    summary = {
+        "release": NAIRAPIPS_ASSIGNMENT_RECOVERY_RELEASE_V169,
+        "checked": 0,
+        "due": 0,
+        "assigned": 0,
+        "already_fulfilled": 0,
+        "waiting_inventory": 0,
+        "blocked": 0,
+        "errors": 0,
+    }
+
+    if not _NP_PASS_FUNDED_V169_LOCK.acquire(blocking=False):
+        summary["busy"] = True
+        return summary
+
+    try:
+        # Pull only completed/pass source accounts.  This avoids the old broad
+        # challenge_purchases sweep and immediately includes newly-created plans.
+        try:
+            sources = (
+                supabase.table("trader_accounts").select("*")
+                .in_("account_status", [
+                    "archived_phase1", "archived_phase2",
+                    "passed", "archived_passed"
+                ])
+                .order("updated_at", desc=True)
+                .limit(max(20, min(int(limit or 120), 250)))
+                .execute().data or []
+            )
+        except Exception as exc:
+            print("V169 PASS->FUNDED SOURCE LOAD ERROR:", exc, flush=True)
+            summary["errors"] += 1
+            return summary
+
+        seen_purchase_ids = set()
+
+        for source in sources:
+            try:
+                source_id = str(source.get("id") or "").strip()
+                trader_id = str(source.get("trader_id") or "").strip()
+                purchase_id = str(
+                    source.get("purchase_id")
+                    or source.get("challenge_purchase_id")
+                    or ""
+                ).strip()
+
+                if not source_id or not trader_id or not purchase_id:
+                    continue
+                if purchase_id in seen_purchase_ids:
+                    continue
+                seen_purchase_ids.add(purchase_id)
+
+                source_stage = _normalize_lifecycle_stage(
+                    source.get("stage") or source.get("phase")
+                )
+                source_status = str(
+                    source.get("account_status") or source.get("status") or ""
+                ).strip().lower()
+                pass_status = str(source.get("phase_pass_status") or "").strip().lower()
+                risk_zone = str(source.get("risk_zone") or "").strip().lower()
+
+                passed = bool(
+                    source_status in {
+                        "archived_phase1", "archived_phase2",
+                        "passed", "archived_passed"
+                    }
+                    or pass_status in {"phase1_passed", "phase2_passed"}
+                    or risk_zone == "passed"
+                )
+                if not passed:
+                    continue
+
+                summary["checked"] += 1
+
+                # Exact immutable root purchase only.
+                prows = (
+                    supabase.table("challenge_purchases").select("*")
+                    .eq("id", purchase_id)
+                    .eq("trader_id", trader_id)
+                    .limit(1).execute().data or []
+                )
+                if not prows:
+                    summary["blocked"] += 1
+                    print(
+                        "V169 PASS->FUNDED BLOCKED: exact purchase missing",
+                        purchase_id, source.get("mt5_login"), flush=True
+                    )
+                    continue
+
+                purchase = prows[0]
+
+                # Preserve the existing clean-automation cutover/business rule.
+                if "_np_is_clean_root_v43" in globals() and not _np_is_clean_root_v43(purchase):
+                    continue
+
+                trader = get_trader_by_id(trader_id)
+                if not trader:
+                    summary["errors"] += 1
+                    continue
+
+                target_stage = (
+                    str(source.get("next_stage") or "").strip().lower()
+                    or _next_stage_for_lifecycle(
+                        source_stage, source, purchase, None, trader
+                    )
+                )
+                target_stage = _normalize_lifecycle_stage(target_stage) if target_stage else None
+
+                if target_stage != "funded":
+                    continue
+
+                # Exact same purchase already has any genuine Funded child:
+                # entitlement is consumed even if that child later changed status.
+                existing_rows = (
+                    supabase.table("trader_accounts").select(
+                        "id,trader_id,purchase_id,stage,phase,account_status,mt5_login,created_at,assigned_at"
+                    )
+                    .eq("trader_id", trader_id)
+                    .eq("purchase_id", purchase_id)
+                    .limit(200).execute().data or []
+                )
+                existing_funded = [
+                    a for a in existing_rows
+                    if str(a.get("id") or "").strip() != source_id
+                    and _normalize_lifecycle_stage(a.get("stage") or a.get("phase")) == "funded"
+                    and str(a.get("mt5_login") or "").strip()
+                ]
+                if existing_funded:
+                    summary["already_fulfilled"] += 1
+                    continue
+
+                summary["due"] += 1
+
+                # IMPORTANT: source is the passed ROOT/PARENT.  We do not ask it
+                # to have a parent.  Existing assignment authority creates child.
+                result = _np_auto_assign_waiting_stage(
+                    trader,
+                    "funded",
+                    purchase,
+                    source,
+                    "lifecycle_progression",
+                )
+
+                if result:
+                    if result.get("already_fulfilled"):
+                        summary["already_fulfilled"] += 1
+                    else:
+                        summary["assigned"] += 1
+                        try:
+                            _audit_safe(
+                                "automation",
+                                "v169_pass_funded_fulfilled",
+                                (
+                                    f"ROOT_PASS_TO_FUNDED purchase={purchase_id}; "
+                                    f"source_account={source_id}; "
+                                    f"source_mt5={source.get('mt5_login')}; "
+                                    f"funded_mt5={(result.get('account') or {}).get('mt5_login')}"
+                                ),
+                                {
+                                    "name": "automation_v169",
+                                    "username": "automation_v169",
+                                    "role": "system",
+                                },
+                                source_id,
+                            )
+                        except Exception:
+                            pass
+                else:
+                    # Do not invent a different reason.  Existing protected
+                    # assignment authority remains the final gate.
+                    summary["waiting_inventory"] += 1
+
+            except Exception as exc:
+                summary["errors"] += 1
+                print(
+                    "V169 PASS->FUNDED ITEM ERROR:",
+                    source.get("mt5_login"),
+                    exc,
+                    flush=True,
+                )
+
+        return summary
+    finally:
+        _NP_PASS_FUNDED_V169_LOCK.release()
+
+
+@app.route("/admin/assignment_recovery_v169/status", methods=["GET", "OPTIONS"])
+def admin_assignment_recovery_v169_status():
+    if request.method == "OPTIONS":
+        return _np_ok({"success": True})
+    admin_user, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return _np_ok({
+        "success": True,
+        "release": NAIRAPIPS_ASSIGNMENT_RECOVERY_RELEASE_V169,
+        "pass_to_funded_source": "exact_passed_trader_account",
+        "root_account_requires_parent": False,
+        "funded_child_created_by_existing_protected_assigner": True,
+        "purchase_approval_pre_reconcile": "best_effort_non_blocking",
+        "reset_logic_changed": False,
+        "payout_logic_changed": False,
+        "second_life_logic_changed": False,
+        "breach_logic_changed": False,
+        "recall_logic_changed": False,
+    })
+
+
+NAIRAPIPS_RELEASE = NAIRAPIPS_ASSIGNMENT_RECOVERY_RELEASE_V169
+
 if __name__ == "__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0", port=port)
@@ -30216,9 +30456,16 @@ def _np_post9_approve_purchase_route():
             if _np_post9_root_purchase(p):
                 tid = str(p.get("trader_id") or "").strip()
 
-                # Repair exact historical ownership before making a new decision.
+                # V169 ASSIGNMENT RECOVERY:
+                # Historical reconciliation is best-effort only.  A temporary
+                # Supabase/resource failure here must not crash a brand-new exact
+                # purchase approval.  The exact-purchase duplicate/ownership guards
+                # below and inside _assign_mt5_to_trader remain authoritative.
                 if tid:
-                    _np_post9_reconcile_trader_journeys(tid, apply=True)
+                    try:
+                        _np_post9_reconcile_trader_journeys(tid, apply=True)
+                    except Exception as _rec_exc:
+                        print("V169 APPROVAL PRE-RECONCILE DEFERRED:", _rec_exc, flush=True)
 
                 # NEW PURCHASE = NEW JOURNEY.  Existing accounts on OTHER purchases
                 # belonging to this trader are irrelevant and must never block or be
@@ -35436,10 +35683,7 @@ def admin_payout_renewal_v31_status():
     })
 
 
-# V168 RESOURCE STABILITY:
-# Legacy payout-renewal V31 worker is intentionally NOT started.
-# V122 is the current payout-renewal worker and remains active.
-# _np_start_payout_renewal_worker_v31()
+_np_start_payout_renewal_worker_v31()
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "SERVER_SIDE_PAYOUT_RENEWAL_WORKER_V31_2026_09_14"
 
@@ -36045,10 +36289,7 @@ def admin_payout_renewal_v33_status():
     })
 
 
-# V168 RESOURCE STABILITY:
-# Legacy payout-renewal V33 worker is intentionally NOT started.
-# V122 provides the active payout-renewal retry loop.
-# _np_start_payout_renewal_worker_v33()
+_np_start_payout_renewal_worker_v33()
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "PAYOUT_RENEWAL_STALE_CLAIM_RECOVERY_V33_2026_09_14"
 
@@ -37765,10 +38006,7 @@ def admin_automation_v41_status():
                    "last_summary":_NP_SECOND_LIFE_RECOVERY_LAST_V41})
 
 
-# V168 RESOURCE STABILITY:
-# Do not start the duplicate V41 broad recovery scanner.
-# The verified V40 lifecycle worker remains active and continues entitlement handling.
-# _np_start_second_life_recovery_v41()
+_np_start_second_life_recovery_v41()
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_SECOND_LIFE_RECOVERY_RELEASE_V41
 
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = "V42_FUNDED_RESET_AFTER_PAYOUT_RENEWAL_2026_09_15"
@@ -52316,7 +52554,7 @@ except Exception:
 try:
     from concurrent.futures import ThreadPoolExecutor
     _NP_NOTIFICATION_EXECUTOR_V97 = ThreadPoolExecutor(
-        max_workers=max(1, min(2, int(os.getenv("NAIRAPIPS_NOTIFICATION_WORKERS", "1")))) ,
+        max_workers=max(2, min(4, int(os.getenv("NAIRAPIPS_NOTIFICATION_WORKERS", "3")))) ,
         thread_name_prefix="np-notify-v97",
     )
 except Exception:
