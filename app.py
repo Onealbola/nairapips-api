@@ -12,7 +12,7 @@ import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json,
 import html
 import requests
 app = Flask(__name__)
-NAIRAPIPS_RELEASE = "V156_PRODUCT_MARKETS_MONITORING_SNAPSHOT_2026_10_06"
+NAIRAPIPS_RELEASE = "V157_PLAN_CARD_FIELDS_2026_10_06"
 CORS(app)
 # SPEED 2026-08-24 — gzip on every JSON response. Cuts payload size 60-70%.
 # Without this, the 200KB admin_bootstrap JSON goes over the wire uncompressed
@@ -1095,7 +1095,7 @@ _TRADER_ACCOUNT_RESPONSE_FIELDS = {
 }
 
 _TRADER_PURCHASE_RESPONSE_FIELDS = {
-    "id", "trader_id", "trader_account_id", "plan_id", "plan_name", "product_category",
+    "id", "trader_id", "trader_account_id", "plan_id", "plan_name", "product_category", "drawdown_type", "payout_frequency",
     "phase1_target", "phase2_target", "max_drawdown", "payout_split", "reset_fee", "funded_reset_fee", "plan_snapshot_at",
     "account_size", "fee", "original_fee", "discount_percent",
     "discount_amount", "final_fee", "amount_due", "payment_status",
@@ -10081,6 +10081,8 @@ def _np_plan_rule_snapshot_v156(plan):
     plan = plan or {}
     return {
         "product_category": _np_plan_category_v156(plan.get("product_category")),
+        "drawdown_type": str(plan.get("drawdown_type") or "STATIC").strip().upper(),
+        "payout_frequency": str(plan.get("payout_frequency") or "Daily").strip(),
         "phase1_target": float(plan.get("phase1_target") or plan.get("profit_target") or 10),
         "phase2_target": float(plan.get("phase2_target") or 0),
         "max_drawdown": float(plan.get("max_drawdown") or plan.get("total_dd") or 20),
@@ -10258,6 +10260,8 @@ def create_plan():
         row={"name":name,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
              "product_category":_np_plan_category_v156(d.get("product_category")),
              "category_sort":int(d.get("category_sort") or 10),
+             "drawdown_type":str(d.get("drawdown_type") or "STATIC").strip().upper(),
+             "payout_frequency":str(d.get("payout_frequency") or "Daily").strip(),
              "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":phase2_target,
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
              "challenge_journey": challenge_journey, "journey_source": "plan_create",
@@ -10287,6 +10291,10 @@ def update_plan():
             upd["product_category"] = _np_plan_category_v156(d.get("product_category"))
         if "category_sort" in d:
             upd["category_sort"] = int(d.get("category_sort") or 10)
+        if "drawdown_type" in d:
+            upd["drawdown_type"] = str(d.get("drawdown_type") or "STATIC").strip().upper()
+        if "payout_frequency" in d:
+            upd["payout_frequency"] = str(d.get("payout_frequency") or "Daily").strip()
         if "payout_split" in d:
             upd["payout_split"] = _effective_payout_split(d.get("payout_split"))
         # V123: Challenge Plans now use paid, admin-priced resets.
