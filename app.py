@@ -1,3 +1,4 @@
+# V188_TRADER_DASHBOARD_FRESHNESS_2026_10_07
 import urllib.parse
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -248,11 +249,16 @@ def _staff_db():
 DEFAULT_PAYOUT_PROFIT_SHARE_PERCENT = 60.0
 FUNDED_MAX_GROSS_PROFIT_PERCENT = 50.0  # absolute payout-liability ceiling; independent of the plan's profit split
 
-def _effective_payout_split(*values):
-    """Return the first explicitly stored valid profit split (0..100).
+# V187 PRODUCT RULE FIREWALL — NairaPips only recognises the commercial
+# payout shares that exist in the business. 80% (and browser-supplied values)
+# must never create a payout liability.
+_NP_ALLOWED_PAYOUT_SPLITS_V187 = {60.0, 70.0}
 
-    This is deliberately configuration-driven. Challenge Plans can use 50/50,
-    60/40, 70/30, 80/20, 100/0, etc. without a code change.
+def _effective_payout_split(*values):
+    """Return the first recognised NairaPips payout split; legacy-safe default 60.
+
+    Product rules are deliberately closed rather than accepting arbitrary 0..100
+    values. This prevents stale/foreign 80% values from becoming financial rules.
     """
     for raw in values:
         if raw in (None, ""):
@@ -261,56 +267,41 @@ def _effective_payout_split(*values):
             value = float(str(raw).replace("%", "").strip())
         except Exception:
             continue
-        if 0.0 <= value <= 100.0:
+        if value in _NP_ALLOWED_PAYOUT_SPLITS_V187:
             return value
+        print("V187 PAYOUT SPLIT REJECTED:", raw, "allowed=60,70", flush=True)
     return DEFAULT_PAYOUT_PROFIT_SHARE_PERCENT
 
 def _np_plan_payout_split_for_account(account, trader=None, request_payload=None):
-    """Resolve the exact Challenge Plan payout split for a funded account.
+    """Resolve payout share without allowing one product to borrow another's rules.
 
-    Authority order:
-      1) linked Challenge Plan (admin-controlled commercial rule)
-      2) account snapshot
-      3) trader snapshot
-      4) request payload (compatibility only)
-      5) legacy fallback 60
+    Authority: immutable purchase snapshot -> exact plan UUID -> legacy 60.
+    Plan-name lookup, trader-level values and browser payload are intentionally
+    excluded because they can cross-contaminate historical/new products.
     """
     account = account or {}
-    trader = trader or {}
-    request_payload = request_payload or {}
-    plan_split = None
+    purchase = {}
+    exact_plan = {}
     try:
         purchase_id = str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip()
-        purchase = {}
         if purchase_id:
             rows = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
             purchase = rows[0] if rows else {}
-        plan_id = str(
-            purchase.get("plan_id")
-            or purchase.get("challenge_plan_id")
-            or account.get("plan_id")
-            or ""
-        ).strip()
-        plan = {}
+
+        # A purchase snapshot is contractual and wins forever once present.
+        purchase_split = purchase.get("payout_split")
+        if purchase_split not in (None, ""):
+            return _effective_payout_split(purchase_split)
+
+        # Legacy purchase without a snapshot may consult ONLY its exact UUID.
+        plan_id = str(purchase.get("plan_id") or purchase.get("challenge_plan_id") or account.get("plan_id") or "").strip()
         if plan_id:
             rows = supabase.table("challenge_plans").select("*").eq("id", plan_id).limit(1).execute().data or []
-            plan = rows[0] if rows else {}
-        if not plan and purchase.get("plan_name"):
-            rows = (
-                supabase.table("challenge_plans").select("*")
-                .eq("name", purchase.get("plan_name")).limit(1).execute().data or []
-            )
-            plan = rows[0] if rows else {}
-        plan_split = plan.get("payout_split") if plan else None
+            exact_plan = rows[0] if rows else {}
     except Exception as exc:
-        print("PLAN PAYOUT SPLIT RESOLUTION WARNING:", exc, flush=True)
+        print("V187 EXACT PAYOUT RULE LOOKUP WARNING:", exc, flush=True)
 
-    return _effective_payout_split(
-        plan_split,
-        account.get("payout_split"),
-        trader.get("payout_split"),
-        request_payload.get("payout_split"),
-    )
+    return _effective_payout_split(exact_plan.get("payout_split") if exact_plan else None)
 
 # ================================
 # STABILITY 2026-08-24 — Layer 4: in-memory read cache.
@@ -880,16 +871,17 @@ def _safe_plan_for_purchase(purchase):
         print("V181 PLAN SNAPSHOT UNAVAILABLE:", exc, flush=True)
         return None
 
+    # V187 PRODUCT ISOLATION: a purchase may resolve only its exact immutable
+    # plan UUID. Never substitute a same-name plan: names are presentation labels,
+    # not product identities. If the historical UUID no longer exists, return None
+    # so purchase/account snapshots or legacy defaults remain authoritative.
     if plan_id:
         row = (snap.get("by_id") or {}).get(plan_id)
-        if row:
-            return row
+        return row if row else None
 
-    if plan_name:
-        row = (snap.get("by_name") or {}).get(plan_name)
-        if row:
-            return row
-
+    # Legacy rows with no UUID must not inherit a modern product merely because
+    # its display name matches. Their frozen account/purchase values and legacy
+    # defaults are safer than cross-product contamination.
     return None
 
 
@@ -10585,12 +10577,19 @@ def create_purchase():
         if quote.get("code") and not quote.get("valid"):
             return bad(quote.get("message") or "Invalid promo/referral code", 400)
 
-        plan_row = _safe_plan_for_purchase({"plan_id": d.get("plan_id"), "plan_name": plan})
+        # V187: NEW PRODUCT BOUNDARY. A new purchase must bind to one exact plan
+        # UUID at checkout. Never infer commercial rules from a reused display name.
+        submitted_plan_id = str(d.get("plan_id") or "").strip()
+        if not submitted_plan_id:
+            return bad("Plan identity is missing. Please refresh the plan page and select the product again.", 400)
+        plan_row = _safe_plan_for_purchase({"plan_id": submitted_plan_id})
+        if not plan_row:
+            return bad("Selected plan is no longer available. Please refresh and select a current product.", 400)
         challenge_journey = _journey_source_value(_journey_for_lifecycle({}, {}, plan_row, None))
         second_life_snapshot = _second_life_plan_snapshot(plan_row)
         plan_rule_snapshot = _np_plan_rule_snapshot_v156(plan_row)
         row={"trader_id":d.get("trader_id"),"trader_name":d.get("trader_name",""),"email":d.get("email",""),"phone":d.get("phone",""),
-             "plan_id":d.get("plan_id"),"plan_name":plan,"account_size":clean(d.get("account_size")),"fee":quote.get("final_fee", original_fee),
+             "plan_id":plan_row.get("id"),"plan_name":plan_row.get("name") or plan,"account_size":clean(plan_row.get("account_size") or d.get("account_size")),"fee":quote.get("final_fee", original_fee),
              "original_fee":quote.get("original_fee", original_fee),"discount_percent":quote.get("discount_percent",0),"discount_amount":quote.get("discount_amount",0),
              "final_fee":quote.get("final_fee", original_fee),"amount_due":quote.get("final_fee", original_fee),
              "payment_proof_url":proof,"payment_status":"pending","status":"pending_review","admin_note":"",
@@ -15056,6 +15055,18 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
                 supabase.table("trader_accounts").update(core_account_update).eq("id", active_account.get("id")).execute()
         except Exception as e:
             print("trader account monitoring update failed:", e)
+        else:
+            # V188 DASHBOARD FRESHNESS FIX (2026-10-07):
+            # Monitoring has just persisted the newest balance/equity/profit/DD
+            # into this exact trader_account. Expire only this trader's short
+            # bootstrap cache so the next dashboard poll cannot receive the
+            # pre-monitoring account payload. This is display/cache plumbing
+            # only: it does not alter DD thresholds, breach calculations,
+            # monitoring decisions, DD Police, assignment, or lifecycle rules.
+            try:
+                _invalidate_trader_bootstrap_cache(trader.get("id"))
+            except Exception as _v188_cache_exc:
+                print("V188 TRADER DASHBOARD CACHE INVALIDATION WARNING:", _v188_cache_exc, flush=True)
 
     if is_current_account:
         _safe_traders_update(trader.get("id"), update_data)
@@ -58255,3 +58266,13 @@ def admin_assignment_v184_status():
 
 _np_v184_start_repair_once()
 print("V184 LOADED: monitoring handover + lifecycle auto-progression repaired", flush=True)
+
+
+# ============================================================================
+# NAIRAPIPS V187 — EXACT PRODUCT RULE ISOLATION — 06 OCT 2026
+# Surgical patch on the user-confirmed production base app (3)(2).py.
+# Prevents same-name plan fallback from mixing DD/payout rules across products;
+# freezes new purchases to exact plan UUID snapshots; rejects unsupported 80% split.
+# ============================================================================
+NAIRAPIPS_RELEASE = "V187_EXACT_PRODUCT_RULE_ISOLATION_2026_10_06"
+print("V187 LOADED: exact product UUID isolation + DD/payout firewall", flush=True)
