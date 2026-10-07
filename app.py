@@ -58317,3 +58317,132 @@ print("V187 LOADED: exact product UUID isolation + DD/payout firewall", flush=Tr
 # ============================================================================
 NAIRAPIPS_RELEASE = "V189_ACCOUNT_TRUTH_TIMESTAMP_SOURCE_FIX_2026_10_07"
 print("V189 LOADED: Account Truth extrema timestamps now follow their actual evidence source", flush=True)
+
+# ============================================================================
+# NAIRAPIPS V192 — RENDER 512MB MEMORY GUARD — 07 OCT 2026
+# Resource-only repair. Does NOT change lifecycle/assignment/reset/payout/DD law.
+# Bounds short-lived in-process caches, collects unreachable objects and asks
+# glibc to return free arenas to the OS after heavy background cycles.
+# ============================================================================
+NAIRAPIPS_MEMORY_GUARD_RELEASE_V192 = "V192_RENDER_512MB_MEMORY_GUARD_2026_10_07"
+_NP_MEMORY_GUARD_STARTED_V192 = False
+
+def _np_trim_dict_oldest_v192(store, max_items):
+    try:
+        if not isinstance(store, dict) or len(store) <= max_items:
+            return
+        # Python dict preserves insertion order. These stores are caches/status
+        # registries only; removing oldest entries cannot change DB authority.
+        excess = len(store) - max_items
+        for k in list(store.keys())[:excess]:
+            store.pop(k, None)
+    except Exception:
+        pass
+
+def _np_memory_maintenance_v192():
+    now = time.time()
+    try:
+        # TTL read cache: remove expired payloads and orphan per-key locks.
+        for k, item in list((_NP_READ_CACHE or {}).items()):
+            try:
+                if not item or float(item[1]) <= now:
+                    _NP_READ_CACHE.pop(k, None)
+                    _NP_READ_CACHE_LOCKS.pop(k, None)
+            except Exception:
+                _NP_READ_CACHE.pop(k, None)
+                _NP_READ_CACHE_LOCKS.pop(k, None)
+        _np_trim_dict_oldest_v192(_NP_READ_CACHE, 128)
+        for k in list(_NP_READ_CACHE_LOCKS.keys()):
+            if k not in _NP_READ_CACHE:
+                _NP_READ_CACHE_LOCKS.pop(k, None)
+        _np_trim_dict_oldest_v192(_NP_READ_CACHE_LOCKS, 128)
+    except Exception:
+        pass
+
+    try:
+        # Trader bootstrap payloads are valid for only five seconds. Do not keep
+        # expired per-trader payloads resident forever.
+        ttl = float(globals().get("TRADER_BOOTSTRAP_TTL_SECONDS", 5) or 5)
+        for k, item in list((_TRADER_BOOTSTRAP_CACHE or {}).items()):
+            try:
+                if not item or (now - float(item[0])) > ttl:
+                    _TRADER_BOOTSTRAP_CACHE.pop(k, None)
+            except Exception:
+                _TRADER_BOOTSTRAP_CACHE.pop(k, None)
+        _np_trim_dict_oldest_v192(_TRADER_BOOTSTRAP_CACHE, 64)
+    except Exception:
+        pass
+
+    try:
+        for k, item in list((_NP_PASSWORD_VERIFY_CACHE or {}).items()):
+            if not item or float(item[1]) <= now:
+                _NP_PASSWORD_VERIFY_CACHE.pop(k, None)
+        _np_trim_dict_oldest_v192(_NP_PASSWORD_VERIFY_CACHE, 256)
+        for k, item in list((_NP_AUTH_TOKEN_VERIFY_CACHE or {}).items()):
+            if not item or float(item[1]) <= now:
+                _NP_AUTH_TOKEN_VERIFY_CACHE.pop(k, None)
+        _np_trim_dict_oldest_v192(_NP_AUTH_TOKEN_VERIFY_CACHE, 512)
+    except Exception:
+        pass
+
+    try:
+        # Registration buckets are rate-limit history, not business authority.
+        window = float(globals().get("REGISTER_RATE_WINDOW_SECONDS", 3600) or 3600)
+        for k, vals in list((REGISTER_RATE_BUCKET or {}).items()):
+            fresh = [t for t in (vals or []) if now - float(t) < window]
+            if fresh:
+                REGISTER_RATE_BUCKET[k] = fresh
+            else:
+                REGISTER_RATE_BUCKET.pop(k, None)
+        _np_trim_dict_oldest_v192(REGISTER_RATE_BUCKET, 1000)
+    except Exception:
+        pass
+
+    # Diagnostic/result maps are not lifecycle authority. Keep recent entries.
+    for name, cap in (
+        ("_NP_PAYOUT_ASYNC_RESULTS_V35", 100),
+        ("_NP_V122_RESULTS", 100),
+        ("_NP_V74_SECOND_LIFE_QUARANTINE", 250),
+        ("_NP_V79_RECALL_ASSIGN_LOCKS", 250),
+        ("_NP_INVENTORY_ALERT_COOLDOWN", 250),
+    ):
+        try:
+            _np_trim_dict_oldest_v192(globals().get(name), cap)
+        except Exception:
+            pass
+
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        # Render is Linux/glibc. malloc_trim releases free allocator arenas so
+        # RSS can fall below the 512MB instance ceiling after large DB responses.
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        trim = getattr(libc, "malloc_trim", None)
+        if trim:
+            trim(0)
+    except Exception:
+        pass
+
+def _np_memory_guard_loop_v192():
+    time.sleep(12)
+    while True:
+        try:
+            _np_memory_maintenance_v192()
+        except Exception as exc:
+            print("V192 MEMORY GUARD WARNING:", exc, flush=True)
+        time.sleep(30)
+
+def _np_start_memory_guard_v192():
+    global _NP_MEMORY_GUARD_STARTED_V192
+    if _NP_MEMORY_GUARD_STARTED_V192:
+        return
+    _NP_MEMORY_GUARD_STARTED_V192 = True
+    threading.Thread(target=_np_memory_guard_loop_v192,
+                     name="nairapips-memory-guard-v192", daemon=True).start()
+    print("V192 Render 512MB memory guard started; automation logic unchanged", flush=True)
+
+_np_start_memory_guard_v192()
