@@ -57300,12 +57300,16 @@ def _np_ht_event_rows_v122(account_id, event_type):
         return []
 
 def _np_ht_snapshot_rows_v122(account_id, mt5_login):
-    # Fallback for accounts that pre-date V122 sparse record-low events.
+    # V190: Historic Truth must not read the OLDEST 5,000 rows and miss today's
+    # observations on high-volume accounts. Read the newest evidence window.
+    # Durable all-time extremes remain protected by trader_accounts.lowest_equity /
+    # highest_equity and sparse historic events; this window supplies fresh,
+    # correctly-timestamped observation evidence.
     try:
         rows = (
             supabase.table("monitoring_snapshots").select("*")
             .eq("trader_account_id", account_id)
-            .order("created_at", desc=False)
+            .order("created_at", desc=True)
             .limit(5000).execute().data or []
         )
         if rows:
@@ -57317,7 +57321,7 @@ def _np_ht_snapshot_rows_v122(account_id, mt5_login):
             return (
                 supabase.table("monitoring_snapshots").select("*")
                 .eq("mt5_login", mt5_login)
-                .order("created_at", desc=False)
+                .order("created_at", desc=True)
                 .limit(5000).execute().data or []
             )
         except Exception:
@@ -57386,7 +57390,7 @@ def account_truth_v122_compat():
                 )
             )
 
-        # V189 ACCOUNT TRUTH TIMESTAMP SOURCE FIX (2026-10-07):
+        # V190 ACCOUNT TRUTH EXTREME TIMESTAMP FIX (2026-10-07):
         # Always load snapshot evidence for this exact immutable account. V122
         # skipped snapshots whenever old sparse low/high events existed. That let
         # a NEW durable lowest/highest value be displayed with an OLD event date.
