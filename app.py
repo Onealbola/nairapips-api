@@ -57386,11 +57386,12 @@ def account_truth_v122_compat():
                 )
             )
 
-        snapshots = []
-        # Only fetch the heavier historical snapshot set when sparse V122 evidence
-        # does not yet provide both extrema/timestamps.
-        if not low_event or not high_event:
-            snapshots = _np_ht_snapshot_rows_v122(account_id, mt5_login)
+        # V189 ACCOUNT TRUTH TIMESTAMP SOURCE FIX (2026-10-07):
+        # Always load snapshot evidence for this exact immutable account. V122
+        # skipped snapshots whenever old sparse low/high events existed. That let
+        # a NEW durable lowest/highest value be displayed with an OLD event date.
+        # This is read-only dashboard truth plumbing; no DD/lifecycle logic changes.
+        snapshots = _np_ht_snapshot_rows_v122(account_id, mt5_login)
 
         valid = [(r, _np_ht_equity_v122(r)) for r in snapshots]
         valid = [(r, eq) for r, eq in valid if eq > 0]
@@ -57423,16 +57424,40 @@ def account_truth_v122_compat():
         breach_level = start * (1.0 - dd_limit / 100.0) if start else 0.0
         ever_crossed = bool(breach_level and lowest and lowest <= breach_level + 0.0001)
 
-        lowest_at = (
-            (low_event or {}).get("created_at")
-            or (snap_low_row[0] or {}).get("created_at")
-            or account.get("last_sync_at")
+        # V189: timestamp must come from the SAME evidence row that supplied
+        # the displayed extreme. Never attach an older sparse-event timestamp to
+        # a newer stored/snapshot value.
+        _eps_v189 = 0.01
+        _low_event_value_v189 = _np_ht_num_v122(
+            (low_event or {}).get("equity"),
+            _np_ht_num_v122((low_event or {}).get("lowest_equity"), 0.0),
         )
-        highest_at = (
-            (high_event or {}).get("created_at")
-            or (snap_high_row[0] or {}).get("created_at")
-            or account.get("last_sync_at")
+        _high_event_value_v189 = _np_ht_num_v122(
+            (high_event or {}).get("equity"),
+            _np_ht_num_v122((high_event or {}).get("highest_equity"), 0.0),
         )
+
+        if snap_low_row[0] and abs(snap_low_row[1] - lowest) <= _eps_v189:
+            lowest_at = (snap_low_row[0] or {}).get("created_at")
+        elif low_event and abs(_low_event_value_v189 - lowest) <= _eps_v189:
+            lowest_at = (low_event or {}).get("created_at")
+        elif stored_low and abs(stored_low - lowest) <= _eps_v189:
+            lowest_at = account.get("last_sync_at") or account.get("updated_at")
+        elif current and abs(current - lowest) <= _eps_v189:
+            lowest_at = account.get("last_sync_at") or account.get("updated_at")
+        else:
+            lowest_at = account.get("last_sync_at") or account.get("updated_at")
+
+        if snap_high_row[0] and abs(snap_high_row[1] - highest) <= _eps_v189:
+            highest_at = (snap_high_row[0] or {}).get("created_at")
+        elif high_event and abs(_high_event_value_v189 - highest) <= _eps_v189:
+            highest_at = (high_event or {}).get("created_at")
+        elif stored_high and abs(stored_high - highest) <= _eps_v189:
+            highest_at = account.get("last_sync_at") or account.get("updated_at")
+        elif current and abs(current - highest) <= _eps_v189:
+            highest_at = account.get("last_sync_at") or account.get("updated_at")
+        else:
+            highest_at = account.get("last_sync_at") or account.get("updated_at")
 
         first_cross_at = None
         if ever_crossed:
@@ -58276,3 +58301,12 @@ print("V184 LOADED: monitoring handover + lifecycle auto-progression repaired", 
 # ============================================================================
 NAIRAPIPS_RELEASE = "V187_EXACT_PRODUCT_RULE_ISOLATION_2026_10_06"
 print("V187 LOADED: exact product UUID isolation + DD/payout firewall", flush=True)
+
+
+# ============================================================================
+# NAIRAPIPS V189 — ACCOUNT TRUTH TIMESTAMP SOURCE FIX — 07 OCT 2026
+# Read-only dashboard historic-truth correction. DD Police, DD limits, breach,
+# assignment, payout, reset and lifecycle logic are untouched.
+# ============================================================================
+NAIRAPIPS_RELEASE = "V189_ACCOUNT_TRUTH_TIMESTAMP_SOURCE_FIX_2026_10_07"
+print("V189 LOADED: Account Truth extrema timestamps now follow their actual evidence source", flush=True)
