@@ -57500,6 +57500,9 @@ def account_truth_v122_compat():
                 "breach_equity_level": breach_level,
                 "ever_crossed_dd_limit": ever_crossed,
                 "first_crossed_dd_limit_at": first_cross_at,
+                # V191: newest monitoring observation for trader-dashboard live freshness.
+                # Read-only telemetry only; no DD/target/breach/lifecycle behaviour changes.
+                "last_monitored_at": ((snapshots[0] or {}).get("created_at") if snapshots else (account.get("last_sync_at") or account.get("updated_at"))),
                 "recovery_never_erases_low": True,
             }
         })
