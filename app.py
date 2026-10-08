@@ -58624,3 +58624,160 @@ print("V195 LOADED: MT5 477365592 management-verified payout N128,027.40; DD/sha
 
 
 NAIRAPIPS_V197_GLOBAL_DASHBOARD_EXACT_LATEST_RELEASE = "V197_GLOBAL_DASHBOARD_EXACT_LATEST_2026_10_08"
+
+# ============================================================================
+# NAIRAPIPS V198 — TRADER BOOTSTRAP LIVE METRICS GLOBAL BRIDGE — 08 OCT 2026
+# Forensic finding: V197 repaired exact-latest enrichment in helper/current-account
+# routes, but /trader_bootstrap (the main dashboard payload) still returned the
+# stored trader_accounts values without applying that exact newest snapshot.
+# Result: Account Truth could show a fresh LIVE MONITOR UPDATE while the main
+# Balance/Equity/Profit cards stayed frozen at assignment/start values.
+#
+# This wrapper is RESPONSE-ONLY. It reads the newest snapshot for each live
+# account by exact trader_account_id (MT5 fallback only if necessary) and overlays
+# live presentation fields. It does NOT write DB state and does NOT touch DD
+# Police, shards, breach/target decisions, lifecycle, assignment, reset or payout.
+# ============================================================================
+NAIRAPIPS_V198_TRADER_BOOTSTRAP_LIVE_METRICS = "V198_TRADER_BOOTSTRAP_LIVE_METRICS_2026_10_08"
+
+_NP_V198_LIVE_STATUSES = {
+    "assigned_active", "active", "current_active", "phase1_active", "phase2_active",
+    "funded_active", "live", "funded", "approved_active", "profit_protected",
+    "payout_pending", "approved_payout_pending", "payment_processing",
+    "funded_profit_cap_reached"
+}
+
+def _np_v198_is_live_row(row):
+    row = row or {}
+    status = str(row.get("account_status") or row.get("status") or "").strip().lower()
+    return bool(str(row.get("mt5_login") or "").strip()) and status in _NP_V198_LIVE_STATUSES
+
+
+def _np_v198_overlay_latest(row, trader_id=""):
+    if not isinstance(row, dict) or not _np_v198_is_live_row(row):
+        return row
+    out = dict(row)
+    account_id = str(out.get("id") or "").strip()
+    login = str(out.get("mt5_login") or "").strip()
+    snap = None
+    try:
+        if account_id and not account_id.startswith("purchase:"):
+            rows = (supabase.table("monitoring_snapshots")
+                    .select("*")
+                    .eq("trader_account_id", account_id)
+                    .order("created_at", desc=True).limit(1).execute().data or [])
+            snap = rows[0] if rows else None
+        if not snap and login:
+            q = supabase.table("monitoring_snapshots").select("*").eq("mt5_login", login)
+            if trader_id:
+                q = q.eq("trader_id", trader_id)
+            rows = q.order("created_at", desc=True).limit(1).execute().data or []
+            snap = rows[0] if rows else None
+    except Exception as exc:
+        print("V198 BOOTSTRAP LIVE SNAPSHOT WARNING:", account_id, login, exc, flush=True)
+        return out
+    if not snap:
+        return out
+
+    out["latest_monitoring_snapshot"] = snap
+    bal = clean(snap.get("current_balance") if snap.get("current_balance") is not None else snap.get("balance"))
+    eq = clean(snap.get("current_equity") if snap.get("current_equity") is not None else snap.get("equity"))
+    if bal > 0:
+        out["current_balance"] = bal
+        out["balance"] = bal
+    if eq > 0:
+        out["current_equity"] = eq
+        out["equity"] = eq
+    elif bal > 0:
+        out["current_equity"] = bal
+        out["equity"] = bal
+
+    # Copy only telemetry/presentation fields when explicitly present.
+    for src, dst in (
+        ("profit", "profit"), ("profit_percent", "profit_percent"),
+        ("drawdown_percent", "absolute_drawdown_percent"),
+        ("drawdown_percent", "drawdown_percent"),
+        ("dd_used_percent", "dd_used_percent"),
+        ("max_drawdown_used", "max_drawdown_used"),
+        ("highest_equity", "highest_equity"), ("lowest_equity", "lowest_equity"),
+        ("risk_zone", "risk_zone"), ("phase_pass_status", "phase_pass_status"),
+        ("pass_progress_percent", "pass_progress_percent"),
+        ("target_percent", "target_percent"), ("target_equity", "target_equity")
+    ):
+        value = snap.get(src)
+        if value is not None and value != "":
+            out[dst] = value
+
+    observed_at = snap.get("created_at") or snap.get("updated_at")
+    if observed_at:
+        out["last_sync_at"] = observed_at
+        out["live_monitor_update_at"] = observed_at
+
+    start = clean(out.get("start_balance") or out.get("account_size") or 0)
+    live_eq = clean(out.get("current_equity") or out.get("current_balance") or start)
+    if start > 0 and live_eq > 0:
+        out["profit"] = live_eq - start
+        out["profit_percent"] = ((live_eq - start) / start) * 100.0
+    out["live_metrics_authority"] = NAIRAPIPS_V198_TRADER_BOOTSTRAP_LIVE_METRICS
+    return out
+
+
+_np_v198_trader_bootstrap_base = app.view_functions.get("trader_bootstrap")
+def _np_v198_trader_bootstrap():
+    resp = _np_v198_trader_bootstrap_base()
+    try:
+        response = app.make_response(resp)
+        data = response.get_json(silent=True)
+        if not isinstance(data, dict):
+            return response
+        root = data.get("data") if isinstance(data.get("data"), dict) else data
+        trader = root.get("trader") if isinstance(root.get("trader"), dict) else {}
+        trader_id = str(trader.get("id") or root.get("trader_id") or "").strip()
+
+        # Cache per account so the same row repeated across bootstrap arrays causes
+        # only one Supabase exact-latest query during this request.
+        cache = {}
+        def overlay(row):
+            if not isinstance(row, dict):
+                return row
+            key = str(row.get("id") or "").strip() or ("mt5:" + str(row.get("mt5_login") or "").strip())
+            if key in cache:
+                # Preserve route-specific extra fields while applying cached live metrics.
+                merged = dict(row)
+                live = cache[key]
+                for k in ("latest_monitoring_snapshot", "current_balance", "balance",
+                          "current_equity", "equity", "profit", "profit_percent",
+                          "absolute_drawdown_percent", "drawdown_percent", "dd_used_percent",
+                          "max_drawdown_used", "highest_equity", "lowest_equity", "risk_zone",
+                          "phase_pass_status", "pass_progress_percent", "target_percent",
+                          "target_equity", "last_sync_at", "live_monitor_update_at",
+                          "live_metrics_authority"):
+                    if k in live:
+                        merged[k] = live[k]
+                return merged
+            live = _np_v198_overlay_latest(row, trader_id)
+            cache[key] = live
+            return live
+
+        if isinstance(root.get("current_account"), dict):
+            root["current_account"] = overlay(root["current_account"])
+
+        for key in ("active_accounts", "accounts", "all_accounts"):
+            rows = root.get(key)
+            if isinstance(rows, list):
+                # Only live rows query snapshots; archived/history rows pass through.
+                root[key] = [overlay(r) for r in rows]
+
+        response.set_data(json.dumps(data, default=str))
+        response.content_type = "application/json"
+        response.headers["X-NairaPips-Live-Metrics"] = NAIRAPIPS_V198_TRADER_BOOTSTRAP_LIVE_METRICS
+        return response
+    except Exception as exc:
+        print("V198 TRADER BOOTSTRAP LIVE BRIDGE WARNING:", exc, flush=True)
+        return resp
+
+if _np_v198_trader_bootstrap_base:
+    app.view_functions["trader_bootstrap"] = _np_v198_trader_bootstrap
+
+NAIRAPIPS_RELEASE = NAIRAPIPS_V198_TRADER_BOOTSTRAP_LIVE_METRICS
+print("V198 LOADED: trader_bootstrap exact-latest live metrics bridge; DD/shards untouched", flush=True)
