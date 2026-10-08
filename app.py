@@ -58492,3 +58492,129 @@ def _payout_eligibility(trader, requested_account_id=None):
     return True, "V193 exact-account payout release for MT5 477365592", account
 
 NAIRAPIPS_RELEASE = NAIRAPIPS_V193_MT5_477365592_PAYOUT_RELEASE_ONLY
+
+# ============================================================================
+# NAIRAPIPS V194 — MT5 477365592 PAYOUT LIVE-BALANCE BRIDGE — 08 OCT 2026
+# Exact-account financial recovery only.
+# Reads the newest persisted monitoring snapshot for this MT5 and presents those
+# values to Trader Bootstrap + create_payout. It does NOT write monitoring/DD
+# state and does NOT alter DD Police, shards, breach, reset or assignment logic.
+# ============================================================================
+NAIRAPIPS_V194_MT5_477365592_PAYOUT_LIVE_BALANCE_BRIDGE = "V194_MT5_477365592_PAYOUT_LIVE_BALANCE_BRIDGE_2026_10_08"
+_NP_V194_ACCOUNT_ID = "55d36867-3523-46af-8193-77c946d98959"
+_NP_V194_MT5 = "477365592"
+
+
+def _np_v194_latest_snapshot():
+    try:
+        rows = (supabase.table("monitoring_snapshots")
+                .select("balance,equity,created_at,trader_account_id,mt5_login")
+                .eq("mt5_login", _NP_V194_MT5)
+                .order("created_at", desc=True)
+                .limit(1).execute().data or [])
+        return rows[0] if rows else None
+    except Exception as exc:
+        print("V194 exact payout snapshot read failed:", exc, flush=True)
+        return None
+
+
+def _np_v194_overlay_account(account):
+    a = dict(account or {})
+    if (str(a.get("id") or "").strip() != _NP_V194_ACCOUNT_ID or
+            str(a.get("mt5_login") or "").strip() != _NP_V194_MT5):
+        return a
+    snap = _np_v194_latest_snapshot()
+    if not snap:
+        return a
+    bal = clean(snap.get("balance"))
+    eq = clean(snap.get("equity"))
+    if bal > 0:
+        a["current_balance"] = bal
+        a["balance"] = bal
+    if eq > 0:
+        a["current_equity"] = eq
+        a["equity"] = eq
+    a["payout_live_snapshot_at"] = snap.get("created_at")
+    a["payout_live_source"] = "monitoring_snapshots"
+    return a
+
+
+# create_payout calls this symbol at request time, so return an enriched COPY.
+_np_payout_eligibility_v194_base = _payout_eligibility
+def _payout_eligibility(trader, requested_account_id=None):
+    eligible, reason, account = _np_payout_eligibility_v194_base(
+        trader, requested_account_id=requested_account_id
+    )
+    if account:
+        account = _np_v194_overlay_account(account)
+    if (account and str(account.get("id") or "").strip() == _NP_V194_ACCOUNT_ID and
+            str(account.get("mt5_login") or "").strip() == _NP_V194_MT5 and eligible):
+        start = clean(account.get("start_balance") or account.get("account_size") or 0)
+        equity = clean(account.get("current_equity") or account.get("equity") or
+                       account.get("current_balance") or account.get("balance") or start)
+        if equity > start:
+            reason = "Verified funded profit is available for payout."
+    return eligible, reason, account
+
+
+# Trader dashboard gets its payout account from /trader_bootstrap. Enrich only
+# this exact account in the response so the existing 60/40 UI computes from the
+# same persisted monitoring observation used by create_payout.
+_np_v194_trader_bootstrap_base = app.view_functions.get("trader_bootstrap")
+def _np_v194_trader_bootstrap():
+    resp = _np_v194_trader_bootstrap_base()
+    try:
+        # Flask route normally returns a Response from ok(). Preserve status/headers.
+        response = app.make_response(resp)
+        data = response.get_json(silent=True)
+        if not isinstance(data, dict):
+            return response
+        root = data.get("data") if isinstance(data.get("data"), dict) else data
+        touched = False
+        for key in ("current_account",):
+            row = root.get(key)
+            if isinstance(row, dict) and str(row.get("id") or "").strip() == _NP_V194_ACCOUNT_ID:
+                root[key] = _np_v194_overlay_account(row); touched = True
+        for key in ("active_accounts", "accounts", "all_accounts"):
+            rows = root.get(key)
+            if isinstance(rows, list):
+                new_rows = []
+                for row in rows:
+                    if isinstance(row, dict) and str(row.get("id") or "").strip() == _NP_V194_ACCOUNT_ID:
+                        row = _np_v194_overlay_account(row); touched = True
+                    new_rows.append(row)
+                root[key] = new_rows
+        if touched:
+            acct = root.get("current_account") or {}
+            if str(acct.get("id") or "").strip() != _NP_V194_ACCOUNT_ID:
+                for row in root.get("active_accounts") or []:
+                    if str((row or {}).get("id") or "").strip() == _NP_V194_ACCOUNT_ID:
+                        acct = row; break
+            start = clean(acct.get("start_balance") or acct.get("account_size") or 0)
+            equity = clean(acct.get("current_equity") or acct.get("equity") or
+                           acct.get("current_balance") or acct.get("balance") or start)
+            profit = max(0, equity - start)
+            split = _np_plan_payout_split_for_account(acct, root.get("trader") or {}, {})
+            root["payout_eligibility"] = {
+                "eligible": profit > 0,
+                "funded": True,
+                "reason": ("Verified funded profit is available for payout." if profit > 0
+                           else "No verified funded profit is currently available for payout."),
+                "verified_profit": profit,
+                "payout_split": split,
+                "available_payout": max(0, round(profit * split / 100.0, 2)),
+                "account": acct,
+                "authority": NAIRAPIPS_V194_MT5_477365592_PAYOUT_LIVE_BALANCE_BRIDGE,
+            }
+            response.set_data(json.dumps(data, default=str))
+            response.content_type = "application/json"
+        return response
+    except Exception as exc:
+        print("V194 bootstrap bridge warning:", exc, flush=True)
+        return resp
+
+if _np_v194_trader_bootstrap_base:
+    app.view_functions["trader_bootstrap"] = _np_v194_trader_bootstrap
+
+NAIRAPIPS_RELEASE = NAIRAPIPS_V194_MT5_477365592_PAYOUT_LIVE_BALANCE_BRIDGE
+print("V194 LOADED: exact MT5 477365592 payout live-balance bridge; DD/shards untouched", flush=True)
