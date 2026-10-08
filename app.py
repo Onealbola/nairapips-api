@@ -58618,3 +58618,100 @@ if _np_v194_trader_bootstrap_base:
 
 NAIRAPIPS_RELEASE = NAIRAPIPS_V194_MT5_477365592_PAYOUT_LIVE_BALANCE_BRIDGE
 print("V194 LOADED: exact MT5 477365592 payout live-balance bridge; DD/shards untouched", flush=True)
+
+# ============================================================================
+# NAIRAPIPS V195 — EXACT ACCOUNT MANAGEMENT-VERIFIED PAYOUT RECOVERY
+# MT5 477365592 only. Financial recovery bridge; no DD/shard/monitoring writes.
+# Management supplied current funded balance: N2,213,379 on 08 Oct 2026.
+# Funded capital: N2,000,000. Gross verified profit: N213,379.
+# Trader share: 60%. Maximum payout: N128,027.40.
+# This override exists only in payout request/bootstrap calculations and does not
+# mutate MT5, monitoring, DD, account balance/equity, or assignment state.
+# Existing create_payout locking + V122 post-PAID renewal remain unchanged.
+# ============================================================================
+NAIRAPIPS_V195_MT5_477365592_MANAGEMENT_VERIFIED_PAYOUT = "V195_MT5_477365592_MANAGEMENT_VERIFIED_PAYOUT_2026_10_08"
+_NP_V195_ACCOUNT_ID = "55d36867-3523-46af-8193-77c946d98959"
+_NP_V195_MT5 = "477365592"
+_NP_V195_FUNDED_CAPITAL = 2000000.0
+_NP_V195_VERIFIED_BALANCE = 2213379.0
+_NP_V195_GROSS_PROFIT = 213379.0
+_NP_V195_SPLIT = 60.0
+_NP_V195_AVAILABLE = 128027.40
+
+# create_payout obtains its account from this symbol at request time. Overlay an
+# in-memory financial proof only for this exact account so the existing payout
+# amount guard calculates N213,379 gross x 60% = N128,027.40.
+_np_payout_eligibility_v195_base = _payout_eligibility
+def _payout_eligibility(trader, requested_account_id=None):
+    eligible, reason, account = _np_payout_eligibility_v195_base(
+        trader, requested_account_id=requested_account_id
+    )
+    if not account:
+        return eligible, reason, account
+    if (str(account.get("id") or "").strip() != _NP_V195_ACCOUNT_ID or
+            str(account.get("mt5_login") or "").strip() != _NP_V195_MT5):
+        return eligible, reason, account
+    a = dict(account)
+    a["start_balance"] = _NP_V195_FUNDED_CAPITAL
+    # Payout-only calculation fields. This copy is never persisted.
+    a["current_balance"] = _NP_V195_VERIFIED_BALANCE
+    a["current_equity"] = _NP_V195_VERIFIED_BALANCE
+    a["payout_verified_profit"] = _NP_V195_GROSS_PROFIT
+    a["payout_split"] = _NP_V195_SPLIT
+    a["payout_available"] = _NP_V195_AVAILABLE
+    a["payout_financial_authority"] = NAIRAPIPS_V195_MT5_477365592_MANAGEMENT_VERIFIED_PAYOUT
+    return True, "Management-verified funded profit available for payout.", a
+
+# Correct only the payout presentation in trader_bootstrap for this account.
+_np_v195_trader_bootstrap_base = app.view_functions.get("trader_bootstrap")
+def _np_v195_trader_bootstrap():
+    resp = _np_v195_trader_bootstrap_base()
+    try:
+        response = app.make_response(resp)
+        data = response.get_json(silent=True)
+        if not isinstance(data, dict):
+            return response
+        root = data.get("data") if isinstance(data.get("data"), dict) else data
+        selected = None
+        for key in ("current_account",):
+            row = root.get(key)
+            if isinstance(row, dict) and (str(row.get("id") or "").strip() == _NP_V195_ACCOUNT_ID or
+                                          str(row.get("mt5_login") or "").strip() == _NP_V195_MT5):
+                selected = row
+                break
+        if selected is None:
+            for key in ("active_accounts", "accounts", "all_accounts"):
+                for row in root.get(key) or []:
+                    if isinstance(row, dict) and (str(row.get("id") or "").strip() == _NP_V195_ACCOUNT_ID or
+                                                  str(row.get("mt5_login") or "").strip() == _NP_V195_MT5):
+                        selected = row
+                        break
+                if selected is not None:
+                    break
+        if selected is not None:
+            proof = dict(selected)
+            proof["payout_verified_profit"] = _NP_V195_GROSS_PROFIT
+            proof["payout_split"] = _NP_V195_SPLIT
+            proof["payout_available"] = _NP_V195_AVAILABLE
+            root["payout_eligibility"] = {
+                "eligible": True,
+                "funded": True,
+                "reason": "Management-verified funded profit available for payout.",
+                "verified_profit": _NP_V195_GROSS_PROFIT,
+                "payout_split": _NP_V195_SPLIT,
+                "available_payout": _NP_V195_AVAILABLE,
+                "account": proof,
+                "authority": NAIRAPIPS_V195_MT5_477365592_MANAGEMENT_VERIFIED_PAYOUT,
+            }
+            response.set_data(json.dumps(data, default=str))
+            response.content_type = "application/json"
+        return response
+    except Exception as exc:
+        print("V195 payout presentation warning:", exc, flush=True)
+        return resp
+
+if _np_v195_trader_bootstrap_base:
+    app.view_functions["trader_bootstrap"] = _np_v195_trader_bootstrap
+
+NAIRAPIPS_RELEASE = NAIRAPIPS_V195_MT5_477365592_MANAGEMENT_VERIFIED_PAYOUT
+print("V195 LOADED: MT5 477365592 management-verified payout N128,027.40; DD/shards untouched", flush=True)
