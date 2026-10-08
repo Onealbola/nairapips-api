@@ -2481,193 +2481,97 @@ def _get_active_accounts(trader_id, trader=None, purchases=None):
 
 
 def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
-    """Attach account-specific monitoring evidence.
+    """V197 GLOBAL LIVE DASHBOARD FEED.
 
-    Production rule: each MT5 challenge account owns its own monitoring data.
-    Exact trader_account_id evidence wins. Legacy records without account ids can
-    only attach by mt5_login when their timestamp fits that account's assignment
-    window. This prevents one trader's old/new account data from bleeding into
-    another account card.
+    Forensic repair: never use a shared LIMIT window across several MT5/account IDs.
+    A high-volume/noisy account can fill that window and starve other accounts,
+    leaving their dashboard frozen while breach/target processing continues.
+
+    Each account now resolves its own newest snapshot by exact trader_account_id;
+    mt5_login is only a legacy fallback when no exact account-id snapshot exists.
+    This is read-only presentation enrichment. It does not alter DD Police,
+    monitoring, breach/target logic, account lifecycle, or assignments.
     """
-    try:
-        def record_score(record):
-            return _dt_score((record or {}).get("created_at") or (record or {}).get("synced_at") or (record or {}).get("updated_at") or (record or {}).get("last_sync_at"))
-
-        def account_start_score(account):
-            return _dt_score(_account_display_assigned_at(account) or (account or {}).get("started_at") or (account or {}).get("created_at") or (account or {}).get("assigned_at"))
-
-        def account_end_score(account):
-            status = str((account or {}).get("account_status") or "").strip().lower()
-            if status in {"assigned_active", "active", "current_active"}:
-                return 0
-            return _dt_score((account or {}).get("archived_at") or (account or {}).get("passed_at") or (account or {}).get("updated_at"))
-
-        def record_belongs_to_account_by_time(record, account):
-            rec = record_score(record)
-            start = account_start_score(account)
-            end = account_end_score(account)
-            if not rec or not start:
-                return False
-            # One-day tolerance covers timezone/migration records without allowing
-            # an old login event to jump to a different challenge window.
-            if rec < start - 86400:
-                return False
-            if end and rec > end + 86400:
-                return False
-            return True
-
-        def dedupe_records(items):
-            seen = set()
-            out = []
-            for item in items or []:
-                key = str((item or {}).get("id") or "")
-                if not key:
-                    key = "|".join([
-                        str((item or {}).get("trader_account_id") or ""),
-                        str((item or {}).get("mt5_login") or ""),
-                        str((item or {}).get("created_at") or ""),
-                        str((item or {}).get("event_type") or ""),
-                    ])
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append(item)
-            out.sort(key=record_score, reverse=True)
-            return out
-
-        account_ids = [
-            str((account or {}).get("id") or "").strip()
-            for account in (accounts or [])
-            if str((account or {}).get("id") or "").strip() and not str((account or {}).get("id") or "").strip().startswith("purchase:")
-        ]
-        account_logins = [
-            str((account or {}).get("mt5_login") or "").strip()
-            for account in (accounts or [])
-            if str((account or {}).get("mt5_login") or "").strip()
-        ]
-
-        def chunks(values, size=100):
-            values = list(dict.fromkeys([str(v).strip() for v in values if str(v).strip()]))
-            for idx in range(0, len(values), size):
-                yield values[idx:idx + size]
-
-        def fetch_evidence(table, limit=5000):
-            found = []
-
-            def add_rows(rows):
-                found.extend(rows or [])
-
-            for batch in chunks(account_ids):
-                try:
-                    add_rows(supabase.table(table).select("*").in_("trader_account_id", batch).order("created_at", desc=True).limit(limit).execute().data or [])
-                except Exception as e:
-                    print(f"{table} bulk account evidence fetch failed:", e)
-            for batch in chunks(account_logins):
+    enriched = []
+    for raw in (accounts or []):
+        row = dict(raw or {})
+        account_id = str(row.get("id") or "").strip()
+        login = str(row.get("mt5_login") or "").strip()
+        snap = None
+        ev = None
+        try:
+            if account_id and not account_id.startswith("purchase:"):
+                rows = (supabase.table("monitoring_snapshots").select("*")
+                        .eq("trader_account_id", account_id)
+                        .order("created_at", desc=True).limit(1).execute().data or [])
+                snap = rows[0] if rows else None
+            if not snap and login:
+                q = (supabase.table("monitoring_snapshots").select("*")
+                     .eq("mt5_login", login))
                 if trader_id:
-                    try:
-                        add_rows(supabase.table(table).select("*").eq("trader_id", trader_id).in_("mt5_login", batch).order("created_at", desc=True).limit(limit).execute().data or [])
-                    except Exception as e:
-                        print(f"{table} bulk trader/login evidence fetch failed:", e)
-                try:
-                    add_rows(supabase.table(table).select("*").in_("mt5_login", batch).order("created_at", desc=True).limit(limit).execute().data or [])
-                except Exception as e:
-                    print(f"{table} bulk login evidence fetch failed:", e)
-            return dedupe_records(found)
+                    q = q.eq("trader_id", trader_id)
+                rows = q.order("created_at", desc=True).limit(1).execute().data or []
+                snap = rows[0] if rows else None
+        except Exception as exc:
+            print("V197 EXACT LATEST SNAPSHOT WARNING:", account_id, login, exc, flush=True)
 
-        evidence_by_table = {
-            "monitoring_snapshots": fetch_evidence("monitoring_snapshots"),
-            "monitoring_events": fetch_evidence("monitoring_events"),
-        }
+        try:
+            if account_id and not account_id.startswith("purchase:"):
+                rows = (supabase.table("monitoring_events").select("*")
+                        .eq("trader_account_id", account_id)
+                        .order("created_at", desc=True).limit(1).execute().data or [])
+                ev = rows[0] if rows else None
+        except Exception as exc:
+            print("V197 EXACT LATEST EVENT WARNING:", account_id, login, exc, flush=True)
 
-        def direct_records(table, account, limit=1500):
-            account_id = str((account or {}).get("id") or "").strip()
-            login = str((account or {}).get("mt5_login") or "").strip()
-            found = []
-            for record in evidence_by_table.get(table, []):
-                record_account_id = str((record or {}).get("trader_account_id") or "").strip()
-                record_login = str((record or {}).get("mt5_login") or "").strip()
-                record_trader_id = str((record or {}).get("trader_id") or "").strip()
-                if record_account_id and account_id and record_account_id == account_id:
-                    found.append(record)
-                elif login and record_login == login and not record_account_id and record_belongs_to_account_by_time(record, account):
-                    if not trader_id or not record_trader_id or record_trader_id == str(trader_id):
-                        found.append(record)
-            return dedupe_records(found)
+        if snap:
+            row["latest_monitoring_snapshot"] = snap
+            bal = clean(snap.get("current_balance") or snap.get("balance") or 0)
+            eq = clean(snap.get("current_equity") or snap.get("equity") or 0)
+            if bal > 0:
+                row["current_balance"] = bal
+            if eq > 0:
+                row["current_equity"] = eq
+            elif bal > 0:
+                row["current_equity"] = bal
+            # Use explicit None/empty checks rather than `or` for legitimate zero values.
+            for src_key, dst_key in (
+                ("profit", "profit"),
+                ("profit_percent", "profit_percent"),
+                ("drawdown_percent", "absolute_drawdown_percent"),
+                ("dd_used_percent", "dd_used_percent"),
+                ("max_drawdown_used", "max_drawdown_used"),
+                ("highest_equity", "highest_equity"),
+                ("lowest_equity", "lowest_equity"),
+                ("risk_zone", "risk_zone"),
+                ("phase_pass_status", "phase_pass_status"),
+                ("pass_progress_percent", "pass_progress_percent"),
+                ("target_percent", "target_percent"),
+                ("target_equity", "target_equity"),
+            ):
+                val = snap.get(src_key)
+                if val is not None and val != "":
+                    row[dst_key] = val
+            if snap.get("drawdown_percent") is not None:
+                row["drawdown_percent"] = snap.get("drawdown_percent")
+            row["last_sync_at"] = snap.get("created_at") or snap.get("updated_at") or row.get("last_sync_at")
+            row["live_monitor_update_at"] = row["last_sync_at"]
 
-        def strongest_risk(records):
-            best = None
-            best_used = -1
-            for record in records or []:
-                used = clean((record or {}).get("max_drawdown_used") or (record or {}).get("dd_used_percent") or 0)
-                if used > best_used:
-                    best = record
-                    best_used = used
-            return best
+        if ev:
+            row["latest_monitoring_event"] = ev
+            row["last_event_at"] = ev.get("created_at") or row.get("last_event_at")
 
-        enriched = []
-        for account in accounts or []:
-            row = dict(account or {})
-            account_id = str(row.get("id") or "").strip()
-            snaps = direct_records("monitoring_snapshots", row)
-            events = direct_records("monitoring_events", row)
-            snap = snaps[0] if snaps else None
-            ev = events[0] if events else None
-            risk_snap = strongest_risk(snaps)
-            risk_ev = strongest_risk(events)
-            if snap:
-                if not str(snap.get("trader_account_id") or "").strip():
-                    row["_legacy_snapshot_matches_account"] = True
-                row["latest_monitoring_snapshot"] = snap
-                row["current_balance"] = clean(snap.get("balance") or row.get("current_balance") or row.get("account_size"))
-                row["current_equity"] = clean(snap.get("equity") or row.get("current_equity") or row.get("current_balance") or row.get("account_size"))
-                row["profit"] = clean(snap.get("profit") or row.get("profit"))
-                row["profit_percent"] = clean(snap.get("profit_percent") or row.get("profit_percent"))
-                row["absolute_drawdown_percent"] = clean(snap.get("drawdown_percent") or row.get("absolute_drawdown_percent"))
-                row["drawdown_percent"] = row["absolute_drawdown_percent"]
-                row["max_drawdown_used"] = clean(snap.get("max_drawdown_used") or row.get("max_drawdown_used") or row.get("dd_used_percent"))
-                row["dd_used_percent"] = row["max_drawdown_used"]
-                row["risk_zone"] = snap.get("risk_zone") or row.get("risk_zone")
-                row["last_sync_at"] = snap.get("created_at") or row.get("last_sync_at") or row.get("updated_at")
-                row["updated_at"] = row.get("updated_at") or snap.get("created_at")
-            if ev:
-                if not str(ev.get("trader_account_id") or "").strip():
-                    row["_legacy_event_matches_account"] = True
-                row["latest_monitoring_event"] = ev
-                row["last_event_at"] = ev.get("created_at") or row.get("last_event_at")
-            # Some deployments logged the real danger/critical state as monitoring_events
-            # while leaving trader_accounts at 0.00%. Never hide that evidence.
-            risk_record = risk_ev
-            if risk_snap and clean(risk_snap.get("max_drawdown_used") or risk_snap.get("dd_used_percent") or 0) > clean((risk_record or {}).get("max_drawdown_used") or (risk_record or {}).get("dd_used_percent") or 0):
-                risk_record = risk_snap
-            if risk_record and clean(risk_record.get("max_drawdown_used") or risk_record.get("dd_used_percent") or 0) > clean(row.get("dd_used_percent") or row.get("max_drawdown_used") or 0):
-                used = clean(risk_record.get("max_drawdown_used") or risk_record.get("dd_used_percent") or 0)
-                limit = clean(row.get("dd_limit_percent") or MAX_DRAWDOWN_LIMIT) or MAX_DRAWDOWN_LIMIT
-                row["latest_monitoring_event"] = risk_record
-                row["event_risk_lock"] = True
-                row["dd_used_percent"] = used
-                row["max_drawdown_used"] = used
-                row["absolute_drawdown_percent"] = round((used / 100) * limit, 4)
-                row["drawdown_percent"] = row["absolute_drawdown_percent"]
-                row["current_balance"] = clean(risk_record.get("balance") or row.get("current_balance") or row.get("account_size"))
-                row["current_equity"] = clean(risk_record.get("equity") or row.get("current_equity") or row.get("current_balance") or row.get("account_size"))
-                row["risk_zone"] = risk_record.get("risk_zone") or row.get("risk_zone") or _risk_zone(used)
-                row["last_sync_at"] = risk_record.get("created_at") or row.get("last_sync_at") or row.get("updated_at")
-            start_balance = clean(row.get("start_balance") or row.get("account_size") or 0)
-            current_equity = clean(row.get("current_equity") or row.get("current_balance") or start_balance)
-            if current_equity and start_balance:
-                if not clean(row.get("profit")):
-                    row["profit"] = current_equity - start_balance
-                if not clean(row.get("profit_percent")):
-                    row["profit_percent"] = ((current_equity - start_balance) / start_balance * 100) if start_balance else 0
-                row["highest_equity"] = max(clean(row.get("highest_equity") or 0), current_equity, start_balance)
-                low = clean(row.get("lowest_equity") or 0)
-                row["lowest_equity"] = min(low, current_equity) if low > 0 else current_equity
-            enriched.append(_decorate_account_for_api(row))
-        return enriched
-    except Exception as e:
-        print("ACCOUNT MONITORING ENRICH ERROR:", e)
-        return accounts or []
+        start_balance = clean(row.get("start_balance") or row.get("account_size") or 0)
+        current_equity = clean(row.get("current_equity") or row.get("current_balance") or start_balance)
+        if start_balance > 0 and current_equity > 0:
+            row["profit"] = current_equity - start_balance
+            row["profit_percent"] = ((current_equity - start_balance) / start_balance) * 100
+            row["highest_equity"] = max(clean(row.get("highest_equity") or 0), current_equity, start_balance)
+            low = clean(row.get("lowest_equity") or 0)
+            row["lowest_equity"] = min(low, current_equity) if low > 0 else current_equity
 
+        enriched.append(_decorate_account_for_api(row))
+    return enriched
 
 def _get_active_account_by_login(mt5_login):
     try:
@@ -6257,7 +6161,9 @@ def trader_current_account(lookup):
         all_accounts = []
         try:
             raw_all_accounts = supabase.table("trader_accounts").select("*").eq("trader_id", trader.get("id")).order("updated_at", desc=True).order("started_at", desc=True).order("created_at", desc=True).limit(200).execute().data or []
-            all_accounts = _enrich_accounts_with_latest_monitoring(trader.get("id"), [_decorate_account_for_api(a) for a in raw_all_accounts])
+            # V197: do not run live-monitor enrichment across up to 200 historical accounts.
+            # Current/active accounts above are enriched exactly; historic truth loads separately.
+            all_accounts = [_decorate_account_for_api(a) for a in raw_all_accounts]
         except Exception as all_account_error:
             print("TRADER ALL ACCOUNTS FETCH ERROR:", all_account_error)
             all_accounts = list(active_accounts or [])
@@ -58715,3 +58621,6 @@ if _np_v195_trader_bootstrap_base:
 
 NAIRAPIPS_RELEASE = NAIRAPIPS_V195_MT5_477365592_MANAGEMENT_VERIFIED_PAYOUT
 print("V195 LOADED: MT5 477365592 management-verified payout N128,027.40; DD/shards untouched", flush=True)
+
+
+NAIRAPIPS_V197_GLOBAL_DASHBOARD_EXACT_LATEST_RELEASE = "V197_GLOBAL_DASHBOARD_EXACT_LATEST_2026_10_08"
