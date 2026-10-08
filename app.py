@@ -13273,7 +13273,14 @@ def create_payout():
                 503,
             )
 
-        if rejected_rows:
+        # V193 — management-authorised one-account payout recovery.
+        # Exact scope: MT5 477365592 only. This does not reopen DD/trading logic.
+        # The normal payout pre-lock below still moves the account into
+        # profit_protected before any payout liability is created, and V122
+        # remains the sole post-PAID fresh-funded renewal authority.
+        _np_v193_exact_release = (str(account.get("mt5_login") or "").strip() == "477365592")
+
+        if rejected_rows and not _np_v193_exact_release:
             rejected_request = rejected_rows[0]
             _audit_safe(
                 "payouts",
@@ -58446,3 +58453,42 @@ def _np_start_memory_guard_v192():
     print("V192 Render 512MB memory guard started; automation logic unchanged", flush=True)
 
 _np_start_memory_guard_v192()
+
+
+# ============================================================================
+# NAIRAPIPS V193 — MT5 477365592 PAYOUT RELEASE ONLY — 08 OCT 2026
+# Management-authorised narrow recovery.
+# - Exact trader_account id + MT5 only.
+# - Allows this funded source to enter the normal create_payout path even if an
+#   old reset/archive compatibility state is still present.
+# - Does NOT alter DD Police, shards, monitoring API, DD maths or breach rules.
+# - Normal create_payout pre-lock still applies before liability creation.
+# - After PAID, existing V122 exact-source payout renewal issues one fresh Funded MT5.
+# ============================================================================
+NAIRAPIPS_V193_MT5_477365592_PAYOUT_RELEASE_ONLY = "V193_MT5_477365592_PAYOUT_RELEASE_ONLY_2026_10_08"
+_NP_V193_ACCOUNT_ID = "55d36867-3523-46af-8193-77c946d98959"
+_NP_V193_MT5 = "477365592"
+_np_payout_eligibility_v193_base = _payout_eligibility
+
+def _payout_eligibility(trader, requested_account_id=None):
+    eligible, reason, account = _np_payout_eligibility_v193_base(
+        trader, requested_account_id=requested_account_id
+    )
+    if eligible:
+        return eligible, reason, account
+    if not trader or not account:
+        return eligible, reason, account
+    trader_id = str((trader or {}).get("id") or "").strip()
+    if (str(account.get("id") or "").strip() != _NP_V193_ACCOUNT_ID or
+        str(account.get("mt5_login") or "").strip() != _NP_V193_MT5 or
+        str(account.get("trader_id") or "").strip() != trader_id):
+        return eligible, reason, account
+    if str(account.get("stage") or account.get("phase") or "").strip().lower() != "funded":
+        return False, "The selected payout account is not a funded-stage account.", account
+    if account.get("breached_at"):
+        return False, "This funded account has breach evidence and cannot be released for payout.", account
+    if not str(account.get("mt5_login") or "").strip():
+        return False, "Payouts require an MT5 login.", account
+    return True, "V193 exact-account payout release for MT5 477365592", account
+
+NAIRAPIPS_RELEASE = NAIRAPIPS_V193_MT5_477365592_PAYOUT_RELEASE_ONLY
