@@ -58796,3 +58796,99 @@ print("V198 LOADED: trader_bootstrap exact-latest live metrics bridge; DD/shards
 NAIRAPIPS_V199_CLEAN_LIVE_STATE_DASHBOARD_AUTHORITY = "V199_CLEAN_LIVE_STATE_DASHBOARD_AUTHORITY_2026_10_09"
 NAIRAPIPS_RELEASE = NAIRAPIPS_V199_CLEAN_LIVE_STATE_DASHBOARD_AUTHORITY
 print("V199 LOADED: clean live-state is dashboard presentation authority; DD/assignment/lifecycle untouched", flush=True)
+
+# ============================================================================
+# V200 — FINAL DASHBOARD LIVE-STATE BRIDGE — 09 OCT 2026
+# Presentation-only. Fixes the remaining split source: trader-level fields and
+# latest_monitoring were still carrying assignment values even when current_account
+# was overlaid. DD Police / breach / close / targets / lifecycle are untouched.
+# ============================================================================
+NAIRAPIPS_V200_DASHBOARD_LIVE_STATE_FINAL_BRIDGE = "V200_DASHBOARD_LIVE_STATE_FINAL_BRIDGE_2026_10_09"
+_np_v200_bootstrap_base = app.view_functions.get("trader_bootstrap")
+
+def _np_v200_bootstrap():
+    resp = _np_v200_bootstrap_base()
+    try:
+        response = app.make_response(resp)
+        data = response.get_json(silent=True)
+        if not isinstance(data, dict):
+            return response
+        root = data.get("data") if isinstance(data.get("data"), dict) else data
+        acct = root.get("current_account") if isinstance(root.get("current_account"), dict) else None
+        if not acct or not str(acct.get("mt5_login") or "").strip():
+            return response
+
+        login = str(acct.get("mt5_login") or "").strip()
+        aid = str(acct.get("id") or "").strip()
+        snap = None
+        # Read the actual base table, not the health view, to remove view/schema-cache
+        # uncertainty from the dashboard path.
+        if aid and not aid.startswith("purchase:"):
+            rows = (supabase.table("np_live_account_state").select("*")
+                    .eq("trader_account_id", aid).limit(1).execute().data or [])
+            snap = rows[0] if rows else None
+        if not snap:
+            rows = (supabase.table("np_live_account_state").select("*")
+                    .eq("mt5_login", login).limit(1).execute().data or [])
+            snap = rows[0] if rows else None
+        if not snap:
+            return response
+
+        bal = clean(snap.get("balance"))
+        eq = clean(snap.get("equity"))
+        start = clean(acct.get("start_balance") or acct.get("account_size") or snap.get("account_size") or 0)
+        profit = (eq - start) if start > 0 and eq > 0 else clean(snap.get("profit"))
+        profit_pct = ((profit / start) * 100.0) if start > 0 else clean(snap.get("profit_percent"))
+        observed = snap.get("observed_at") or snap.get("updated_at") or snap.get("received_at")
+
+        live_fields = {
+            "current_balance": bal, "balance": bal,
+            "current_equity": eq, "equity": eq,
+            "profit": profit, "profit_percent": profit_pct,
+            "drawdown_percent": snap.get("drawdown_percent"),
+            "absolute_drawdown_percent": snap.get("drawdown_percent"),
+            "dd_used_percent": snap.get("dd_used_percent"),
+            "risk_zone": snap.get("risk_zone"),
+            "last_sync_at": observed, "live_monitor_update_at": observed,
+            "latest_monitoring_snapshot": snap,
+            "live_metrics_authority": NAIRAPIPS_V200_DASHBOARD_LIVE_STATE_FINAL_BRIDGE,
+        }
+        live_fields = {k:v for k,v in live_fields.items() if v is not None and v != ""}
+
+        # Current account.
+        acct.update(live_fields)
+        root["current_account"] = acct
+
+        # Every repeated copy of this exact account.
+        for key in ("active_accounts", "accounts", "all_accounts"):
+            rows = root.get(key)
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict) and str(row.get("mt5_login") or "").strip() == login:
+                        row.update(live_fields)
+
+        # Critical missing bridge: legacy dashboard cards also read trader-level
+        # balance/equity/profit fields instead of current_account.
+        trader = root.get("trader")
+        if isinstance(trader, dict):
+            trader.update({k:v for k,v in live_fields.items() if k not in {"latest_monitoring_snapshot"}})
+            trader["mt5_login"] = login
+
+        # Legacy dashboard monitor widgets read this root field.
+        root["latest_monitoring"] = snap
+        root["live_state"] = snap
+        root["live_metrics_authority"] = NAIRAPIPS_V200_DASHBOARD_LIVE_STATE_FINAL_BRIDGE
+
+        response.set_data(json.dumps(data, default=str))
+        response.content_type = "application/json"
+        response.headers["X-NairaPips-Live-Metrics"] = NAIRAPIPS_V200_DASHBOARD_LIVE_STATE_FINAL_BRIDGE
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return response
+    except Exception as exc:
+        print("V200 DASHBOARD LIVE STATE WARNING:", exc, flush=True)
+        return resp
+
+if _np_v200_bootstrap_base:
+    app.view_functions["trader_bootstrap"] = _np_v200_bootstrap
+NAIRAPIPS_RELEASE = NAIRAPIPS_V200_DASHBOARD_LIVE_STATE_FINAL_BRIDGE
+print("V200 LOADED: dashboard now uses clean live-state across account + trader + latest_monitoring; DD untouched", flush=True)
