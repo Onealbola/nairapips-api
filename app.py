@@ -58638,7 +58638,7 @@ NAIRAPIPS_V197_GLOBAL_DASHBOARD_EXACT_LATEST_RELEASE = "V197_GLOBAL_DASHBOARD_EX
 # live presentation fields. It does NOT write DB state and does NOT touch DD
 # Police, shards, breach/target decisions, lifecycle, assignment, reset or payout.
 # ============================================================================
-NAIRAPIPS_V198_TRADER_BOOTSTRAP_LIVE_METRICS = "V198_TRADER_BOOTSTRAP_LIVE_METRICS_2026_10_08"
+NAIRAPIPS_V198_TRADER_BOOTSTRAP_LIVE_METRICS = "V199_CLEAN_LIVE_STATE_DASHBOARD_AUTHORITY_2026_10_09"
 
 _NP_V198_LIVE_STATUSES = {
     "assigned_active", "active", "current_active", "phase1_active", "phase2_active",
@@ -58661,17 +58661,21 @@ def _np_v198_overlay_latest(row, trader_id=""):
     login = str(out.get("mt5_login") or "").strip()
     snap = None
     try:
+        # V199: the clean live-state table is now the presentation authority.
+        # It is written directly by the V3.20 DD telemetry path and contains one
+        # monotonic newest row per account.  Do NOT fall back to the old
+        # monitoring_snapshots table: that was the stale dashboard source.
         if account_id and not account_id.startswith("purchase:"):
-            rows = (supabase.table("monitoring_snapshots")
+            rows = (supabase.table("np_live_account_state_health")
                     .select("*")
                     .eq("trader_account_id", account_id)
-                    .order("created_at", desc=True).limit(1).execute().data or [])
+                    .limit(1).execute().data or [])
             snap = rows[0] if rows else None
         if not snap and login:
-            q = supabase.table("monitoring_snapshots").select("*").eq("mt5_login", login)
+            q = supabase.table("np_live_account_state_health").select("*").eq("mt5_login", login)
             if trader_id:
                 q = q.eq("trader_id", trader_id)
-            rows = q.order("created_at", desc=True).limit(1).execute().data or []
+            rows = q.limit(1).execute().data or []
             snap = rows[0] if rows else None
     except Exception as exc:
         print("V198 BOOTSTRAP LIVE SNAPSHOT WARNING:", account_id, login, exc, flush=True)
@@ -58708,7 +58712,7 @@ def _np_v198_overlay_latest(row, trader_id=""):
         if value is not None and value != "":
             out[dst] = value
 
-    observed_at = snap.get("created_at") or snap.get("updated_at")
+    observed_at = snap.get("observed_at") or snap.get("updated_at") or snap.get("received_at")
     if observed_at:
         out["last_sync_at"] = observed_at
         out["live_monitor_update_at"] = observed_at
@@ -58781,3 +58785,14 @@ if _np_v198_trader_bootstrap_base:
 
 NAIRAPIPS_RELEASE = NAIRAPIPS_V198_TRADER_BOOTSTRAP_LIVE_METRICS
 print("V198 LOADED: trader_bootstrap exact-latest live metrics bridge; DD/shards untouched", flush=True)
+
+
+# ============================================================================
+# NAIRAPIPS V199 — CLEAN LIVE STATE -> TRADER DASHBOARD AUTHORITY — 09 OCT 2026
+# Dashboard presentation only. Reads np_live_account_state_health, which is fed
+# successfully by V3.20 through the dedicated live-state service. No writes.
+# Does NOT alter DD Police, breach/close rules, targets, assignment or lifecycle.
+# ============================================================================
+NAIRAPIPS_V199_CLEAN_LIVE_STATE_DASHBOARD_AUTHORITY = "V199_CLEAN_LIVE_STATE_DASHBOARD_AUTHORITY_2026_10_09"
+NAIRAPIPS_RELEASE = NAIRAPIPS_V199_CLEAN_LIVE_STATE_DASHBOARD_AUTHORITY
+print("V199 LOADED: clean live-state is dashboard presentation authority; DD/assignment/lifecycle untouched", flush=True)
