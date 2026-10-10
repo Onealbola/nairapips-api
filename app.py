@@ -2495,6 +2495,14 @@ def _enrich_accounts_with_latest_monitoring(trader_id, accounts):
     enriched = []
     for raw in (accounts or []):
         row = dict(raw or {})
+        # Prefer the compact live-state observation over serial scans of the
+        # old snapshot/event history when this live account has current telemetry.
+        live_overlay = globals().get("_np_v198_overlay_latest")
+        if callable(live_overlay):
+            live_row = live_overlay(row, trader_id)
+            if live_row.get("live_metrics_authority") and live_row.get("latest_monitoring_snapshot"):
+                enriched.append(_decorate_account_for_api(live_row))
+                continue
         account_id = str(row.get("id") or "").strip()
         login = str(row.get("mt5_login") or "").strip()
         snap = None
@@ -58683,10 +58691,7 @@ def _np_v198_overlay_latest(row, trader_id=""):
         # monotonic newest row per account.  Do NOT fall back to the old
         # monitoring_snapshots table: that was the stale dashboard source.
         if account_id and not account_id.startswith("purchase:"):
-            rows = (supabase.table("np_live_account_state")
-                    .select("*")
-                    .eq("trader_account_id", account_id)
-                    .limit(1).execute().data or [])
+            rows = _np_query_rows_v173("np_live_account_state", filters=[("eq", "trader_account_id", account_id)], limit=1)
             snap = rows[0] if rows else None
         if not snap and login and (not account_id or account_id.startswith("purchase:")):
             q = supabase.table("np_live_account_state").select("*").eq("mt5_login", login)
@@ -58843,8 +58848,7 @@ def _np_v200_bootstrap():
         # Read the actual base table, not the health view, to remove view/schema-cache
         # uncertainty from the dashboard path.
         if not snap and aid and not aid.startswith("purchase:"):
-            rows = (supabase.table("np_live_account_state").select("*")
-                    .eq("trader_account_id", aid).limit(1).execute().data or [])
+            rows = _np_query_rows_v173("np_live_account_state", filters=[("eq", "trader_account_id", aid)], limit=1)
             snap = rows[0] if rows else None
         if not snap and (not aid or aid.startswith("purchase:")):
             rows = (supabase.table("np_live_account_state").select("*")
@@ -58941,9 +58945,7 @@ def _np_verified_payout_quote(account, trader=None, snapshot=None, allow_stale=F
     else:
         if snapshot is None:
             try:
-                rows = (supabase.table("np_live_account_state").select("*")
-                        .eq("trader_account_id", aid)
-                        .limit(1).execute().data or [])
+                rows = _np_query_rows_v173("np_live_account_state", filters=[("eq", "trader_account_id", aid)], limit=1)
                 snapshot = rows[0] if rows else None
             except Exception:
                 return unavailable
@@ -59034,3 +59036,52 @@ if _np_v201_bootstrap_base:
 # the existing payout record preserves verification state across restarts.
 def _np_payout_awaiting_verification(payout):
     return "[NP_PAYOUT_VERIFY_PENDING]" in str((payout or {}).get("admin_note") or "")
+
+# The fast dashboard refresh and account-list refresh must use the same live
+# presentation authority as bootstrap, or they overwrite fresh cards with old
+# assignment balances. This decorates responses only; lifecycle stays intact.
+def _np_v204_live_refresh_response(resp):
+    response = app.make_response(resp)
+    if response.status_code >= 400:
+        return response
+    data = response.get_json(silent=True)
+    if not isinstance(data, dict):
+        return response
+    root = data.get("data", data)
+    trader = root.get("trader", {}) if isinstance(root, dict) else {}
+    cache = {}
+    def overlay(row):
+        if not isinstance(row, dict) or not _np_v198_is_live_row(row):
+            return row
+        key = (str(row.get("id") or ""), str(row.get("mt5_login") or ""))
+        if key not in cache:
+            cache[key] = _np_v198_overlay_latest(row, trader.get("id") or row.get("trader_id") or "")
+        return dict(row, **cache[key])
+    if isinstance(root, list):
+        data["data"] = [overlay(row) for row in root]
+    elif isinstance(root, dict):
+        for key in ("current_account", "account"):
+            if isinstance(root.get(key), dict):
+                root[key] = overlay(root[key])
+        for key in ("active_accounts", "accounts", "all_accounts", "trader_accounts"):
+            if isinstance(root.get(key), list):
+                root[key] = [overlay(row) for row in root[key]]
+        current = root.get("current_account") or root.get("account") or {}
+        if current.get("latest_monitoring_snapshot"):
+            root["latest_monitoring"] = current["latest_monitoring_snapshot"]
+            for field in ("current_balance", "balance", "current_equity", "equity", "profit", "profit_percent", "last_sync_at", "live_monitor_update_at"):
+                if field in current and isinstance(root.get("trader"), dict):
+                    root["trader"][field] = current[field]
+    response.set_data(json.dumps(data, default=str))
+    response.content_type = "application/json"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+def _np_v204_wrap_live_refresh(base):
+    def wrapped(*args, **kwargs):
+        return _np_v204_live_refresh_response(base(*args, **kwargs))
+    return wrapped
+
+for _np_v204_endpoint in ("trader_current_account", "trader_dashboard_payload", "admin_trader_accounts_feed"):
+    if _np_v204_endpoint in app.view_functions:
+        app.view_functions[_np_v204_endpoint] = _np_v204_wrap_live_refresh(app.view_functions[_np_v204_endpoint])

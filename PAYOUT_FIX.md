@@ -93,3 +93,17 @@ starting capital 500000, profit 70981.44, share 60%, available payout 42588.86.
 rejection of other accounts/logins and unknown financial values. The live-state
 service is separately corrected to resolve the canonical owner before its RPC,
 with a bounded 30-second lookup cache to avoid a database read per observation.
+
+Dashboard refresh consistency and read performance (10 October)
+- Fast current-account refresh and account-list responses now overlay the same
+  exact live-account observation as bootstrap, so polling cannot replace fresh
+  balances with stored assignment values. Archived accounts are preserved.
+- Balance and payout reads use the existing REST-first database helper, avoiding
+  the shared Supabase connection already documented as unreliable in production.
+- Live account enrichment skips serial old snapshot/event history scans when
+  live-state evidence exists. No lifecycle or database records are changed.
+- Read-only live verification again returned balance/equity 570981.44 and
+  available share 42588.86. Backend checks cover refresh consistency, duplicate
+  read suppression, history preservation, payout verification and queue safety.
+- Public Render HTTP checks are blocked by this environment's network proxy;
+  deployment completion and end-to-end browser speed remain unconfirmed.

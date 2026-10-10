@@ -32,8 +32,15 @@ class DashboardTests(unittest.TestCase):
         self.scope = dict(app=self.app, supabase=self.db, clean=lambda v: float(v or 0), json=json,
                           NAIRAPIPS_V198_TRADER_BOOTSTRAP_LIVE_METRICS='live',
                           NAIRAPIPS_V200_DASHBOARD_LIVE_STATE_FINAL_BRIDGE='final')
+        def read_rows(table, select="*", filters=None, limit=1):
+            q = self.db.table(table).select(select)
+            for kind, col, value in filters or []:
+                q = q.eq(col, value)
+            return q.limit(limit).execute().data
+        self.scope['_np_query_rows_v173'] = read_rows
+        self.scope['_decorate_account_for_api'] = lambda row: row
         tree = ast.parse(SOURCE.read_text())
-        names = {'_np_v198_is_live_row', '_np_v198_overlay_latest', '_np_v198_trader_bootstrap', '_np_v200_bootstrap'}
+        names = {'_np_v198_is_live_row', '_np_v198_overlay_latest', '_np_v198_trader_bootstrap', '_np_v200_bootstrap', '_np_v204_live_refresh_response', '_enrich_accounts_with_latest_monitoring'}
         selected = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names or isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == '_NP_V198_LIVE_STATUSES' for t in n.targets)]
         exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), 'exec'), self.scope)
     def account(self, aid='a', status='active'):
@@ -64,6 +71,24 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(data['accounts'][1]['current_balance'], 1000)
         self.assertNotIn('current_equity', data['accounts'][1])
         self.assertEqual(self.db.calls, ['np_live_account_state'])
+    def test_fast_refresh_and_account_feed_keep_live_values(self):
+        self.db.rows = [self.snapshot()]
+        for payload in (dict(data=dict(trader={'id':'trader'}, current_account=self.account(), all_accounts=[self.account()])), dict(data=[self.account(),self.account('old','archived')])):
+            self.db.calls = []
+            with self.app.test_request_context('/trader_current_account/trader'):
+                result = self.scope['_np_v204_live_refresh_response'](self.app.json.response(payload)).get_json()['data']
+            if isinstance(result, list):
+                self.assertEqual(result[0]['current_equity'],1200)
+                self.assertEqual(result[1]['current_balance'],1000)
+            else:
+                self.assertEqual(result['current_account']['current_equity'],1200)
+                self.assertEqual(result['trader']['current_equity'],1200)
+            self.assertEqual(self.db.calls,['np_live_account_state'])
+    def test_live_enrichment_skips_old_history_scans(self):
+        self.db.rows = [self.snapshot()]
+        result = self.scope['_enrich_accounts_with_latest_monitoring']('trader',[self.account()])
+        self.assertEqual(result[0]['current_equity'],1200)
+        self.assertEqual(self.db.calls,['np_live_account_state'])
     def test_database_failure_preserves_stored_metrics(self):
         def fail(_): raise TimeoutError('database unavailable')
         self.db.table = fail

@@ -54,6 +54,12 @@ class PayoutTests(unittest.TestCase):
                       _staff_db=lambda:self.db,send_email_safe=lambda *args:None,send_admin_alert=lambda *args:None,
                       _audit_safe=lambda *args:None,_admin_from_payload=lambda d:{},
                       bad=lambda message,status=400:(self.app.json.response({'error':message}),status))
+        def read_rows(table, select="*", filters=None, limit=1):
+            q = self.db.table(table).select(select)
+            for kind, col, value in filters or []:
+                q = q.eq(col, value)
+            return q.limit(limit).execute().data
+        self.env['_np_query_rows_v173'] = read_rows
         funcs=[copy.deepcopy(n) for n in TREE.body if isinstance(n,ast.FunctionDef) and n.name in {'_np_verified_payout_quote','create_payout','_np_v201_bootstrap','approve_payout','cancel_payout','_np_payout_awaiting_verification','_np_v122_mark_paid_route'}]
         for f in funcs: f.decorator_list=[]
         exec(compile(ast.Module(body=funcs,type_ignores=[]),'payout','exec'),self.env)
