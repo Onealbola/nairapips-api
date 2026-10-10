@@ -107,3 +107,12 @@ Dashboard refresh consistency and read performance (10 October)
   read suppression, history preservation, payout verification and queue safety.
 - Public Render HTTP checks are blocked by this environment's network proxy;
   deployment completion and end-to-end browser speed remain unconfirmed.
+
+Global Account Truth refresh consistency
+The authenticated Account Truth route now combines the exact account's newest
+live observation with its existing historic evidence. Its delayed history response
+therefore cannot replace a newly observed high with an old assignment balance.
+Owner/account/login validation also accepts only the known exact-account legacy
+owner alias. Existing low-water marks, limit crossings and their evidence remain
+intact. Tests cover the refreshed high and timestamp, preserved past breaches,
+and rejection of other accounts/owners/logins. All 32 backend tests passed.

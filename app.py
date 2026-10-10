@@ -57335,6 +57335,24 @@ def account_truth_v122_compat():
         # This is read-only dashboard truth plumbing; no DD/lifecycle logic changes.
         snapshots = _np_ht_snapshot_rows_v122(account_id, mt5_login)
 
+        # Keep durable history, but include the exact account's newest live
+        # observation. The old history stream no longer receives every update.
+        try:
+            live_rows = _np_query_rows_v173("np_live_account_state", filters=[("eq", "trader_account_id", account_id)], limit=1)
+            live = (live_rows or [{}])[0]
+            if (str(live.get("trader_account_id") or "") == account_id
+                    and str(live.get("mt5_login") or "") == mt5_login
+                    and str(live.get("trader_id") or "") in {trader_id, account_id}
+                    and live.get("observed_at")):
+                observation = dict(live, created_at=live["observed_at"])
+                live_equity = _np_ht_equity_v122(observation)
+                if live_equity > 0:
+                    snapshots = list(snapshots or []) + [observation]
+                    snapshots.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+                    current = live_equity
+        except Exception as exc:
+            print("ACCOUNT TRUTH LIVE READ WARNING:", account_id, exc, flush=True)
+
         valid = [(r, _np_ht_equity_v122(r)) for r in snapshots]
         valid = [(r, eq) for r, eq in valid if eq > 0]
 
