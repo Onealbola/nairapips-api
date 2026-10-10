@@ -182,3 +182,22 @@ class PayoutTests(unittest.TestCase):
         self.assertEqual(self.quote()['available_payout'],120)
         self.a['id']='other'
         self.assertFalse(self.quote()['verified'])
+
+    def test_legacy_collector_account_id_owner_alias_uses_canonical_ownership(self):
+        self.db.snap=dict(self.snap,trader_id=self.a['id'])
+        quote=self.quote()
+        self.assertTrue(quote['verified'])
+        self.assertEqual(quote['available_payout'],120)
+        self.assertEqual(quote['payout_split'],60)
+        self.assertFalse(self.env['_np_verified_payout_quote'](self.a,{'id':'different_owner'})['verified'])
+    def test_legacy_alias_cannot_borrow_another_account_or_login(self):
+        for field in ('trader_account_id','mt5_login'):
+            self.db.snap=dict(self.snap,trader_id=self.a['id'])
+            self.db.snap[field]='different'
+            self.assertFalse(self.quote()['verified'])
+    def test_missing_quote_is_unknown_instead_of_zero_profit(self):
+        self.db.snap=None
+        quote=self.quote()
+        self.assertIsNone(quote['available_payout'])
+        self.assertIsNone(quote['verified_profit'])
+        self.assertIsNone(quote['payout_split'])

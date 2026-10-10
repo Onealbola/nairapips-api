@@ -58925,7 +58925,7 @@ def _np_verified_payout_quote(account, trader=None, snapshot=None, allow_stale=F
     aid = str(a.get("id") or "").strip()
     tid = str(trader.get("id") or a.get("trader_id") or "").strip()
     login = str(a.get("mt5_login") or "").strip()
-    unavailable = {"verified": False, "available_payout": 0,
+    unavailable = {"verified": False, "available_payout": None, "verified_profit": None, "payout_split": None,
                    "reason": "Your latest account update is temporarily unavailable. Please try again after it updates.",
                    "trader_account_id": aid, "authority": "V201_EXACT_LIVE_PAYOUT"}
     if not aid or not tid or str(a.get("trader_id") or "").strip() != tid or not login:
@@ -58942,14 +58942,19 @@ def _np_verified_payout_quote(account, trader=None, snapshot=None, allow_stale=F
         if snapshot is None:
             try:
                 rows = (supabase.table("np_live_account_state").select("*")
-                        .eq("trader_account_id", aid).eq("trader_id", tid)
+                        .eq("trader_account_id", aid)
                         .limit(1).execute().data or [])
                 snapshot = rows[0] if rows else None
             except Exception:
                 return unavailable
         snap = snapshot or {}
         if (str(snap.get("trader_account_id") or "").strip() != aid
-                or str(snap.get("trader_id") or "").strip() != tid
+                # V203 compatibility: the deployed V3.20 collector copied the
+                # immutable account UUID into trader_id. Ownership still comes
+                # from the canonical account bound to this authenticated trader;
+                # account UUID and broker login must match exactly. Other owners
+                # remain rejected. Never fall back by broker login alone.
+                or str(snap.get("trader_id") or "").strip() not in {tid, aid}
                 or str(snap.get("mt5_login") or "").strip() != login):
             return unavailable
         observed = snap.get("observed_at")

@@ -68,3 +68,28 @@ pending labels. Read-only production schema inspection confirmed all payout
 columns needed by the verification update. No production payout was created or
 changed during testing. Full infrastructure outages can still prevent storage;
 the UI must never report receipt if no request was saved.
+
+## V203: collector ownership metadata compatibility — 10 October 2026
+
+A read-only audit found all 66 persisted live-state rows had trader_id equal to
+trader_account_id, rather than the canonical trader_accounts.trader_id. The
+legacy deployed V3.20 collector caused this. V201's new strict owner filter
+therefore rejected otherwise exact-account broker observations and the page
+rendered unknown amounts/share as zero. This was a regression in the new payout
+verification path, not evidence that traders lost profit.
+
+Quotes now select only by immutable account UUID and still verify canonical
+account ownership against the authenticated trader. An observation's owner may
+match either that canonical trader UUID or the exact same account UUID (the
+known legacy metadata error). Observation account UUID and MT5 login must also
+match. Another trader UUID, another account UUID or a reused login alone cannot
+authorize a payout. No balance or account record is rewritten by this fix.
+Missing quote amounts, profit and share are null, not zero. The revised trader
+HTML displays Verifying instead of a fabricated zero when evidence is absent.
+
+Read-only verification of MT5 477509676 returned fresh equity/balance 570981.44,
+starting capital 500000, profit 70981.44, share 60%, available payout 42588.86.
+27 backend tests passed, including legacy owner aliases with exact ownership,
+rejection of other accounts/logins and unknown financial values. The live-state
+service is separately corrected to resolve the canonical owner before its RPC,
+with a bounded 30-second lookup cache to avoid a database read per observation.
