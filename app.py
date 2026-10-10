@@ -13292,7 +13292,9 @@ def create_payout():
             return bad("Payout was not opened because the funded account could not be locked safely.", 503)
 
         now = now_iso()
+        import uuid
         row={
+            "id": str(uuid.uuid4()),
             "trader_id":trader_row.get("id"),
             "trader_account_id":account.get("id"),
             "trader_name":d.get("trader_name") or trader_row.get("name") or trader_row.get("full_name") or "",
@@ -13325,6 +13327,7 @@ def create_payout():
             except Exception as insert_error:
                 # Backward compatible fallback for older payouts table schemas.
                 fallback={
+                    "id": row["id"],
                     "trader_id":row["trader_id"],
                     "trader_account_id":row["trader_account_id"],
                     "trader_name":row["trader_name"],
@@ -13343,16 +13346,25 @@ def create_payout():
                 row.update(fallback)
                 print("PAYOUT RICH INSERT FALLBACK:", insert_error)
         except Exception as insert_failure:
-            # No payout liability exists if both inserts fail. Restore only the
-            # payout-request lock; cap-locked accounts remain cap-locked.
+            # An HTTP failure can occur AFTER the insert commits. Both attempts
+            # share one UUID, so the primary key prevents a duplicate liability.
+            # Recover that row before considering release of the trading lock.
             try:
-                _release_funded_payout_trade_lock(
-                    trader_row, account,
-                    reason="Payout insert failed; submission lock released.",
-                )
-            except Exception as unlock_error:
-                print("PAYOUT INSERT FAILURE UNLOCK WARNING:", unlock_error, flush=True)
-            raise insert_failure
+                persisted = _np_query_rows_v173("payouts", filters=[("eq", "id", row["id"])], limit=1)
+            except Exception:
+                # Preserve the financial lock until history can be verified.
+                raise RuntimeError("Submission confirmation is delayed. Check your payout history before retrying; account safety lock is retained.")
+            if persisted:
+                created = persisted
+            else:
+                try:
+                    _release_funded_payout_trade_lock(
+                        trader_row, account,
+                        reason="Payout insert failed; no persisted request exists; submission lock released.",
+                    )
+                except Exception as unlock_error:
+                    print("PAYOUT INSERT FAILURE UNLOCK WARNING:", unlock_error, flush=True)
+                raise insert_failure
 
         created_payout = (created or [None])[0] or {}
         payout_id = created_payout.get("id")
@@ -56257,7 +56269,9 @@ def _np_v122_mark_paid_route():
         paid_now = now_iso()
         result = supabase.table("payouts").update({
             "status":"paid","paid_at":paid_now,"admin_note":note,"updated_at":paid_now
-        }).eq("id",pid).execute().data
+        }).eq("id",pid).eq("status", "approved").is_("paid_at", "null").execute().data
+        if not result:
+            return bad("Payout changed state or was already paid. No payment completion was recorded.", 409)
 
         source_id = _np_v122_s(payout.get("trader_account_id") or payout.get("account_id"))
         trader_id = _np_v122_s(payout.get("trader_id"))
@@ -59103,3 +59117,140 @@ def _np_v204_wrap_live_refresh(base):
 for _np_v204_endpoint in ("trader_current_account", "trader_dashboard_payload", "admin_trader_accounts_feed"):
     if _np_v204_endpoint in app.view_functions:
         app.view_functions[_np_v204_endpoint] = _np_v204_wrap_live_refresh(app.view_functions[_np_v204_endpoint])
+
+# Global payout safety: serialize financial actions in the database rather than
+# in process memory. An exact account with payment evidence is terminal even if
+# an old recovery override or account reactivation says it is eligible again.
+def _np_v206_claim_payout_action(account):
+    import uuid
+    aid = str(account.get("id") or "")
+    tid = str(account.get("trader_id") or "")
+    original = account.get("archive_reason")
+    if "[NP_PAYOUT_ACTION:" in str(original or ""):
+        return None
+    token = "[NP_PAYOUT_ACTION:" + str(uuid.uuid4()) + "]"
+    claimed = (str(original or "") + " " + token).strip()
+    q = _staff_db().table("trader_accounts").update({"archive_reason": claimed}).eq("id", aid).eq("trader_id", tid)
+    q = q.is_("archive_reason", "null") if original is None else q.eq("archive_reason", original)
+    rows = q.execute().data or []
+    return (token, original, claimed) if rows else None
+
+def _np_v206_release_payout_action(account, claim):
+    aid, tid = str(account.get("id") or ""), str(account.get("trader_id") or "")
+    rows = _np_query_rows_v173("trader_accounts", filters=[("eq", "id", aid), ("eq", "trader_id", tid)], limit=1)
+    if not rows:
+        return
+    current = rows[0].get("archive_reason")
+    token, original, claimed = claim
+    if token not in str(current or ""):
+        return
+    restored = original if current == claimed else str(current).replace(token, "").strip()
+    _staff_db().table("trader_accounts").update({"archive_reason": restored}).eq("id", aid).eq("trader_id", tid).eq("archive_reason", current).execute()
+
+def _np_v206_broker_scope(account):
+    login = str(account.get("mt5_login") or "").strip()
+    server = str(account.get("mt5_server") or "").strip().lower()
+    if not login or not server:
+        raise ValueError("Broker login and server are required for duplicate-payment verification")
+    siblings = _np_query_rows_v173("trader_accounts", filters=[("eq", "mt5_login", login)], limit=10000)
+    # Missing server metadata for this reused login cannot establish a different
+    # broker account. Include it for financial review, never silently ignore it.
+    group = [row for row in siblings if str(row.get("mt5_server") or "").strip().lower() in {server, ""}]
+    if not any(str(row.get("id")) == str(account.get("id")) for row in group):
+        raise ValueError("Exact broker account could not be verified")
+    ids = [str(row["id"]) for row in group]
+    canonical = min(group, key=lambda row: (str(row.get("created_at") or "9999"), str(row["id"])))
+    return canonical, ids
+
+def _np_v206_broker_ledger(account, ids):
+    ledger = []
+    for offset in range(0, len(ids), 100):
+        ledger.extend(_np_query_rows_v173("payouts", filters=[("in", "trader_account_id", ids[offset:offset+100])], limit=10000))
+    # Older schema fallbacks could omit the account link. Never let such records
+    # bypass the paid/open checks for the same broker login.
+    orphan_rows = _np_query_rows_v173("payouts", filters=[("eq", "mt5_login", str(account.get("mt5_login")))], limit=10000)
+    server = str(account.get("mt5_server") or "").strip().lower()
+    ledger.extend(row for row in orphan_rows if not row.get("trader_account_id") and str(row.get("mt5_server") or "").strip().lower() in {server, ""})
+    return ledger
+
+def _np_v206_payout_guard(base, action):
+    def guarded(*args, **kwargs):
+        if request.method == "OPTIONS":
+            return base(*args, **kwargs)
+        account = None
+        lock_account = None
+        claim = None
+        try:
+            payload = request.get_json(silent=True) or {}
+            if action in {"create", "cancel"}:
+                tid, auth_error = _authenticated_trader_id_for_request(payload.get("trader_id"))
+                if auth_error:
+                    return bad(auth_error, 401)
+            else:
+                admin, auth_response = _require_admin()
+                if auth_response:
+                    return auth_response
+            pid = str(payload.get("id") or payload.get("payout_id") or "").strip()
+            if action == "create":
+                pid = ""
+                trader = get_trader_by_id(tid)
+                if not trader:
+                    return bad("Authenticated trader could not be verified.", 403)
+                eligible, reason, account = _payout_eligibility(trader, requested_account_id=str(payload.get("trader_account_id") or payload.get("account_id") or "").strip())
+                if not eligible:
+                    return bad(reason, 403)
+            else:
+                rows = _np_query_rows_v173("payouts", filters=[("eq", "id", pid)], limit=1)
+                payout = rows[0] if rows else None
+                if not payout:
+                    return bad("Payout not found", 404)
+                if action == "cancel" and str(payout.get("trader_id") or "") != tid:
+                    return bad("You can cancel only your own payout request.", 403)
+                if payout_status(payout) == "paid" or payout.get("paid_at"):
+                    return bad("This payout is already paid and cannot be changed.", 409)
+                aid = str(payout.get("trader_account_id") or "").strip()
+                account_rows = _np_query_rows_v173("trader_accounts", filters=[("eq", "id", aid)], limit=1) if aid else []
+                account = account_rows[0] if account_rows else None
+                if not account or str(account.get("trader_id") or "") != str(payout.get("trader_id") or ""):
+                    return bad("Exact payout account ownership could not be verified.", 409)
+            # Read the current persisted reason for compare-and-set, not an overlay.
+            fresh = _np_query_rows_v173("trader_accounts", filters=[("eq", "id", account.get("id")), ("eq", "trader_id", account.get("trader_id"))], limit=1)
+            if not fresh:
+                return bad("Exact payout account could not be verified.", 409)
+            account = fresh[0]
+            lock_account, broker_account_ids = _np_v206_broker_scope(account)
+            claim = _np_v206_claim_payout_action(lock_account)
+            if not claim:
+                return bad("A payout action is already being processed for this account. Refresh your payout history before trying again.", 409)
+            ledger = _np_v206_broker_ledger(account, broker_account_ids)
+            if any(payout_status(row) == "paid" or row.get("paid_at") for row in ledger):
+                return bad("This trading account has already received a payout. A fresh funded account is required for another payout.", 409)
+            open_states = {"pending", "approved", "processing", "payment_processing", "requested", "submitted", "under_review", "pending_review", "awaiting_review", "request_pending"}
+            others = [row for row in ledger if str(row.get("id") or "") != pid and payout_status(row) in open_states]
+            if action in {"create", "approve", "paid"} and others:
+                return bad("Another payout request already exists for this account. Review the existing request; no additional payout was authorized.", 409)
+            return base(*args, **kwargs)
+        except Exception as exc:
+            print("GLOBAL PAYOUT GUARD ERROR:", action, exc, flush=True)
+            return bad("Payout safety verification is temporarily unavailable. No additional payout was authorized.", 503)
+        finally:
+            if lock_account and claim:
+                try:
+                    _np_v206_release_payout_action(lock_account, claim)
+                except Exception as exc:
+                    # A stuck guard requires review; never blindly expire a lock
+                    # while another process might still be completing payment.
+                    print("GLOBAL PAYOUT GUARD RELEASE REQUIRES REVIEW:", account.get("id"), exc, flush=True)
+    return guarded
+
+for _np_v206_endpoint, _np_v206_action in (("create_payout", "create"), ("approve_payout", "approve"), ("mark_paid", "paid"), ("cancel_payout", "cancel"), ("reject_payout", "reject"), ("admin_reopen_payout_review", "review")):
+    if _np_v206_endpoint in app.view_functions:
+        app.view_functions[_np_v206_endpoint] = _np_v206_payout_guard(app.view_functions[_np_v206_endpoint], _np_v206_action)
+
+def _np_v206_disable_paid_account_reactivation():
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    return bad("A paid account cannot be reopened for another payout. Use the fresh funded account renewal process.", 409)
+
+app.view_functions["admin_complete_funded_payout_cycle"] = _np_v206_disable_paid_account_reactivation

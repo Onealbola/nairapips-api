@@ -11,7 +11,7 @@ TREE = ast.parse((Path(__file__).resolve().parents[1] / 'app.py').read_text())
 
 class DB:
     def __init__(self, snap):
-        self.snap=snap;self.tables={'payouts':[]};self.writes=[];self.fail_rich=False
+        self.snap=snap;self.tables={'payouts':[]};self.writes=[];self.fail_rich=False;self.lose_insert_response=False
     def table(self,name):
         self.name=name;self.filters={};self.not_filters={};self.members={};self.mode='read';return self
     def select(self,*_):return self
@@ -25,8 +25,11 @@ class DB:
     def execute(self):
         if self.mode=='insert':
             if self.fail_rich and 'verified_profit' in self.payload:raise RuntimeError('legacy schema')
-            row=dict(self.payload,id='request-1');self.tables.setdefault(self.name,[]).append(row)
-            self.writes.append((self.name,self.mode,dict(row)));self.data=[dict(row)];return self
+            if any(r.get('id')==self.payload.get('id') for r in self.tables.get(self.name,[])):raise RuntimeError('duplicate primary key')
+            row=dict(self.payload);self.tables.setdefault(self.name,[]).append(row)
+            self.writes.append((self.name,self.mode,dict(row)))
+            if self.lose_insert_response:raise TimeoutError('response lost after commit')
+            self.data=[dict(row)];return self
         rows=([self.snap] if self.snap else []) if self.name=='np_live_account_state' else self.tables.get(self.name,[])
         selected=[r for r in rows if all(str(r.get(k))==str(v) for k,v in self.filters.items())
                   and all(str(r.get(k))!=str(v) for k,v in self.not_filters.items())
@@ -64,6 +67,14 @@ class PayoutTests(unittest.TestCase):
         for f in funcs: f.decorator_list=[]
         exec(compile(ast.Module(body=funcs,type_ignores=[]),'payout','exec'),self.env)
     def quote(self,snapshot=None): return self.env['_np_verified_payout_quote'](self.a,{'id':'owner'},snapshot)
+    def test_lost_insert_response_does_not_duplicate_or_unlock_request(self):
+        self.db.lose_insert_response=True
+        self.env['_set_funded_payout_trade_lock']=lambda *args,**kwargs:None
+        self.env['_release_funded_payout_trade_lock']=lambda *args,**kwargs:self.fail('Committed payout was unlocked')
+        with self.app.test_request_context('/create_payout',method='POST',json={'trader_id':'owner','trader_account_id':'exact','amount':100,'bank_name':'Bank','account_number':'123','account_name':'Owner'}):
+            response=self.app.make_response(self.env['create_payout']())
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(len(self.db.tables['payouts']),1)
     def test_live_profit_replaces_frozen_assignment_balance(self):
         self.assertEqual(self.quote()['available_payout'],120)
         self.assertEqual(self.a['current_equity'],1000)
@@ -119,7 +130,7 @@ class PayoutTests(unittest.TestCase):
                         _get_exact_trader_account=lambda aid:dict(self.a),
                         payout_status=lambda p:p['status'],_np_v122_s=lambda v:str(v or ''))
     def approve(self):
-        with self.app.test_request_context('/approve_payout',method='POST',json={'id':'request-1'}):
+        with self.app.test_request_context('/approve_payout',method='POST',json={'id':self.db.tables['payouts'][0]['id']}):
             return self.env['approve_payout']()
     def test_pending_request_cannot_be_approved_without_fresh_proof(self):
         self.prepare_admin();response,status=self.approve()
@@ -140,7 +151,7 @@ class PayoutTests(unittest.TestCase):
         self.assertEqual(self.db.tables['payouts'][0]['status'],'pending')
     def test_mark_paid_cannot_bypass_verification_even_if_status_was_changed(self):
         self.prepare_admin();self.db.tables['payouts'][0]['status']='approved'
-        with self.app.test_request_context('/mark_payout_paid',method='POST',json={'id':'request-1'}):
+        with self.app.test_request_context('/mark_payout_paid',method='POST',json={'id':self.db.tables['payouts'][0]['id']}):
             response,status=self.env['_np_v122_mark_paid_route']()
         self.assertEqual(status,409);self.assertIn('cannot be paid',response.get_json()['error'])
     def test_delayed_request_can_be_cancelled_and_lock_released(self):
@@ -150,7 +161,7 @@ class PayoutTests(unittest.TestCase):
                         get_trader_by_id=lambda tid:{'id':'owner'},
                         _release_funded_payout_trade_lock=lambda *args,**kw:released.append(True),
                         _trader_safe_account_row=lambda a:a)
-        with self.app.test_request_context('/cancel_payout',method='POST',json={'id':'request-1','trader_id':'owner'}):
+        with self.app.test_request_context('/cancel_payout',method='POST',json={'id':self.db.tables['payouts'][0]['id'],'trader_id':'owner'}):
             response,status=self.env['cancel_payout']()
         self.assertEqual(status,200);self.assertEqual(released,[True])
         self.assertEqual(self.db.tables['payouts'][0]['status'],'cancelled')

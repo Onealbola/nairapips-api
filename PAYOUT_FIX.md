@@ -116,3 +116,37 @@ Owner/account/login validation also accepts only the known exact-account legacy
 owner alias. Existing low-water marks, limit crossings and their evidence remain
 intact. Tests cover the refreshed high and timestamp, preserved past breaches,
 and rejection of other accounts/owners/logins. All 32 backend tests passed.
+
+Global duplicate payout protection
+- Every create/approve/mark-paid/cancel/reject/reopen-review route now requires
+  authenticated trader ownership or a signed administrator token.
+- Financial actions acquire a compare-and-set guard in the database, shared by
+  all API processes and duplicate records for the same MT5 login/broker server.
+  The oldest account row is the common serialization anchor. Guard failure or
+  unverifiable history fails closed; it never authorizes another payout.
+- All sibling IDs for that broker account are checked. Paid status OR paid_at
+  evidence makes further financial actions terminal, even when recovery overrides
+  or duplicated internal accounts would otherwise call the account eligible.
+- Existing open requests on any sibling block new requests, approval and payment.
+- Mark Paid changes only approved, unpaid rows atomically and emits completion
+  side effects only after a successful transition.
+- Rich/fallback insert attempts share one UUID. A lost response after commit
+  recovers the existing request and preserves its lock rather than duplicating it.
+- Same-account paid cycle reactivation remains disabled. Fresh renewal must use
+  a different broker account; a fresh UUID alone cannot bypass paid history.
+- Crash-stuck action guards require explicit investigation, not automatic expiry.
+  Guard cleanup uses compare-and-set and preserves appended renewal/audit notes.
+
+Read-only audit of 345 payout records found 170 marked paid. No duplicate paid
+immutable IDs existed, but grouping by broker server + MT5 login revealed three
+broker logins with multiple paid records: 477287946, 477214688, 477213799. Five
+paid broker accounts also had open requests. The private reports remain outside
+Git. Record statuses establish risk, not proof of actual bank transfers/fraud.
+For 477287946, 46 internal records share Exness-MT5Trial9 and that broker login.
+Two payments are marked paid: 90400 on September 28 and 89900 on October 8;
+two pending requests remain 89999 and 89900. Production data was not altered.
+
+42 backend tests passed, including concurrent claims/submission, repeated payment,
+clone-ID bypass prevention, broker separation, ownership/authentication, preservation
+of payment evidence, and recovery after lost insertion responses. Frontend payout
+validation checks passed. Render completion cannot be checked through this proxy.
