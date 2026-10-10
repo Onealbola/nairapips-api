@@ -13132,7 +13132,8 @@ def create_payout():
     try:
         d=request.json or {}
         amount=clean(d.get("amount"))
-        if amount<=0:
+        import math
+        if not math.isfinite(amount) or amount<=0:
             return bad("Invalid payout amount")
 
         trader_row = _resolve_trader_for_money_action(d)
@@ -13244,16 +13245,15 @@ def create_payout():
                 409,
             )
 
-        start_balance = clean(account.get("start_balance") or account.get("account_size") or 0)
-        current_equity = clean(account.get("current_equity") or account.get("equity") or account.get("current_balance") or account.get("balance") or start_balance)
-        actual_verified_profit = max(0, current_equity - start_balance)
-        funded_profit_ceiling = max(0, round(start_balance * (FUNDED_MAX_GROSS_PROFIT_PERCENT / 100.0), 2))
-        # Business liability rule: payout calculations can never recognise more than
-        # 50% gross profit on the exact funded plan/start balance, even if MT5 overshoots
-        # between scans. Profit split itself comes from the exact Challenge Plan.
-        verified_profit = min(actual_verified_profit, funded_profit_ceiling)
-        split_pct = _np_plan_payout_split_for_account(account, trader_row, d)
-        max_payout = max(0, round((verified_profit * split_pct) / 100, 2))
+        quote = _np_verified_payout_quote(account, trader_row)
+        if not quote["verified"]:
+            return bad(quote["reason"], 503)
+        start_balance = quote["start_balance"]
+        current_equity = quote["current_equity"]
+        verified_profit = quote["verified_profit"]
+        split_pct = quote["payout_split"]
+        max_payout = quote["available_payout"]
+
         if max_payout <= 0:
             return bad("No verified withdrawable profit yet.", 403)
         if amount > max_payout:
@@ -13293,7 +13293,7 @@ def create_payout():
             "mt5_server":account.get("mt5_server") or d.get("mt5_server") or "",
             "account_size":clean(account.get("account_size") or d.get("account_size") or 0),
             "start_balance":start_balance,
-            "current_balance":clean(account.get("current_balance") or account.get("balance") or 0),
+            "current_balance":quote["current_balance"],
             "current_equity":current_equity,
             "verified_profit":verified_profit,
             "payout_split":split_pct,
@@ -58666,13 +58666,13 @@ def _np_v198_overlay_latest(row, trader_id=""):
         # monotonic newest row per account.  Do NOT fall back to the old
         # monitoring_snapshots table: that was the stale dashboard source.
         if account_id and not account_id.startswith("purchase:"):
-            rows = (supabase.table("np_live_account_state_health")
+            rows = (supabase.table("np_live_account_state")
                     .select("*")
                     .eq("trader_account_id", account_id)
                     .limit(1).execute().data or [])
             snap = rows[0] if rows else None
-        if not snap and login:
-            q = supabase.table("np_live_account_state_health").select("*").eq("mt5_login", login)
+        if not snap and login and (not account_id or account_id.startswith("purchase:")):
+            q = supabase.table("np_live_account_state").select("*").eq("mt5_login", login)
             if trader_id:
                 q = q.eq("trader_id", trader_id)
             rows = q.limit(1).execute().data or []
@@ -58744,7 +58744,9 @@ def _np_v198_trader_bootstrap():
         def overlay(row):
             if not isinstance(row, dict):
                 return row
-            key = str(row.get("id") or "").strip() or ("mt5:" + str(row.get("mt5_login") or "").strip())
+            if not _np_v198_is_live_row(row):
+                return row
+            key = (str(row.get("id") or "").strip(), str(row.get("mt5_login") or "").strip())
             if key in cache:
                 # Preserve route-specific extra fields while applying cached live metrics.
                 merged = dict(row)
@@ -58815,21 +58817,23 @@ def _np_v200_bootstrap():
             return response
         root = data.get("data") if isinstance(data.get("data"), dict) else data
         acct = root.get("current_account") if isinstance(root.get("current_account"), dict) else None
-        if not acct or not str(acct.get("mt5_login") or "").strip():
+        if not acct or not _np_v198_is_live_row(acct):
             return response
 
         login = str(acct.get("mt5_login") or "").strip()
         aid = str(acct.get("id") or "").strip()
-        snap = None
+        snap = acct.get("latest_monitoring_snapshot") if acct.get("live_metrics_authority") == NAIRAPIPS_V198_TRADER_BOOTSTRAP_LIVE_METRICS else None
         # Read the actual base table, not the health view, to remove view/schema-cache
         # uncertainty from the dashboard path.
-        if aid and not aid.startswith("purchase:"):
+        if not snap and aid and not aid.startswith("purchase:"):
             rows = (supabase.table("np_live_account_state").select("*")
                     .eq("trader_account_id", aid).limit(1).execute().data or [])
             snap = rows[0] if rows else None
-        if not snap:
+        if not snap and (not aid or aid.startswith("purchase:")):
             rows = (supabase.table("np_live_account_state").select("*")
-                    .eq("mt5_login", login).limit(1).execute().data or [])
+                    .eq("mt5_login", login)
+                    .eq("trader_id", str((root.get("trader") or {}).get("id") or root.get("trader_id") or ""))
+                    .limit(1).execute().data or [])
             snap = rows[0] if rows else None
         if not snap:
             return response
@@ -58864,7 +58868,9 @@ def _np_v200_bootstrap():
             rows = root.get(key)
             if isinstance(rows, list):
                 for row in rows:
-                    if isinstance(row, dict) and str(row.get("mt5_login") or "").strip() == login:
+                    if (isinstance(row, dict) and _np_v198_is_live_row(row)
+                            and str(row.get("id") or "").strip() == aid
+                            and str(row.get("mt5_login") or "").strip() == login):
                         row.update(live_fields)
 
         # Critical missing bridge: legacy dashboard cards also read trader-level
@@ -58892,3 +58898,109 @@ if _np_v200_bootstrap_base:
     app.view_functions["trader_bootstrap"] = _np_v200_bootstrap
 NAIRAPIPS_RELEASE = NAIRAPIPS_V200_DASHBOARD_LIVE_STATE_FINAL_BRIDGE
 print("V200 LOADED: dashboard now uses clean live-state across account + trader + latest_monitoring; DD untouched", flush=True)
+
+# V201: one exact-account financial quote for dashboard and payout validation.
+# Read-only. Existing eligibility, duplicate payout checks and trading locks remain.
+def _np_verified_payout_quote(account, trader=None, snapshot=None):
+    import math
+    a = account or {}
+    trader = trader or {}
+    aid = str(a.get("id") or "").strip()
+    tid = str(trader.get("id") or a.get("trader_id") or "").strip()
+    login = str(a.get("mt5_login") or "").strip()
+    unavailable = {"verified": False, "available_payout": 0,
+                   "reason": "Your latest account update is temporarily unavailable. Please try again after it updates.",
+                   "trader_account_id": aid, "authority": "V201_EXACT_LIVE_PAYOUT"}
+    if not aid or not tid or str(a.get("trader_id") or "").strip() != tid or not login:
+        return unavailable
+    # Retain the pre-existing, management-authorised exact-account recovery.
+    management = (aid == "55d36867-3523-46af-8193-77c946d98959" and login == "477365592"
+                  and a.get("payout_financial_authority") == NAIRAPIPS_V195_MT5_477365592_MANAGEMENT_VERIFIED_PAYOUT)
+    if management:
+        equity = a.get("current_equity")
+        balance = a.get("current_balance")
+        observed = None
+    else:
+        if snapshot is None:
+            try:
+                rows = (supabase.table("np_live_account_state").select("*")
+                        .eq("trader_account_id", aid).eq("trader_id", tid)
+                        .limit(1).execute().data or [])
+                snapshot = rows[0] if rows else None
+            except Exception:
+                return unavailable
+        snap = snapshot or {}
+        if (str(snap.get("trader_account_id") or "").strip() != aid
+                or str(snap.get("trader_id") or "").strip() != tid
+                or str(snap.get("mt5_login") or "").strip() != login):
+            return unavailable
+        observed = snap.get("observed_at")
+        try:
+            dt = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                return unavailable
+            age = (datetime.now(timezone.utc) - dt).total_seconds()
+            if age > 180 or age < -60:
+                return unavailable
+        except (ValueError, TypeError):
+            return unavailable
+        equity = snap.get("current_equity") if snap.get("current_equity") is not None else snap.get("equity")
+        balance = snap.get("current_balance") if snap.get("current_balance") is not None else snap.get("balance")
+    try:
+        start = float(a.get("start_balance") or a.get("account_size") or 0)
+        equity = float(equity)
+        balance = float(balance)
+        split = float(_np_plan_payout_split_for_account(a, trader, {}))
+        if not all(math.isfinite(v) for v in (start, equity, balance, split)) or start <= 0 or balance < 0 or equity < 0 or not 0 < split <= 100:
+            return unavailable
+    except (ValueError, TypeError):
+        return unavailable
+    profit = min(max(0, equity - start), round(start * FUNDED_MAX_GROSS_PROFIT_PERCENT / 100, 2))
+    available = max(0, round(profit * split / 100, 2))
+    return {"verified": True, "trader_account_id": aid, "start_balance": start,
+            "current_equity": equity, "current_balance": balance, "verified_profit": profit, "payout_split": split,
+            "available_payout": available, "observed_at": observed,
+            "reason": "Verified profit is available for payout." if available > 0 else "No verified withdrawable profit yet.",
+            "authority": "V201_EXACT_LIVE_PAYOUT"}
+
+_np_v201_bootstrap_base = app.view_functions.get("trader_bootstrap")
+
+def _np_v201_bootstrap():
+    response = app.make_response(_np_v201_bootstrap_base())
+    data = response.get_json(silent=True)
+    if not isinstance(data, dict) or response.status_code >= 400:
+        return response
+    root = data.get("data") if isinstance(data.get("data"), dict) else data
+    trader = root.get("trader") or {}
+    quotes = {}
+    for key in ("current_account", "active_accounts", "accounts", "all_accounts"):
+        value = root.get(key)
+        rows = value if isinstance(value, list) else [value]
+        for a in rows:
+            if not isinstance(a, dict) or not _np_v198_is_live_row(a):
+                continue
+            if str(a.get("stage") or a.get("phase") or "").lower() != "funded":
+                continue
+            aid = str(a.get("id") or "")
+            if aid not in quotes:
+                # Reuse the exact-account observation already read by the dashboard.
+                proof_account = a
+                existing = root.get("payout_eligibility") or {}
+                proof = existing.get("account") or {}
+                if (existing.get("authority") == NAIRAPIPS_V195_MT5_477365592_MANAGEMENT_VERIFIED_PAYOUT
+                        and str(proof.get("id") or "") == aid
+                        and aid == "55d36867-3523-46af-8193-77c946d98959"
+                        and str(a.get("mt5_login") or "") == "477365592"):
+                    proof_account = dict(a, current_balance=_NP_V195_VERIFIED_BALANCE, current_equity=_NP_V195_VERIFIED_BALANCE,
+                                         start_balance=_NP_V195_FUNDED_CAPITAL,
+                                         payout_financial_authority=existing["authority"])
+                quotes[aid] = _np_verified_payout_quote(proof_account, trader, a.get("latest_monitoring_snapshot"))
+            a["payout_quote"] = quotes[aid]
+    root["payout_quotes"] = quotes
+    response.set_data(json.dumps(data, default=str))
+    response.content_type = "application/json"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+if _np_v201_bootstrap_base:
+    app.view_functions["trader_bootstrap"] = _np_v201_bootstrap
