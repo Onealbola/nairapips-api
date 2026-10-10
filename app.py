@@ -13246,17 +13246,18 @@ def create_payout():
             )
 
         quote = _np_verified_payout_quote(account, trader_row)
-        if not quote["verified"]:
-            return bad(quote["reason"], 503)
-        start_balance = quote["start_balance"]
-        current_equity = quote["current_equity"]
-        verified_profit = quote["verified_profit"]
-        split_pct = quote["payout_split"]
-        max_payout = quote["available_payout"]
+        awaiting_verification = not quote["verified"]
+        start_balance = quote.get("start_balance", clean(account.get("start_balance") or account.get("account_size") or 0))
+        current_equity = quote.get("current_equity", 0) if not awaiting_verification else 0
+        verified_profit = quote.get("verified_profit", 0) if not awaiting_verification else 0
+        split_pct = quote.get("payout_split", 0) if not awaiting_verification else 0
+        max_payout = quote.get("available_payout", 0) if not awaiting_verification else 0
+        verification_note = ("[NP_PAYOUT_VERIFY_PENDING] Request received. We're verifying your latest account balance."
+                             if awaiting_verification else "")
 
-        if max_payout <= 0:
+        if not awaiting_verification and max_payout <= 0:
             return bad("No verified withdrawable profit yet.", 403)
-        if amount > max_payout:
+        if not awaiting_verification and amount > max_payout:
             return bad(f"Requested amount exceeds verified available payout. Available: {email_money(max_payout)}", 403)
 
         method = str(d.get("payment_method") or d.get("method") or "bank").strip().lower()
@@ -13293,7 +13294,7 @@ def create_payout():
             "mt5_server":account.get("mt5_server") or d.get("mt5_server") or "",
             "account_size":clean(account.get("account_size") or d.get("account_size") or 0),
             "start_balance":start_balance,
-            "current_balance":quote["current_balance"],
+            "current_balance":quote.get("current_balance", 0) if not awaiting_verification else 0,
             "current_equity":current_equity,
             "verified_profit":verified_profit,
             "payout_split":split_pct,
@@ -13306,7 +13307,7 @@ def create_payout():
             "account_name":account_name,
             "status":"pending",
             "note":d.get("note", ""),
-            "admin_note":"",
+            "admin_note":verification_note,
             "requested_at":now,
             "created_at":now,
         }
@@ -13327,7 +13328,7 @@ def create_payout():
                     "account_name":row["account_name"],
                     "status":"pending",
                     "note":row["note"],
-                    "admin_note":"",
+                    "admin_note":verification_note,
                     "requested_at":now,
                 }
                 created = supabase.table("payouts").insert(fallback).execute().data
@@ -13367,7 +13368,7 @@ def create_payout():
 Your payout request has been received.
 
 Amount: {email_money(amount)}
-Available verified payout before this request ({split_pct}% share cap): {email_money(max_payout)}
+{"We are verifying your latest account balance before approval and payment." if awaiting_verification else f"Available verified payout before this request ({split_pct}% share cap): {email_money(max_payout)}"}
 MT5 Login: {row.get("mt5_login") or "Not provided"}
 Bank / Wallet: {row.get("bank_name") or "Not provided"}
 Account / Wallet Address: {row.get("account_number") or "Not provided"}
@@ -13385,14 +13386,14 @@ Email: {row.get("email") or "Not provided"}
 Phone: {row.get("phone") or "Not provided"}
 MT5 Login: {row.get("mt5_login") or "Not provided"}
 Amount: {email_money(amount)}
-Verified Available ({split_pct}% share cap): {email_money(max_payout)}
+{"AWAITING FINANCIAL VERIFICATION — do not approve or pay until latest balance is verified." if awaiting_verification else f"Verified Available ({split_pct}% share cap): {email_money(max_payout)}"}
 Method: {method.upper()}
 Bank / Wallet: {row.get("bank_name") or "Not provided"}
 Account / Wallet Address: {row.get("account_number") or "Not provided"}"""
         )
 
         _audit_safe("payouts", "payout_requested", f"Payout requested amount={amount} available={max_payout}", {"name":"trader","username":row.get("email")}, (created[0].get("id") if created else ""))
-        return ok(created, "Payout request created")
+        return ok(created, "Request received. We are verifying your latest account balance." if awaiting_verification else "Payout request created")
     except Exception as e:
         return bad(e)
 
@@ -13559,8 +13560,22 @@ def approve_payout():
                 409,
             )
 
+        verification_fields = {}
+        if _np_payout_awaiting_verification(payout):
+            quote = _np_verified_payout_quote(account, trader_row)
+            if not quote["verified"]:
+                return bad("Request remains received and awaiting verification. A fresh account update is needed before approval.", 409)
+            import math
+            requested = clean(payout.get("amount"))
+            if not math.isfinite(requested) or requested <= 0 or requested > quote["available_payout"]:
+                return bad("Request remains under review: the requested amount is above the latest verified payout. Review the amount with the trader before approval.", 409)
+            verification_fields = {k: quote[k] for k in
+                ("start_balance", "current_balance", "current_equity", "verified_profit", "payout_split", "available_payout")}
         note = d.get("admin_note","")
+        if "[NP_PAYOUT_VERIFY_PENDING]" in str(note):
+            return bad("Remove the awaiting-verification marker from the approval note after verification.", 409)
         result = _staff_db().table("payouts").update({
+            **verification_fields,
             "status":"approved",
             "approved_at":now_iso(),
             "admin_note":note
@@ -56228,6 +56243,8 @@ def _np_v122_mark_paid_route():
             return bad("Payout not found",404)
         if payout_status(payout) != "approved":
             return bad("Only approved payouts can be marked paid",409)
+        if _np_payout_awaiting_verification(payout):
+            return bad("This request is awaiting balance verification and cannot be paid.", 409)
         note = d.get("admin_note","")
         paid_now = now_iso()
         result = supabase.table("payouts").update({
@@ -58901,7 +58918,7 @@ print("V200 LOADED: dashboard now uses clean live-state across account + trader 
 
 # V201: one exact-account financial quote for dashboard and payout validation.
 # Read-only. Existing eligibility, duplicate payout checks and trading locks remain.
-def _np_verified_payout_quote(account, trader=None, snapshot=None):
+def _np_verified_payout_quote(account, trader=None, snapshot=None, allow_stale=False):
     import math
     a = account or {}
     trader = trader or {}
@@ -58914,6 +58931,7 @@ def _np_verified_payout_quote(account, trader=None, snapshot=None):
     if not aid or not tid or str(a.get("trader_id") or "").strip() != tid or not login:
         return unavailable
     # Retain the pre-existing, management-authorised exact-account recovery.
+    fresh = True
     management = (aid == "55d36867-3523-46af-8193-77c946d98959" and login == "477365592"
                   and a.get("payout_financial_authority") == NAIRAPIPS_V195_MT5_477365592_MANAGEMENT_VERIFIED_PAYOUT)
     if management:
@@ -58940,8 +58958,9 @@ def _np_verified_payout_quote(account, trader=None, snapshot=None):
             if dt.tzinfo is None:
                 return unavailable
             age = (datetime.now(timezone.utc) - dt).total_seconds()
-            if age > 180 or age < -60:
+            if age < -60 or (age > 180 and not allow_stale):
                 return unavailable
+            fresh = age <= 180
         except (ValueError, TypeError):
             return unavailable
         equity = snap.get("current_equity") if snap.get("current_equity") is not None else snap.get("equity")
@@ -58957,10 +58976,11 @@ def _np_verified_payout_quote(account, trader=None, snapshot=None):
         return unavailable
     profit = min(max(0, equity - start), round(start * FUNDED_MAX_GROSS_PROFIT_PERCENT / 100, 2))
     available = max(0, round(profit * split / 100, 2))
-    return {"verified": True, "trader_account_id": aid, "start_balance": start,
+    return {"verified": fresh, "last_verified_available": not fresh, "trader_account_id": aid, "start_balance": start,
             "current_equity": equity, "current_balance": balance, "verified_profit": profit, "payout_split": split,
             "available_payout": available, "observed_at": observed,
-            "reason": "Verified profit is available for payout." if available > 0 else "No verified withdrawable profit yet.",
+            "reason": ("You can submit your request while we verify your latest account balance." if not fresh else
+                       "Verified profit is available for payout." if available > 0 else "No verified withdrawable profit yet."),
             "authority": "V201_EXACT_LIVE_PAYOUT"}
 
 _np_v201_bootstrap_base = app.view_functions.get("trader_bootstrap")
@@ -58994,7 +59014,7 @@ def _np_v201_bootstrap():
                     proof_account = dict(a, current_balance=_NP_V195_VERIFIED_BALANCE, current_equity=_NP_V195_VERIFIED_BALANCE,
                                          start_balance=_NP_V195_FUNDED_CAPITAL,
                                          payout_financial_authority=existing["authority"])
-                quotes[aid] = _np_verified_payout_quote(proof_account, trader, a.get("latest_monitoring_snapshot"))
+                quotes[aid] = _np_verified_payout_quote(proof_account, trader, a.get("latest_monitoring_snapshot"), allow_stale=True)
             a["payout_quote"] = quotes[aid]
     root["payout_quotes"] = quotes
     response.set_data(json.dumps(data, default=str))
@@ -59004,3 +59024,8 @@ def _np_v201_bootstrap():
 
 if _np_v201_bootstrap_base:
     app.view_functions["trader_bootstrap"] = _np_v201_bootstrap
+
+# V202: pending requests remain receivable during MT5 update delays. A marker in
+# the existing payout record preserves verification state across restarts.
+def _np_payout_awaiting_verification(payout):
+    return "[NP_PAYOUT_VERIFY_PENDING]" in str((payout or {}).get("admin_note") or "")

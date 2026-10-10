@@ -10,17 +10,31 @@ from flask import Flask
 TREE = ast.parse((Path(__file__).resolve().parents[1] / 'app.py').read_text())
 
 class DB:
-    def __init__(self, snap): self.snap = snap; self.filters = {}; self.writes = 0
-    def table(self, name): self.name=name; self.filters={}; return self
-    def select(self, *_): return self
-    def eq(self, k, v): self.filters[k]=v; return self
-    def in_(self, *_): return self
-    def order(self, *_, **kw): return self
-    def limit(self, *_): return self
+    def __init__(self, snap):
+        self.snap=snap;self.tables={'payouts':[]};self.writes=[];self.fail_rich=False
+    def table(self,name):
+        self.name=name;self.filters={};self.not_filters={};self.members={};self.mode='read';return self
+    def select(self,*_):return self
+    def eq(self,k,v):self.filters[k]=v;return self
+    def neq(self,k,v):self.not_filters[k]=v;return self
+    def in_(self,k,values):self.members[k]=values;return self
+    def order(self,*_,**kw):return self
+    def limit(self,*_):return self
+    def insert(self,row):self.mode='insert';self.payload=dict(row);return self
+    def update(self,row):self.mode='update';self.payload=dict(row);return self
     def execute(self):
-        rows = [self.snap] if self.name == 'np_live_account_state' and self.snap else []
-        self.data=[r for r in rows if all(str(r.get(k))==str(v) for k,v in self.filters.items())]
-        return self
+        if self.mode=='insert':
+            if self.fail_rich and 'verified_profit' in self.payload:raise RuntimeError('legacy schema')
+            row=dict(self.payload,id='request-1');self.tables.setdefault(self.name,[]).append(row)
+            self.writes.append((self.name,self.mode,dict(row)));self.data=[dict(row)];return self
+        rows=([self.snap] if self.snap else []) if self.name=='np_live_account_state' else self.tables.get(self.name,[])
+        selected=[r for r in rows if all(str(r.get(k))==str(v) for k,v in self.filters.items())
+                  and all(str(r.get(k))!=str(v) for k,v in self.not_filters.items())
+                  and all(r.get(k) in values for k,values in self.members.items())]
+        if self.mode=='update':
+            for r in selected:r.update(self.payload)
+            self.writes.append((self.name,self.mode,dict(self.payload)))
+        self.data=[dict(r) for r in selected];return self
 
 class PayoutTests(unittest.TestCase):
     def setUp(self):
@@ -36,8 +50,11 @@ class PayoutTests(unittest.TestCase):
                       _payout_eligibility=lambda *args,**kw:(True,'ok',dict(self.a)),
                       now_iso=lambda:datetime.now(timezone.utc).isoformat(),
                       email_money=lambda x:str(x),request=__import__('flask').request,
+                      ok=lambda data,message='':(self.app.json.response({'data':data,'message':message}),200),
+                      _staff_db=lambda:self.db,send_email_safe=lambda *args:None,send_admin_alert=lambda *args:None,
+                      _audit_safe=lambda *args:None,_admin_from_payload=lambda d:{},
                       bad=lambda message,status=400:(self.app.json.response({'error':message}),status))
-        funcs=[copy.deepcopy(n) for n in TREE.body if isinstance(n,ast.FunctionDef) and n.name in {'_np_verified_payout_quote','create_payout','_np_v201_bootstrap'}]
+        funcs=[copy.deepcopy(n) for n in TREE.body if isinstance(n,ast.FunctionDef) and n.name in {'_np_verified_payout_quote','create_payout','_np_v201_bootstrap','approve_payout','cancel_payout','_np_payout_awaiting_verification','_np_v122_mark_paid_route'}]
         for f in funcs: f.decorator_list=[]
         exec(compile(ast.Module(body=funcs,type_ignores=[]),'payout','exec'),self.env)
     def quote(self,snapshot=None): return self.env['_np_verified_payout_quote'](self.a,{'id':'owner'},snapshot)
@@ -66,12 +83,77 @@ class PayoutTests(unittest.TestCase):
         with self.app.test_request_context('/create_payout',method='POST',json={'amount':121,'trader_account_id':'exact','current_equity':999999,'payout_split':100}):
             response,status=self.env['create_payout']()
         self.assertEqual(status,403);self.assertIn('120',response.get_json()['error'])
-    def test_missing_update_returns_temporary_error_before_lock(self):
+    def create_delayed(self):
         self.db.snap=None
-        self.env['_set_funded_payout_trade_lock']=lambda *args,**kw:self.fail('must not lock')
-        with self.app.test_request_context('/create_payout',method='POST',json={'amount':100,'trader_account_id':'exact'}):
-            response,status=self.env['create_payout']()
-        self.assertEqual(status,503);self.assertIn('temporarily unavailable',response.get_json()['error'])
+        self.env['_set_funded_payout_trade_lock']=lambda *args,**kw:None
+        with self.app.test_request_context('/create_payout',method='POST',json={'amount':100,'trader_account_id':'exact','bank_name':'bank','account_name':'name','account_number':'123'}):
+            return self.env['create_payout']()
+    def test_missing_update_accepts_request_awaiting_verification(self):
+        response,status=self.create_delayed()
+        self.assertEqual(status,200)
+        p=response.get_json()['data'][0]
+        self.assertEqual(p['status'],'pending')
+        self.assertIn('[NP_PAYOUT_VERIFY_PENDING]',p['admin_note'])
+        self.assertEqual(p['verified_profit'],0)
+        self.assertIn('verifying',response.get_json()['message'])
+    def test_legacy_insert_keeps_verification_marker(self):
+        self.db.fail_rich=True
+        response,status=self.create_delayed()
+        self.assertEqual(status,200)
+        self.assertIn('[NP_PAYOUT_VERIFY_PENDING]',response.get_json()['data'][0]['admin_note'])
+    def test_duplicate_delayed_request_is_blocked(self):
+        self.create_delayed()
+        response,status=self.create_delayed()
+        self.assertEqual(status,409)
+        self.assertEqual(len(self.db.tables['payouts']),1)
+    def prepare_admin(self):
+        self.create_delayed()
+        self.a['account_status']='profit_protected'
+        self.env.update(get_payout_by_id=lambda pid:dict(self.db.tables['payouts'][0]),
+                        _get_exact_trader_account=lambda aid:dict(self.a),
+                        payout_status=lambda p:p['status'],_np_v122_s=lambda v:str(v or ''))
+    def approve(self):
+        with self.app.test_request_context('/approve_payout',method='POST',json={'id':'request-1'}):
+            return self.env['approve_payout']()
+    def test_pending_request_cannot_be_approved_without_fresh_proof(self):
+        self.prepare_admin();response,status=self.approve()
+        self.assertEqual(status,409)
+        self.assertEqual(self.db.tables['payouts'][0]['status'],'pending')
+    def test_same_request_can_be_verified_and_approved_after_updates_resume(self):
+        self.prepare_admin();self.db.snap=self.snap
+        response,status=self.approve()
+        self.assertEqual(status,200)
+        p=self.db.tables['payouts'][0]
+        self.assertEqual(p['status'],'approved');self.assertEqual(p['available_payout'],120)
+        self.assertNotIn('[NP_PAYOUT_VERIFY_PENDING]',p['admin_note'])
+        self.assertEqual(len(self.db.tables['payouts']),1)
+    def test_insufficient_profit_keeps_request_pending_for_review(self):
+        self.prepare_admin();self.db.snap=dict(self.snap,equity=1050)
+        response,status=self.approve()
+        self.assertEqual(status,409)
+        self.assertEqual(self.db.tables['payouts'][0]['status'],'pending')
+    def test_mark_paid_cannot_bypass_verification_even_if_status_was_changed(self):
+        self.prepare_admin();self.db.tables['payouts'][0]['status']='approved'
+        with self.app.test_request_context('/mark_payout_paid',method='POST',json={'id':'request-1'}):
+            response,status=self.env['_np_v122_mark_paid_route']()
+        self.assertEqual(status,409);self.assertIn('cannot be paid',response.get_json()['error'])
+    def test_delayed_request_can_be_cancelled_and_lock_released(self):
+        self.prepare_admin();released=[]
+        self.a['account_status']='assigned_active'
+        self.env.update(_authenticated_trader_id_for_request=lambda tid:('owner',None),
+                        get_trader_by_id=lambda tid:{'id':'owner'},
+                        _release_funded_payout_trade_lock=lambda *args,**kw:released.append(True),
+                        _trader_safe_account_row=lambda a:a)
+        with self.app.test_request_context('/cancel_payout',method='POST',json={'id':'request-1','trader_id':'owner'}):
+            response,status=self.env['cancel_payout']()
+        self.assertEqual(status,200);self.assertEqual(released,[True])
+        self.assertEqual(self.db.tables['payouts'][0]['status'],'cancelled')
+    def test_stale_quote_keeps_last_verified_amount_for_display_only(self):
+        snap=dict(self.snap,observed_at=(datetime.now(timezone.utc)-timedelta(minutes=4)).isoformat())
+        q=self.env['_np_verified_payout_quote'](self.a,{'id':'owner'},snap,allow_stale=True)
+        self.assertFalse(q['verified']);self.assertTrue(q['last_verified_available'])
+        self.assertEqual(q['available_payout'],120)
+        self.assertFalse(self.quote(snap)['verified'])
     def test_valid_request_reaches_existing_lock_using_live_values(self):
         seen=[]
         def lock(*args,**kw): seen.append(True);raise RuntimeError('test lock stopped')

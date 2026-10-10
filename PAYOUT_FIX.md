@@ -31,3 +31,40 @@ them on refresh, distinguishes unavailable data, and removes the fixed 60% copy.
 This file requires deployment to the website host separately from Render.
 The uploaded admin HTML does not perform this customer payout calculation; its
 payout records already use backend verified_profit and available_payout fields.
+
+## V202: receive requests during update delays
+
+A missing or stale financial update no longer rejects an otherwise eligible
+funded trader's submission. The existing duplicate/rejected-cycle checks,
+payment details and pre-submission trading lock remain. The request is stored
+as pending, with [NP_PAYOUT_VERIFY_PENDING] in its existing admin_note field.
+Unverified requests have zero verified financial amounts; the requested amount
+is a request for review, not a confirmed withdrawable entitlement.
+
+The marker survives the existing legacy-schema insert fallback. Approval of a
+marked request requires a fresh exact-account quote and sufficient verified
+profit. The financial evidence and marker removal are written in the same
+conditional pending-to-approved update. The effective V122 mark-paid handler
+blocks requests still carrying the verification marker. Existing cancellation
+releases the payout lock; no new payout status or schema migration is required.
+There is no automatic approval or payment. Admin's approval action verifies the
+existing request after updates resume; the trader need not submit again.
+
+Dashboard quotes can retain a stale last-verified amount for presentation only.
+They remain verified=false, with an observation timestamp. Submission does not
+trust the browser quote. The trader page keeps requests open during delays,
+labels the last known amount and its date, and displays a received/verifying
+label in history. The admin page identifies requests awaiting verification and
+labels the approval button Verify & Approve. These website changes are in both
+/workspace/payout-dashboard-fix/trader_clean.html and admin_clean.html and still
+require publication to the website host separately from Render.
+
+Validation: 24 backend tests, including delayed acceptance, duplicate prevention,
+legacy fallback, blocked premature approval/payment, resumed verification,
+insufficient funds remaining pending, and cancellation. JavaScript syntax
+checks pass for both pages. tests/test_payout_dashboard.js verifies delayed form
+submission, stale amount display, fresh limits, destination validation and
+pending labels. Read-only production schema inspection confirmed all payout
+columns needed by the verification update. No production payout was created or
+changed during testing. Full infrastructure outages can still prevent storage;
+the UI must never report receipt if no request was saved.
