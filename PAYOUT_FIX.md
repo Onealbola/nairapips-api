@@ -150,3 +150,15 @@ two pending requests remain 89999 and 89900. Production data was not altered.
 clone-ID bypass prevention, broker separation, ownership/authentication, preservation
 of payment evidence, and recovery after lost insertion responses. Frontend payout
 validation checks passed. Render completion cannot be checked through this proxy.
+
+Staff sign-in availability (11 October)
+The staff login lookup now uses a direct database request with a two-second
+connection timeout and four-second read timeout, rather than the shared staff
+client. Submitted passwords are compared on the server and are not placed in
+lookup URLs. Existing local bootstrap authentication, active-account checks,
+signed tokens and deferred audit writes remain intact. Dependency failures return
+a generic 503 without database details. No credentials or permissions changed.
+Read-only production staff lookup returned HTTP 200 in 1.07 seconds. Six targeted
+login checks plus the existing payout/dashboard checks passed: 48 total tests.
+This addresses the identified lookup delay; public Render access remains blocked
+by the environment proxy, so server queueing and end-to-end login remain unverified.

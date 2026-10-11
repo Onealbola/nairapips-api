@@ -16809,32 +16809,13 @@ def staff_login():
                 'status': 'active',
             }
         else:
-            # Database lookup is only for additional staff accounts.
-            db = _staff_db()
-            rows = (
-                db.table('admin_staff_members')
-                .select('*')
-                .eq('username', login)
-                .eq('password', password)
-                .limit(1)
-                .execute()
-                .data
-                or []
-            )
-
-            if not rows and '@' in login:
-                rows = (
-                    db.table('admin_staff_members')
-                    .select('*')
-                    .eq('email', login.lower())
-                    .eq('password', password)
-                    .limit(1)
-                    .execute()
-                    .data
-                    or []
-                )
-
-            staff = rows[0] if rows else None
+            # Bounded REST lookup bypasses the shared staff client's stalled
+            # connection pool. Password comparison stays on the server; never
+            # put the submitted password into a URL/database filter.
+            rows = _np_staff_login_rows_v207(login)
+            matches = [row for row in rows if hmac.compare_digest(
+                str(row.get("password") or "").encode("utf-8"), password.encode("utf-8"))]
+            staff = matches[0] if len(matches) == 1 else None
 
         if not staff:
             return jsonify({'success': False, 'error': 'Invalid username/email or password'}), 401
@@ -16881,8 +16862,9 @@ def staff_login():
             'token': token
         })
     except Exception as e:
-        print('STAFF LOGIN ERROR:', repr(e))
-        return jsonify({'success': False, 'error': str(e)}), 500
+        # Avoid returning database details or credential-bearing exceptions.
+        print('STAFF LOGIN ERROR:', type(e).__name__, flush=True)
+        return jsonify({'success': False, 'error': 'Sign-in verification is temporarily unavailable. Please try again shortly.'}), 503
 
 @app.post('/staff_members')
 def create_staff_member():
@@ -59254,3 +59236,24 @@ def _np_v206_disable_paid_account_reactivation():
     return bad("A paid account cannot be reopened for another payout. Use the fresh funded account renewal process.", 409)
 
 app.view_functions["admin_complete_funded_payout_cycle"] = _np_v206_disable_paid_account_reactivation
+
+# Staff authentication is an interactive request. Never spend the client's
+# entire retry window waiting on a shared connection or background audit write.
+def _np_staff_login_rows_v207(login):
+    base = str(SUPABASE_URL or "").rstrip("/")
+    key = str(SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY or "").strip()
+    if not base or not key:
+        raise RuntimeError("Staff verification configuration unavailable")
+    headers = {"apikey": key, "Authorization": "Bearer " + key, "Accept": "application/json"}
+    def lookup(column, value):
+        response = requests.get(base + "/rest/v1/admin_staff_members", headers=headers,
+            params={"select": "*", column: "eq." + value, "limit": "2"}, timeout=(2, 4))
+        response.raise_for_status()
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise RuntimeError("Invalid staff verification response")
+        return rows
+    rows = lookup("username", login)
+    if not rows and "@" in login:
+        rows = lookup("email", login.lower())
+    return rows
