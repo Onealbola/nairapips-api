@@ -26941,10 +26941,11 @@ def _np_ops_make_action(severity, category, code, title, trader=None, purchase=N
 
 
 def _np_ops_build():
-    traders = supabase.table("traders").select("*").limit(5000).execute().data or []
-    accounts = supabase.table("trader_accounts").select("*").order("created_at", desc=False).limit(10000).execute().data or []
-    purchases = supabase.table("challenge_purchases").select("*").order("created_at", desc=False).limit(10000).execute().data or []
-    payouts = supabase.table("payouts").select("*").order("created_at", desc=False).limit(10000).execute().data or []
+    tables = _np_ops_tables_v208()
+    traders = tables["traders"]
+    accounts = tables["trader_accounts"]
+    purchases = tables["challenge_purchases"]
+    payouts = tables["payouts"]
 
     trader_by_id = {str(t.get("id")): t for t in traders if t.get("id")}
     accounts_by_purchase, accounts_by_trader = {}, {}
@@ -54454,9 +54455,7 @@ def _np_ops_build():
             tid = _np_mh_s(item.get("trader_id"))
             if not pid:
                 kept.append(item); continue
-            rows = (supabase.table("trader_accounts").select("*")
-                    .eq("purchase_id", pid).order("created_at", desc=False)
-                    .limit(500).execute().data or [])
+            rows = _np_ops_accounts_v208("purchase_id", pid, 500)
             if tid:
                 rows = [r for r in rows if _np_mh_s(r.get("trader_id")) == tid]
             phase1 = [r for r in rows if _normalize_lifecycle_stage(r.get("stage") or r.get("phase")) == "phase1"]
@@ -54684,9 +54683,7 @@ def _np_ops_build():
                 kept.append(item)
                 continue
 
-            rows = (supabase.table("trader_accounts").select("*")
-                    .eq("purchase_id", pid)
-                    .order("created_at", desc=False).limit(500).execute().data or [])
+            rows = _np_ops_accounts_v208("purchase_id", pid, 500)
             if tid:
                 rows = [r for r in rows if _np_mh_s(r.get("trader_id")) == tid]
 
@@ -55275,9 +55272,7 @@ def _np_ops_build():
             if not pid:
                 kept.append(item); continue
             # Match the original builder's purchase alias behavior.
-            rows=(supabase.table("trader_accounts").select("*")
-                  .eq("trader_id",tid).order("created_at",desc=False)
-                  .limit(1000).execute().data or []) if tid else []
+            rows=_np_ops_accounts_v208("trader_id", tid, 1000) if tid else []
             rows=[r for r in rows if _np_mh_purchase_id(r)==pid]
             phase1=[r for r in rows if _normalize_lifecycle_stage(r.get("stage") or r.get("phase"))=="phase1"]
             pairs=_np_mh_source_pairs_v108(phase1)
@@ -55459,8 +55454,7 @@ def _np_ops_build():
             tid=_np_mh_s(item.get("trader_id")); pid=_np_mh_s(item.get("purchase_id"))
             if not tid or not pid:
                 kept.append(item); continue
-            rows=(supabase.table("trader_accounts").select("*").eq("trader_id",tid)
-                  .order("created_at",desc=False).limit(1000).execute().data or [])
+            rows=_np_ops_accounts_v208("trader_id", tid, 1000)
             rows=[r for r in rows if _np_mh_purchase_id(r)==pid]
             phase1=[r for r in rows if _normalize_lifecycle_stage(r.get("stage") or r.get("phase"))=="phase1"]
             pairs=_np_mh_unique_successor_pairs_v109(phase1)
@@ -59257,3 +59251,50 @@ def _np_staff_login_rows_v207(login):
     if not rows and "@" in login:
         rows = lookup("email", login.lower())
     return rows
+
+
+# Interactive Admin reads: independent REST connections and request-local history.
+def _np_ops_read_v208(table, limit, ordered=True):
+    base = (SUPABASE_URL or "").rstrip("/")
+    key = SUPABASE_KEY
+    headers = {"apikey": key, "Authorization": "Bearer " + key, "Accept": "application/json"}
+    rows = []
+    while len(rows) < limit:
+        size = min(1000, limit - len(rows))
+        params = {"select": "*", "limit": str(size), "offset": str(len(rows))}
+        if ordered:
+            params["order"] = "created_at.asc,id.asc"
+        else:
+            params["order"] = "id.asc"
+        response = requests.get(base + "/rest/v1/" + table, headers=headers,
+                                params=params, timeout=(2, 5))
+        response.raise_for_status()
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Invalid Admin table response")
+        rows.extend(page)
+        if len(page) < size:
+            break
+    return rows
+
+
+def _np_ops_tables_v208():
+    from flask import g
+    from concurrent.futures import ThreadPoolExecutor
+    cached = getattr(g, "np_ops_tables_v208", None)
+    if cached is not None:
+        return cached
+    specs = [("traders", 5000, False), ("trader_accounts", 10000, True),
+             ("challenge_purchases", 10000, True), ("payouts", 10000, True)]
+    # No shared SDK client: each independent read owns its HTTP connection.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {name: pool.submit(_np_ops_read_v208, name, limit, ordered)
+                   for name, limit, ordered in specs}
+        result = {name: future.result() for name, future in futures.items()}
+    g.np_ops_tables_v208 = result
+    return result
+
+
+def _np_ops_accounts_v208(column, value, limit):
+    return [row for row in _np_ops_tables_v208()["trader_accounts"]
+            if str(row.get(column) or "") == str(value)][:limit]

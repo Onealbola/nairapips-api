@@ -162,3 +162,10 @@ Read-only production staff lookup returned HTTP 200 in 1.07 seconds. Six targete
 login checks plus the existing payout/dashboard checks passed: 48 total tests.
 This addresses the identified lookup delay; public Render access remains blocked
 by the environment proxy, so server queueing and end-to-end login remain unverified.
+
+Admin Action Centre refresh (v208): replace shared-client bulk reads with four
+independent bounded REST reads, paginate complete history, and reuse account
+rows across all management-recall reconciliation passes within each request.
+Failures raise rather than report empty successful totals. No financial writes
+or payout approval rules changed. Live read-only validation: 487 traders, 1,903
+accounts, 467 purchases and 348 payouts in 3.5 seconds. 52 tests passed.
