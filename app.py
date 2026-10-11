@@ -55954,6 +55954,12 @@ def _np_v122_finalize(payout, source, child):
     aid = _np_v122_s(c.get("id")); login = _np_v122_s(c.get("mt5_login")); now = now_iso()
     marker = _np_v122_done_marker(pid, aid, login)
 
+    # A recovered partial insert is not delivered until monitoring and pointer
+    # persistence succeed. Reuse the exact child; never allocate another MT5.
+    _np_monitoring_registry_activate(c, predecessor_account_id=sid,
+        reason="paid_payout_replacement_completion:" + pid)
+    _np_update_trader_current_pointer_v59(tid, c, "funded")
+
     # Preserve exact journey link when one exists, but payout authority does not
     # depend on it. This is a post-success bookkeeping repair only.
     source_pid = _np_v122_s(s.get("purchase_id") or s.get("challenge_purchase_id"))
@@ -56359,8 +56365,19 @@ def _np_v122_repair_outstanding_current_paid(limit=80):
             blob=" ".join(_np_v122_s(source.get(k)) for k in ("archive_reason","admin_note")).lower()
             if _np_v122_paid_marker(pid).lower() not in blob:
                 summary["skipped"]+=1; continue
-            if _np_v122_existing_delivery(p,source):
-                summary["skipped"]+=1; continue
+            existing_delivery = _np_v122_existing_delivery(p,source)
+            if existing_delivery:
+                receipt = _np_v122_done_marker(pid, existing_delivery.get("id"), existing_delivery.get("mt5_login")).lower()
+                if receipt in blob:
+                    summary["skipped"]+=1; continue
+                # A reserved/inserted child without its receipt must be completed,
+                # not silently treated as delivered by startup recovery.
+                started = _np_v122_start(pid)
+                if started.get("state") in {"queued", "processing"}:
+                    summary["queued"]+=1
+                else:
+                    summary["skipped"]+=1
+                continue
             if "np_payout_renewal_error_v122:" in blob:
                 summary["skipped"]+=1; continue
             trader=get_trader_by_id(tid) or {}

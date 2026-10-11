@@ -199,3 +199,12 @@ context as execution. Exact trader and management-hold reads honor that context;
 ordinary requests retain their existing transport. Recovery selection and
 management-hold rules remain unchanged. 67 tests passed, including startup
 context restoration.
+
+V213 partial-delivery recovery: startup discovery queues an existing exact child
+without a durable completion receipt, rather than silently skipping it. Finalize
+must successfully register monitoring and persist the current dashboard pointer
+before closing the source cycle. Existing-child reuse prevents a second MT5.
+69 tests passed, including blocked finalization on monitoring failure and startup
+partial-vs-completed delivery behavior. Etim's previously inserted replacement
+was completed directly with exact pool/payout identity, source CAS, active registry
+verification and persisted trader pointer; private before/after audit outside Git.
