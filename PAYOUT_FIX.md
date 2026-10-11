@@ -176,3 +176,12 @@ identity reads return 503 without minting a token or entering legacy lookup.
 Admin authorization remains required. Read-only live lookup verified in 0.69s.
 57 backend tests passed; browser-script tests cover immediate and delayed
 same-origin handoff rendering, acknowledgement and handoff removal.
+
+Owner-reconciled paid replacement (v210): breached-source renewal remains blocked
+unless both the exact PAID payout and funded source carry a privileged exact
+payout exception marker. Require paid_at, matching trader/account/login and
+funded stage. Reset, recall and management-hold checks remain enforced, as do
+existing-delivery checks and database source claims. Startup repair also queues
+these explicitly owed replacements even when the trader mirror points elsewhere.
+62 tests passed. Production reconciliation is private and outside the repository;
+no money was transferred. Original breach facts are retained.

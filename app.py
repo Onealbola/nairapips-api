@@ -55740,9 +55740,10 @@ def _np_v122_load_source(payout):
     return source, "ok"
 
 
-def _np_v122_source_block_reason(source):
+def _np_v122_source_block_reason(source, payout=None):
     s = source or {}
-    if s.get("breached_at"):
+    exception = _np_paid_replacement_exception_v210(s, payout)
+    if s.get("breached_at") and not exception:
         return "source_breached"
     if s.get("reset_at") or s.get("replaced_at") or s.get("superseded_at"):
         return "source_already_reset_or_replaced"
@@ -55754,7 +55755,7 @@ def _np_v122_source_block_reason(source):
         return "source_recalled_or_wrong_assignment"
     # Do not reject simply because the word 'archived' exists. Cap/payout repairs
     # may carry historical archive text while the exact PAID payout is still due.
-    if "max_drawdown" in blob or "account_level_max_drawdown" in blob:
+    if ("max_drawdown" in blob or "account_level_max_drawdown" in blob) and not exception:
         return "source_breached"
     return ""
 
@@ -56040,7 +56041,7 @@ def _np_v122_dryrun(pid):
     if not source:
         return {"ready":False,"reason":why,"payout_id":pid}
     tid = _np_v122_s(p.get("trader_id")); sid = _np_v122_s(source.get("id"))
-    blocked = _np_v122_source_block_reason(source)
+    blocked = _np_v122_source_block_reason(source, p)
     if blocked:
         return {"ready":False,"reason":blocked,"payout_id":pid,"source_account_id":sid,"source_mt5":source.get("mt5_login")}
     try:
@@ -56097,7 +56098,7 @@ def _np_v122_process(pid, actor=None):
             return _np_v122_result(pid,state="blocked",reason=why)
         tid = _np_v122_s(p.get("trader_id")); sid = _np_v122_s(source.get("id"))
 
-        blocked = _np_v122_source_block_reason(source)
+        blocked = _np_v122_source_block_reason(source, p)
         if blocked:
             return _np_v122_result(pid,state="blocked",reason=blocked,source_account_id=sid)
         try:
@@ -56364,7 +56365,8 @@ def _np_v122_repair_outstanding_current_paid(limit=80):
             )
             st=_np_v122_l(source.get("account_status") or source.get("status"))
             stuck=st in {"payout_renewal_waiting_mt5","payout_renewal_assigning","funded_profit_cap_reached","profit_protected","payment_processing","payout_pending","approved_payout_pending"}
-            if not current and not stuck:
+            explicitly_owed = _np_paid_replacement_exception_v210(source, p)
+            if not current and not stuck and not explicitly_owed:
                 summary["skipped"]+=1; continue
             started=_np_v122_start(pid)
             if started.get("state") in {"queued","processing"}: summary["queued"]+=1
@@ -59308,3 +59310,26 @@ def _np_admin_view_trader_v209(trader_id):
     if len(rows) != 1 or str(rows[0].get("id") or "") != trader_id:
         raise RuntimeError("Trader identity mismatch")
     return rows[0]
+
+
+def _np_paid_replacement_exception_v210(source, payout):
+    """Owner-reconciled paid event only; historical breaches remain recorded.
+
+    This marker can only be written through privileged database reconciliation,
+    never through a trader request. It authorizes renewal, not another payment.
+    Existing delivery and database claim checks still govern exact-once issue.
+    """
+    s, p = source or {}, payout or {}
+    pid = str(p.get("id") or "").strip()
+    sid = str(s.get("id") or "").strip()
+    tid = str(s.get("trader_id") or "").strip()
+    if not pid or not sid or not tid or str(p.get("status") or "").lower() != "paid" or not p.get("paid_at"):
+        return False
+    if str(p.get("trader_account_id") or p.get("account_id") or "") != sid or str(p.get("trader_id") or "") != tid:
+        return False
+    if str(s.get("stage") or s.get("phase") or "").lower() != "funded":
+        return False
+    if not s.get("mt5_login") or str(p.get("mt5_login") or "") != str(s.get("mt5_login")):
+        return False
+    marker = "[NP_PAID_REPLACEMENT_EXCEPTION_V210:" + pid + "]"
+    return marker in str(s.get("archive_reason") or "") and marker in str(p.get("admin_note") or "")
