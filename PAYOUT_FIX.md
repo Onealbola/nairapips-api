@@ -185,3 +185,11 @@ existing-delivery checks and database source claims. Startup repair also queues
 these explicitly owed replacements even when the trader mirror points elsewhere.
 62 tests passed. Production reconciliation is private and outside the repository;
 no money was transferred. Original breach facts are retained.
+
+Payout-renewal transport (v211): renewal worker uses bounded independent REST for
+its existing query chains, assignment writes and dashboard pointer persistence.
+ContextVar limits this transport change to that worker; other routes retain their
+existing database path. CAS filters remain intact. Inserts generate one UUID and
+recover only that exact row after a lost response, without repeating the POST.
+Preserve required purchase_id when older schemas lack optional predecessor fields.
+66 tests passed, including lost-response and cross-thread isolation checks.

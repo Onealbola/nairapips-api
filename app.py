@@ -2847,7 +2847,7 @@ def _update_trader_lifecycle(trader_id, state, account=None, extra=None, staff=N
         payload["current_account_id"] = None
     if extra:
         payload.update(extra)
-    result = supabase.table("traders").update(payload).eq("id", trader_id).execute().data or []
+    result = _np_renewal_db_v211().table("traders").update(payload).eq("id", trader_id).execute().data or []
     _log_lifecycle_event(trader_id, account.get("id") if account else None, None, state, action, str(extra or ""), staff)
     return result[0] if result else get_trader_by_id(trader_id)
 
@@ -3494,7 +3494,7 @@ def _np_update_trader_current_pointer_v59(trader_id, account, stage):
     for _attempt in range(12):
         try:
             rows = (
-                supabase.table("traders")
+                _np_renewal_db_v211().table("traders")
                 .update(payload)
                 .eq("id", trader_id)
                 .execute().data or []
@@ -3670,10 +3670,10 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         "updated_at": now,
     }
     print("V175 ASSIGN STEP: create_trader_account", mt5.get("mt5_login"), flush=True)
-    account = (supabase.table("trader_accounts").insert(account_row).execute().data or [None])[0]
+    account = (_np_renewal_db_v211().table("trader_accounts").insert(account_row).execute().data or [None])[0]
     if not account:
         raise RuntimeError("Could not create trader account")
-    supabase.table("mt5_pool").update({
+    _np_renewal_db_v211().table("mt5_pool").update({
         "status": "assigned",
         "assigned_trader_id": trader.get("id"),
         "assigned_trader_name": trader.get("name"),
@@ -3684,7 +3684,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         "admin_note": note,
     }).eq("id", mt5.get("id")).execute()
     if purchase and purchase.get("id"):
-        supabase.table("challenge_purchases").update({
+        _np_renewal_db_v211().table("challenge_purchases").update({
             "payment_status": "approved",
             "status": "approved_active",
             "lifecycle_state": _active_state_for_stage(stage),
@@ -3738,12 +3738,12 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         )
     except Exception as _pointer_err:
         try:
-            supabase.table("trader_accounts").update({
+            _np_renewal_db_v211().table("trader_accounts").update({
                 "monitoring_enabled": False,
                 "account_status": "assignment_sync_error",
                 "updated_at": now_iso(),
             }).eq("id", account.get("id")).execute()
-            supabase.table("mt5_pool").update({
+            _np_renewal_db_v211().table("mt5_pool").update({
                 "status": "assigned_sync_error",
                 "admin_note": f"DO NOT TRADE: dashboard pointer sync failed: {_pointer_err}",
                 "updated_at": now_iso(),
@@ -3767,13 +3767,13 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         )
     except Exception as _registry_err:
         try:
-            supabase.table("trader_accounts").update({
+            _np_renewal_db_v211().table("trader_accounts").update({
                 "monitoring_enabled": False,
                 "account_status": "assignment_sync_error",
                 "updated_at": now_iso(),
                 "archive_reason": f"MONITORING_REGISTRY_ACTIVATION_FAILED: {str(_registry_err)[:300]}",
             }).eq("id", account.get("id")).execute()
-            supabase.table("mt5_pool").update({
+            _np_renewal_db_v211().table("mt5_pool").update({
                 "status": "assigned_sync_error",
                 "admin_note": f"DO NOT TRADE: monitoring registry activation failed: {_registry_err}",
                 "updated_at": now_iso(),
@@ -30913,7 +30913,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         if actual_pid != pid:
             # Fail closed, but preserve the transaction record for forensic review.
             try:
-                supabase.table("trader_accounts").update({
+                _np_renewal_db_v211().table("trader_accounts").update({
                     "account_status": "assignment_quarantined",
                     "monitoring_enabled": False,
                     "archive_reason": (
@@ -30927,7 +30927,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
             raise ValueError("ASSIGNMENT QUARANTINED — new MT5 was not bound to the exact purchase journey")
 
         try:
-            supabase.table("trader_accounts").update({
+            _np_renewal_db_v211().table("trader_accounts").update({
                 "journey_source": "post9_purchase_root_immutable",
                 "updated_at": now_iso(),
             }).eq("id", aid).eq("trader_id", tid).eq("purchase_id", pid).execute()
@@ -45582,7 +45582,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         sid = str(source_match.group(1) or "").strip()
 
         rows = (
-            supabase.table("challenge_purchases").select("*")
+            _np_renewal_db_v211().table("challenge_purchases").select("*")
             .eq("id", oid).limit(1).execute().data or []
         )
         if not rows:
@@ -55712,7 +55712,7 @@ def _np_v122_error_marker(pid, reason):
 
 def _np_v122_load_payout(pid):
     rows = (
-        supabase.table("payouts").select("*")
+        _np_renewal_db_v211().table("payouts").select("*")
         .eq("id", _np_v122_s(pid)).limit(1).execute().data or []
     )
     return rows[0] if rows else None
@@ -55725,7 +55725,7 @@ def _np_v122_load_source(payout):
     if not tid or not sid:
         return None, "missing_exact_payout_linkage"
     rows = (
-        supabase.table("trader_accounts").select("*")
+        _np_renewal_db_v211().table("trader_accounts").select("*")
         .eq("id", sid).eq("trader_id", tid).limit(1).execute().data or []
     )
     if not rows:
@@ -55771,20 +55771,20 @@ def _np_v122_purchase_hint(source):
     candidates = {}
     if direct:
         try:
-            rows = supabase.table("challenge_purchases").select("*").eq("id", direct).eq("trader_id", tid).limit(1).execute().data or []
+            rows = _np_renewal_db_v211().table("challenge_purchases").select("*").eq("id", direct).eq("trader_id", tid).limit(1).execute().data or []
             for r in rows: candidates[_np_v122_s(r.get("id"))] = r
         except Exception:
             pass
     if not candidates and tid and sid:
         try:
-            rows = supabase.table("challenge_purchases").select("*").eq("trader_id", tid).eq("trader_account_id", sid).limit(10).execute().data or []
+            rows = _np_renewal_db_v211().table("challenge_purchases").select("*").eq("trader_id", tid).eq("trader_account_id", sid).limit(10).execute().data or []
             for r in rows:
                 if _np_v122_s(r.get("id")): candidates[_np_v122_s(r.get("id"))] = r
         except Exception:
             pass
     if not candidates and tid and login:
         try:
-            rows = supabase.table("challenge_purchases").select("*").eq("trader_id", tid).eq("mt5_login", login).limit(10).execute().data or []
+            rows = _np_renewal_db_v211().table("challenge_purchases").select("*").eq("trader_id", tid).eq("mt5_login", login).limit(10).execute().data or []
             for r in rows:
                 if _np_v122_s(r.get("id")): candidates[_np_v122_s(r.get("id"))] = r
         except Exception:
@@ -55808,21 +55808,21 @@ def _np_v122_existing_delivery(payout, source):
     m = re.search(r"\[NP_PAYOUT_RENEWAL_DONE_V122:" + re.escape(pid) + r":([^:\]]+):([^\]]+)\]", blob, re.I)
     if m:
         aid = _np_v122_s(m.group(1)); login = _np_v122_s(m.group(2))
-        rows = supabase.table("trader_accounts").select("*").eq("id", aid).eq("trader_id", tid).limit(1).execute().data or []
+        rows = _np_renewal_db_v211().table("trader_accounts").select("*").eq("id", aid).eq("trader_id", tid).limit(1).execute().data or []
         if rows and (not login or _np_v122_s(rows[0].get("mt5_login")) == login):
             return rows[0]
 
     # Exact payout marker on the consumed MT5 pool row.
     exact = f"[np_payout_renewal_v122:{pid.lower()}]"
     try:
-        rows = supabase.table("mt5_pool").select("*").eq("assigned_trader_id", tid).order("updated_at", desc=True).limit(1000).execute().data or []
+        rows = _np_renewal_db_v211().table("mt5_pool").select("*").eq("assigned_trader_id", tid).order("updated_at", desc=True).limit(1000).execute().data or []
     except Exception:
         rows = []
     matches = [r for r in rows if exact in _np_v122_s(r.get("admin_note")).lower()]
     if len(matches) == 1:
         mrow = matches[0]
         aid = _np_v122_s(mrow.get("trader_account_id"))
-        q = supabase.table("trader_accounts").select("*").eq("trader_id", tid)
+        q = _np_renewal_db_v211().table("trader_accounts").select("*").eq("trader_id", tid)
         if aid:
             q = q.eq("id", aid)
         else:
@@ -55834,7 +55834,7 @@ def _np_v122_existing_delivery(payout, source):
     # Exact source link written after successful V122 assignment.
     try:
         rows = (
-            supabase.table("trader_accounts").select("*")
+            _np_renewal_db_v211().table("trader_accounts").select("*")
             .eq("trader_id", tid).eq("previous_trader_account_id", sid)
             .order("created_at", desc=True).limit(20).execute().data or []
         )
@@ -55847,7 +55847,7 @@ def _np_v122_existing_delivery(payout, source):
     # Reuse existing exact business helper if it can prove the replacement.
     try:
         trader = get_trader_by_id(tid) or {}
-        all_rows = supabase.table("trader_accounts").select("*").eq("trader_id", tid).order("created_at", desc=False).limit(1000).execute().data or []
+        all_rows = _np_renewal_db_v211().table("trader_accounts").select("*").eq("trader_id", tid).order("created_at", desc=False).limit(1000).execute().data or []
         helper = globals().get("_np_exact_post_payout_replacement_20260908")
         if callable(helper):
             child = helper(s, p, all_rows, trader)
@@ -55889,7 +55889,7 @@ def _np_v122_claim_source(payout, source):
     ).strip(" |")
     marker = _np_v122_claim_marker(pid, token)
     new_reason = _np_v122_append(cleaned, marker)
-    q = supabase.table("trader_accounts").update({"archive_reason":new_reason, "updated_at":now_iso()}).eq("id",sid).eq("trader_id",tid)
+    q = _np_renewal_db_v211().table("trader_accounts").update({"archive_reason":new_reason, "updated_at":now_iso()}).eq("id",sid).eq("trader_id",tid)
     # Database compare-and-set without introducing a lifecycle status.
     if raw_reason is None:
         try:
@@ -55915,7 +55915,7 @@ def _np_v122_set_candidate(source, payout_id, claim, candidate_login):
     replacement = _np_v122_claim_marker(pid, token, candidate_login)
     new = re.sub(pattern, replacement, old, flags=re.I)
     try:
-        rows = supabase.table("trader_accounts").update({"archive_reason":new,"updated_at":now_iso()}).eq("id",sid).eq("trader_id",tid).eq("archive_reason",old).execute().data or []
+        rows = _np_renewal_db_v211().table("trader_accounts").update({"archive_reason":new,"updated_at":now_iso()}).eq("id",sid).eq("trader_id",tid).eq("archive_reason",old).execute().data or []
         return rows[0] if rows else s
     except Exception:
         return s
@@ -55930,7 +55930,7 @@ def _np_v122_recover_claim_candidate(payout, source):
     if not login or login == "-":
         return None
     try:
-        pools = supabase.table("mt5_pool").select("*").eq("mt5_login", login).limit(2).execute().data or []
+        pools = _np_renewal_db_v211().table("mt5_pool").select("*").eq("mt5_login", login).limit(2).execute().data or []
         if len(pools) != 1:
             return None
         pool = pools[0]
@@ -55940,7 +55940,7 @@ def _np_v122_recover_claim_candidate(payout, source):
         pstatus = _np_v122_l(pool.get("status"))
         if pstatus not in {"assigned","assigned_active","assigned_sync_error","active","in_use","used","allocated"}:
             return None
-        rows = supabase.table("trader_accounts").select("*").eq("trader_id",tid).eq("mt5_login",login).limit(2).execute().data or []
+        rows = _np_renewal_db_v211().table("trader_accounts").select("*").eq("trader_id",tid).eq("mt5_login",login).limit(2).execute().data or []
         if len(rows) == 1 and _normalize_lifecycle_stage(rows[0].get("stage") or rows[0].get("phase")) == "funded":
             return rows[0]
     except Exception:
@@ -55965,14 +55965,19 @@ def _np_v122_finalize(payout, source, child):
     if source_pid:
         child_patch["purchase_id"] = source_pid
     try:
-        supabase.table("trader_accounts").update(child_patch).eq("id",aid).eq("trader_id",tid).execute()
+        _np_renewal_db_v211().table("trader_accounts").update(child_patch).eq("id",aid).eq("trader_id",tid).execute()
     except Exception as exc:
         print("V122 CHILD LINEAGE PATCH WARNING:", pid, exc, flush=True)
+        # Older schemas lack previous_trader_account_id; do not lose purchase_id.
+        if source_pid:
+            _np_renewal_db_v211().table("trader_accounts").update({
+                "purchase_id": source_pid, "updated_at": now
+            }).eq("id", aid).eq("trader_id", tid).execute()
 
     # If the original purchase exists, advance only its compatibility pointer.
     if source_pid:
         try:
-            supabase.table("challenge_purchases").update({
+            _np_renewal_db_v211().table("challenge_purchases").update({
                 "trader_account_id": aid,
                 "mt5_login": login,
                 "mt5_server": c.get("mt5_server"),
@@ -55992,7 +55997,7 @@ def _np_v122_finalize(payout, source, child):
         "", old_reason, flags=re.I
     ).strip(" |")
     final_reason = _np_v122_append(_np_v122_append(clean_reason, _np_v122_paid_marker(pid)), marker)
-    supabase.table("trader_accounts").update({
+    _np_renewal_db_v211().table("trader_accounts").update({
         "account_status":"archived",
         "monitoring_enabled":False,
         "archive_reason":final_reason,
@@ -56004,7 +56009,7 @@ def _np_v122_finalize(payout, source, child):
     old_login = _np_v122_s(s.get("mt5_login"))
     if old_login:
         try:
-            supabase.table("mt5_pool").update({
+            _np_renewal_db_v211().table("mt5_pool").update({
                 "status":"archived",
                 "updated_at":now,
                 "admin_note":f"PAID PAYOUT CYCLE CLOSED V122 payout_id={pid}; replacement_mt5={login}",
@@ -56015,7 +56020,7 @@ def _np_v122_finalize(payout, source, child):
     try:
         fresh = _np_v122_load_payout(pid) or p
         note = _np_v122_append(_np_v122_s(fresh.get("admin_note")), marker)
-        supabase.table("payouts").update({"admin_note":note,"updated_at":now}).eq("id",pid).execute()
+        _np_renewal_db_v211().table("payouts").update({"admin_note":note,"updated_at":now}).eq("id",pid).execute()
     except Exception as exc:
         print("V122 PAYOUT RECEIPT WARNING:", pid, exc, flush=True)
 
@@ -56172,7 +56177,7 @@ def _np_v122_process(pid, actor=None):
                     "", old, flags=re.I
                 ).strip(" |")
                 new_reason = _np_v122_append(clean_reason, _np_v122_error_marker(pid, err))
-                supabase.table("trader_accounts").update({"archive_reason":new_reason,"updated_at":now_iso()}).eq("id",sid).eq("trader_id",tid).execute()
+                _np_renewal_db_v211().table("trader_accounts").update({"archive_reason":new_reason,"updated_at":now_iso()}).eq("id",sid).eq("trader_id",tid).execute()
             except Exception:
                 pass
             return _np_v122_result(pid,state="assignment_error",reason=err,candidate_mt5=mt5.get("mt5_login"),account_size=size)
@@ -56730,7 +56735,7 @@ def _np_v122_load_source(payout):
 
     try:
         rows = (
-            supabase.table("trader_accounts").select("*")
+            _np_renewal_db_v211().table("trader_accounts").select("*")
             .eq("trader_id", tid).order("updated_at", desc=True).limit(500).execute().data or []
         )
     except Exception as exc:
@@ -59333,3 +59338,89 @@ def _np_paid_replacement_exception_v210(source, payout):
         return False
     marker = "[NP_PAID_REPLACEMENT_EXCEPTION_V210:" + pid + "]"
     return marker in str(s.get("archive_reason") or "") and marker in str(p.get("admin_note") or "")
+
+
+from contextvars import ContextVar as _NPContextVarV211
+_NP_RENEWAL_REST_V211 = _NPContextVarV211("np_renewal_rest", default=False)
+
+
+class _NPRenewalRestQueryV211:
+    """Small bounded transport for the existing payout-renewal query chains.
+
+    No automatic mutation retry. Inserts carry one UUID and recover only that
+    exact row after a lost response. CAS filters are forwarded unchanged.
+    """
+    def __init__(self, table):
+        self.table_name = table
+        self.method = "GET"
+        self.params = {}
+        self.payload = None
+    def select(self, columns="*"):
+        self.params["select"] = columns
+        return self
+    def eq(self, column, value):
+        self.params[column] = "eq." + str(value)
+        return self
+    def is_(self, column, value):
+        self.params[column] = "is." + str(value)
+        return self
+    def limit(self, value):
+        self.params["limit"] = str(value)
+        return self
+    def order(self, column, desc=False):
+        self.params["order"] = column + (".desc" if desc else ".asc")
+        return self
+    def update(self, payload):
+        self.method, self.payload = "PATCH", dict(payload)
+        return self
+    def insert(self, payload):
+        import uuid
+        self.method, self.payload = "POST", dict(payload)
+        self.payload.setdefault("id", str(uuid.uuid4()))
+        return self
+    def execute(self):
+        from types import SimpleNamespace
+        base, headers = _np_v184_rest_headers()
+        headers = dict(headers, Prefer="return=representation")
+        url = base + "/rest/v1/" + self.table_name
+        try:
+            response = requests.request(self.method, url, headers=headers,
+                params=self.params, json=self.payload, timeout=(2, 7))
+            if response.status_code >= 400:
+                raise RuntimeError("Renewal database request failed: " + response.text[:300])
+            rows = response.json()
+            if not isinstance(rows, list):
+                raise RuntimeError("Invalid renewal database response")
+            return SimpleNamespace(data=rows)
+        except Exception:
+            if self.method != "POST":
+                raise
+            # A committed insert with a lost HTTP response must not be repeated.
+            response = requests.get(url, headers=headers,
+                params={"select": "*", "id": "eq." + str(self.payload["id"]), "limit": "2"}, timeout=(2, 7))
+            response.raise_for_status()
+            rows = response.json()
+            if not isinstance(rows, list) or len(rows) != 1:
+                raise RuntimeError("Renewal insert could not be confirmed; no insert retry performed")
+            row = rows[0]
+            for column in ("id", "trader_id", "mt5_login", "stage"):
+                if column in self.payload and str(row.get(column)) != str(self.payload[column]):
+                    raise RuntimeError("Renewal insert identity mismatch")
+            return SimpleNamespace(data=rows)
+
+
+def _np_renewal_db_v211():
+    from types import SimpleNamespace
+    if not _NP_RENEWAL_REST_V211.get():
+        return supabase
+    return SimpleNamespace(table=_NPRenewalRestQueryV211)
+
+
+_np_v122_process_v211_core = _np_v122_process
+
+def _np_v122_process(pid, actor=None):
+    token = _NP_RENEWAL_REST_V211.set(True)
+    try:
+        return _np_v122_process_v211_core(pid, actor)
+    finally:
+        _NP_RENEWAL_REST_V211.reset(token)
