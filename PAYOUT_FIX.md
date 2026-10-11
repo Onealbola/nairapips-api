@@ -193,3 +193,9 @@ existing database path. CAS filters remain intact. Inserts generate one UUID and
 recover only that exact row after a lost response, without repeating the POST.
 Preserve required purchase_id when older schemas lack optional predecessor fields.
 66 tests passed, including lost-response and cross-thread isolation checks.
+
+V212: Startup outstanding-paid discovery now enters the same isolated REST
+context as execution. Exact trader and management-hold reads honor that context;
+ordinary requests retain their existing transport. Recovery selection and
+management-hold rules remain unchanged. 67 tests passed, including startup
+context restoration.

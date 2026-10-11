@@ -30,3 +30,11 @@ class TransportTests(unittest.TestCase):
    self.assertIsNot(helper(),self.sdk);seen=[];t=threading.Thread(target=lambda:seen.append(helper()));t.start();t.join();self.assertIs(seen[0],self.sdk)
   finally:self.ctx.reset(token)
   self.assertIs(helper(),self.sdk)
+
+class RecoveryContextTests(unittest.TestCase):
+ def test_startup_recovery_enters_and_restores_isolated_context(self):
+  ctx=ContextVar('recovery',default=False);observed=[]
+  ns={'_NP_RENEWAL_REST_V211':ctx,'_np_v122_repair_v212_core':lambda limit:observed.append((ctx.get(),limit)) or {'queued':1}}
+  nodes=[n for n in TREE.body if isinstance(n,ast.FunctionDef) and n.name=='_np_v122_repair_outstanding_current_paid']
+  exec(compile(ast.Module(body=[nodes[-1]],type_ignores=[]),'startup','exec'),ns)
+  self.assertEqual(ns['_np_v122_repair_outstanding_current_paid'](80),{'queued':1});self.assertEqual(observed,[(True,80)]);self.assertFalse(ctx.get())

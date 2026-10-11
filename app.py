@@ -7002,7 +7002,7 @@ def get_purchase_by_id(pid):
     return rows[0] if rows else {}
 
 def get_trader_by_id(tid):
-    rows = supabase.table("traders").select("*").eq("id", tid).limit(1).execute().data or []
+    rows = _np_renewal_db_v211().table("traders").select("*").eq("id", tid).limit(1).execute().data or []
     return rows[0] if rows else {}
 
 def send_mt5_reset_email(trader, mt5_login="", mt5_server="", master_password="", investor_password="", reason="MT5 login details updated"):
@@ -54018,7 +54018,7 @@ def _np_mh_find_active(trader_id, purchase_id=None):
     if not tid:
         return None
     try:
-        q = supabase.table("trader_accounts").select("*").eq("trader_id", tid)
+        q = _np_renewal_db_v211().table("trader_accounts").select("*").eq("trader_id", tid)
         if pid:
             # purchase_id is canonical in current production; fallback below handles legacy alias.
             rows = q.order("updated_at", desc=True).limit(500).execute().data or []
@@ -54043,7 +54043,7 @@ def _np_mh_account(account_id, trader_id=None):
     aid, tid = _np_mh_s(account_id), _np_mh_s(trader_id)
     if not aid:
         return None
-    q = supabase.table("trader_accounts").select("*").eq("id", aid)
+    q = _np_renewal_db_v211().table("trader_accounts").select("*").eq("id", aid)
     if tid:
         q = q.eq("trader_id", tid)
     rows = q.limit(1).execute().data or []
@@ -56344,7 +56344,7 @@ def _np_v122_repair_outstanding_current_paid(limit=80):
     No date window and no generic history sweep."""
     summary={"checked":0,"queued":0,"skipped":0,"errors":0,"at":now_iso()}
     try:
-        payouts = supabase.table("payouts").select("*").eq("status","paid").order("paid_at",desc=True).limit(limit).execute().data or []
+        payouts = _np_renewal_db_v211().table("payouts").select("*").eq("status","paid").order("paid_at",desc=True).limit(limit).execute().data or []
     except Exception as exc:
         summary["errors"]+=1; summary["error"]=str(exc)[:300]; return summary
     for p in payouts:
@@ -59422,5 +59422,16 @@ def _np_v122_process(pid, actor=None):
     token = _NP_RENEWAL_REST_V211.set(True)
     try:
         return _np_v122_process_v211_core(pid, actor)
+    finally:
+        _NP_RENEWAL_REST_V211.reset(token)
+
+
+_np_v122_repair_v212_core = _np_v122_repair_outstanding_current_paid
+
+def _np_v122_repair_outstanding_current_paid(limit=80):
+    # Startup discovery must use the same isolated transport as execution.
+    token = _NP_RENEWAL_REST_V211.set(True)
+    try:
+        return _np_v122_repair_v212_core(limit)
     finally:
         _NP_RENEWAL_REST_V211.reset(token)
