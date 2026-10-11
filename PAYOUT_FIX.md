@@ -169,3 +169,10 @@ rows across all management-recall reconciliation passes within each request.
 Failures raise rather than report empty successful totals. No financial writes
 or payout approval rules changed. Live read-only validation: 487 traders, 1,903
 accounts, 467 purchases and 348 payouts in 3.5 seconds. 52 tests passed.
+
+Admin View session (v209): exact trader identity resolution uses bounded REST
+instead of the shared SDK. Missing exact traders return 404; failed or mismatched
+identity reads return 503 without minting a token or entering legacy lookup.
+Admin authorization remains required. Read-only live lookup verified in 0.69s.
+57 backend tests passed; browser-script tests cover immediate and delayed
+same-origin handoff rendering, acknowledgement and handoff removal.

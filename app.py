@@ -6308,22 +6308,13 @@ def admin_view_trader_token():
 
         trader = None
 
-        # FAST PATH: Admin cards already know the exact trader UUID.
+        # Exact selections never enter the ambiguous legacy lookup path.
         if exact_id:
             try:
-                rows = (
-                    supabase.table("traders")
-                    .select("*")
-                    .eq("id", exact_id)
-                    .limit(1)
-                    .execute().data or []
-                )
-                trader = rows[0] if rows else None
-            except Exception as exc:
-                print("V145 ADMIN VIEW DIRECT-ID LOOKUP WARNING:", exc, flush=True)
-
-        # Compatibility fallback for older callers without a trader_id.
-        if trader is None and lookup:
+                trader = _np_admin_view_trader_v209(exact_id)
+            except Exception:
+                return bad("Trader session service is temporarily unavailable. Please retry.", 503)
+        elif lookup:
             trader = _latest_trader_for_lookup(lookup)
 
         if not trader:
@@ -59298,3 +59289,22 @@ def _np_ops_tables_v208():
 def _np_ops_accounts_v208(column, value, limit):
     return [row for row in _np_ops_tables_v208()["trader_accounts"]
             if str(row.get(column) or "") == str(value)][:limit]
+
+
+def _np_admin_view_trader_v209(trader_id):
+    """Bound the exact Admin View identity read; never mint a token on failure."""
+    base = (SUPABASE_URL or "").rstrip("/")
+    key = SUPABASE_KEY
+    response = requests.get(base + "/rest/v1/traders",
+        headers={"apikey": key, "Authorization": "Bearer " + key, "Accept": "application/json"},
+        params={"select": "*", "id": "eq." + trader_id, "limit": "2"},
+        timeout=(2, 4))
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list):
+        raise RuntimeError("Invalid trader identity response")
+    if not rows:
+        return None
+    if len(rows) != 1 or str(rows[0].get("id") or "") != trader_id:
+        raise RuntimeError("Trader identity mismatch")
+    return rows[0]
