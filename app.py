@@ -891,7 +891,7 @@ def _safe_purchase_for_account(account):
     try:
         purchase_id = str(account.get("purchase_id") or account.get("challenge_purchase_id") or "").strip()
         if purchase_id:
-            rows = supabase.table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
+            rows = _np_renewal_db_v211().table("challenge_purchases").select("*").eq("id", purchase_id).limit(1).execute().data or []
             if rows:
                 return rows[0]
     except Exception as e:
@@ -2759,7 +2759,7 @@ def _mt5_login_has_any_history(mt5_login, exclude_mt5_pool_id=None):
 
     for table, column in checks:
         try:
-            rows = supabase.table(table).select("id").eq(column, login).limit(1).execute().data or []
+            rows = _np_renewal_db_v211().table(table).select("id").eq(column, login).limit(1).execute().data or []
             if rows:
                 return True, f"MT5 {login} already exists in {table}.{column}"
         except Exception as e:
@@ -2769,7 +2769,7 @@ def _mt5_login_has_any_history(mt5_login, exclude_mt5_pool_id=None):
     # Also protect against mt5_pool rows that were previously assigned but later
     # manually marked available again. This check ignores the selected row's own id.
     try:
-        rows = supabase.table("mt5_pool").select("*").eq("mt5_login", login).limit(20).execute().data or []
+        rows = _np_renewal_db_v211().table("mt5_pool").select("*").eq("mt5_login", login).limit(20).execute().data or []
         for row in rows:
             if exclude_mt5_pool_id and str(row.get("id")) == str(exclude_mt5_pool_id):
                 # The selected vault row is allowed only if it has never carried assignment evidence.
@@ -2947,7 +2947,7 @@ def _np_mt5_auto_eligible(mt5, account_size=None, target_stage=None):
 def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
     expected_pool = _np_expected_pool_class(target_stage)
     try:
-        rows=(supabase.table("mt5_pool").select("*")
+        rows=(_np_renewal_db_v211().table("mt5_pool").select("*")
               .eq("account_size",clean(account_size))
               .eq("pool_class",expected_pool)
               .order("created_at",desc=True).limit(250).execute().data or [])
@@ -2955,7 +2955,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
         # Compatibility during migration: existing rows are PHASE only.
         if expected_pool == "funded":
             return None
-        rows=supabase.table("mt5_pool").select("*").eq("account_size",clean(account_size)).order("created_at",desc=True).limit(250).execute().data or []
+        rows=_np_renewal_db_v211().table("mt5_pool").select("*").eq("account_size",clean(account_size)).order("created_at",desc=True).limit(250).execute().data or []
     for m in rows:
         ok,_=_np_mt5_auto_eligible(m,account_size,target_stage)
         if ok: return m
@@ -38154,7 +38154,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
 
     statuses = ["available", "unused", "new", "ready", "open"]
     try:
-        q = (supabase.table("mt5_pool").select("*")
+        q = (_np_renewal_db_v211().table("mt5_pool").select("*")
              .eq("account_size", size)
              .eq("pool_class", expected_pool)
              .in_("status", statuses)
@@ -38168,7 +38168,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
             print("V38 FUNDED MT5 PICK QUERY ERROR:", exc)
             return None
         try:
-            rows = (supabase.table("mt5_pool").select("*")
+            rows = (_np_renewal_db_v211().table("mt5_pool").select("*")
                     .eq("account_size", size)
                     .in_("status", statuses)
                     .order("created_at", desc=True).limit(80)
@@ -39489,7 +39489,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
     while start < max_candidates:
         try:
             q = (
-                supabase.table("mt5_pool").select("*")
+                _np_renewal_db_v211().table("mt5_pool").select("*")
                 .eq("account_size", size)
                 .eq("pool_class", expected_pool)
                 .in_("status", statuses)
@@ -39504,7 +39504,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
                 return None
             try:
                 rows = (
-                    supabase.table("mt5_pool").select("*")
+                    _np_renewal_db_v211().table("mt5_pool").select("*")
                     .eq("account_size", size)
                     .in_("status", statuses)
                     .order("created_at", desc=True)
@@ -39841,7 +39841,7 @@ def _mt5_login_has_any_history(mt5_login, exclude_mt5_pool_id=None):
     # incorrectly treating inventory as unavailable.
     try:
         rows = (
-            supabase.table("trader_accounts").select("id,mt5_login")
+            _np_renewal_db_v211().table("trader_accounts").select("id,mt5_login")
             .eq("mt5_login", login).limit(1).execute().data or []
         )
     except Exception as exc:
@@ -39893,7 +39893,7 @@ def _np_used_mt5_logins_batch_v48(pool_rows):
     for chunk in _np_chunks_v48(logins):
         try:
             hist = (
-                supabase.table("trader_accounts").select("mt5_login")
+                _np_renewal_db_v211().table("trader_accounts").select("mt5_login")
                 .in_("mt5_login", chunk).limit(10000).execute().data or []
             )
         except Exception as exc:
@@ -39923,7 +39923,7 @@ def _np_used_mt5_logins_batch_v48(pool_rows):
         for chunk in _np_chunks_v48(remaining):
             try:
                 hist = (
-                    supabase.table(table).select(column)
+                    _np_renewal_db_v211().table(table).select(column)
                     .in_(column, chunk).limit(10000).execute().data or []
                 )
                 for h in hist:
@@ -39938,7 +39938,7 @@ def _np_used_mt5_logins_batch_v48(pool_rows):
     for chunk in _np_chunks_v48(logins):
         try:
             pool_hist = (
-                supabase.table("mt5_pool").select(
+                _np_renewal_db_v211().table("mt5_pool").select(
                     "id,mt5_login,status,assigned_trader_id,assigned_trader_name,"
                     "assigned_email,trader_account_id,assigned_at,archived_at,archive_reason"
                 )
@@ -40006,7 +40006,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
     while start < max_candidates:
         try:
             rows = (
-                supabase.table("mt5_pool").select("*")
+                _np_renewal_db_v211().table("mt5_pool").select("*")
                 .eq("account_size", size)
                 .eq("pool_class", expected_pool)
                 .in_("status", statuses)
@@ -40020,7 +40020,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
                 return None
             try:
                 rows = (
-                    supabase.table("mt5_pool").select("*")
+                    _np_renewal_db_v211().table("mt5_pool").select("*")
                     .eq("account_size", size)
                     .in_("status", statuses)
                     .order("created_at", desc=True)
@@ -48565,7 +48565,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
     while start < max_candidates:
         try:
             rows = (
-                supabase.table("mt5_pool").select("*")
+                _np_renewal_db_v211().table("mt5_pool").select("*")
                 .eq("account_size", size)
                 .eq("pool_class", expected_pool)
                 .in_("status", statuses)
@@ -48580,7 +48580,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
                 return None
             try:
                 rows = (
-                    supabase.table("mt5_pool").select("*")
+                    _np_renewal_db_v211().table("mt5_pool").select("*")
                     .eq("account_size", size)
                     .in_("status", statuses)
                     .order("created_at", desc=False)
@@ -49228,7 +49228,7 @@ def _np_pick_fresh_mt5(account_size, target_stage="phase1"):
     while start < max_candidates:
         try:
             rows = (
-                supabase.table("mt5_pool").select("*")
+                _np_renewal_db_v211().table("mt5_pool").select("*")
                 .eq("account_size", size)
                 .eq("pool_class", expected_pool)
                 .in_("status", statuses)
@@ -58138,7 +58138,7 @@ def _np_retry_clean_pass_funded_v19(limit=250):
         base, headers = _np_v184_rest_headers()
         params = {
             "select": "*",
-            "account_status": "eq.archived_phase1",
+            "account_status": "in.(archived_phase1,archived_phase2)",
             "order": "updated_at.desc",
             "limit": str(page_size),
             "offset": str(offset),
@@ -58174,7 +58174,7 @@ def _np_retry_clean_pass_funded_v19(limit=250):
                 continue
 
             # Current product route may be Phase1->Funded or Phase1->Phase2.
-            target = _next_stage_for_lifecycle("phase1", source, purchase, None, None)
+            target = _next_stage_for_lifecycle(source.get("stage") or source.get("phase"), source, purchase, None, None)
             target = _normalize_lifecycle_stage(target, "")
             if target not in ACCOUNT_STAGES:
                 continue
@@ -58253,6 +58253,8 @@ def admin_assignment_v184_status():
         "lifecycle_progression": "REST_FIRST_EXACT_LINEAGE",
         "v40_worker_enabled": _NP_LIFECYCLE_WORKER_STARTED_V40,
         "v40_last_summary": _NP_LIFECYCLE_WORKER_LAST_SUMMARY_V40,
+        "live_pass_reconciliation": dict(globals().get("_NP_V214_LAST_LIVE_PASS_SCAN") or {}),
+        "pass_assignment_release": "V214_EXACT_LIVE_PASS_RECONCILIATION",
         "sync_repair_last": _NP_V184_REPAIR_LAST,
     })
 
@@ -59387,6 +59389,14 @@ class _NPRenewalRestQueryV211:
     def order(self, column, desc=False):
         self.params["order"] = column + (".desc" if desc else ".asc")
         return self
+    def in_(self, column, values):
+        import json
+        self.params[column] = "in.(" + ",".join(json.dumps(str(v)) for v in values) + ")"
+        return self
+    def range(self, first, last):
+        self.params["offset"] = str(first)
+        self.params["limit"] = str(last - first + 1)
+        return self
     def update(self, payload):
         self.method, self.payload = "PATCH", dict(payload)
         return self
@@ -59452,3 +59462,240 @@ def _np_v122_repair_outstanding_current_paid(limit=80):
         return _np_v122_repair_v212_core(limit)
     finally:
         _NP_RENEWAL_REST_V211.reset(token)
+
+
+# V214: durable evaluation passes from the same exact live-state authority that
+# powers dashboard balances. Uses the existing lifecycle worker, no new thread.
+_NP_V214_LIVE_CURSOR = 0
+_NP_V214_LAST_LIVE_PASS_SCAN = {}
+
+
+def _np_live_pass_proof_v214(account, snapshot, purchase, now=None):
+    import math
+    from datetime import datetime, timezone
+    a, live, p = account or {}, snapshot or {}, purchase or {}
+    aid, tid = str(a.get("id") or ""), str(a.get("trader_id") or "")
+    stage = str(a.get("stage") or "").lower()
+    if not aid or not tid or stage not in {"phase1", "phase2"}:
+        return None
+    if str(a.get("account_status") or "").lower() != "assigned_active" or not a.get("monitoring_enabled"):
+        return None
+    if a.get("breached_at") or a.get("breach_reason") or a.get("reset_at") or a.get("replaced_at"):
+        return None
+    if "breach" in str(a.get("archive_reason") or "").lower():
+        return None
+    if str(live.get("trader_account_id") or "") != aid or str(live.get("trader_id") or "") not in {tid, aid}:
+        return None
+    if not a.get("mt5_login") or str(live.get("mt5_login") or "") != str(a.get("mt5_login")) or str(live.get("stage") or "").lower() != stage:
+        return None
+    if str(p.get("id") or "") != str(a.get("purchase_id") or "") or str(p.get("trader_id") or "") != tid:
+        return None
+    if str(p.get("status") or "").lower() not in {"approved_active", "approved", "paid"}:
+        return None
+    try:
+        size = float(a.get("start_balance") or a.get("account_size"))
+        target = float(p.get(stage + "_target") if p.get(stage + "_target") is not None else a.get("target_percent"))
+        dd = float(p.get("max_drawdown") if p.get("max_drawdown") is not None else a.get("dd_limit_percent"))
+        balance, equity = float(live["balance"]), float(live["equity"])
+        if float(live["account_size"]) != size or (p.get("account_size") is not None and float(p["account_size"]) != size):
+            return None
+        used = float(live["dd_used_percent"])
+        if not all(math.isfinite(v) for v in (size, target, dd, balance, equity, used)):
+            return None
+        if size <= 0 or not 0 < target <= 100 or not 0 < dd < 100 or used < 0 or used >= 100:
+            return None
+        if str(live.get("risk_zone") or "").lower() in {"breached", "breach", "blocked", "quarantined"}:
+            return None
+        for key in ("worst_dd_used_percent", "max_drawdown_used"):
+            if a.get(key) is not None and float(a[key]) >= 100:
+                return None
+        for key in ("lowest_equity",):
+            if a.get(key) is not None and float(a[key]) <= size * (1-dd/100):
+                return None
+        if min(balance, equity) <= size * (1-dd/100) or equity < size * (1+target/100):
+            return None
+        observed = datetime.fromisoformat(str(live["observed_at"]).replace("Z", "+00:00"))
+        started = datetime.fromisoformat(str(a.get("started_at") or a["created_at"]).replace("Z", "+00:00"))
+        now = now or datetime.now(timezone.utc)
+        if observed.tzinfo is None or started.tzinfo is None or observed < started or not 0 <= (now-observed).total_seconds() <= 900:
+            return None
+        return {"balance": balance, "equity": equity, "target": target,
+                "observed_at": observed.isoformat(), "profit_percent": (equity-size)/size*100}
+    except (ValueError, TypeError, KeyError, OverflowError):
+        return None
+
+
+def _np_v214_rows(table, params):
+    base, headers = _np_v184_rest_headers()
+    r = requests.get(base + "/rest/v1/" + table, headers=headers,
+        params={"select": "*", **params}, timeout=(2, 7))
+    r.raise_for_status()
+    rows = r.json()
+    if not isinstance(rows, list):
+        raise RuntimeError("Invalid live pass reconciliation response")
+    return rows
+
+
+def _np_record_live_passes_v214(limit=250):
+    import json
+    global _NP_V214_LIVE_CURSOR, _NP_V214_LAST_LIVE_PASS_SCAN
+    summary = {"checked":0, "recorded":0, "errors":0}
+    token = _NP_RENEWAL_REST_V211.set(True)
+    try:
+        live_rows = _np_v214_rows("np_live_account_state", {
+            "stage":"in.(phase1,phase2)", "order":"trader_account_id.asc",
+            "limit":str(limit), "offset":str(_NP_V214_LIVE_CURSOR)})
+        _NP_V214_LIVE_CURSOR = 0 if len(live_rows) < limit else _NP_V214_LIVE_CURSOR + limit
+        for offset in range(0, len(live_rows), 100):
+            chunk = live_rows[offset:offset+100]
+            ids = [str(r.get("trader_account_id") or "") for r in chunk if r.get("trader_account_id")]
+            if not ids:
+                continue
+            accounts = _np_v214_rows("trader_accounts", {
+                "id":"in.("+",".join(json.dumps(v) for v in ids)+")", "limit":"100"})
+            by_id = {str(a["id"]):a for a in accounts}
+            pids = sorted({str(a.get("purchase_id")) for a in accounts if a.get("purchase_id")})
+            purchases = _np_v214_rows("challenge_purchases", {
+                "id":"in.("+",".join(json.dumps(v) for v in pids)+")", "limit":"100"}) if pids else []
+            by_pid = {str(p["id"]):p for p in purchases}
+            for live in chunk:
+                a = by_id.get(str(live.get("trader_account_id") or ""), {})
+                p = by_pid.get(str(a.get("purchase_id") or ""), {})
+                summary["checked"] += 1
+                proof = _np_live_pass_proof_v214(a, live, p)
+                if not proof:
+                    continue
+                try:
+                    if _np_mh_blocked(a["trader_id"], p["id"]):
+                        continue
+                    next_stage = _next_stage_for_lifecycle(a["stage"], a, p, None, None)
+                    if next_stage not in {"phase2", "funded"}:
+                        continue
+                    raw_reason = a.get("archive_reason")
+                    reason = (str(raw_reason or "") + " | [NP_LIVE_PASS_V214] "
+                        + a["stage"].upper() + " PASSED: exact observed equity=" + str(proof["equity"])
+                        + "; target=" + str(proof["target"]) + "%; observed=" + proof["observed_at"]).strip(" |")
+                    patch = {"account_status":"archived_"+a["stage"],
+                        "phase_pass_status":a["stage"]+"_passed", "passed_at":proof["observed_at"],
+                        "archived_at":now_iso(), "monitoring_enabled":False,
+                        "current_balance":proof["balance"], "current_equity":proof["equity"],
+                        "profit":proof["equity"]-float(a.get("start_balance") or a["account_size"]),
+                        "current_profit":proof["equity"]-float(a.get("start_balance") or a["account_size"]),
+                        "profit_percent":proof["profit_percent"], "current_profit_percent":proof["profit_percent"],
+                        "highest_equity":max(proof["equity"],float(a.get("highest_equity") or 0)),
+                        "risk_zone":"passed", "archive_reason":reason, "updated_at":now_iso()}
+                    q = _np_renewal_db_v211().table("trader_accounts").update(patch).eq("id",a["id"]).eq("trader_id",a["trader_id"]).eq("account_status","assigned_active")
+                    q = q.is_("archive_reason","null") if raw_reason is None else q.eq("archive_reason",raw_reason)
+                    q = q.is_("breached_at", "null")
+                    if a.get("updated_at"):
+                        q = q.eq("updated_at", a["updated_at"])
+                    changed = q.execute().data or []
+                    if changed:
+                        summary["recorded"] += 1
+                        _invalidate_trader_bootstrap_cache(a["trader_id"])
+                        _np_v184_rpc("np_monitoring_retire", {"p_trader_account_id":a["id"], "p_reason":"verified live evaluation pass v214", "p_successor_account_id":None})
+                except Exception as exc:
+                    summary["errors"] += 1
+                    print("V214 LIVE PASS ITEM ERROR:", a.get("id"), type(exc).__name__, flush=True)
+        if summary["recorded"]:
+            np_invalidate_admin_bootstrap("all")
+    except Exception as exc:
+        summary["errors"] += 1
+        print("V214 LIVE PASS READ ERROR:", type(exc).__name__, flush=True)
+    finally:
+        _NP_V214_LAST_LIVE_PASS_SCAN = {**summary, "checked_at": now_iso()}
+        _NP_RENEWAL_REST_V211.reset(token)
+    return summary
+
+
+_np_auto_assign_v214_core = _np_auto_assign_waiting_stage
+
+def _np_auto_assign_waiting_stage(trader, stage, purchase=None, source_account=None, reason="lifecycle_progression"):
+    if reason != "lifecycle_progression" or not source_account or not purchase:
+        return _np_auto_assign_v214_core(trader, stage, purchase, source_account, reason)
+    import re, uuid
+    token = _NP_RENEWAL_REST_V211.set(True)
+    claimed = None
+    try:
+        tid, sid, pid = str(trader.get("id") or ""), str(source_account.get("id") or ""), str(purchase.get("id") or "")
+        rows = _np_v214_rows("trader_accounts", {"id":"eq."+sid, "trader_id":"eq."+tid, "limit":"1"})
+        if not rows:
+            return None
+        source = rows[0]
+        if str(source.get("purchase_id") or "") != pid or str(purchase.get("trader_id") or "") != tid:
+            return None
+        if source.get("breached_at") or str(source.get("account_status") or "") not in {"archived_phase1", "archived_phase2"}:
+            return None
+        if _np_mh_blocked(tid, pid):
+            return None
+        expected = _next_stage_for_lifecycle(source["stage"], source, purchase, None, trader)
+        if expected != stage:
+            return None
+        # A successor remains consumed even if it later breaches or its pass
+        # timestamp was written late. Never repeat a completed exact pass.
+        chain = _np_v214_rows("trader_accounts", {"purchase_id":"eq."+pid, "trader_id":"eq."+tid, "order":"created_at.asc", "limit":"1000"})
+        created = _np_parse_dt_safe(source.get("created_at") or source.get("started_at"))
+        if not created:
+            return None
+        for child in chain:
+            at = _np_parse_dt_safe(child.get("created_at") or child.get("started_at"))
+            if child.get("id") != sid and child.get("stage") == stage and child.get("mt5_login") and at and at > created:
+                if child.get("account_status") == "assigned_active":
+                    _np_monitoring_registry_activate(child, predecessor_account_id=sid, reason="complete_exact_phase_successor_v214")
+                    _np_update_trader_current_pointer_v59(tid, child, stage)
+                return {"account":child, "trader":trader, "already_fulfilled":True}
+        old = source.get("archive_reason")
+        if "[NP_PHASE_ASSIGNMENT_CLAIM_V214:" in str(old or ""):
+            return None
+        marker = "[NP_PHASE_ASSIGNMENT_CLAIM_V214:"+uuid.uuid4().hex+"]"
+        q = _np_renewal_db_v211().table("trader_accounts").update({"archive_reason":(str(old or "")+" | "+marker).strip(" |")}).eq("id",sid).eq("trader_id",tid).eq("account_status",source["account_status"])
+        q = q.is_("archive_reason","null") if old is None else q.eq("archive_reason",old)
+        rows = q.execute().data or []
+        if not rows:
+            return None
+        claimed = (sid, tid, marker, old)
+        return _np_auto_assign_v214_core(trader, stage, purchase, rows[0], reason)
+    finally:
+        try:
+            if claimed:
+                sid, tid, marker, old = claimed
+                rows = _np_v214_rows("trader_accounts", {"id":"eq."+sid, "trader_id":"eq."+tid, "limit":"1"})
+                if rows and marker in str(rows[0].get("archive_reason") or ""):
+                    current = rows[0]["archive_reason"]
+                    restored = str(current).replace(marker, "").strip(" |")
+                    _np_renewal_db_v211().table("trader_accounts").update({"archive_reason":restored or None}).eq("id",sid).eq("trader_id",tid).eq("archive_reason",current).execute()
+        finally:
+            _NP_RENEWAL_REST_V211.reset(token)
+
+
+_np_v214_pass_retry_core = _np_retry_clean_pass_funded_v19
+
+def _np_retry_clean_pass_funded_v19(limit=250):
+    token = _NP_RENEWAL_REST_V211.set(True)
+    try:
+        return _np_v214_pass_retry_core(limit)
+    finally:
+        _NP_RENEWAL_REST_V211.reset(token)
+
+
+_np_v214_cycle_core = _np_run_verified_lifecycle_cycle_v40
+
+def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
+    live_passes = _np_record_live_passes_v214()
+    # Complete verified passes before older purchase/reset scans can stall.
+    # Use the existing cross-process lifecycle lock, never a second worker.
+    lock_fn = globals().get("_np_v74_try_file_lock")
+    unlock_fn = globals().get("_np_v74_release_file_lock")
+    lock = lock_fn() if callable(lock_fn) else True
+    progression = {"deferred_cross_process_busy": True}
+    if lock:
+        try:
+            progression = _np_retry_clean_pass_funded_v19(limit=100)
+        finally:
+            if callable(unlock_fn):
+                unlock_fn(lock)
+    result = _np_v214_cycle_core(trigger)
+    if isinstance(result, dict):
+        result["live_pass_reconciliation"] = live_passes
+        result["verified_pass_priority_recovery"] = progression
+    return result

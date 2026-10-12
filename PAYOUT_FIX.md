@@ -208,3 +208,27 @@ before closing the source cycle. Existing-child reuse prevents a second MT5.
 partial-vs-completed delivery behavior. Etim's previously inserted replacement
 was completed directly with exact pool/payout identity, source CAS, active registry
 verification and persisted trader pointer; private before/after audit outside Git.
+
+V214 global live-pass reconciliation: the existing lifecycle worker now reconciles
+exact current evaluation telemetry before running progression. The dashboard's
+np_live_account_state feed previously had no durable evaluation-pass consumer;
+retry scanned only already-archived passes, so active rows with target-reaching
+balances never entered the assignment queue. Both Phase 1 and Phase 2 are handled.
+
+Proof requires exact account/login/owner/stage/capital, immutable purchase target,
+finite metrics, recent observation after assignment, and absence of breach/reset
+or management hold. CAS includes original status/reason/update timestamp and null
+breach time. Historical equity highs and pass metrics are persisted; the source
+monitoring registry is retired. Existing exact progression then assigns from the
+correct pool under the current lifecycle lock using isolated bounded transport.
+
+Progression uses a database source claim and checks successors against source
+creation time, preventing late-recorded passes from issuing another funded MT5
+when a prior successor later breached. Active partial successors are completed;
+breached successors are never reactivated. Pass recovery runs before older
+purchase/reset scans and diagnostic counts are exposed in existing admin status.
+
+Read-only production dry-run: 36 evaluation snapshots, 3 verified unrecorded
+passes including Sanni's 477297550. Full 92-test regression suite passed, followed
+by updated 24 pass-specific checks (including one added capital-mismatch case).
+Existing dashboard handoff and payout-display JavaScript checks also passed.
