@@ -5654,49 +5654,9 @@ def _np_exact_registered_trader_count_v134(force=False):
     ):
         return cached
 
-    # Preferred: PostgREST exact count; returns no full trader payload.
-    try:
-        res = supabase.table("traders").select("id", count="exact").limit(1).execute()
-        count = getattr(res, "count", None)
-        if count is not None:
-            count = int(count)
-            _NP_TRADER_COUNT_CACHE_V134.update({"ts": now, "count": count})
-            return count
-    except Exception as exc:
-        print("V134 EXACT TRADER COUNT primary warning:", exc, flush=True)
-
-    # Fallback: stable pagination. This is still exact up to the generous safety cap.
-    try:
-        page_size = 1000
-        max_rows = 50000
-        total = 0
-        offset = 0
-        while offset < max_rows:
-            rows = (
-                supabase.table("traders")
-                .select("id")
-                .order("id", desc=False)
-                .range(offset, min(offset + page_size - 1, max_rows - 1))
-                .execute().data or []
-            )
-            total += len(rows)
-            if len(rows) < page_size:
-                _NP_TRADER_COUNT_CACHE_V134.update({"ts": now, "count": total})
-                return total
-            offset += page_size
-
-        print(
-            "V134 TRADER COUNT SAFETY CAP REACHED:",
-            {"max_rows": max_rows, "counted": total},
-            flush=True,
-        )
-        _NP_TRADER_COUNT_CACHE_V134.update({"ts": now, "count": total})
-        return total
-    except Exception as exc:
-        print("V134 EXACT TRADER COUNT fallback error:", exc, flush=True)
-        if isinstance(cached, int) and cached >= 0:
-            return cached
-        raise
+    count = _np_admin_registered_count_v215()
+    _NP_TRADER_COUNT_CACHE_V134.update({"ts": now, "count": count})
+    return count
 
 
 
@@ -5731,21 +5691,10 @@ def _np_admin_traders_fast_payload_v135(force=False):
 
         started = time.time()
 
-        # V174: no extra per-request worker threads on cache miss.
-        traders = (
-            supabase.table("traders")
-            .select("*")
-            .order("created_at", desc=True)
-            .limit(10000)
-            .execute().data or []
-        )
-        accounts = (
-            supabase.table("trader_accounts")
-            .select("*")
-            .order("updated_at", desc=True)
-            .limit(10000)
-            .execute().data or []
-        )
+        # V215: keep the full trader list off the shared SDK pool as well.
+        deadline = time.monotonic() + 10
+        traders = _np_admin_paged_rows_v215("traders", "created_at", deadline)
+        accounts = _np_admin_paged_rows_v215("trader_accounts", "updated_at", deadline)
 
         # Do not run lifecycle decoration / plan lookup here. This endpoint exists
         # specifically to make the list screen fast. Exact lifecycle actions keep
@@ -5845,211 +5794,46 @@ def admin_bootstrap():
     # "1 dict lookup" for 30s after the first hit. The force/fresh
     # query param bypasses the cache, which keeps the manual "Refresh"
     # button on the dashboard working as before.
-    if not force:
-        def _fetch_bootstrap():
-            return _build_admin_bootstrap_payload(admin)
-        try:
-            payload = np_cached_read("admin_bootstrap", 30, _fetch_bootstrap)
+    try:
+        if not force:
+            payload = dict(np_cached_read("admin_bootstrap", 30,
+                lambda: _build_admin_bootstrap_payload(admin)))
             payload["cached"] = True
-            return _np_ok(payload)
-        except Exception as _cache_exc:
-            print("ADMIN BOOTSTRAP cache-miss fetch failed, falling through to live:", _cache_exc)
-    return _np_ok(_build_admin_bootstrap_payload(admin))
+        else:
+            payload = _build_admin_bootstrap_payload(admin)
+        return _np_ok(payload)
+    except Exception as exc:
+        print("ADMIN BOOTSTRAP V215 unavailable:", type(exc).__name__, flush=True)
+        return jsonify({"success": False,
+            "error": "Live refresh is temporarily unavailable. Your saved data has not changed."}), 503
 
 
 def _build_admin_bootstrap_payload(admin):
 
     started = time.time()
 
-    # RECOVERY MODE:
-    # Restore the exact core table authority and practical row coverage used by
-    # the previously working Admin. Do NOT parallelize these queries. Recent
-    # concurrent bootstrap experiments could return a fast but empty dashboard.
-    # STABILITY RECOVERY 2026-08-24:
-    # The previous pass raised every limit to 500-2500 rows. With the 7s
-    # Supabase REST read timeout, those payloads could not complete in
-    # time, every query returned [], the core_rows_loaded==0 guard fired
-    # 503, and the Admin dashboard rendered all zeros. These limits
-    # match the previously working first-screen scope (about 2-4x the
-    # original, but well inside the 7s timeout for the data sizes that
-    # this Admin's Overview actually uses).
-    traders_rows = _admin_rest_rows("traders", "created_at", True, 400)
-    plan_rows = _admin_rest_rows("challenge_plans", "created_at", True, 100)
-    purchase_rows = _admin_rest_rows("challenge_purchases", "created_at", True, 400)
-    account_rows = _admin_rest_rows("trader_accounts", "updated_at", True, 600)
-    payout_rows = _admin_rest_rows("payouts", "created_at", True, 200)
-    mt5_rows = _admin_rest_rows("mt5_pool", "created_at", True, 400)
-
-    # Nonessential/heavy modules must not block Overview.
-    ticket_rows = []
-    announcement_rows = _admin_rest_rows("announcements", "created_at", True, 25)
-    snapshot_rows = []
-    event_rows = _admin_rest_rows("monitoring_events", "created_at", True, 50)
-    phase_queue_rows = []
-
-    available_mt5_rows = _quick_available_mt5(mt5_rows)
-
-    core_rows_loaded = (
-        len(traders_rows)
-        + len(purchase_rows)
-        + len(account_rows)
-        + len(payout_rows)
-        + len(mt5_rows)
-    )
-
-    # Render-log diagnostic: one line per table, so empty / partial
-    # bootstrap is visible in production logs without having to
-    # reproduce the issue.
+    # V215: a failed read is unavailable, never a genuine empty table.
+    # Read independent tables together; do not fall back to a stalled SDK pool.
     try:
-        print(
-            "ADMIN BOOTSTRAP rows: "
-            f"traders={len(traders_rows)} plans={len(plan_rows)} "
-            f"purchases={len(purchase_rows)} accounts={len(account_rows)} "
-            f"payouts={len(payout_rows)} mt5={len(mt5_rows)} "
-            f"announcements={len(announcement_rows)} events={len(event_rows)} "
-            f"core_rows_loaded={core_rows_loaded}"
-        )
+        tables = _np_admin_bootstrap_tables_v215()
     except Exception:
-        pass
-
-    # Never represent a failed data connection as a genuine all-zero business.
-    # STABILITY 2026-08-24: when the live bootstrap is unable to reach
-    # Supabase but a recent good cache exists (under 5 minutes old), serve
-    # that cache with degraded=True so the dashboard stays usable. This is
-    # strictly better than a hard 503 + empty dashboard when the underlying
-    # issue is on Supabase's side, not ours. The cache is only used when it
-    # is recent AND it was a real success (cached_rows > 0), so we never
-    # serve an empty "good" cache as a false "degraded" success.
-    #
-    # STABILITY 2026-08-24 (pass 3): if the live Supabase is responsive but
-    # all six tables coincidentally come back empty, we no longer 503. We
-    # still return 200 with empty arrays, because 503 was previously the
-    # root cause of the v9 Obsidian admin_clean.html page rendering all
-    # zeros. The dashboard at least gets a valid response it can render.
-    if core_rows_loaded == 0:
-        stale_payload = None
-        try:
-            if (
-                isinstance(_ADMIN_BOOTSTRAP_CACHE, dict)
-                and _ADMIN_BOOTSTRAP_CACHE.get("payload")
-                and (time.time() - float(_ADMIN_BOOTSTRAP_CACHE.get("ts") or 0)) <= 300
-                and int((_ADMIN_BOOTSTRAP_CACHE.get("payload") or {}).get("counts", {}).get("traders", 0)
-                        or 0) > 0
-            ):
-                stale_payload = dict(_ADMIN_BOOTSTRAP_CACHE["payload"])
-        except Exception:
-            stale_payload = None
-        if stale_payload:
-            stale_payload["cached"] = True
-            stale_payload["degraded"] = True
-            stale_payload["source"] = "admin_bootstrap_stale_cache_during_supabase_outage"
-            stale_payload["degraded_reason"] = "live_supabase_unreachable_using_recent_cache"
-            try:
-                print(
-                    "ADMIN BOOTSTRAP DEGRADED: live Supabase unreachable, "
-                    "serving recent cache (age_s="
-                    f"{int(time.time() - float(_ADMIN_BOOTSTRAP_CACHE.get('ts') or 0))})."
-                )
-            except Exception:
-                pass
-            return stale_payload
-        # PASS 3 CHANGE: do not 503 on "live Supabase reachable but all
-        # tables empty". That condition used to mean "failed connection",
-        # but with the retry-with-backoff in _admin_rest_rows it can also
-        # mean "we connected successfully, the project is healthy, the
-        # tables just happen to be empty right now". A 503 was the wrong
-        # answer in that case — it caused the v9 admin_clean.html to
-        # render as all zeros because its fallback path also failed.
-        # Returning 200 with empty arrays is the safer default.
-        try:
-            print(
-                "ADMIN BOOTSTRAP EMPTY: live Supabase returned 0 rows on "
-                "all six core tables. Returning 200 with empty arrays. "
-                "If this is unexpected, check Supabase project status and "
-                "Row Level Security policies on the traders / challenge_"
-                "purchases / trader_accounts / payouts / mt5_pool tables."
-            )
-        except Exception:
-            pass
-        # Fall through to payload build below. Do not 503.
-
-    # PASS 3: parallel supabase-client fallback. If the direct REST path
-    # in _admin_rest_rows returned empty for any of the six core tables,
-    # try the supabase client (supabase-py) as a second path. The two
-    # paths use different connection pools; if REST 5xx's because the
-    # PostgREST layer is exhausted, the client can sometimes still serve
-    # the read. We never overwrite non-empty REST data with empty client
-    # data; we only fill in tables where REST came back empty AND the
-    # client returned something.
-    if core_rows_loaded == 0:
-        try:
-            if not traders_rows:
-                try:
-                    _r = supabase.table("traders").select("*").order("created_at", desc=True).limit(400).execute().data or []
-                    if _r:
-                        traders_rows = _r
-                        print("ADMIN BOOTSTRAP PASS3 client-fill traders:", len(_r))
-                except Exception as _exc:
-                    print("ADMIN BOOTSTRAP PASS3 client-fill traders FAILED:", _exc)
-            if not purchase_rows:
-                try:
-                    _r = supabase.table("challenge_purchases").select("*").order("created_at", desc=True).limit(400).execute().data or []
-                    if _r:
-                        purchase_rows = _r
-                        print("ADMIN BOOTSTRAP PASS3 client-fill purchases:", len(_r))
-                except Exception as _exc:
-                    print("ADMIN BOOTSTRAP PASS3 client-fill purchases FAILED:", _exc)
-            if not account_rows:
-                try:
-                    _r = supabase.table("trader_accounts").select("*").order("updated_at", desc=True).limit(600).execute().data or []
-                    if _r:
-                        account_rows = _r
-                        print("ADMIN BOOTSTRAP PASS3 client-fill accounts:", len(_r))
-                except Exception as _exc:
-                    print("ADMIN BOOTSTRAP PASS3 client-fill accounts FAILED:", _exc)
-            if not payout_rows:
-                try:
-                    _r = supabase.table("payouts").select("*").order("created_at", desc=True).limit(200).execute().data or []
-                    if _r:
-                        payout_rows = _r
-                        print("ADMIN BOOTSTRAP PASS3 client-fill payouts:", len(_r))
-                except Exception as _exc:
-                    print("ADMIN BOOTSTRAP PASS3 client-fill payouts FAILED:", _exc)
-            if not mt5_rows:
-                try:
-                    _r = supabase.table("mt5_pool").select("*").order("created_at", desc=True).limit(400).execute().data or []
-                    if _r:
-                        mt5_rows = _r
-                        available_mt5_rows = _quick_available_mt5(mt5_rows)
-                        print("ADMIN BOOTSTRAP PASS3 client-fill mt5:", len(_r))
-                except Exception as _exc:
-                    print("ADMIN BOOTSTRAP PASS3 client-fill mt5 FAILED:", _exc)
-            if not plan_rows:
-                try:
-                    _r = supabase.table("challenge_plans").select("*").order("created_at", desc=True).limit(100).execute().data or []
-                    if _r:
-                        plan_rows = _r
-                        print("ADMIN BOOTSTRAP PASS3 client-fill plans:", len(_r))
-                except Exception as _exc:
-                    print("ADMIN BOOTSTRAP PASS3 client-fill plans FAILED:", _exc)
-            core_rows_loaded = (
-                len(traders_rows)
-                + len(purchase_rows)
-                + len(account_rows)
-                + len(payout_rows)
-                + len(mt5_rows)
-            )
-            try:
-                print(
-                    "ADMIN BOOTSTRAP PASS3 after client-fill: "
-                    f"traders={len(traders_rows)} purchases={len(purchase_rows)} "
-                    f"accounts={len(account_rows)} payouts={len(payout_rows)} "
-                    f"mt5={len(mt5_rows)} core_rows_loaded={core_rows_loaded}"
-                )
-            except Exception:
-                pass
-        except Exception as _outer_exc:
-            print("ADMIN BOOTSTRAP PASS3 client-fill wrapper error:", _outer_exc)
+        cached = _ADMIN_BOOTSTRAP_CACHE.get("payload")
+        if cached and time.time() - float(_ADMIN_BOOTSTRAP_CACHE.get("ts") or 0) <= 300:
+            out = dict(cached)
+            out.update(cached=True, degraded=True,
+                degraded_reason="Live refresh unavailable; displaying recent saved data")
+            return out
+        raise
+    traders_rows = tables["traders"]
+    plan_rows = tables["challenge_plans"]
+    purchase_rows = tables["challenge_purchases"]
+    account_rows = tables["trader_accounts"]
+    payout_rows = tables["payouts"]
+    mt5_rows = tables["mt5_pool"]
+    announcement_rows = tables["announcements"]
+    event_rows = tables["monitoring_events"]
+    ticket_rows, snapshot_rows, phase_queue_rows = [], [], []
+    available_mt5_rows = _quick_available_mt5(mt5_rows)
 
     payload = {
         "success": True,
@@ -6116,7 +5900,7 @@ def _build_admin_bootstrap_payload(admin):
         "counts": {
             # V134: exact registered customers total. `traders_rows` remains a
             # bounded display/bootstrap slice for speed and must never define this KPI.
-            "traders": _np_exact_registered_trader_count_v134(),
+            "traders": tables["registered_count"],
             "traders_loaded": len(traders_rows),
             "plans": len(plan_rows),
             "purchases": len(purchase_rows),
@@ -6128,6 +5912,10 @@ def _build_admin_bootstrap_payload(admin):
         "bootstrap_scope": "recovered_stable_core_only_v9_compat",
     }
 
+    if tables.get("warnings"):
+        payload["degraded"] = True
+        payload["degraded_reason"] = "; ".join(tables["warnings"])
+        payload["warnings"] = tables["warnings"]
     try:
         _ADMIN_BOOTSTRAP_CACHE["ts"] = time.time()
         _ADMIN_BOOTSTRAP_CACHE["payload"] = payload
@@ -59699,3 +59487,94 @@ def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
         result["live_pass_reconciliation"] = live_passes
         result["verified_pass_priority_recovery"] = progression
     return result
+
+
+# V215: keep interactive overview reads out of shared SDK connection queues.
+_NP_ADMIN_BOOTSTRAP_EXECUTOR_V215 = None
+_NP_ADMIN_BOOTSTRAP_EXECUTOR_LOCK_V215 = threading.Lock()
+
+def _np_admin_interactive_rows_v215(table, order_col, desc, limit):
+    params = {"select": "*", "limit": str(limit)}
+    if order_col:
+        params["order"] = order_col + (".desc" if desc else ".asc")
+    response = requests.get((SUPABASE_URL or "").rstrip("/") + "/rest/v1/" + table,
+        headers={"apikey": SUPABASE_KEY, "Authorization": "Bearer " + SUPABASE_KEY,
+                 "Accept": "application/json"}, params=params, timeout=(2, 4))
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list):
+        raise RuntimeError("Invalid Admin table response")
+    return rows
+
+def _np_admin_registered_count_v215():
+    response = requests.get((SUPABASE_URL or "").rstrip("/") + "/rest/v1/traders",
+        headers={"apikey": SUPABASE_KEY, "Authorization": "Bearer " + SUPABASE_KEY,
+                 "Accept": "application/json", "Prefer": "count=exact"},
+        params={"select": "id", "limit": "1"}, timeout=(2, 4))
+    response.raise_for_status()
+    total = str(response.headers.get("Content-Range") or "").rsplit("/", 1)[-1]
+    if not total.isdigit():
+        raise RuntimeError("Exact registered customer count unavailable")
+    return int(total)
+
+def _np_admin_bootstrap_tables_v215():
+    global _NP_ADMIN_BOOTSTRAP_EXECUTOR_V215
+    from concurrent.futures import wait
+    specs = [("traders", "created_at", 400), ("challenge_plans", "created_at", 100),
+        ("challenge_purchases", "created_at", 400), ("trader_accounts", "updated_at", 600),
+        ("payouts", "created_at", 200), ("mt5_pool", "created_at", 400),
+        ("announcements", "created_at", 25), ("monitoring_events", "created_at", 50)]
+    with _NP_ADMIN_BOOTSTRAP_EXECUTOR_LOCK_V215:
+        if _NP_ADMIN_BOOTSTRAP_EXECUTOR_V215 is None:
+            _NP_ADMIN_BOOTSTRAP_EXECUTOR_V215 = ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="np-admin-read")
+        pool = _NP_ADMIN_BOOTSTRAP_EXECUTOR_V215
+    futures = {}
+    try:
+        for table, order, limit in specs:
+            futures[table] = pool.submit(_np_admin_interactive_rows_v215, table, order, True, limit)
+        futures["registered_count"] = pool.submit(_np_exact_registered_trader_count_v134)
+        _, pending = wait(futures.values(), timeout=10)
+        if pending:
+            raise TimeoutError("Admin overview refresh deadline exceeded")
+        out, warnings = {}, []
+        for table, future in futures.items():
+            try:
+                out[table] = future.result()
+            except Exception:
+                if table not in {"announcements", "monitoring_events"}:
+                    raise
+                aliases = {"announcements": "announcements", "monitoring_events": "monitoring_events"}
+                saved = _ADMIN_BOOTSTRAP_CACHE.get("payload") or {}
+                recent = time.time() - float(_ADMIN_BOOTSTRAP_CACHE.get("ts") or 0) <= 300
+                out[table] = list(saved.get(aliases[table]) or []) if recent else []
+                warnings.append(table + " history temporarily unavailable")
+        out["warnings"] = warnings
+        return out
+    finally:
+        # Running reads finish under their HTTP timeout; queued reads need not run
+        # after the response deadline. The fixed pool cannot grow on every retry.
+        for future in futures.values():
+            future.cancel()
+
+
+def _np_admin_paged_rows_v215(table, order_col, deadline):
+    rows = []
+    while len(rows) < 10000:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Admin trader list deadline exceeded")
+        response = requests.get((SUPABASE_URL or "").rstrip("/") + "/rest/v1/" + table,
+            headers={"apikey": SUPABASE_KEY, "Authorization": "Bearer " + SUPABASE_KEY,
+                     "Accept": "application/json"},
+            params={"select": "*", "limit": "1000", "offset": str(len(rows)),
+                    "order": order_col + ".desc,id.desc"},
+            timeout=(min(2, remaining), min(4, remaining)))
+        response.raise_for_status()
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Invalid Admin trader list response")
+        rows.extend(page)
+        if len(page) < 1000:
+            return rows
+    return rows

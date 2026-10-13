@@ -232,3 +232,33 @@ Read-only production dry-run: 36 evaluation snapshots, 3 verified unrecorded
 passes including Sanni's 477297550. Full 92-test regression suite passed, followed
 by updated 24 pass-specific checks (including one added capital-mismatch case).
 Existing dashboard handoff and payout-display JavaScript checks also passed.
+
+## V215 — bound recurring Admin startup and refresh waits
+
+The login UI waits before receiving `/staff_login`; dashboard loading starts only
+following successful authentication. The overview still contained eight serial
+REST reads with retry/backoff and an SDK fallback, plus an unbounded SDK count.
+A read-only production check found monitoring-events history timing out while
+core tables completed in approximately 0.7–1.6 seconds.
+
+Overview reads now use one fixed four-thread pool and a ten-second response
+deadline. Core read failures use recent (at most five minutes) saved data marked
+degraded, or return 503 without false empty business data. Optional announcement
+and monitoring-event failures are marked separately and do not discard successful
+core reads. Failed bootstrap requests no longer repeat a complete refresh or fall
+back to the shared SDK connection pool. Exact customer counts use bounded REST
+with `Prefer: count=exact`; missing count metadata fails rather than guessing.
+The full Traders feed also uses bounded, stable pagination instead of SDK waits.
+
+No financial mutations, account lifecycle rules, authentication checks, pricing,
+or worker concurrency settings change. Local tests cover authentication failure,
+real zero count, partial read errors, optional history timeout, recent cache age,
+concurrent reads, response deadline cancellation and full trader pagination.
+Read-only live overview validation returned the exact customer count (495) and
+core data in 5.61 seconds with the monitoring-history timeout clearly isolated.
+Render service connectivity is blocked by the execution environment's proxy, so
+this check does not establish deployed login latency or deployment completion.
+The bounded full Traders feed also read all 495 customers and 1,921 account records
+in 5.07 seconds; pagination preserves records beyond PostgREST's default page cap.
+Validation: 103 Python tests passed, plus the existing Admin View handoff and
+trader payout UI checks. No full production app import or financial write was used.
