@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client
+from supabase import ClientOptions as _NPClientOptionsV218
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timezone
@@ -74,12 +75,14 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY,
+    options=_NPClientOptionsV218(postgrest_client_timeout=8))
 
 # Service-role client is used only for protected server-side staff operations.
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase_admin = (
-    create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+        options=_NPClientOptionsV218(postgrest_client_timeout=8))
     if SUPABASE_SERVICE_ROLE_KEY
     else None
 )
@@ -59634,4 +59637,18 @@ if callable(_np_approve_purchase_v216_core):
 # retain the old one-at-a-time behavior inside each worker; database CAS guards
 # still protect financial/account changes across different workers/instances.
 from request_serialization import SerialMutationMiddleware as _NPSerialMutationsV217
-app.wsgi_app = _NPSerialMutationsV217(app.wsgi_app)
+app.wsgi_app = _NPSerialMutationsV217(app.wsgi_app,
+    serial_paths=_NP_FAST_ADMIN_PATHS_V97,
+    bypass_paths=_NP_AUTOMATION_HEARTBEAT_PATHS_V20,
+    admin_prefixes=("/admin/", "/admin_", "/approve_", "/reject_", "/assign_",
+        "/lifecycle/assign_", "/mark_payout_", "/reopen_payout_", "/cancel_payout_",
+        "/update_trader", "/delete_trader", "/remove_trader", "/recall_"))
+
+
+@app.get("/healthz/http")
+def _np_http_readiness_v218():
+    # Public operational metadata only: never include credentials or business rows.
+    response = jsonify({"status": "ok", "http_release": "V218_NONBLOCKING_ADMIN_SCHEDULING",
+        "commit": os.getenv("RENDER_GIT_COMMIT")})
+    response.headers["Cache-Control"] = "no-store"
+    return response

@@ -36,7 +36,7 @@ def slow():
   with stats_lock:stats['active']-=1
 @app.get('/stats')
 def read_stats():return jsonify(stats)
-app.wsgi_app=SerialMutationMiddleware(app.wsgi_app)
+app.wsgi_app=SerialMutationMiddleware(app.wsgi_app, serial_paths={'/slow'})
 '''
 
 class HTTPWorkerTests(unittest.TestCase):
@@ -112,7 +112,17 @@ class HTTPWorkerTests(unittest.TestCase):
             started=time.monotonic();result=self.login(url)
             self.assertEqual(result.status_code,200);self.assertLess(time.monotonic()-started,.7)
             first.join(4);second.join(4)
-            self.assertEqual(one,[200]);self.assertEqual(two,[200])
+            self.assertEqual(one,[200]);self.assertEqual(two,[503])
+            self.assertEqual(self.http.get(url+'/stats',timeout=2).json()['maximum'],1)
+    def test_full_mutation_wave_cannot_exhaust_authentication_threads(self):
+        with self.server(True) as (url,path):
+            first,one=self.slow(url,'wave-first','POST');self.wait_started(path,'wave-first')
+            wave=[self.slow(url,'wave-'+str(i),'POST') for i in range(12)]
+            started=time.monotonic();result=self.login(url)
+            self.assertEqual(result.status_code,200);self.assertLess(time.monotonic()-started,.7)
+            for thread,outcomes in wave:
+                thread.join(3);self.assertEqual(outcomes,[503])
+            first.join(3);self.assertEqual(one,[200])
             self.assertEqual(self.http.get(url+'/stats',timeout=2).json()['maximum'],1)
 
 class MiddlewareTests(unittest.TestCase):
@@ -127,5 +137,36 @@ class MiddlewareTests(unittest.TestCase):
         thread=threading.Thread(target=lambda:result.extend(app({'REQUEST_METHOD':'POST'},lambda *a:None)))
         thread.start();thread.join(1)
         self.assertFalse(thread.is_alive());self.assertEqual(result,[b'ok'])
+    def test_busy_response_does_not_run_mutation_and_preserves_cors(self):
+        import json
+        from request_serialization import SerialMutationMiddleware
+        calls=[];entered=threading.Event();release=threading.Event()
+        def work(env,start):
+            calls.append(env['PATH_INFO']);entered.set();release.wait(2)
+            return [b'ok']
+        app=SerialMutationMiddleware(work,serial_paths={'/approve'})
+        first=threading.Thread(target=lambda:list(app({'REQUEST_METHOD':'POST','PATH_INFO':'/approve'},lambda *a:None)))
+        first.start();self.assertTrue(entered.wait(1));response=[]
+        try:
+            body=b''.join(app({'REQUEST_METHOD':'POST','PATH_INFO':'/approve','HTTP_ORIGIN':'https://nairapips.com'},lambda status,headers:response.append((status,dict(headers)))))
+            self.assertTrue(response[0][0].startswith('503'))
+            self.assertFalse(json.loads(body)['operation_started'])
+            self.assertEqual(response[0][1]['Access-Control-Allow-Origin'],'https://nairapips.com')
+            self.assertEqual(calls,['/approve'])
+        finally:release.set();first.join(3)
+    def test_account_ingestion_is_not_parked_behind_admin_action(self):
+        from request_serialization import SerialMutationMiddleware
+        entered=threading.Event();release=threading.Event()
+        def work(env,start):
+            if env['PATH_INFO']=='/approve':entered.set();release.wait(2)
+            return [b'ok']
+        app=SerialMutationMiddleware(work,serial_paths={'/approve'})
+        first=threading.Thread(target=lambda:list(app({'REQUEST_METHOD':'POST','PATH_INFO':'/approve'},lambda *a:None)))
+        first.start();self.assertTrue(entered.wait(1))
+        try:
+            started=time.monotonic()
+            self.assertEqual(list(app({'REQUEST_METHOD':'POST','PATH_INFO':'/monitoring_snapshot'},lambda *a:None)),[b'ok'])
+            self.assertLess(time.monotonic()-started,.2)
+        finally:release.set();first.join(3)
 
 if __name__=='__main__':unittest.main()

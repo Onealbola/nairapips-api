@@ -340,3 +340,38 @@ review/save/publish before those runtime network changes take effect. This draft
 is unrelated to the Render deployment triggered by the application Git push.
 Final V217 validation: 130 Python tests passed, including real Gunicorn HTTP
 concurrency tests and bounded staff-audit failure/context-restoration cases.
+
+## V218 — do not park HTTP threads behind an admin-write lock
+
+A live read for Odinaka Emmanuel (the exact 1ceoxauusd@gmail.com trader) found
+purchase f1093f83-966f-458e-a1ae-2d07e7d0482d still pending_review, no assigned
+purchase mirrors and no trader_account for that purchase. Candidate 477500066
+remains available with no ownership/archive history and one exact pool row.
+No approval, account issue, historical account revival or email was performed
+by these diagnostic queries. Public API probes then repeatedly timed out even
+on the root health response, despite previously responding within a second.
+
+V217's blocking mutation-lock acquisition could park all Gunicorn threads behind
+one slow write. The gate now applies to administrative writes, not customer
+payout submissions or ordinary account-data intake, and known engine heartbeat
+routes explicitly bypass it. Lock acquisition is nonblocking. A competing admin
+write gets JSON 503 with NP_ADMIN_ACTION_BUSY, operation_started=false, Retry-After
+and correct browser CORS before Flask runs any handler. No write is silently
+queued and no operation is reported as successful without executing it. Database
+claims/financial CAS remain authoritative across workers and for customer requests.
+
+Both remaining Supabase SDK clients used the SDK's 120-second default database
+timeout; this is now eight seconds for connection, pool and read waits using the
+SDK's public synchronous ClientOptions export. Storage settings are unchanged.
+The real SDK clients were instantiated with private fixture keys (no network
+calls), validating the effective timeout and privileged-client absence behavior.
+
+Added /healthz/http returns only a scheduling release tag and optional public
+RENDER_GIT_COMMIT, with no-store caching, to confirm actual live code independently
+of Git push. A real Gunicorn test covers one active write plus twelve competing
+writes: login remains responsive, only one write runs and others explicitly
+return not-started busy responses. Additional tests cover data-ingestion progress
+while an admin action runs, busy-response CORS and release after exceptions.
+Validation: 135 Python tests passed, including real Gunicorn saturation, SDK
+client-construction timeout checks, and the existing financial/lifecycle tests.
+Existing Admin View handoff and trader payout JavaScript checks also passed.
