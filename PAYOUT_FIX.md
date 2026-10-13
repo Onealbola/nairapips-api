@@ -262,3 +262,42 @@ The bounded full Traders feed also read all 495 customers and 1,921 account reco
 in 5.07 seconds; pagination preserves records beyond PostgREST's default page cap.
 Validation: 103 Python tests passed, plus the existing Admin View handoff and
 trader payout UI checks. No full production app import or financial write was used.
+
+## V216 — make purchase approval use isolated assignment transport
+
+The Purchase Approve + Auto Assign request repeated server-side history scans,
+used shared SDK calls for purchase/trader/pool/affiliate reads and writes, and
+queried/possibly repaired journeys again after the protected assignment had
+already completed. Credential sends remain synchronous; their recipient lookup
+and email logging now honor the isolated transport, avoiding another shared SDK
+wait after provider acceptance. No email is sent by tests or read-only probes.
+
+Ordinary approval now enters the existing bounded REST transport used by renewal
+and phase-pass recovery. The reset-payment bridge retains its prior transport.
+Server eligibility may issue a request-local picker proof; the final gate still
+re-reads the ownership ledger and selected pool immediately before insertion.
+Interactive safety reads use one bounded attempt and cannot fall back to a stuck
+SDK client or interpret non-list responses as an unused account. A failed exact
+purchase-history read stops assignment rather than continuing without the guard.
+
+A conditional purchase-note claim prevents simultaneous approvals of the same
+purchase. Assigned/rejected purchases and outstanding claims are blocked. A
+precommit failure releases only its own claim; partial/uncertain assignments keep
+it for reconciliation rather than creating another account on retry. The core
+still freezes rules, binds the exact journey, persists the current account,
+activates/verifies monitoring and sends credentials. The redundant post-success
+journey sweep was removed; it never owned the actual assignment validation.
+
+A read-only never-used inventory verification completed in 2.62 seconds. This is
+not an end-to-end approval benchmark: no production purchase was approved or
+account/email issued for testing. Tests exercise concurrent requests, interrupted
+writes, authentication/rejection guards, context restoration, reset routing,
+expired proof, newly consumed inventory and invalid safety responses.
+Out-of-stock approval keeps its exact waiting entitlement and removes its
+in-flight claim. The REST adapter forwards the existing rejection `neq` filters.
+Production read-only schema checks confirmed UUID identifiers for email,
+lifecycle and affiliate ledgers, but integer identity IDs for admin_audit_logs;
+audit inserts preserve that integer identity and do not repeat lost-response
+inserts. Final validation: 124 Python tests passed, plus the existing Admin View
+handoff and payout dashboard JavaScript checks. Render deployment and live
+end-to-end approval latency remain unconfirmed from this environment.

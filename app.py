@@ -121,7 +121,9 @@ def _np_rest_rows_v170(table, select="*", filters=None, limit=1000, order=None):
     if order:
         params["order"] = str(order)
     last = None
-    for delay in (0.0, 0.20, 0.60):
+    approval_context = globals().get("_NP_APPROVAL_CONTEXT_V216")
+    interactive = bool(approval_context and approval_context.get())
+    for delay in ((0.0,) if interactive else (0.0, 0.20, 0.60)):
         if delay:
             time.sleep(delay)
         try:
@@ -136,7 +138,9 @@ def _np_rest_rows_v170(table, select="*", filters=None, limit=1000, order=None):
                 if r.status_code >= 400:
                     raise RuntimeError(f"{table} REST {r.status_code}: {r.text[:180]}")
                 data = r.json()
-                return data if isinstance(data, list) else []
+                if not isinstance(data, list):
+                    raise RuntimeError("Invalid assignment safety response")
+                return data
         except Exception as exc:
             last = exc
             continue
@@ -1432,7 +1436,7 @@ def _sync_identity_fields(trader):
         if trader.get("phone"):
             payload["canonical_phone"] = _normalize_phone_value(trader.get("phone"))
         if payload:
-            supabase.table("traders").update(payload).eq("id", trader.get("id")).execute()
+            _np_renewal_db_v211().table("traders").update(payload).eq("id", trader.get("id")).execute()
     except Exception as e:
         print("IDENTITY SYNC ERROR:", e)
 
@@ -2804,7 +2808,7 @@ def _assert_mt5_never_used(mt5):
 
 def _log_lifecycle_event(trader_id, account_id, from_state, to_state, action, details="", staff=None):
     try:
-        supabase.table("lifecycle_events").insert({
+        _np_renewal_db_v211().table("lifecycle_events").insert({
             "trader_id": trader_id,
             "trader_account_id": account_id,
             "from_state": from_state,
@@ -2861,12 +2865,12 @@ def _ensure_trader_for_purchase(purchase):
     email = str(purchase.get("email") or "").strip().lower()
     phone = str(purchase.get("phone") or "").strip()
     if email:
-        rows = supabase.table("traders").select("*").eq("email", email).limit(1).execute().data or []
+        rows = _np_renewal_db_v211().table("traders").select("*").eq("email", email).limit(1).execute().data or []
         if rows:
             _sync_identity_fields(rows[0])
             return rows[0]
     if phone:
-        rows = supabase.table("traders").select("*").eq("phone", phone).limit(1).execute().data or []
+        rows = _np_renewal_db_v211().table("traders").select("*").eq("phone", phone).limit(1).execute().data or []
         if rows:
             _sync_identity_fields(rows[0])
             return rows[0]
@@ -2887,7 +2891,7 @@ def _ensure_trader_for_purchase(purchase):
         "canonical_email": email,
         "canonical_phone": _normalize_phone_value(phone),
     }
-    created = supabase.table("traders").insert(row).execute().data or []
+    created = _np_renewal_db_v211().table("traders").insert(row).execute().data or []
     return created[0] if created else None
 
 
@@ -6467,7 +6471,8 @@ def _log_email_bank(to_email, subject, email_type=None, status="queued", trader_
     last_error = None
     for row in attempts:
         try:
-            inserted = supabase_admin.table("email_logs").insert(row).execute().data or []
+            ctx = globals().get("_NP_RENEWAL_REST_V211")
+            inserted = (_np_renewal_db_v211() if ctx and ctx.get() else supabase_admin).table("email_logs").insert(row).execute().data or []
             return inserted[0] if inserted else row
         except Exception as e:
             last_error = e
@@ -6627,7 +6632,7 @@ def send_assignment_email_with_owner_copy(trader, subject, title, details=""):
     if trader_id:
         try:
             rows = (
-                supabase.table("traders").select("*")
+                _np_renewal_db_v211().table("traders").select("*")
                 .eq("id", trader_id).limit(1).execute().data or []
             )
             if rows:
@@ -10872,7 +10877,7 @@ def approve_purchase():
     try:
         d=request.json or {}; pid=d.get("id"); mt5_id=d.get("mt5_id")
         if not pid: return bad("Missing purchase id")
-        pres=supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute()
+        pres=_np_renewal_db_v211().table("challenge_purchases").select("*").eq("id",pid).limit(1).execute()
         if not pres.data: return bad("Purchase not found",404)
         p=pres.data[0]
 
@@ -10893,7 +10898,7 @@ def approve_purchase():
         _seen_linked = set()
         for _col in ("purchase_id",):
             try:
-                _rows = (supabase.table("trader_accounts").select("id,stage,account_status,status,mt5_login")
+                _rows = (_np_renewal_db_v211().table("trader_accounts").select("id,stage,account_status,status,mt5_login")
                          .eq(_col, pid).limit(100).execute().data or [])
                 for _a in _rows:
                     _aid = str(_a.get("id") or "")
@@ -10901,7 +10906,7 @@ def approve_purchase():
                         _seen_linked.add(_aid)
                         _linked_accounts.append(_a)
             except Exception as _link_exc:
-                print(f"PURCHASE HISTORY GUARD LOOKUP SKIP {_col}:", _link_exc)
+                raise RuntimeError("Purchase ownership history verification is unavailable; approval stopped") from _link_exc
         if _linked_accounts:
             _has_breach = any("breach" in str(a.get("account_status") or a.get("status") or "").lower() for a in _linked_accounts)
             if _second_life_bool(p.get("second_life_enabled")) and not _second_life_bool(p.get("second_life_used")) and _has_breach:
@@ -10910,7 +10915,7 @@ def approve_purchase():
 
         auto_mode = str(d.get("assignment_mode") or "").lower() in {"auto","auto_after_payment_approval","automatic"}
         if mt5_id:
-            mres=supabase.table("mt5_pool").select("*").eq("id",mt5_id).limit(1).execute()
+            mres=_np_renewal_db_v211().table("mt5_pool").select("*").eq("id",mt5_id).limit(1).execute()
             if not mres.data: return bad("Selected MT5 account was not found")
             m=mres.data[0]
         else:
@@ -10990,7 +10995,7 @@ def approve_purchase():
         )
         master_password=m.get("mt5_master_password","")
         investor_password=m.get("mt5_investor_password","")
-        approved_rows = supabase.table("challenge_purchases").select("*").eq("id",pid).limit(1).execute().data
+        approved_rows = _np_renewal_db_v211().table("challenge_purchases").select("*").eq("id",pid).limit(1).execute().data
         _affiliate_create_commission_from_purchase(approved_rows[0] if approved_rows else p, d)
 
         # V133: no duplicate email here. _assign_mt5_to_trader already sent
@@ -16724,10 +16729,13 @@ def audit_log(staff, module, action, details='', record_affected='', created_at=
         }
         # admin_audit_logs is server-only. Write through the service-role
         # client so RLS remains enabled for browser/public clients.
-        db = _staff_db()
+        ctx = globals().get("_NP_RENEWAL_REST_V211")
+        db = _np_renewal_db_v211() if ctx and ctx.get() else _staff_db()
         try:
             db.table('admin_audit_logs').insert(row).execute()
-        except Exception:
+        except Exception as exc:
+            if ctx and ctx.get() and "PGRST204" not in str(exc):
+                raise  # A lost audit response must not cause another insert.
             row.pop('record_affected', None)
             row.pop('created_at', None)
             db.table('admin_audit_logs').insert(row).execute()
@@ -17529,9 +17537,9 @@ def _affiliate_abuse_check(d, source):
     try:
         owned = []
         if buyer["email"]:
-            owned += supabase.table("affiliate_partners").select("*").eq("email", buyer["email"]).limit(3).execute().data or []
+            owned += _np_renewal_db_v211().table("affiliate_partners").select("*").eq("email", buyer["email"]).limit(3).execute().data or []
         if buyer["phone"]:
-            owned += supabase.table("affiliate_partners").select("*").eq("phone", buyer["phone"]).limit(3).execute().data or []
+            owned += _np_renewal_db_v211().table("affiliate_partners").select("*").eq("phone", buyer["phone"]).limit(3).execute().data or []
         for row in owned:
             if _aff_code(row.get("code") or row.get("partner_code")) == code:
                 return False, "Self-referral is not allowed: buyer owns this affiliate code"
@@ -17602,7 +17610,7 @@ def _aff_get_code(code):
     if not code:
         return None
     try:
-        rows = supabase.table("affiliate_codes").select("*").eq("code", code).limit(1).execute().data or []
+        rows = _np_renewal_db_v211().table("affiliate_codes").select("*").eq("code", code).limit(1).execute().data or []
         return rows[0] if rows else None
     except Exception as e:
         print("AFFILIATE CODE FETCH ERROR:", str(e))
@@ -17613,7 +17621,7 @@ def _aff_get_partner_by_code(code):
     if not code:
         return None
     try:
-        rows = supabase.table("affiliate_partners").select("*").eq("code", code).limit(1).execute().data or []
+        rows = _np_renewal_db_v211().table("affiliate_partners").select("*").eq("code", code).limit(1).execute().data or []
         return rows[0] if rows else None
     except Exception as e:
         print("AFFILIATE PARTNER FETCH ERROR:", str(e))
@@ -17952,7 +17960,7 @@ def _affiliate_record_code_usage(purchase):
         source = _aff_get_code(code)
         if source:
             try:
-                supabase.table("affiliate_codes").update({
+                _np_renewal_db_v211().table("affiliate_codes").update({
                     "total_uses": int(clean(source.get("total_uses")) or 0) + 1,
                     "updated_at": now_iso()
                 }).eq("code", code).execute()
@@ -17961,7 +17969,7 @@ def _affiliate_record_code_usage(purchase):
         pid = p.get("id")
         if pid:
             try:
-                supabase.table("challenge_purchases").update({"affiliate_usage_recorded": True, "updated_at": now_iso()}).eq("id", pid).execute()
+                _np_renewal_db_v211().table("challenge_purchases").update({"affiliate_usage_recorded": True, "updated_at": now_iso()}).eq("id", pid).execute()
             except Exception as e:
                 print("AFFILIATE PURCHASE USAGE FLAG ERROR:", str(e))
         return True
@@ -18003,7 +18011,7 @@ def _affiliate_create_commission_from_purchase(purchase, admin_payload=None):
         }, source)
         if not ok_referral:
             try:
-                supabase.table("challenge_purchases").update({
+                _np_renewal_db_v211().table("challenge_purchases").update({
                     "affiliate_status": reason,
                     "commission_percent": 0,
                     "commission_amount": 0,
@@ -18018,7 +18026,7 @@ def _affiliate_create_commission_from_purchase(purchase, admin_payload=None):
         if commission_pct <= 0 or sale_amount <= 0:
             return None
         commission_amount = clean(p.get("commission_amount")) or round(sale_amount * commission_pct / 100, 2)
-        existing = supabase.table("affiliate_commissions").select("id").eq("purchase_id", p.get("id")).limit(1).execute().data or []
+        existing = _np_renewal_db_v211().table("affiliate_commissions").select("id").eq("purchase_id", p.get("id")).limit(1).execute().data or []
         if existing:
             return existing[0]
         row = {
@@ -18033,7 +18041,7 @@ def _affiliate_create_commission_from_purchase(purchase, admin_payload=None):
             "status": "pending",
             "created_at": now_iso(),
         }
-        created = supabase.table("affiliate_commissions").insert(row).execute().data
+        created = _np_renewal_db_v211().table("affiliate_commissions").insert(row).execute().data
         _audit_safe("affiliates", "commission_created", f"Affiliate commission created for code {code}", _admin_from_payload(admin_payload or {}))
         return created[0] if created else row
     except Exception as e:
@@ -28029,7 +28037,7 @@ def _np_approve_purchase_router_20260907():
     pid = str(d.get("id") or "").strip()
     if pid:
         try:
-            rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
+            rows = _np_renewal_db_v211().table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
             if rows:
                 _row = rows[0] or {}
                 _note = str(_row.get("admin_note") or "")
@@ -30757,80 +30765,14 @@ def _np_post9_approve_purchase_route():
         print("V171 APPROVAL CORE UNHANDLED ERROR:", exc, flush=True)
         return _np_fail(
             "Approval service is temporarily unable to complete the assignment. "
-            "No MT5 was consumed. Please retry once.",
+            "Refresh the purchase to check its account before retrying.",
             503,
         )
 
-    # Post-success journey verification is evidence/repair only and must never
-    # convert a completed approval into a frontend failure.
-    try:
-        status_code = getattr(resp, "status_code", 200)
-        if pid and status_code < 400:
-            try:
-                rows = (
-                    supabase.table("challenge_purchases").select("*")
-                    .eq("id", pid).limit(1).execute().data or []
-                )
-            except Exception as exc:
-                print("V171 POST-APPROVAL PURCHASE VERIFY CLIENT FALLBACK:", exc, flush=True)
-                rows = _np_rest_rows_v170(
-                    "challenge_purchases",
-                    select="*",
-                    filters=[("id", f"eq.{pid}")],
-                    limit=1,
-                )
-
-            p = rows[0] if rows else None
-            if p and _np_post9_root_purchase(p):
-                tid = str(p.get("trader_id") or "").strip()
-
-                try:
-                    all_accounts = (
-                        supabase.table("trader_accounts").select("*")
-                        .eq("trader_id", tid).limit(2000).execute().data or []
-                    )
-                except Exception as exc:
-                    print("V171 POST-APPROVAL ACCOUNT VERIFY CLIENT FALLBACK:", exc, flush=True)
-                    all_accounts = _np_rest_rows_v170(
-                        "trader_accounts",
-                        select="*",
-                        filters=[("trader_id", f"eq.{tid}")],
-                        limit=2000,
-                    )
-
-                a, evidence = _np_post9_exact_account_claim(p, all_accounts)
-                if a:
-                    if str(a.get("purchase_id") or "").strip() != pid:
-                        try:
-                            supabase.table("trader_accounts").update({
-                                "purchase_id": pid,
-                                "journey_source": "post9_purchase_root_verified",
-                                "updated_at": now_iso(),
-                            }).eq("id", a.get("id")).eq("trader_id", tid).execute()
-                        except Exception as fix_exc:
-                            print("V171 POST-APPROVAL OWNERSHIP REPAIR DEFERRED:", fix_exc, flush=True)
-
-                    try:
-                        _audit_safe(
-                            "journey_authority",
-                            "new_purchase_new_journey_verified",
-                            f"NEW PURCHASE journey={pid} owns MT5={a.get('mt5_login')} "
-                            f"account={a.get('id')} evidence={evidence}",
-                            _admin_from_payload(d),
-                            pid,
-                        )
-                    except Exception:
-                        pass
-                else:
-                    print(
-                        "V171 POST-APPROVAL VERIFY DEFERRED: "
-                        "purchase did not yet identify its assigned account",
-                        pid,
-                        flush=True,
-                    )
-    except Exception as exc:
-        print("V171 POST-APPROVAL VERIFY DEFERRED:", exc, flush=True)
-
+    # V216: the core assigner already verifies exact purchase ownership,
+    # persists the dashboard pointer and activates/verifies monitoring BEFORE
+    # sending credentials. Re-reading/repairing all journeys here delayed an
+    # already completed assignment and could make a successful approval time out.
     return resp
 
 if _np_post9_approve_purchase_core:
@@ -41937,6 +41879,12 @@ def _np_mark_purchase_approved_waiting_v60(purchase, admin_payload=None, reason=
     now = now_iso()
     marker = f"[NP_ENTITLEMENT:FIRST_PHASE1:{pid}]"
     old_note = str(p.get("admin_note") or "").strip()
+    approval_context = globals().get("_NP_APPROVAL_CONTEXT_V216")
+    if approval_context and approval_context.get():
+        # Approved waiting is a completed payment decision, not an in-flight
+        # assignment. Keep the entitlement receipt, release our approval claim.
+        old_note = re.sub(r"\[NP_APPROVAL_CLAIM_V216:[^\]]+\]", "", old_note).strip()
+
     note = old_note
     if marker.lower() not in old_note.lower():
         note = (old_note + " | " + marker + " " + str(reason or "")).strip(" |")
@@ -41945,7 +41893,7 @@ def _np_mark_purchase_approved_waiting_v60(purchase, admin_payload=None, reason=
         raise ValueError("This purchase is REJECTED. WAITING FOR MT5 cannot be created.")
 
     rows = (
-        supabase.table("challenge_purchases").update({
+        _np_renewal_db_v211().table("challenge_purchases").update({
             "payment_status": "approved",
             "status": "approved_waiting_mt5",
             "lifecycle_state": "phase1_waiting_mt5",
@@ -57403,6 +57351,8 @@ def _np_query_rows_v173(table, select="*", filters=None, limit=1000):
         # One bounded compatibility fallback.  We never turn a failed safety
         # read into "unused"; if this also fails the caller fails closed.
         print("V182 REST READ FALLBACK TO CLIENT:", table, rest_exc, flush=True)
+        if _NP_RENEWAL_REST_V211.get():
+            raise RuntimeError("Assignment safety verification unavailable") from rest_exc
         q = supabase.table(table).select(select)
         for kind, col, val in (filters or []):
             if kind == "eq":
@@ -59168,6 +59118,9 @@ class _NPRenewalRestQueryV211:
     def eq(self, column, value):
         self.params[column] = "eq." + str(value)
         return self
+    def neq(self, column, value):
+        self.params[column] = "neq." + str(value)
+        return self
     def is_(self, column, value):
         self.params[column] = "is." + str(value)
         return self
@@ -59191,7 +59144,9 @@ class _NPRenewalRestQueryV211:
     def insert(self, payload):
         import uuid
         self.method, self.payload = "POST", dict(payload)
-        self.payload.setdefault("id", str(uuid.uuid4()))
+        # Production admin_audit_logs uses an integer identity, not a UUID.
+        if self.table_name != "admin_audit_logs":
+            self.payload.setdefault("id", str(uuid.uuid4()))
         return self
     def execute(self):
         from types import SimpleNamespace
@@ -59208,7 +59163,7 @@ class _NPRenewalRestQueryV211:
                 raise RuntimeError("Invalid renewal database response")
             return SimpleNamespace(data=rows)
         except Exception:
-            if self.method != "POST":
+            if self.method != "POST" or "id" not in (self.payload or {}):
                 raise
             # A committed insert with a lost HTTP response must not be repeated.
             response = requests.get(url, headers=headers,
@@ -59578,3 +59533,89 @@ def _np_admin_paged_rows_v215(table, order_col, deadline):
         if len(page) < 1000:
             return rows
     return rows
+
+
+# V216: ordinary purchase approvals use the proven isolated assignment transport.
+# No background issuance, no skipped email, and no re-use of a paid/breached account.
+from contextvars import ContextVar as _NPApprovalContextVarV216
+_NP_APPROVAL_CONTEXT_V216 = _NPApprovalContextVarV216("np_approval_v216", default=False)
+_np_mt5_auto_eligible_v216_core = _np_mt5_auto_eligible
+
+def _np_mt5_auto_eligible(mt5, account_size=None, target_stage=None):
+    eligible, reason = _np_mt5_auto_eligible_v216_core(mt5, account_size, target_stage)
+    if eligible and _NP_APPROVAL_CONTEXT_V216.get():
+        # Server-only, request-local proof. The final gate still re-reads the
+        # ownership ledger AND exact pool row immediately before inserting.
+        mt5["_np_v173_picker_verified"] = True
+        mt5["_np_v182_picker_verified_at"] = time.time()
+        mt5["_np_v182_picker_stage"] = _normalize_lifecycle_stage(target_stage)
+        mt5["_np_v182_picker_size"] = clean(account_size)
+    return eligible, reason
+
+_np_approve_purchase_v216_core = app.view_functions.get("approve_purchase")
+
+def _np_approve_purchase_v216():
+    if request.method == "OPTIONS":
+        return _np_approve_purchase_v216_core()
+    admin, auth_response = _require_admin()
+    if auth_response:
+        return auth_response
+    data = request.get_json(silent=True) or {}
+    pid = str(data.get("id") or "").strip()
+    if not pid:
+        return bad("Missing purchase id", 400)
+    transport = _NP_RENEWAL_REST_V211.set(True)
+    context = _NP_APPROVAL_CONTEXT_V216.set(True)
+    marker, original_note = None, None
+    try:
+        rows = _np_renewal_db_v211().table("challenge_purchases").select("*").eq("id", pid).limit(2).execute().data
+        if len(rows) != 1:
+            return bad("Purchase not found", 404)
+        purchase = rows[0]
+        # Dedicated reset payment routing retains its existing implementation.
+        if str(purchase.get("purchase_type") or "").lower() == "reset" or "[NP_RESET_REQUEST:" in str(purchase.get("admin_note") or ""):
+            _NP_RENEWAL_REST_V211.reset(transport)
+            transport = _NP_RENEWAL_REST_V211.set(False)
+            _NP_APPROVAL_CONTEXT_V216.reset(context)
+            context = _NP_APPROVAL_CONTEXT_V216.set(False)
+            return _np_approve_purchase_v216_core()
+        if _np_purchase_is_rejected_v154(purchase, refresh=False):
+            return bad("This purchase is rejected. Approval is blocked.", 409)
+        if any(purchase.get(k) for k in ("trader_account_id", "assigned_mt5_id", "mt5_login")):
+            return bad("This purchase already has an assigned account. Refresh to view it; do not approve again.", 409)
+        original_note = purchase.get("admin_note")
+        if "[NP_APPROVAL_CLAIM_V216:" in str(original_note or ""):
+            return bad("Approval for this purchase is already in progress. No second account will be issued.", 409)
+        marker = "[NP_APPROVAL_CLAIM_V216:" + str(uuid.uuid4()) + "]"
+        note = (str(original_note or "") + " " + marker).strip()
+        query = _np_renewal_db_v211().table("challenge_purchases").update({"admin_note": note}).eq("id", pid)
+        query = query.is_("admin_note", "null") if original_note is None else query.eq("admin_note", original_note)
+        if purchase.get("status") is None:
+            query = query.is_("status", "null")
+        else:
+            query = query.eq("status", purchase["status"])
+        if purchase.get("updated_at"):
+            query = query.eq("updated_at", purchase["updated_at"])
+        if not query.execute().data:
+            marker = None
+            return bad("This purchase changed or another approval started. Refresh before continuing.", 409)
+        return _np_approve_purchase_v216_core()
+    except Exception as exc:
+        print("V216 PURCHASE APPROVAL TRANSPORT ERROR:", type(exc).__name__, flush=True)
+        return bad("Approval could not be confirmed. Refresh this purchase before trying again; do not select another account.", 503)
+    finally:
+        if marker:
+            try:
+                # Release only this request's exact claim. A committed assignment
+                # replaces admin_note; we never overwrite that transaction record.
+                claim_note = (str(original_note or "") + " " + marker).strip()
+                history = _np_renewal_db_v211().table("trader_accounts").select("id").eq("purchase_id", pid).limit(1).execute().data
+                if not history:
+                    _np_renewal_db_v211().table("challenge_purchases").update({"admin_note": original_note}).eq("id", pid).eq("admin_note", claim_note).execute()
+            except Exception as exc:
+                print("V216 PURCHASE CLAIM RETAINED FOR SAFE RECONCILIATION:", type(exc).__name__, flush=True)
+        _NP_APPROVAL_CONTEXT_V216.reset(context)
+        _NP_RENEWAL_REST_V211.reset(transport)
+
+if callable(_np_approve_purchase_v216_core):
+    app.view_functions["approve_purchase"] = _np_approve_purchase_v216
