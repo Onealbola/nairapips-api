@@ -16619,17 +16619,25 @@ def staff_login():
         # Successful authentication returns without waiting for last_login/audit
         # Supabase writes. Those records remain best-effort background work.
         def _record_staff_login(staff_snapshot):
+            # Best-effort audit must finish under bounded HTTP timeouts rather
+            # than leave another background thread in the shared SDK queue.
+            context = globals().get("_NP_RENEWAL_REST_V211")
+            token = context.set(True) if context is not None else None
             try:
-                if staff_snapshot.get('id') != 'bootstrap-super-admin':
-                    _staff_db().table('admin_staff_members').update({
-                        'last_login_at': now_iso()
-                    }).eq('id', staff_snapshot['id']).execute()
-            except Exception as update_error:
-                print('STAFF LAST LOGIN UPDATE ERROR:', str(update_error))
-            try:
-                audit_log(staff_snapshot, 'auth', 'login', 'Staff logged in')
-            except Exception as audit_error:
-                print('STAFF LOGIN AUDIT ERROR:', str(audit_error))
+                try:
+                    if staff_snapshot.get('id') != 'bootstrap-super-admin':
+                        _np_renewal_db_v211().table('admin_staff_members').update({
+                            'last_login_at': now_iso()
+                        }).eq('id', staff_snapshot['id']).execute()
+                except Exception as update_error:
+                    print('STAFF LAST LOGIN UPDATE ERROR:', type(update_error).__name__)
+                try:
+                    audit_log(staff_snapshot, 'auth', 'login', 'Staff logged in')
+                except Exception as audit_error:
+                    print('STAFF LOGIN AUDIT ERROR:', type(audit_error).__name__)
+            finally:
+                if context is not None:
+                    context.reset(token)
 
         try:
             threading.Thread(
@@ -59619,3 +59627,11 @@ def _np_approve_purchase_v216():
 
 if callable(_np_approve_purchase_v216_core):
     app.view_functions["approve_purchase"] = _np_approve_purchase_v216
+
+
+# V217: an external-service wait must not monopolize a synchronous HTTP worker.
+# Gunicorn's repository configuration enables request threads. Business mutations
+# retain the old one-at-a-time behavior inside each worker; database CAS guards
+# still protect financial/account changes across different workers/instances.
+from request_serialization import SerialMutationMiddleware as _NPSerialMutationsV217
+app.wsgi_app = _NPSerialMutationsV217(app.wsgi_app)

@@ -301,3 +301,42 @@ audit inserts preserve that integer identity and do not repeat lost-response
 inserts. Final validation: 124 Python tests passed, plus the existing Admin View
 handoff and payout dashboard JavaScript checks. Render deployment and live
 end-to-end approval latency remain unconfirmed from this environment.
+
+## V217 — serve admin authentication while another HTTP request is busy
+
+The continued screenshot is an authentication-response timeout, preceding all
+Admin dashboard loading. Gunicorn's default synchronous worker serves only one
+request at a time. A real isolated Gunicorn test reproduced login waiting behind
+an intentionally slow handler, even though credential verification itself is
+local and fast. The actual Render start command/runtime configuration has not
+been read; this reproduction establishes the failure mode, not a confirmed
+inspection of Render's running workers.
+
+The automatically discovered gunicorn.conf.py selects gthread with eight request
+threads, preserves Gunicorn/command-line worker count, and does not preload this
+app (its import starts background workers). Startup logs identify the effective
+worker class/thread count; access logs include duration and omit query strings.
+SerialMutationMiddleware preserves one business-mutating HTTP handler at a time
+inside each worker. Admin credential verification remains on the original signed
+Flask authentication route and bypasses only that scheduling lock. Existing DB
+claims/CAS guards remain authoritative across workers. It does not bypass auth,
+change passwords, resurrect historical accounts or change financial eligibility.
+
+Login background last-login/audit writes also enter bounded REST transport so a
+successful sign-in does not accumulate SDK-blocked background threads. The
+transport context is always restored, including failure cases.
+
+Real Gunicorn tests verify automatic config loading, successful signed login
+while a slow read runs, rejection of incorrect passwords, concurrent business
+mutations staying serial, login responding while mutations are queued, and lock
+release on handler failure. These tests use only private fixture credentials and
+an AST-extracted auth function; they do not import the production app, contact
+customers, send email or issue real accounts.
+
+Live verification remains blocked by this cloud environment's restricted egress.
+A configuration draft preserves *.supabase.co and adds only the API hostname,
+nairapips.com and www.nairapips.com. The tool confirmed saving and requires user
+review/save/publish before those runtime network changes take effect. This draft
+is unrelated to the Render deployment triggered by the application Git push.
+Final V217 validation: 130 Python tests passed, including real Gunicorn HTTP
+concurrency tests and bounded staff-audit failure/context-restoration cases.

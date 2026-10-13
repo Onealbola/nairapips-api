@@ -1,5 +1,6 @@
 """Authenticate without the shared client; timeouts must never bypass credentials."""
 import ast,copy,hmac,unittest
+from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -41,6 +42,32 @@ class LoginTests(unittest.TestCase):
         self.assertNotIn('sensitive',r.get_data(as_text=True));self.assertNotIn('token',r.get_json())
     def test_inactive_staff_cannot_sign_in(self):
         self.rows[0]['status']='disabled';self.assertEqual(self.login().status_code,403)
+    def test_background_login_audit_uses_bounded_transport_and_restores_context(self):
+        capture={}
+        def thread(**kw):
+            capture.update(kw)
+            return SimpleNamespace(start=lambda:None)
+        context=ContextVar('staff-audit',default=False)
+        db=Mock();seen=[]
+        self.env.update(threading=SimpleNamespace(Thread=thread),
+            _NP_RENEWAL_REST_V211=context,_np_renewal_db_v211=lambda:db,
+            now_iso=lambda:'now',audit_log=lambda *args:seen.append(context.get()))
+        self.assertEqual(self.login().status_code,200)
+        capture['target'](*capture['args'])
+        db.table.assert_called_once_with('admin_staff_members')
+        self.assertEqual(seen,[True]);self.assertFalse(context.get())
+    def test_background_audit_failure_does_not_leak_transport_context(self):
+        capture={}
+        def thread(**kw):
+            capture.update(kw)
+            return SimpleNamespace(start=lambda:None)
+        context=ContextVar('staff-audit-failure',default=False)
+        self.env.update(threading=SimpleNamespace(Thread=thread),
+            _NP_RENEWAL_REST_V211=context,_np_renewal_db_v211=Mock(side_effect=TimeoutError()),
+            audit_log=Mock(side_effect=TimeoutError()))
+        self.assertEqual(self.login().status_code,200)
+        capture['target'](*capture['args'])
+        self.assertFalse(context.get())
     def test_email_fallback_and_ambiguous_accounts(self):
         self.response.json.side_effect=[[],[dict(self.rows[0],email='member@example.com')]]
         self.assertEqual(self.login('Member@example.com').status_code,200)

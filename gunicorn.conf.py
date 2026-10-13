@@ -1,0 +1,23 @@
+"""Allow authentication to run while another request waits on an external service.
+
+Gunicorn loads this file automatically from the repository working directory.
+Keep its configured worker count (including Render's command-line override).
+Do not preload: this application starts background workers during import.
+"""
+worker_class = "gthread"
+threads = 8
+preload_app = False
+# Gthread workers keep reporting liveness while requests wait on I/O. Raising
+# timeout is not the remedy; keep the usual thirty-second worker watchdog.
+timeout = 30
+graceful_timeout = 30
+accesslog = "-"
+errorlog = "-"
+# Include duration so Render logs distinguish slow handlers from client errors.
+access_log_format = '%(h)s %(t)s "%(m)s %(U)s %(H)s" %(s)s %(b)s duration_us=%(D)s'
+
+
+def on_starting(server):
+    server.log.info("NP HTTP V217 worker_class=%s threads=%s workers=%s preload=%s",
+        server.cfg.worker_class.__name__, server.cfg.threads,
+        server.cfg.workers, server.cfg.preload_app)
