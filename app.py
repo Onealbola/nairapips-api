@@ -1747,7 +1747,7 @@ def _np_reset_entitlement_for_source(source, trader=None):
             if paid_rows and not open_rows and trader_state == "funded_waiting_mt5":
                 reset_rows = (
                     supabase.table("trader_accounts")
-                    .select("id,account_status,archived_at,reset_at,updated_at,created_at")
+                    .select("id,account_status,archived_at,updated_at,created_at")
                     .eq("trader_id", trader_id)
                     .execute().data
                     or []
@@ -5520,7 +5520,7 @@ def _fetch_phase_assignment_queue():
         except Exception as e:
             print("PHASE QUEUE TRADER FETCH ERROR:", e)
         try:
-            active_rows = supabase.table("trader_accounts").select("id,trader_id,purchase_id,stage,phase,account_status,status,mt5_login,account_size,start_balance").in_("trader_id", trader_ids).in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded", "funded_profit_cap_reached"]).limit(3000).execute().data or []
+            active_rows = supabase.table("trader_accounts").select("id,trader_id,purchase_id,stage,account_status,mt5_login,account_size,start_balance").in_("trader_id", trader_ids).in_("account_status", ["assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded", "funded_profit_cap_reached"]).limit(3000).execute().data or []
             for row in active_rows:
                 tid = str(row.get("trader_id") or "").strip()
                 if tid:
@@ -10901,7 +10901,7 @@ def approve_purchase():
         _seen_linked = set()
         for _col in ("purchase_id",):
             try:
-                _rows = (_np_renewal_db_v211().table("trader_accounts").select("id,stage,account_status,status,mt5_login")
+                _rows = (_np_renewal_db_v211().table("trader_accounts").select("id,stage,account_status,mt5_login")
                          .eq(_col, pid).limit(100).execute().data or [])
                 for _a in _rows:
                     _aid = str(_a.get("id") or "")
@@ -11044,8 +11044,7 @@ def admin_purchase_assignment_status_v147():
         p = rows[0]
         linked = (
             supabase.table("trader_accounts").select(
-                "id,trader_id,purchase_id,stage,account_status,status,mt5_login,"
-                "mt5_server,account_size,assigned_at,started_at,updated_at"
+                "id,trader_id,purchase_id,stage,account_status,mt5_login,mt5_server,account_size,started_at,updated_at"
             )
             .eq("purchase_id", pid)
             .order("created_at", desc=True)
@@ -11480,7 +11479,7 @@ def reject_purchase():
 
         linked = (
             supabase.table("trader_accounts")
-            .select("id,mt5_login,account_status,status")
+            .select("id,mt5_login,account_status")
             .eq("purchase_id", pid).limit(20).execute().data or []
         )
         real_linked = [a for a in linked if str(a.get("mt5_login") or "").strip()]
@@ -17018,7 +17017,7 @@ def revenue_summary():
             counted_payouts.append((row, dt))
 
         try:
-            revenue_accounts = supabase.table("trader_accounts").select("id,stage,phase,account_status,status,risk_zone,display_risk_zone,dd_used_percent,mt5_access_disabled").limit(5000).execute().data or []
+            revenue_accounts = supabase.table("trader_accounts").select("id,stage,account_status,risk_zone,dd_used_percent").limit(5000).execute().data or []
         except Exception:
             revenue_accounts = []
         active_account_statuses = {"assigned_active", "active", "current_active", "phase1_active", "phase2_active", "funded_active", "live", "funded"}
@@ -19307,7 +19306,7 @@ def _v2_summary_counts():
     }
 
     try:
-        accounts = supabase.table("trader_accounts").select("id,stage,phase,account_status,status,risk_zone,display_risk_zone,dd_used_percent,mt5_access_disabled").limit(5000).execute().data or []
+        accounts = supabase.table("trader_accounts").select("id,stage,account_status,risk_zone,dd_used_percent").limit(5000).execute().data or []
     except Exception:
         accounts = []
     counts["active_accounts"] = len([a for a in accounts if not _v2_is_breached(a) and _v2_account_status(a) in ACTIVE_ACCOUNT_STATUSES])
@@ -24002,7 +24001,7 @@ def _np_retry_clean_pass_funded_v19(limit=120):
                 # entitlement is consumed even if that child later changed status.
                 existing_rows = (
                     supabase.table("trader_accounts").select(
-                        "id,trader_id,purchase_id,stage,phase,account_status,mt5_login,created_at,assigned_at"
+                        "id,trader_id,purchase_id,stage,account_status,mt5_login,created_at"
                     )
                     .eq("trader_id", trader_id)
                     .eq("purchase_id", purchase_id)
@@ -59648,7 +59647,7 @@ app.wsgi_app = _NPSerialMutationsV217(app.wsgi_app,
 @app.get("/healthz/http")
 def _np_http_readiness_v218():
     # Public operational metadata only: never include credentials or business rows.
-    response = jsonify({"status": "ok", "http_release": "V226_RESERVED_ADMIN_READS",
+    response = jsonify({"status": "ok", "http_release": "V228_SCHEMA_SAFE_ASSIGNMENT",
         "commit": os.getenv("RENDER_GIT_COMMIT")})
     response.headers["Cache-Control"] = "no-store"
     return response

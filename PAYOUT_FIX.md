@@ -516,3 +516,29 @@ Adds paid_then_breached_closed count/rate to backend report and per-plan totals.
 Website keeps strict DD/MM/YYYY handling, date-scoped recalculation, Total row,
 and admin failed-load safeguards. 16 report/auth/date/payment tests passed plus
 JS date scope, input refresh, failed-load and operations preservation checks.
+
+### V228 — confirmed schema mismatch blocking ordinary purchase assignment
+
+Read-only inspection of Odinaka's exact new purchase f1093f83-966f-458e-a1ae-
+2d07e7d0482d confirmed pending payment/status, no assigned broker/account mirror,
+no account linked to the purchase and no retained approval claim. A direct live
+query using approve_purchase's history projection returned HTTP400 / PostgreSQL
+42703: trader_accounts.status does not exist. Real field is account_status.
+V216's required fail-closed ownership check therefore stopped approval before
+trader resolution or assignment; it did not indicate a lack of inventory.
+
+Remove nonexistent fields from literal trader_accounts read projections, using
+live field-name metadata only: approval history, assignment-status polling,
+rejection history, assignment queue, clean pass retry, reset entitlement lookup
+and summary reads. These read-only compatibility changes preserve all rejection,
+duplicate, exact-owner, account-size, fresh-inventory and final ownership guards.
+No errors are swallowed, no historical accounts reactivated, and no customer
+payment approvals/MT5 allocations are performed during diagnosis.
+
+The final approval-body regression test uses the actual AST-extracted function
+with a strict field schema: valid pending purchase reaches a stub assigner; an
+existing assignment/rejected purchase/failed ownership read still stops before
+assignment. Assignment-status polling now uses supported fields (including
+removing nonexistent assigned_at from trader_accounts). All eight corrected
+projections returned HTTP200 against live PostgREST with read-only limit1 queries.
+A fixture contains column names only, no account values or credentials.
