@@ -1,0 +1,25 @@
+name: Stability checks
+on:
+  push:
+    branches: [main, fix-login-capacity]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  backend-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.9'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Check application syntax without starting production workers
+        run: python -c "import ast,pathlib; ast.parse(pathlib.Path('app.py').read_bytes())"
+      - name: Test authentication, capacity, assignments, payouts and reports
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -m unittest discover -s tests -v
