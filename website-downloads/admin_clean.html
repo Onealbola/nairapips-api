@@ -12388,6 +12388,29 @@ function exportPurchaseSalesCSV(){
 
 let npSalesReportSequence=0;
 
+function npSalesDateISOv225(raw){
+ const value=String(raw||'').trim();
+ if(!value)return '';
+ let day,month,year;
+ const british=/^(\d{2})\/(\d{2})\/(\d{4})$/.exec(value);
+ const iso=/^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+ if(british){day=+british[1];month=+british[2];year=+british[3];}
+ else if(iso){year=+iso[1];month=+iso[2];day=+iso[3];}
+ else throw new Error('Enter dates as DD/MM/YYYY, for example 03/10/2026 means 3 October 2026.');
+ const check=new Date(Date.UTC(year,month-1,day));
+ if(year<1900||year>2100||check.getUTCFullYear()!==year||check.getUTCMonth()!==month-1||check.getUTCDate()!==day)throw new Error('Enter a valid date as DD/MM/YYYY.');
+ return String(year)+'-'+String(month).padStart(2,'0')+'-'+String(day).padStart(2,'0');
+}
+function npSalesDateInputv225(value){
+ const raw=String(value||'');
+ return /^\d{4}-\d{2}-\d{2}$/.test(raw)?raw.slice(8,10)+'/'+raw.slice(5,7)+'/'+raw.slice(0,4):(/^[0-9/]{0,10}$/.test(raw)?raw:'');
+}
+function npSalesDateLabelv225(iso){
+ const months=['January','February','March','April','May','June','July','August','September','October','November','December'];
+ const parts=iso.split('-');return Number(parts[2])+' '+months[Number(parts[1])-1]+' '+parts[0];
+}
+
+
 function npSalesScopedReportV224(response,from,to){
  if(!Array.isArray(response.rows))throw new Error('Complete dated purchase rows are missing. No totals are shown.');
  const keys=['awaiting_account','no_recorded_result','passed_not_funded','failed_before_funded','funded_no_payout','funded_breached_no_payout','paid_no_funded_breach','paid_and_funded_breached','needs_review'];
@@ -12433,13 +12456,17 @@ function npSalesDatesChanged(){
  npSalesDateTimer=setTimeout(()=>{if(document.getElementById('np-sales-result'))loadSalesOutcomes();},300);
 }
 function renderSalesOutcomes(){
- document.getElementById('content').innerHTML=`<div class="vault mb-6"><div class="badge">SALES OUTCOMES</div><h1 style="font-size:28px;font-weight:900;margin:12px 0">Where your sold accounts ended up</h1><p class="text-gray-400">Each approved original purchase appears once in the outcome totals. Follow its journey from challenge to funded to payout.</p></div><div class="card mb-4"><div class="flex flex-wrap gap-3 items-end"><label>Sold from<br><input id="np-sales-from" type="date" oninput="npSalesDatesChanged()" onchange="npSalesDatesChanged()" class="input" value="${window.npSalesFrom||''}"></label><label>Sold through<br><input id="np-sales-to" type="date" oninput="npSalesDatesChanged()" onchange="npSalesDatesChanged()" class="input" value="${window.npSalesTo||''}"></label><button class="btn btn-gold" onclick="loadSalesOutcomes()">Show results</button><button class="btn btn-ghost" onclick="document.getElementById('np-sales-from').value='';document.getElementById('np-sales-to').value='';loadSalesOutcomes()">All time</button></div><p class="text-gray-400 text-sm mt-3">Dates select when purchases were made, using Nigerian dates. Results include their linked history up to today. Resets do not count as new sales.</p></div><div id="np-sales-result" aria-live="polite">Choose a period, then Show results.</div>`;
+ document.getElementById('content').innerHTML=`<div class="vault mb-6"><div class="badge">SALES OUTCOMES</div><h1 style="font-size:28px;font-weight:900;margin:12px 0">Where your sold accounts ended up</h1><p class="text-gray-400">Each approved original purchase appears once in the outcome totals. Follow its journey from challenge to funded to payout.</p></div><div class="card mb-4"><div class="flex flex-wrap gap-3 items-end"><label>Sold from (DD/MM/YYYY)<br><input id="np-sales-from" type="text" inputmode="numeric" placeholder="DD/MM/YYYY" maxlength="10" oninput="npSalesDatesChanged()" onchange="npSalesDatesChanged()" class="input" value="${npSalesDateInputv225(window.npSalesFrom)}"></label><label>Sold through (DD/MM/YYYY)<br><input id="np-sales-to" type="text" inputmode="numeric" placeholder="DD/MM/YYYY" maxlength="10" oninput="npSalesDatesChanged()" onchange="npSalesDatesChanged()" class="input" value="${npSalesDateInputv225(window.npSalesTo)}"></label><button class="btn btn-gold" onclick="loadSalesOutcomes()">Show results</button><button class="btn btn-ghost" onclick="document.getElementById('np-sales-from').value='';document.getElementById('np-sales-to').value='';loadSalesOutcomes()">All time</button></div><p class="text-gray-400 text-sm mt-3">Enter day/month/year. Example: 03/10/2026 means 3 October 2026. Dates use Nigerian business days. Results include their linked history up to today. Resets do not count as new sales.</p></div><div id="np-sales-result" aria-live="polite">Choose a period, then Show results.</div>`;
 }
 async function loadSalesOutcomes(){
  clearTimeout(npSalesDateTimer);
  const sequence=++npSalesReportSequence;
- const from=document.getElementById('np-sales-from').value,to=document.getElementById('np-sales-to').value;
  const box=document.getElementById('np-sales-result');
+ let from,to;
+ try{
+  from=npSalesDateISOv225(document.getElementById('np-sales-from').value);
+  to=npSalesDateISOv225(document.getElementById('np-sales-to').value);
+ }catch(err){box.textContent=err.message;return;}
  if(from&&to&&from>to){box.textContent='The start date must come before the end date.';return;}
  window.npSalesFrom=from;window.npSalesTo=to;
  box.textContent='Loading complete purchase, account and payout history…';
@@ -12454,7 +12481,7 @@ async function loadSalesOutcomes(){
   const card=(label,value,note,color)=>`<div class="card"><div class="text-gray-400 text-sm">${label}</div><div style="font-size:32px;font-weight:950;color:${color||'#ffda5c'}">${value}</div><div class="text-gray-400 text-sm">${note}</div></div>`;
   const line=(label,count,tone)=>`<div style="display:flex;justify-content:space-between;gap:18px;padding:12px 0;border-bottom:1px solid #ffffff16"><span>${label}</span><strong style="color:${tone||'#fff'}">${count}</strong></div>`;
   box.innerHTML=`
-   <div class="card mb-4" style="border-color:#b69b36"><strong>REPORT PERIOD: ${from||to?e(from||'Beginning')+' → '+e(to||'Latest sales'):'ALL TIME'}</strong><div class="text-gray-400 text-sm">Only purchases sold during this period are included. Their outcomes are followed up to today.</div></div>
+   <div class="card mb-4" style="border-color:#b69b36"><strong>REPORT PERIOD: ${from||to?e(from?npSalesDateLabelv225(from):'Beginning')+' → '+e(to?npSalesDateLabelv225(to):'Latest sales'):'ALL TIME'}</strong><div class="text-gray-400 text-sm">Only purchases sold during this period are included. Their outcomes are followed up to today.</div></div>
    <div class="grid md:grid-cols-3 gap-3 mb-4">
     ${card('BOUGHT',t.sold,'Original approved purchases','#ffda5c')}
     ${card('HAD A BREACH',t.breached,'Purchases with a recorded breach at any stage','#ef4444')}

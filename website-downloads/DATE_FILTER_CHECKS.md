@@ -18,3 +18,18 @@ The report remains a purchase cohort report: dates identify purchases sold in th
 period, and outcomes follow those purchases up to today. It is not an event-only
 cashflow report of payments or breaches occurring during the selected period.
 No business records, payment actions or monitoring/assignment rules are changed.
+
+Confirmed root cause from the user's screenshots: date fields displayed
+03/10/2026 and 12/10/2026, while REPORT PERIOD echoed 2026-03-10 to 2026-12-10.
+The browser interpreted month/day/year: 10 March through 10 December. September
+rows and all-time-looking totals were therefore within the request's actual
+nine-month interval. Earlier filter checks missed this locale ambiguity.
+
+Replacement date fields explicitly accept DD/MM/YYYY as text, validate Gregorian
+calendar dates, and convert 03/10/2026 into 2026-10-03. Report period displays
+3 October 2026 → 12 October 2026. Invalid/partial dates stop the request instead
+of falling back to all time. Strict ISO entry also remains unambiguous. Tests
+cover leap years, invalid dates, and the user's exact values. Real Chromium with
+en-US locale sends the intended October interval and excludes September rows.
+Read-only live calculation for 3–12 October: 32 bought, 22 ever breached,
+6 paid recipients, amount recorded paid 392,744 NGN. No production writes.
