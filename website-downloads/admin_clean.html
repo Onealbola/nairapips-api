@@ -16404,10 +16404,10 @@ window.adminOpenIntelligence=async function(traderId,accountId){
   const timer=setTimeout(()=>controller.abort(),25000);
   try{
     if(!SESSION.token) throw new Error('Your admin session has expired. Please sign in again.');
-    const base=npMonitoringApiUrl().replace(/\/$/,'');
+    const base=API_URL.replace(/\/$/,'');
     const headers={'Accept':'application/json'};
     if(SESSION.token) headers['Authorization']='Bearer '+SESSION.token;
-    const resp=await fetch(base+'/breach_black_box?trader_id='+encodeURIComponent(traderId)+'&account_id='+encodeURIComponent(accountId),{headers,signal:controller.signal,cache:'no-store'});
+    const resp=await fetch(base+'/admin/breach_intelligence?trader_id='+encodeURIComponent(traderId)+'&account_id='+encodeURIComponent(accountId),{headers,signal:controller.signal,cache:'no-store'});
     const j=await resp.json();
     if(!resp.ok || j.success===false) throw new Error(j.error||j.message||('HTTP '+resp.status));
     const x=j.data||j,a=x.account||{},r=x.rule||{},f=x.first_crossing||{},low=x.lowest_observed||{},rec=x.recovery_after_breach||{};
@@ -16445,7 +16445,7 @@ window.adminOpenIntelligence=async function(traderId,accountId){
     </div></div>`;
     if(dialog.isConnected) dialog.querySelector('.modal-card').innerHTML=`<button class="btn btn-sm" onclick="this.closest('.modal-bg').remove()">Close</button>`+html;
   }catch(e){
-    const message=e.name==='AbortError'?'The monitoring service did not respond within 25 seconds. Please retry.':String(e.message||e);
+    const message=e.name==='AbortError'?'The account evidence did not respond within 25 seconds. Please retry.':String(e.message||e);
     if(dialog.isConnected) dialog.querySelector('.modal-card').innerHTML=`<h3>Breach Intelligence unavailable</h3><div role="alert" style="margin:16px 0;color:#fca5a5">${esc(message)}</div><button class="btn btn-gold" onclick="this.closest('.modal-bg').remove();adminOpenIntelligence('${esc(String(traderId))}','${esc(String(accountId))}')">Retry</button> <button class="btn" onclick="this.closest('.modal-bg').remove()">Close</button>`;
   }finally{clearTimeout(timer)}
 };
