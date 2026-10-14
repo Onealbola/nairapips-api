@@ -59652,3 +59652,59 @@ def _np_http_readiness_v218():
         "commit": os.getenv("RENDER_GIT_COMMIT")})
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+# V219: authenticated, read-only sales cohort history (independent of bootstrap slices).
+from sales_outcomes import build_report as _np_build_sales_outcomes_v219
+from concurrent.futures import ThreadPoolExecutor as _NPReportExecutorV219
+_np_report_executor_v219 = _NPReportExecutorV219(max_workers=2)
+
+def _np_sales_rows_v219(table):
+    import time
+    deadline = time.monotonic() + 12
+    rows = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Report read deadline")
+        response = requests.get(SUPABASE_URL.rstrip("/") + "/rest/v1/" + table,
+            headers={"apikey": SUPABASE_KEY, "Authorization": "Bearer " + SUPABASE_KEY},
+            params={"select": "*", "order": "created_at.asc,id.asc", "limit": "1000", "offset": str(len(rows))},
+            timeout=(min(2, remaining), min(4, remaining)))
+        response.raise_for_status()
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError("Invalid report rows")
+        rows.extend(page)
+        if len(page) < 1000:
+            return rows
+        if len(rows) >= 50000:
+            raise RuntimeError("Report requires a larger history query; no partial totals returned")
+
+@app.get("/admin/sales_outcomes")
+def _np_sales_outcomes_v219():
+    admin, error = _require_admin()
+    if error is not None:
+        return error
+    start, end = request.args.get("from", ""), request.args.get("to", "")
+    try:
+        # Validate before querying; dates are inclusive Nigerian business dates.
+        _np_build_sales_outcomes_v219([], [], start, end)
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    futures = [_np_report_executor_v219.submit(_np_sales_rows_v219, table)
+               for table in ("challenge_purchases", "trader_accounts")]
+    try:
+        from concurrent.futures import wait
+        done, pending = wait(futures, timeout=13)
+        if pending:
+            raise RuntimeError("Report timed out")
+        payload = _np_build_sales_outcomes_v219(futures[0].result(), futures[1].result(), start, end)
+        response = jsonify(payload)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except Exception as exc:
+        for future in futures:
+            future.cancel()
+        print("V219 SALES REPORT ERROR:", type(exc).__name__, flush=True)
+        return jsonify({"success": False, "error": "The complete report could not be loaded. Please retry; partial totals are not shown."}), 503

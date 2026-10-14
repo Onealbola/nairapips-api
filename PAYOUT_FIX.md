@@ -375,3 +375,30 @@ while an admin action runs, busy-response CORS and release after exceptions.
 Validation: 135 Python tests passed, including real Gunicorn saturation, SDK
 client-construction timeout checks, and the existing financial/lifecycle tests.
 Existing Admin View handoff and trader payout JavaScript checks also passed.
+
+### V219 — read-only sales cohort outcomes
+
+Adds authenticated GET /admin/sales_outcomes?from=YYYY-MM-DD&to=YYYY-MM-DD.
+Inclusive Africa/Lagos dates use the original purchase creation/transaction date,
+not approval date. Approved original purchases are counted once by purchase ID;
+reset purchases and rejected/cancelled/refunded purchases are excluded. Exact
+purchase IDs, account mirrors with matching owners, and exact same-owner source
+links connect account history. No name/email/login matching merges purchases.
+Ever-breached, passed-at-least-one-phase, and reached-funded milestones overlap;
+percentages use sold purchases as denominator. Replacement history cannot create
+another sale. A funded placeholder without a broker login is not a funded issue.
+
+Independent bounded REST pagination reads complete history, up to 50,000 rows per
+table; deadline/cap/schema errors return 503 instead of partial/zero totals. No
+business writes, notifications, monitoring rules, or assignment changes.
+
+Updated website file: /workspace/payout-dashboard-fix/admin_sales_outcomes.html,
+based on the current publicly served admin page downloaded 14 October 2026.
+Adds Sales Outcomes navigation, dates, four KPI cards, plan breakdown and purchase
+history. HTML values are escaped; stale report responses cannot replace new ones.
+Website upload remains separate from backend auto-deployment.
+
+Validation: 141 Python regression tests passed before adding two endpoint
+validation/auth tests; all eight focused report tests then passed. All inline
+admin scripts parse and mocked UI success/error/escaping checks pass. Read-only
+live validation loaded 481 purchases and 1,927 accounts without mutations.
