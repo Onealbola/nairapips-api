@@ -99,3 +99,13 @@ class ReservedAdminReadTests(unittest.TestCase):
             list(app({'PATH_INFO':'/ordinary'},lambda status,h:headers.append(status)))
             self.assertTrue(headers[0].startswith('503'))
         finally:release.set();one.join(3);two.join(3)
+
+class ResponseWriteTests(unittest.TestCase):
+    def test_large_response_is_chunked_without_changing_any_wire_bytes(self):
+        from types import SimpleNamespace
+        payload=bytes(range(256))*1000;timeouts=[]
+        app=RequestAdmissionMiddleware(lambda *a:[payload],1)
+        parts=list(app({'PATH_INFO':'/download','gunicorn.socket':SimpleNamespace(settimeout=timeouts.append)},lambda *a:None))
+        self.assertEqual(b''.join(parts),payload)
+        self.assertTrue(all(len(part)<=65536 for part in parts))
+        self.assertEqual(timeouts,[15]);self.assertEqual(app.capacity_snapshot()['active_lanes'],{})

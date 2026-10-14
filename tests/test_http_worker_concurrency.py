@@ -7,7 +7,7 @@ FIXTURE=r'''
 import ast,base64,copy,hashlib,hmac,time,threading
 from pathlib import Path
 from types import SimpleNamespace
-from flask import Flask,request,jsonify
+from flask import Flask,request,jsonify,Response
 from request_serialization import SerialMutationMiddleware
 from request_admission import RequestAdmissionMiddleware
 app=Flask(__name__)
@@ -35,11 +35,15 @@ def slow():
  try:time.sleep(1.2);return jsonify(ok=True)
  finally:
   with stats_lock:stats['active']-=1
+@app.get('/blocked-response')
+def blocked_response():
+ Path(MARKER_DIR,'blocked-response').touch()
+ return Response((b'x'*65536 for _ in range(512)),mimetype='application/octet-stream')
 @app.get('/stats')
 def read_stats():return jsonify(stats)
 app.wsgi_app=SerialMutationMiddleware(app.wsgi_app, serial_paths={'/slow'})
 if ENABLE_ADMISSION:
- app.wsgi_app=RequestAdmissionMiddleware(app.wsgi_app, reserved_paths=('/admin_bootstrap','/admin_operations_center','/approve_challenge_purchase','/admin/sales_outcomes') if ENABLE_RESERVED else ())
+ app.wsgi_app=RequestAdmissionMiddleware(app.wsgi_app, io_idle_timeout=ADMISSION_IO_TIMEOUT, reserved_paths=('/admin_bootstrap','/admin_operations_center','/approve_challenge_purchase','/admin/sales_outcomes') if ENABLE_RESERVED else ())
 app.add_url_rule('/admin_operations_center','slow_ops',slow,methods=['GET'])
 app.add_url_rule('/approve_challenge_purchase','private_approval_fixture',slow,methods=['POST'])
 app.add_url_rule('/admin/sales_outcomes','private_report_fixture',lambda: jsonify(ok=True),methods=['GET'])
@@ -54,10 +58,10 @@ class HTTPWorkerTests(unittest.TestCase):
         self.http=requests.Session();self.http.trust_env=False
     def tearDown(self):self.http.close()
     @contextlib.contextmanager
-    def server(self,configured,admission=False,reserved=False,cli_threads=None):
+    def server(self,configured,admission=False,reserved=False,cli_threads=None,io_timeout=15):
         with tempfile.TemporaryDirectory(prefix='np-http-worker-') as tmp:
             path=Path(tmp)
-            code=FIXTURE.replace('ENABLE_RESERVED',repr(reserved)).replace('ENABLE_ADMISSION',repr(admission)).replace('SOURCE_PATH',repr(str(ROOT/'app.py'))).replace('MARKER_DIR',repr(tmp))
+            code=FIXTURE.replace('ADMISSION_IO_TIMEOUT',repr(io_timeout)).replace('ENABLE_RESERVED',repr(reserved)).replace('ENABLE_ADMISSION',repr(admission)).replace('SOURCE_PATH',repr(str(ROOT/'app.py'))).replace('MARKER_DIR',repr(tmp))
             (path/'http_fixture.py').write_text(code)
             with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
             env=dict(os.environ,PYTHONPATH=str(ROOT)+os.pathsep+tmp,PYTHONDONTWRITEBYTECODE='1')
@@ -151,6 +155,26 @@ class HTTPWorkerTests(unittest.TestCase):
             for thread,outcomes in active:
                 thread.join(3);self.assertEqual(outcomes,[200])
             self.assertEqual(self.http.get(url+'/stats',timeout=2).json()['maximum'],8)
+
+    def test_client_that_stops_reading_releases_admission_slot(self):
+        with self.server(True,admission=True,io_timeout=.2) as (url,path):
+            port=int(url.rsplit(':',1)[1])
+            with socket.socket() as client:
+                client.setsockopt(socket.SOL_SOCKET,socket.SO_RCVBUF,1024)
+                client.connect(('127.0.0.1',port))
+                client.sendall(b'GET /blocked-response HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n')
+                self.wait_started(path,'blocked-response')
+                snapshot={'active_lanes':{'unobserved':True}}
+                deadline=time.monotonic()+3
+                while time.monotonic()<deadline:
+                    try:
+                        snapshot=self.http.get(url+'/healthz/http',timeout=.7).json()['capacity']
+                    except requests.RequestException:
+                        continue
+                    if not snapshot['active_lanes']:break
+                    time.sleep(.05)
+                self.assertEqual(snapshot['active_lanes'],{})
+                self.assertEqual(self.login(url).status_code,200)
 
     def test_admin_bootstrap_and_login_survive_busy_general_and_ops_requests(self):
         # Reproduce the actual Render override: --threads 4 used to remove the

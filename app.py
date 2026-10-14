@@ -11742,27 +11742,28 @@ def mt5_pool():
 
 @app.route("/create_mt5_account", methods=["POST"])
 def create_mt5():
+    admin, auth_error = _require_admin()
+    if auth_error is not None:
+        return auth_error
     try:
+        from types import SimpleNamespace
+        db = SimpleNamespace(table=_NPRenewalRestQueryV211)
         d=request.json or {}
         required=["mt5_login","mt5_server","mt5_master_password","mt5_investor_password"]
         if any(not str(d.get(x,"")).strip() for x in required): return bad("All MT5 details are required")
         mt5_login=str(d.get("mt5_login","")).strip()
-        existing=supabase.table("mt5_pool").select("id,status").eq("mt5_login",mt5_login).limit(1).execute().data or []
+        existing=db.table("mt5_pool").select("id,status").eq("mt5_login",mt5_login).limit(1).execute().data or []
         if existing: return bad("MT5 login already exists in pool",409)
         row={"plan_name":d.get("plan_name",""),"account_size":clean(d.get("account_size")),"pool_class":_np_normalize_pool_class(d.get("pool_class") or "phase"),"mt5_login":mt5_login,
              "mt5_server":str(d.get("mt5_server","")).strip(),"mt5_master_password":str(d.get("mt5_master_password","")).strip(),
              "mt5_investor_password":str(d.get("mt5_investor_password","")).strip(),"status":d.get("status","available"),
              "admin_note":d.get("admin_note",""),"created_at":now_iso(),"updated_at":now_iso()}
-        inserted = supabase.table("mt5_pool").insert(row).execute().data
-        # Inventory recovery: adding a fresh MT5 is the natural retry trigger for
-        # verified zero-cost entitlements that were safely waiting for stock.
-        # Run after the insert commits; failures never undo the inventory upload.
-        retry_summary = None
-        try:
-            retry_summary = _np_resume_waiting_zero_cost_automations("mt5_inventory_added")
-        except Exception as retry_exc:
-            print("MT5 INVENTORY AUTO-RETRY SKIPPED:", retry_exc)
-        return ok({"mt5": inserted, "automation_retry": retry_summary}, "MT5 account added")
+        inserted = db.table("mt5_pool").insert(row).execute().data
+        if not isinstance(inserted, list) or len(inserted) != 1 or str(inserted[0].get("mt5_login")) != mt5_login:
+            raise RuntimeError("Pool insert could not be confirmed; check the login before retrying")
+        # Saving inventory must not wait for a fleet-wide entitlement sweep.
+        retry_summary = {"scheduled": _np_schedule_inventory_retry_v236()}
+        return ok({**inserted[0], "mt5": inserted, "automation_retry": retry_summary}, "MT5 account added")
     except Exception as e: return bad(e)
 
 @app.route("/update_mt5_account", methods=["POST"])
@@ -59638,7 +59639,7 @@ if callable(_np_approve_purchase_v216_core):
 # still protect financial/account changes across different workers/instances.
 from request_serialization import SerialMutationMiddleware as _NPSerialMutationsV217
 app.wsgi_app = _NPSerialMutationsV217(app.wsgi_app,
-    serial_paths=_NP_FAST_ADMIN_PATHS_V97,
+    serial_paths=set(_NP_FAST_ADMIN_PATHS_V97) | {"/create_mt5_account"},
     bypass_paths=_NP_AUTOMATION_HEARTBEAT_PATHS_V20,
     admin_prefixes=("/admin/", "/admin_", "/approve_", "/reject_", "/assign_",
         "/lifecycle/assign_", "/mark_payout_", "/reopen_payout_", "/cancel_payout_",
@@ -59648,6 +59649,25 @@ app.wsgi_app = _NPSerialMutationsV217(app.wsgi_app,
 # Independent, read-only forensic view: never waits for the monitoring service.
 from breach_intelligence import build_breach_report as _np_breach_report_v235
 from breach_intelligence import BreachReader as _NPBreachReaderV235, BreachReadUnavailable as _NPBreachUnavailableV235, BreachRecordError as _NPBreachRecordErrorV235
+_NP_INVENTORY_RETRY_LOCK_V236 = threading.Lock()
+def _np_schedule_inventory_retry_v236():
+    if not _NP_INVENTORY_RETRY_LOCK_V236.acquire(blocking=False):
+        return False
+    def run():
+        try:
+            _np_maybe_run_verified_retry_v19("mt5_inventory_added")
+        except Exception as exc:
+            print("MT5 INVENTORY RETRY DEFERRED:", type(exc).__name__, flush=True)
+        finally:
+            _NP_INVENTORY_RETRY_LOCK_V236.release()
+    try:
+        threading.Thread(target=run, name="np-inventory-retry", daemon=True).start()
+        return True
+    except Exception:
+        _NP_INVENTORY_RETRY_LOCK_V236.release()
+        return False
+
+
 @app.get("/admin/breach_intelligence")
 def _np_breach_intelligence_v235():
     admin, error = _require_admin()

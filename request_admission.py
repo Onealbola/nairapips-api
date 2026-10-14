@@ -21,8 +21,9 @@ class RequestAdmissionMiddleware:
     PRIORITY_PATHS = frozenset({'/staff_login', '/healthz/http', '/admin/auth_check'})
     ALLOWED_ORIGINS = frozenset({'https://nairapips.com', 'https://www.nairapips.com'})
 
-    def __init__(self, application, capacity=6, reserved_paths=()):
+    def __init__(self, application, capacity=6, reserved_paths=(), io_idle_timeout=15):
         self.application = application
+        self.io_idle_timeout = io_idle_timeout
         self._state_lock = threading.Lock()
         self._active = {}
         self._executions = {}
@@ -63,6 +64,12 @@ class RequestAdmissionMiddleware:
             'long_requests': stuck}
 
     def __call__(self, environ, start_response):
+        # Gthread changes the accepted socket back to blocking mode. Without an
+        # idle timeout a client that stops reading holds this iterator, its
+        # admission slot, and its HTTP thread indefinitely after the handler ends.
+        connection = environ.get('gunicorn.socket')
+        if connection is not None:
+            connection.settimeout(self.io_idle_timeout)
         path = str(environ.get('PATH_INFO') or '')
         if path in self.PRIORITY_PATHS or environ.get('REQUEST_METHOD') == 'OPTIONS':
             yield from self.application(environ, start_response)
@@ -92,7 +99,14 @@ class RequestAdmissionMiddleware:
         try:
             response = self.application(environ, start_response)
             try:
-                yield from response
+                # Bound each write rather than timing out a healthy slow download
+                # of one large JSON body. The wire content/length stays identical.
+                for chunk in response:
+                    if len(chunk) <= 65536:
+                        yield chunk
+                    else:
+                        for offset in range(0, len(chunk), 65536):
+                            yield chunk[offset:offset + 65536]
             finally:
                 close = getattr(response, 'close', None)
                 if close:
