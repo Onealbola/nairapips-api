@@ -18,6 +18,14 @@ access_log_format = '%(h)s %(t)s "%(m)s %(U)s %(H)s" %(s)s %(b)s duration_us=%(D
 
 
 def on_starting(server):
+    # Render's command-line --threads overrides this file's `threads` value.
+    # Four threads left only two business slots and dropped the approval lane.
+    # Establish the required floor before workers construct their thread pools.
+    configured_threads = server.cfg.threads
+    if server.cfg.worker_class.__name__ == 'ThreadWorker' and configured_threads < threads:
+        server.cfg.set('threads', threads)
+        server.log.warning('NP HTTP capacity floor: configured_threads=%s effective_threads=%s',
+                           configured_threads, server.cfg.threads)
     server.log.info("NP HTTP V217 worker_class=%s threads=%s workers=%s preload=%s",
         server.cfg.worker_class.__name__, server.cfg.threads,
         server.cfg.workers, server.cfg.preload_app)

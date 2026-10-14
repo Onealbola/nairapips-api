@@ -59647,7 +59647,7 @@ app.wsgi_app = _NPSerialMutationsV217(app.wsgi_app,
 @app.get("/healthz/http")
 def _np_http_readiness_v218():
     # Public operational metadata only: never include credentials or business rows.
-    response = jsonify({"status": "ok", "http_release": "V230_HTTP_CAPACITY_DIAGNOSTICS",
+    response = jsonify({"status": "ok", "http_release": "V231_RENDER_THREAD_CAPACITY_FLOOR",
         "commit": os.getenv("RENDER_GIT_COMMIT"),
         "request_capacity": app.wsgi_app.capacity_snapshot()})
     response.headers["Cache-Control"] = "no-store"

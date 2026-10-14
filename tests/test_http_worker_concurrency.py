@@ -45,7 +45,7 @@ app.add_url_rule('/approve_challenge_purchase','private_approval_fixture',slow,m
 @app.get('/admin_bootstrap')
 def bootstrap():return jsonify(ok=True)
 @app.get('/healthz/http')
-def priority_health():return jsonify(ok=True)
+def priority_health():return jsonify(ok=True, capacity=app.wsgi_app.capacity_snapshot() if ENABLE_ADMISSION else None)
 '''
 
 class HTTPWorkerTests(unittest.TestCase):
@@ -53,7 +53,7 @@ class HTTPWorkerTests(unittest.TestCase):
         self.http=requests.Session();self.http.trust_env=False
     def tearDown(self):self.http.close()
     @contextlib.contextmanager
-    def server(self,configured,admission=False,reserved=False):
+    def server(self,configured,admission=False,reserved=False,cli_threads=None):
         with tempfile.TemporaryDirectory(prefix='np-http-worker-') as tmp:
             path=Path(tmp)
             code=FIXTURE.replace('ENABLE_RESERVED',repr(reserved)).replace('ENABLE_ADMISSION',repr(admission)).replace('SOURCE_PATH',repr(str(ROOT/'app.py'))).replace('MARKER_DIR',repr(tmp))
@@ -61,6 +61,7 @@ class HTTPWorkerTests(unittest.TestCase):
             with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
             env=dict(os.environ,PYTHONPATH=str(ROOT)+os.pathsep+tmp,PYTHONDONTWRITEBYTECODE='1')
             cmd=[sys.executable,'-m','gunicorn','--bind',f'127.0.0.1:{port}','--workers','1','http_fixture:app']
+            if cli_threads is not None:cmd.extend(['--threads',str(cli_threads)])
             # Configured case tests automatic discovery from Render's repository
             # cwd, using no --config argument. Baseline has no config file.
             cwd=ROOT if configured else path
@@ -151,7 +152,12 @@ class HTTPWorkerTests(unittest.TestCase):
             self.assertEqual(self.http.get(url+'/stats',timeout=2).json()['maximum'],8)
 
     def test_admin_bootstrap_and_login_survive_busy_general_and_ops_requests(self):
-        with self.server(True,admission=True,reserved=True) as (url,path):
+        # Reproduce the actual Render override: --threads 4 used to remove the
+        # reserved approval lane despite this repository specifying ten threads.
+        with self.server(True,admission=True,reserved=True,cli_threads=4) as (url,path):
+            capacity=self.http.get(url+'/healthz/http',timeout=1).json()['capacity']
+            self.assertEqual(capacity['business_slots'],8)
+            self.assertIn('/approve_challenge_purchase',capacity['reserved_paths'])
             active=[self.slow(url,'general-'+str(i)) for i in range(5)]
             for i in range(5):self.wait_started(path,'general-'+str(i))
             outcomes=[]
