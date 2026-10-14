@@ -12387,8 +12387,45 @@ function exportPurchaseSalesCSV(){
 
 
 let npSalesReportSequence=0;
+
+function npSalesScopedReportV224(response,from,to){
+ if(!Array.isArray(response.rows))throw new Error('Complete dated purchase rows are missing. No totals are shown.');
+ const keys=['awaiting_account','no_recorded_result','passed_not_funded','failed_before_funded','funded_no_payout','funded_breached_no_payout','paid_no_funded_breach','paid_and_funded_breached','needs_review'];
+ const seen=new Set();
+ const rows=response.rows.filter(row=>{
+  if(!row.purchase_id||seen.has(row.purchase_id))throw new Error('Duplicate or missing purchase identity. No totals are shown.');
+  seen.add(row.purchase_id);
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(row.sale_date||''))throw new Error('A purchase has no valid sale date. No totals are shown.');
+  return (!from||row.sale_date>=from)&&(!to||row.sale_date<=to);
+ });
+ const totals=group=>{
+  const t={sold:group.length,breached:0,passed:0,funded:0,funded_breached:0,collected_payout:0,assigned:0,paid_payout_count:0,payout_amount:0,outcomes:Object.fromEntries(keys.map(k=>[k,0]))};
+  let pennies=0;
+  for(const row of group){
+   if(!keys.includes(row.outcome))throw new Error('An account outcome is missing. No totals are shown.');
+   t.outcomes[row.outcome]++;
+   for(const key of ['breached','passed','funded','funded_breached','collected_payout','assigned'])t[key]+=row[key]?1:0;
+   const amount=Number(row.payout_amount),count=Number(row.paid_payout_count);
+   if(!Number.isFinite(amount)||amount<0||!Number.isSafeInteger(count)||count<0)throw new Error('Invalid payment totals. No totals are shown.');
+   pennies+=Math.round(amount*100);t.paid_payout_count+=count;
+  }
+  if(!Number.isSafeInteger(pennies))throw new Error('Payment total is outside the supported range. No totals are shown.');
+  t.payout_amount=pennies/100;
+  t.failed_before_funded=t.outcomes.failed_before_funded;
+  t.not_funded_yet=t.outcomes.awaiting_account+t.outcomes.no_recorded_result+t.outcomes.passed_not_funded;
+  t.needs_review=t.outcomes.needs_review;
+  if(t.failed_before_funded+t.not_funded_yet+t.funded+t.needs_review!==t.sold)throw new Error('Outcome totals do not match the dated purchases. No totals are shown.');
+  return t;
+ };
+ const plans=new Map();
+ for(const row of rows){const name=String(row.plan||'Unspecified');if(!plans.has(name))plans.set(name,[]);plans.get(name).push(row);}
+ return {...response,from,to,rows,summary:totals(rows),plans:[...plans].sort((a,b)=>a[0].localeCompare(b[0])).map(([plan,group])=>({plan,...totals(group)}))};
+}
+
 let npSalesDateTimer=null;
 function npSalesDatesChanged(){
+ window.npSalesFrom=document.getElementById('np-sales-from')?.value||'';
+ window.npSalesTo=document.getElementById('np-sales-to')?.value||'';
  ++npSalesReportSequence;
  clearTimeout(npSalesDateTimer);
  const box=document.getElementById('np-sales-result');
@@ -12396,7 +12433,7 @@ function npSalesDatesChanged(){
  npSalesDateTimer=setTimeout(()=>{if(document.getElementById('np-sales-result'))loadSalesOutcomes();},300);
 }
 function renderSalesOutcomes(){
- document.getElementById('content').innerHTML=`<div class="vault mb-6"><div class="badge">SALES OUTCOMES</div><h1 style="font-size:28px;font-weight:900;margin:12px 0">Where your sold accounts ended up</h1><p class="text-gray-400">Each approved original purchase appears once in the outcome totals. Follow its journey from challenge to funded to payout.</p></div><div class="card mb-4"><div class="flex flex-wrap gap-3 items-end"><label>Sold from<br><input id="np-sales-from" type="date" onchange="npSalesDatesChanged()" class="input" value="${window.npSalesFrom||''}"></label><label>Sold through<br><input id="np-sales-to" type="date" onchange="npSalesDatesChanged()" class="input" value="${window.npSalesTo||''}"></label><button class="btn btn-gold" onclick="loadSalesOutcomes()">Show results</button><button class="btn btn-ghost" onclick="document.getElementById('np-sales-from').value='';document.getElementById('np-sales-to').value='';loadSalesOutcomes()">All time</button></div><p class="text-gray-400 text-sm mt-3">Dates select when purchases were made, using Nigerian dates. Results include their linked history up to today. Resets do not count as new sales.</p></div><div id="np-sales-result" aria-live="polite">Choose a period, then Show results.</div>`;
+ document.getElementById('content').innerHTML=`<div class="vault mb-6"><div class="badge">SALES OUTCOMES</div><h1 style="font-size:28px;font-weight:900;margin:12px 0">Where your sold accounts ended up</h1><p class="text-gray-400">Each approved original purchase appears once in the outcome totals. Follow its journey from challenge to funded to payout.</p></div><div class="card mb-4"><div class="flex flex-wrap gap-3 items-end"><label>Sold from<br><input id="np-sales-from" type="date" oninput="npSalesDatesChanged()" onchange="npSalesDatesChanged()" class="input" value="${window.npSalesFrom||''}"></label><label>Sold through<br><input id="np-sales-to" type="date" oninput="npSalesDatesChanged()" onchange="npSalesDatesChanged()" class="input" value="${window.npSalesTo||''}"></label><button class="btn btn-gold" onclick="loadSalesOutcomes()">Show results</button><button class="btn btn-ghost" onclick="document.getElementById('np-sales-from').value='';document.getElementById('np-sales-to').value='';loadSalesOutcomes()">All time</button></div><p class="text-gray-400 text-sm mt-3">Dates select when purchases were made, using Nigerian dates. Results include their linked history up to today. Resets do not count as new sales.</p></div><div id="np-sales-result" aria-live="polite">Choose a period, then Show results.</div>`;
 }
 async function loadSalesOutcomes(){
  clearTimeout(npSalesDateTimer);
@@ -12407,10 +12444,11 @@ async function loadSalesOutcomes(){
  window.npSalesFrom=from;window.npSalesTo=to;
  box.textContent='Loading complete purchase, account and payout history…';
  try{
-  const r=await api('/admin/sales_outcomes?'+new URLSearchParams({from,to}));
+  const response=await api('/admin/sales_outcomes?'+new URLSearchParams({from,to}));
   if(sequence!==npSalesReportSequence||!box.isConnected)return;
-  if(r.success===false||!r.summary||!r.summary.outcomes)throw new Error(r.error||'The updated report is not available yet. Please retry shortly.');
-  if(r.from!==from||r.to!==to)throw new Error('The server returned a different date period. Please retry; old totals are not shown.');
+  if(response.success===false)throw new Error(response.error||'Report unavailable');
+  if(response.from!==from||response.to!==to)throw new Error('The server returned a different date period. Please retry; old totals are not shown.');
+  const r=npSalesScopedReportV224(response,from,to);
   const e=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const t=r.summary,o=t.outcomes;
   const card=(label,value,note,color)=>`<div class="card"><div class="text-gray-400 text-sm">${label}</div><div style="font-size:32px;font-weight:950;color:${color||'#ffda5c'}">${value}</div><div class="text-gray-400 text-sm">${note}</div></div>`;
