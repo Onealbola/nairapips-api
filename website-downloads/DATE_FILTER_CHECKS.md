@@ -33,3 +33,12 @@ cover leap years, invalid dates, and the user's exact values. Real Chromium with
 en-US locale sends the intended October interval and excludes September rows.
 Read-only live calculation for 3–12 October: 32 bought, 22 ever breached,
 6 paid recipients, amount recorded paid 392,744 NGN. No production writes.
+
+Admin loading recovery V226: failed core requests no longer become empty arrays.
+Initial missing data displays unavailable, not zero. A failed refresh keeps the
+last successful snapshot and timestamp; overlapping refreshes share one request.
+Fallback requests run at most two at a time. Action Centre refreshes also share
+one in-flight request and retain old data on failure or invalid responses. The
+backend separately reserves capacity for bootstrap and Action Centre, so normal
+traffic and operations reads cannot consume the bootstrap's request lane. The
+DD/MM/YYYY sales report, date-scope checks and totals row remain preserved.

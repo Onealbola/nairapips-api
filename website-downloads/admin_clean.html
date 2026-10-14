@@ -3838,7 +3838,13 @@ async function pagedAll(table, pageSize, maxPages){
 }
 
 /* ====== LOADER ====== */
-async function loadAll(){
+let npAdminLoadPromiseV226=null;
+function loadAll(){
+ if(npAdminLoadPromiseV226)return npAdminLoadPromiseV226;
+ npAdminLoadPromiseV226=npLoadAllCoreV226().finally(()=>{npAdminLoadPromiseV226=null;});
+ return npAdminLoadPromiseV226;
+}
+async function npLoadAllCoreV226(){
   try{
     let boot = null;
     try{
@@ -3852,6 +3858,9 @@ async function loadAll(){
     const leadRows = [];
 
     if(boot){
+      const coreArrays=[boot.traders,boot.accounts||boot.trader_accounts||boot.data?.accounts,
+        boot.purchases||boot.challenge_purchases,boot.payouts,boot.mt5_pool,boot.plans||boot.challenge_plans];
+      if(coreArrays.some(rows=>!Array.isArray(rows)))throw new Error('The complete admin data was not returned. Previous data is kept; retry Refresh.');
       tradersRes = boot;
       accounts = boot.accounts || boot.trader_accounts || boot.data?.accounts || [];
       purchases = boot.purchases || boot.challenge_purchases || [];
@@ -3862,15 +3871,19 @@ async function loadAll(){
       tickets = boot.support_tickets || boot.tickets || [];
     }else{
       // Critical first-screen data loads concurrently. Noncritical modules remain lazy.
-      const results = await Promise.all([
-        api('/traders?limit=1000').catch(()=>({traders:[]})),
-        api('/trader_accounts?limit=1000').catch(()=>({accounts:[]})),
-        api('/challenge_purchases?limit=500').catch(()=>({purchases:[]})),
-        api('/payouts?limit=500').catch(()=>({payouts:[]})),
-        api('/mt5_pool?all=1&limit=10000').catch(()=>({mt5_pool:[]})),
-        api('/challenge_plans').catch(()=>({plans:[]})),
-        api('/announcements?limit=500').catch(()=>({announcements:[]}))
-      ]);
+      const feeds = [
+        ()=>api('/traders?limit=1000'),
+        ()=>api('/trader_accounts?limit=1000'),
+        ()=>api('/challenge_purchases?limit=500'),
+        ()=>api('/payouts?limit=500'),
+        ()=>api('/mt5_pool?all=1&limit=10000'),
+        ()=>api('/challenge_plans'),
+        ()=>api('/announcements?limit=500').catch(()=>({announcements:[]}))
+      ];
+      const results=[];
+      for(let i=0;i<feeds.length;i+=2){
+        results.push(...await Promise.all(feeds.slice(i,i+2).map(read=>read())));
+      }
       [tradersRes, accounts, purchases, payouts, mt5pool, plans, announcements] = results;
     }
 
@@ -3953,6 +3966,8 @@ async function loadAll(){
     SESSION.availableMT5 = assignRes.available_mt5 || [];
     SESSION.phaseQueueReady = !!assignRes.assignment_queue;
     SESSION.loadedAt = new Date();
+    SESSION.coreDataReady=true;
+    SESSION.coreDataError=null;
     // AUTO-MERGE: pending purchases for traders with no MT5 should appear in assignment queue
     try{
       const trackerByName = new Map();
@@ -3993,7 +4008,12 @@ async function loadAll(){
       }
     }catch(e){console.warn('queue merge failed',e);}
   }catch(e){
-    toast('Load failed: '+e.message,'err');
+    SESSION.coreDataError=e?.message||String(e);
+    toast('Load failed: '+SESSION.coreDataError,'err');
+    if(SESSION.currentMod==='overview'){
+      try{renderOverview();}catch(_){}
+    }
+    throw e;
   }
 }
 
@@ -5619,13 +5639,20 @@ function renderBusinessExposureRadar(){
    ============================================================================ */
 const OPS={data:null,loading:false,error:'',showCompleted:false,filter:'all',q:''};
 
-async function npLoadOperations(force=false){
-  if(OPS.loading) return OPS.data;
+function npLoadOperations(force=false){
+  if(OPS.pendingV226)return OPS.pendingV226;
+  if(OPS.data&&!force)return Promise.resolve(OPS.data);
+  OPS.pendingV226=npLoadOperationsCoreV226(force).finally(()=>{OPS.pendingV226=null;});
+  return OPS.pendingV226;
+}
+async function npLoadOperationsCoreV226(force=false){
   if(OPS.data && !force) return OPS.data;
   OPS.loading=true; OPS.error='';
   try{
     const r=await api('/admin_operations_center?fresh='+Date.now());
-    OPS.data=r?.data||r||{};
+    const data=r?.data||r;
+    if(!data||typeof data.summary!=='object'||!Array.isArray(data.actions))throw new Error('Complete Action Centre data was not returned.');
+    OPS.data=data;
     return OPS.data;
   }catch(e){
     OPS.error=e?.message||String(e);
@@ -5726,8 +5753,16 @@ function renderOperations(){
     document.getElementById('np-ops-body').innerHTML=`<div class="card" style="border-color:#7f1d1d">Failed to load Action Centre: ${npOpsEsc(e.message||e)}</div>`;
   });
 }
-async function npRefreshOperations(){OPS.data=null;await npLoadOperations(true);npPaintOperations();}
+async function npRefreshOperations(){
+  try{await npLoadOperations(true);}catch(e){toast('Action Centre refresh failed: '+(e?.message||e),'err');}
+  npPaintOperations();
+}
 function npPaintOperations(){
+  if(!OPS.data){
+    const host=document.getElementById('np-ops-body');
+    if(host)host.innerHTML=`<div class="card">${OPS.loading?'Loading Action Centre…':'Action Centre data is unavailable. No zero totals are assumed.'}${OPS.error?'<p>'+npOpsEsc(OPS.error)+'</p>':''}</div>`;
+    return;
+  }
   const d=OPS.data||{},s=d.summary||{};
   const src=OPS.showCompleted?(d.completed||[]):(d.actions||[]);
   const rows=src.filter(npOpsMatches);
@@ -7706,6 +7741,10 @@ async function npOpenTrader360(id){
 }
 
 function renderOverview(){
+  if(!SESSION.coreDataReady && !SESSION.loadedAt){
+    document.getElementById('content').innerHTML=`<div class="vault mb-6"><div class="badge">OVERVIEW</div><h1 style="font-size:28px;font-weight:900;margin:12px 0">NairaPips Command</h1><button id="overview-refresh-btn" class="btn btn-gold" onclick="refreshAdminOverview(this);return false;">↻ Retry data load</button></div><div class="card mb-6" role="status"><strong>${SESSION.coreDataError?'Overview data has not loaded':'Loading overview data…'}</strong><p class="text-gray-400 mt-3">${esc(SESSION.coreDataError||'Connecting to your account, purchase and payout records.')}</p><p class="text-gray-400 mt-3">Account and payment totals are unavailable until the data loads. They are not zero.</p></div>`;
+    return;
+  }
   const counts = rangeOf(SESSION.traders, stageOf);
   const availableMT5 = SESSION.mt5Pool.filter(m=>!m.assigned_trader_id&&!m.trader_id&&['available','unused','free','','new','ready','open'].includes(String(m.status||'available').toLowerCase())).length;
   const assignedMT5 = SESSION.mt5Pool.filter(m=>m.assigned_trader_id||m.trader_id).length;
@@ -7732,6 +7771,7 @@ function renderOverview(){
         <button id="overview-refresh-btn" type="button" class="btn btn-gold overview-refresh-action" onclick="refreshAdminOverview(this);return false;">↻ Refresh</button>
       </div>
     </div>
+    ${SESSION.coreDataError?`<div class="card mb-6" style="border-color:#f59e0b"><strong>Refresh did not complete. Previously loaded figures remain below.</strong><p>${esc(SESSION.coreDataError)}</p></div>`:''}
     <div id="np-ops-overview"><div class="card mb-6">Reconciling Action Required Management…</div></div>
     <div class="grid md:grid-cols-7 gap-3 mb-6 tab-content">
       <div class="kpi"><div class="kpi-label">Registered Customers</div><div class="kpi-value" id="np-registered-traders-count">${SESSION.registeredTraderCount>0?SESSION.registeredTraderCount.toLocaleString('en-GB'):'—'}</div><div class="kpi-sub">Exact traders-table total</div></div>
