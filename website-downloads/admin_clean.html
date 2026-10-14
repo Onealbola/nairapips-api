@@ -10702,8 +10702,9 @@ window.showCreateMT5 = function(){
       <div><div class="kpi-sub">Investor Password</div><div class="copy-field"><input class="input" id="cm-inv"><button class="btn" onclick="genMT5('cm-inv')">⚄ Gen</button><button class="btn" onclick="copyField('cm-inv')">⧉</button></div></div>
       <div style="grid-column:1 / -1"><div class="kpi-sub">Admin Note</div><input class="input" id="cm-note" placeholder="optional"></div>
     </div>
+    <div id="cm-error" role="alert" style="display:none;color:#fca5a5;margin-top:12px"></div>
     <div class="flex gap-2 mt-3">
-      <button class="btn btn-gold" onclick="createMT5()">＋ Add</button>
+      <button id="cm-add-btn" class="btn btn-gold" onclick="createMT5()">＋ Add</button>
       <button class="btn" onclick="genMT5('cm-master');genMT5('cm-inv')">⚄ Gen both</button>
     </div>
   `);
@@ -10712,7 +10713,9 @@ window.showCreateMT5 = function(){
 window.createMT5 = async function(){
   if(window.__npCreatingMT5){ toast('Already adding this MT5. Please wait…','err'); return; }
   const modal = document.querySelector('.modal-bg');
-  const btn = [...document.querySelectorAll('button')].find(b => (b.textContent||'').includes('＋ Add'));
+  const btn = document.getElementById('cm-add-btn');
+  const error = document.getElementById('cm-error');
+  if(error){error.textContent='';error.style.display='none';}
   const payload = {
     plan_name: document.getElementById('cm-plan')?.value.trim() || '',
     account_size: Number(document.getElementById('cm-size')?.value)||0,
@@ -10730,10 +10733,13 @@ window.createMT5 = async function(){
   window.__npCreatingMT5 = true;
   const oldText = btn ? btn.textContent : '';
   if(btn){ btn.disabled = true; btn.textContent = 'Adding…'; btn.style.opacity = '.65'; }
+  let requestTimer;
   try{
-    const timeout = new Promise((_, reject)=>setTimeout(()=>reject(new Error('Request timed out. Check Render/API then refresh.')), 25000));
+    const timeout = new Promise((_, reject)=>requestTimer=setTimeout(()=>reject(new Error('Request timed out. Check Render/API then refresh.')), 25000));
     const res = await Promise.race([api('/create_mt5_account','POST',payload), timeout]);
-    const created = Array.isArray(res?.data) ? res.data[0] : (Array.isArray(res) ? res[0] : (res?.data || res));
+    const records=res?.data?.mt5 || res?.mt5 || (Array.isArray(res?.data)?res.data:(Array.isArray(res)?res:[]));
+    const created=records[0];
+    if(!created?.id || String(created.mt5_login)!==String(payload.mt5_login)) throw new Error('Save result could not be confirmed. Check this login in the pool before retrying.');
     if(created && typeof created === 'object'){
       SESSION.mt5Pool = SESSION.mt5Pool || [];
       if(!SESSION.mt5Pool.some(x => String(x.mt5_login) === String(payload.mt5_login))){ SESSION.mt5Pool.unshift(created); }
@@ -10744,8 +10750,11 @@ window.createMT5 = async function(){
     try{ renderMT5Pool(); }catch(_e){ try{ render(); }catch(__e){} }
     setTimeout(()=>{ try{ reload(); }catch(_e){} }, 1200);
   }catch(e){
-    toast('Failed: '+(e?.message || e),'err');
+    const message='Failed: '+(e?.message || e);
+    if(error){error.textContent=message;error.style.display='block';}
+    toast(message,'err');
   }finally{
+    clearTimeout(requestTimer);
     window.__npCreatingMT5 = false;
     if(btn){ btn.disabled = false; btn.textContent = oldText || '＋ Add'; btn.style.opacity = '1'; }
   }
