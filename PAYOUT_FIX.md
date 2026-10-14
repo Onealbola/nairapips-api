@@ -427,3 +427,23 @@ readiness200; existing mutation serialization tests pass. Additional middleware
 checks cover rejected financial writes, CORS, stream failures and actual worker
 capacity. Tests use private fixture credentials and AST-extracted auth, never
 import production app.py or send notifications.
+
+### V221 — distinguish paid payouts and funded breaches in sales outcomes
+
+Read-only report now reads payouts alongside purchases/accounts, with the same
+bounded complete pagination. Adds collected_payout purchases, collected rate,
+paid transaction count, amount paid and funded_breached purchases/rate. A paid
+payout must have status paid, an exact account ID and matching account owner.
+Pending/approved/cancelled/rejected requests never count even with a stray old
+paid_at timestamp. Distinct payment IDs sum once each using Decimal; multiple
+payments still count the purchase once. Payments remain visible if that funded
+account later breaches. Evaluation-only breaches are not funded breaches.
+Invalid amounts fail the report instead of silently understating money; unlinked
+paid rows are explicitly reported rather than assigned by name or broker login.
+Dates select the sales cohort; paid amounts cover that cohort's history to now.
+
+UI based on current live admin HTML, adds six KPI cards, funded-breach/collected/
+amount columns by plan and by purchase. No account or financial actions changed.
+Validation: 13 report/auth/date/payment tests, whole inline-script syntax and UI
+render/escaping/error checks passed. Read-only live aggregation verified complete
+history and exact paid associations; no database mutations or notifications.

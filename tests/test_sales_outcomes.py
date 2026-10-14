@@ -30,6 +30,35 @@ class SalesOutcomesTests(unittest.TestCase):
         r=build_report([self.p()],[a],'','')['summary']
         self.assertEqual(r['funded'],0);self.assertEqual(r['passed'],0)
 
+    def test_paid_then_funded_breach_keeps_all_milestones(self):
+        account=self.a(stage='funded',breached_at='2026-10-10')
+        paid=dict(id='paid',trader_account_id='a',trader_id='t',status='paid',amount='42000.25',paid_at='2026-10-20')
+        pending=dict(paid,id='pending',status='pending',paid_at=None,amount=99000)
+        approved=dict(pending,id='approved',status='approved',paid_at='old-timestamp')
+        r=build_report([self.p()],[account],'2026-10-02','2026-10-02',[paid,paid,pending,approved])
+        t=r['summary']
+        self.assertEqual((t['funded'],t['funded_breached'],t['collected_payout'],t['paid_payout_count']),(1,1,1,1))
+        self.assertEqual(t['payout_amount'],42000.25)
+    def test_wrong_owner_and_missing_account_are_not_guessed(self):
+        paid=dict(id='wrong',trader_account_id='a',trader_id='other',status='paid',amount=100)
+        unknown=dict(paid,id='unknown',trader_account_id='missing',trader_id='t')
+        r=build_report([self.p()],[self.a()],'','',[paid,unknown])
+        self.assertEqual(r['summary']['collected_payout'],0)
+        self.assertEqual(r['unlinked_paid_records'],2)
+    def test_multiple_paid_payments_count_purchase_once_and_sum_money(self):
+        payouts=[dict(id=str(i),trader_account_id='a',trader_id='t',status='paid',amount='0.10') for i in range(3)]
+        r=build_report([self.p()],[self.a()],'','',payouts)['summary']
+        self.assertEqual(r['collected_payout'],1)
+        self.assertEqual(r['paid_payout_count'],3)
+        self.assertEqual(r['payout_amount'],0.3)
+    def test_evaluation_breach_is_not_funded_breach(self):
+        r=build_report([self.p()],[self.a(breached_at='today')],'','')['summary']
+        self.assertEqual(r['breached'],1);self.assertEqual(r['funded_breached'],0)
+    def test_invalid_money_does_not_silently_zero_total(self):
+        for amount in ('NaN','Infinity','-1','bad'):
+            with self.assertRaises(ValueError):
+                build_report([self.p()],[self.a()],'','',[dict(id='paid',trader_account_id='a',trader_id='t',status='paid',amount=amount)])
+
 class SalesOutcomesRouteTests(unittest.TestCase):
     def route(self, auth):
         import ast

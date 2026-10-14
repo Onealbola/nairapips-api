@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
 
 TZ = ZoneInfo("Africa/Lagos")
 
@@ -18,7 +19,7 @@ def sale_day(p):
                 continue
     return None
 
-def build_report(purchases, accounts, start, end):
+def build_report(purchases, accounts, start, end, payouts=None):
     for value in (start, end):
         if value:
             datetime.strptime(value, "%Y-%m-%d")
@@ -34,6 +35,28 @@ def build_report(purchases, accounts, start, end):
         pid = str(a.get("purchase_id") or a.get("challenge_purchase_id") or "")
         if pid:
             linked[pid].append(a)
+    paid_by_account = defaultdict(list)
+    paid_seen = set()
+    unlinked_paid = 0
+    for payout in payouts or []:
+        payout_id = str(payout.get("id") or "")
+        if not payout_id or payout_id in paid_seen:
+            continue
+        paid_seen.add(payout_id)
+        if str(payout.get("status") or "").strip().lower() != "paid":
+            continue
+        account_id = str(payout.get("trader_account_id") or payout.get("account_id") or "")
+        account = by_id.get(account_id)
+        if not account or str(payout.get("trader_id") or "") != str(account.get("trader_id") or ""):
+            unlinked_paid += 1
+            continue
+        try:
+            amount = Decimal(str(payout.get("amount") or 0))
+        except (InvalidOperation, ValueError):
+            raise ValueError("Invalid paid payout amount")
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("Invalid paid payout amount")
+        paid_by_account[account_id].append((payout_id, amount))
     rows, seen, undated = [], set(), 0
     for p in purchases:
         pid = str(p.get("id") or "")
@@ -71,25 +94,31 @@ def build_report(purchases, accounts, start, end):
                 if other and other != pid:
                     continue
                 journey.append(a); ids.add(aid); queue.append(aid)
-        breached = passed = funded = False
+        breached = passed = funded = funded_breached = False
         for a in journey:
             stage = str(a.get("stage") or a.get("phase") or "").lower().replace("_", "").replace(" ", "")
             state = " ".join(str(a.get(k) or "").lower() for k in ("status", "account_status", "lifecycle_state"))
-            breached |= bool(a.get("breached_at") or a.get("breach_at") or "breach" in state)
+            account_breached = bool(a.get("breached_at") or a.get("breach_at") or "breach" in state)
+            breached |= account_breached
+            funded_breached |= account_breached and "funded" in stage
             issued = bool(a.get("mt5_login"))
             funded |= issued and "funded" in stage
             passed |= bool(a.get("passed_at") or "passed" in state or (issued and ("phase2" in stage or "funded" in stage)))
-        rows.append({"purchase_id": pid, "sale_date": day, "plan": str(p.get("plan_name") or p.get("plan") or "Unspecified"), "account_size": p.get("account_size") or 0, "mt5_login": str(p.get("mt5_login") or (journey[0].get("mt5_login") if journey else "") or ""), "breached": breached, "passed": passed, "funded": funded, "assigned": any(a.get("mt5_login") for a in journey)})
+        paid_records = {paid_id: amount for aid in ids for paid_id, amount in paid_by_account.get(aid, [])}
+        payout_amount = float(sum(paid_records.values(), Decimal("0")).quantize(Decimal("0.01")))
+        rows.append({"purchase_id": pid, "sale_date": day, "plan": str(p.get("plan_name") or p.get("plan") or "Unspecified"), "account_size": p.get("account_size") or 0, "mt5_login": str(p.get("mt5_login") or (journey[0].get("mt5_login") if journey else "") or ""), "breached": breached, "passed": passed, "funded": funded, "funded_breached": funded_breached, "collected_payout": bool(paid_records), "paid_payout_count": len(paid_records), "payout_amount": payout_amount, "assigned": any(a.get("mt5_login") for a in journey)})
     def totals(group):
         sold = len(group)
         result = {"sold": sold}
-        for key in ("breached", "passed", "funded", "assigned"):
+        for key in ("breached", "passed", "funded", "funded_breached", "collected_payout", "assigned"):
             result[key] = sum(bool(r[key]) for r in group)
             result[key + "_rate"] = round(result[key] * 100 / sold, 1) if sold else 0
+        result["paid_payout_count"] = sum(r["paid_payout_count"] for r in group)
+        result["payout_amount"] = float(sum((Decimal(str(r["payout_amount"])) for r in group), Decimal("0")))
         result["awaiting_assignment"] = sold - result["assigned"]
         result["no_milestone"] = sum(not (r["breached"] or r["passed"] or r["funded"]) for r in group)
         return result
     plans = defaultdict(list)
     for row in rows:
         plans[row["plan"]].append(row)
-    return {"success": True, "from": start, "to": end, "timezone": "Africa/Lagos", "summary": totals(rows), "plans": [{"plan": name, **totals(group)} for name, group in sorted(plans.items())], "rows": sorted(rows, key=lambda r: (r["sale_date"], r["purchase_id"]), reverse=True), "undated_sales_excluded": undated, "definition": "Approved original purchases by transaction date. Milestones cover their linked account history up to now; passed means at least one evaluation phase passed. Counts overlap: a funded trader can later breach. Resets are excluded as new sales."}
+    return {"success": True, "from": start, "to": end, "timezone": "Africa/Lagos", "summary": totals(rows), "plans": [{"plan": name, **totals(group)} for name, group in sorted(plans.items())], "rows": sorted(rows, key=lambda r: (r["sale_date"], r["purchase_id"]), reverse=True), "undated_sales_excluded": undated, "unlinked_paid_records": unlinked_paid, "definition": "Approved original purchases by transaction date. Milestones cover their linked account history up to now; passed means at least one evaluation phase passed. Counts overlap: a funded trader can receive payouts and later breach. Collected payouts are records marked paid, linked by exact account and owner; pending/approved requests are excluded. Amounts cover payments up to now for the selected sales cohort, not payments made only within the sale dates. Resets are excluded as new sales."}

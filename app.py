@@ -59657,7 +59657,7 @@ def _np_http_readiness_v218():
 # V219: authenticated, read-only sales cohort history (independent of bootstrap slices).
 from sales_outcomes import build_report as _np_build_sales_outcomes_v219
 from concurrent.futures import ThreadPoolExecutor as _NPReportExecutorV219
-_np_report_executor_v219 = _NPReportExecutorV219(max_workers=2)
+_np_report_executor_v219 = _NPReportExecutorV219(max_workers=3)
 
 def _np_sales_rows_v219(table):
     import time
@@ -59693,13 +59693,13 @@ def _np_sales_outcomes_v219():
     except ValueError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
     futures = [_np_report_executor_v219.submit(_np_sales_rows_v219, table)
-               for table in ("challenge_purchases", "trader_accounts")]
+               for table in ("challenge_purchases", "trader_accounts", "payouts")]
     try:
         from concurrent.futures import wait
         done, pending = wait(futures, timeout=13)
         if pending:
             raise RuntimeError("Report timed out")
-        payload = _np_build_sales_outcomes_v219(futures[0].result(), futures[1].result(), start, end)
+        payload = _np_build_sales_outcomes_v219(futures[0].result(), futures[1].result(), start, end, futures[2].result())
         response = jsonify(payload)
         response.headers["Cache-Control"] = "no-store"
         return response
