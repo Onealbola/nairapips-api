@@ -59,6 +59,36 @@ class SalesOutcomesTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build_report([self.p()],[self.a()],'','',[dict(id='paid',trader_account_id='a',trader_id='t',status='paid',amount=amount)])
 
+    def test_exclusive_outcomes_reconcile_and_do_not_call_survivors_funded(self):
+        purchases=[];accounts=[];payouts=[]
+        specs=[('awaiting_account',None,None),
+               ('no_recorded_result',dict(stage='phase1'),None),
+               ('passed_not_funded',dict(stage='phase1',passed_at='today'),None),
+               ('failed_before_funded',dict(stage='phase2',breached_at='today'),None),
+               ('funded_no_payout',dict(stage='funded'),None),
+               ('funded_breached_no_payout',dict(stage='funded',breached_at='today'),None),
+               ('paid_no_funded_breach',dict(stage='funded'),True),
+               ('paid_and_funded_breached',dict(stage='funded',breached_at='today'),True),
+               ('needs_review',dict(stage='phase1'),True)]
+        for key,a,paid in specs:
+            purchases.append(self.p(key))
+            if a:accounts.append(dict(self.a(key,**a),purchase_id=key))
+            if paid:payouts.append(dict(id='payout-'+key,trader_id='t',trader_account_id=key,status='paid',amount=100))
+        r=build_report(purchases,accounts,'','',payouts);t=r['summary']
+        self.assertEqual(t['sold'],9)
+        self.assertEqual(set(t['outcomes'].values()),{1})
+        self.assertEqual(t['reconciliation_total'],9)
+        self.assertEqual(t['failed_before_funded']+t['not_funded_yet']+t['funded']+t['needs_review'],9)
+        self.assertEqual(t['not_funded_yet'],3)
+        self.assertEqual(t['funded'],4)
+        self.assertEqual(t['collected_payout'],3)
+        for plan in r['plans']:self.assertEqual(plan['reconciliation_total'],plan['sold'])
+    def test_earlier_evaluation_breach_does_not_double_count_recovered_funded_sale(self):
+        accounts=[self.a('old',breached_at='old'),self.a('new',stage='funded')]
+        r=build_report([self.p()],accounts,'','')
+        self.assertEqual(r['summary']['failed_before_funded'],0)
+        self.assertEqual(r['rows'][0]['outcome'],'funded_no_payout')
+
 class SalesOutcomesRouteTests(unittest.TestCase):
     def route(self, auth):
         import ast

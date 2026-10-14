@@ -447,3 +447,28 @@ amount columns by plan and by purchase. No account or financial actions changed.
 Validation: 13 report/auth/date/payment tests, whole inline-script syntax and UI
 render/escaping/error checks passed. Read-only live aggregation verified complete
 history and exact paid associations; no database mutations or notifications.
+
+### V222 — reconcile sales outcomes at a glance
+
+Replace overlapping headline milestones in the website with exclusive historical
+purchase outcomes. Retain old backend milestone fields for compatibility. Adds
+outcomes and reconciliation_total by cohort and plan, with one outcome_label per
+purchase. Sold reconciles exactly to breached-before-funded + not-funded-yet +
+reached-funded + records-needing-review. Not-funded-yet splits into awaiting first
+account, no pass/breach recorded, and passed a phase but not funded. A recorded
+breach from an older challenge does not double-count a recovered funded purchase.
+Funded splits into paid/no funded breach, paid/also funded breach, no payout/funded
+breach, and no payout/no funded breach. A paid account with no funded proof is
+explicitly classified as needs_review, not silently credited as a funded success.
+No unbreached account is presumed passed or active; missing outcomes are labelled.
+
+UI removes “ever breached” and “passed a phase” as headline competing totals;
+shows reconciled arithmetic, funded breakdown, separately labelled payout result,
+plan reconciliation and one labelled outcome per original purchase. Paid is a
+recorded status, not independent bank-transfer verification. No business writes.
+
+Validation: 15 Python report/auth/payment/reconciliation tests; inline script
+parsing and UI rendering/error/escaping checks pass. Read-only full-history sample:
+336 sold = 121 breached before funded + 52 not yet funded + 163 funded + 0 review.
+Funded: 25 no payout/no funded breach + 50 no payout/funded breach + 17 paid/no
+funded breach + 71 paid/funded breach = 163. 88 recorded payout recipients.

@@ -5,6 +5,33 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
 TZ = ZoneInfo("Africa/Lagos")
+OUTCOMES = {
+    "awaiting_account": "Awaiting first account",
+    "no_recorded_result": "Challenge: no pass or breach recorded",
+    "passed_not_funded": "Passed a phase, not funded yet",
+    "failed_before_funded": "Breached before reaching funded",
+    "funded_no_payout": "Funded: no payout, no funded breach recorded",
+    "funded_breached_no_payout": "Funded: breached without collecting payout",
+    "paid_no_funded_breach": "Collected payout: no funded breach recorded",
+    "paid_and_funded_breached": "Collected payout and had a funded breach",
+    "needs_review": "Records need review",
+}
+
+
+def outcome_for(row):
+    # Exclusive historical result, not a guess at whether trading is active.
+    if row["collected_payout"] and not row["funded"]:
+        return "needs_review"
+    if row["funded"]:
+        if row["collected_payout"]:
+            return "paid_and_funded_breached" if row["funded_breached"] else "paid_no_funded_breach"
+        return "funded_breached_no_payout" if row["funded_breached"] else "funded_no_payout"
+    if row["breached"]:
+        return "failed_before_funded"
+    if row["passed"]:
+        return "passed_not_funded"
+    return "no_recorded_result" if row["assigned"] else "awaiting_account"
+
 
 def sale_day(p):
     for key in ("created_at", "payment_submitted_at", "payment_date", "date", "paid_at", "payment_confirmed_at", "approved_at"):
@@ -107,6 +134,9 @@ def build_report(purchases, accounts, start, end, payouts=None):
         paid_records = {paid_id: amount for aid in ids for paid_id, amount in paid_by_account.get(aid, [])}
         payout_amount = float(sum(paid_records.values(), Decimal("0")).quantize(Decimal("0.01")))
         rows.append({"purchase_id": pid, "sale_date": day, "plan": str(p.get("plan_name") or p.get("plan") or "Unspecified"), "account_size": p.get("account_size") or 0, "mt5_login": str(p.get("mt5_login") or (journey[0].get("mt5_login") if journey else "") or ""), "breached": breached, "passed": passed, "funded": funded, "funded_breached": funded_breached, "collected_payout": bool(paid_records), "paid_payout_count": len(paid_records), "payout_amount": payout_amount, "assigned": any(a.get("mt5_login") for a in journey)})
+    for row in rows:
+        row["outcome"] = outcome_for(row)
+        row["outcome_label"] = OUTCOMES[row["outcome"]]
     def totals(group):
         sold = len(group)
         result = {"sold": sold}
@@ -117,8 +147,15 @@ def build_report(purchases, accounts, start, end, payouts=None):
         result["payout_amount"] = float(sum((Decimal(str(r["payout_amount"])) for r in group), Decimal("0")))
         result["awaiting_assignment"] = sold - result["assigned"]
         result["no_milestone"] = sum(not (r["breached"] or r["passed"] or r["funded"]) for r in group)
+        result["outcomes"] = {key: sum(r["outcome"] == key for r in group) for key in OUTCOMES}
+        result["not_funded_yet"] = sum(result["outcomes"][key] for key in ("awaiting_account", "no_recorded_result", "passed_not_funded"))
+        result["failed_before_funded"] = result["outcomes"]["failed_before_funded"]
+        result["needs_review"] = result["outcomes"]["needs_review"]
+        result["reconciliation_total"] = sum(result["outcomes"].values())
+        if result["reconciliation_total"] != sold:
+            raise ValueError("Cohort outcomes do not reconcile")
         return result
     plans = defaultdict(list)
     for row in rows:
         plans[row["plan"]].append(row)
-    return {"success": True, "from": start, "to": end, "timezone": "Africa/Lagos", "summary": totals(rows), "plans": [{"plan": name, **totals(group)} for name, group in sorted(plans.items())], "rows": sorted(rows, key=lambda r: (r["sale_date"], r["purchase_id"]), reverse=True), "undated_sales_excluded": undated, "unlinked_paid_records": unlinked_paid, "definition": "Approved original purchases by transaction date. Milestones cover their linked account history up to now; passed means at least one evaluation phase passed. Counts overlap: a funded trader can receive payouts and later breach. Collected payouts are records marked paid, linked by exact account and owner; pending/approved requests are excluded. Amounts cover payments up to now for the selected sales cohort, not payments made only within the sale dates. Resets are excluded as new sales."}
+    return {"success": True, "from": start, "to": end, "timezone": "Africa/Lagos", "summary": totals(rows), "outcome_labels": OUTCOMES, "plans": [{"plan": name, **totals(group)} for name, group in sorted(plans.items())], "rows": sorted(rows, key=lambda r: (r["sale_date"], r["purchase_id"]), reverse=True), "undated_sales_excluded": undated, "unlinked_paid_records": unlinked_paid, "definition": "Approved original purchases by transaction date. Milestones cover their linked account history up to now; passed means at least one evaluation phase passed. Counts overlap: a funded trader can receive payouts and later breach. Collected payouts are records marked paid, linked by exact account and owner; pending/approved requests are excluded. Amounts cover payments up to now for the selected sales cohort, not payments made only within the sale dates. Resets are excluded as new sales."}
