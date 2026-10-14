@@ -18,7 +18,7 @@ def configure_worker_capacity(threads):
 
 
 class RequestAdmissionMiddleware:
-    PRIORITY_PATHS = frozenset({'/staff_login', '/healthz/http'})
+    PRIORITY_PATHS = frozenset({'/staff_login', '/healthz/http', '/admin/auth_check'})
     ALLOWED_ORIGINS = frozenset({'https://nairapips.com', 'https://www.nairapips.com'})
 
     def __init__(self, application, capacity=6, reserved_paths=()):

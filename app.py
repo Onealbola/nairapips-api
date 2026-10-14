@@ -59645,6 +59645,16 @@ app.wsgi_app = _NPSerialMutationsV217(app.wsgi_app,
         "/update_trader", "/delete_trader", "/remove_trader", "/recall_"))
 
 
+@app.get("/admin/auth_check")
+def _np_admin_auth_check_v234():
+    admin, error = _require_admin()
+    if error is not None:
+        return error
+    response = jsonify({"success": True})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.get("/healthz/http")
 def _np_http_readiness_v218():
     # Public operational metadata only: never include credentials or business rows.
