@@ -1,0 +1,13 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const html=fs.readFileSync(__dirname+'/admin_clean.html','utf8');
+const code=html.slice(html.indexOf('let npSalesReportSequence=0;'),html.indexOf('function renderPurchases(skipLiveRefresh=false){'));
+const box={isConnected:true};const fields={'np-sales-from':{value:'03/10/2026'},'np-sales-to':{value:'12/10/2026'},'np-sales-result':box};
+const paid=(id,closed)=>({purchase_id:id,sale_date:'2026-10-04',plan:'Legend',assigned:true,breached:closed,passed:true,funded:true,funded_breached:closed,collected_payout:true,paid_then_breached_closed:closed,paid_payout_count:1,payout_amount:100,outcome:closed?'paid_and_funded_breached':'paid_no_funded_breach',outcome_label:'paid'});
+const pending={purchase_id:'3',sale_date:'2026-10-05',plan:'Legend',assigned:false,breached:false,funded:false,collected_payout:false,paid_then_breached_closed:false,paid_payout_count:0,payout_amount:0,outcome:'awaiting_account',outcome_label:'awaiting'};
+const ctx={window:{},document:{getElementById:id=>fields[id]},URLSearchParams,clearTimeout(){},money:v=>'₦'+v,api:async()=>({success:true,from:'2026-10-03',to:'2026-10-12',rows:[paid('1',false),paid('2',true),pending]})};vm.createContext(ctx);vm.runInContext(code,ctx);
+(async()=>{await ctx.loadSalesOutcomes();
+ for(const label of ['TOTAL BOUGHT','TOTAL BREACHED','TOTAL REACHED FUNDED','TOTAL GOT PAYOUT','Payout Journey','GOT PAID → BREACHED → CLOSED'])assert(box.innerHTML.includes(label));
+ assert(box.innerHTML.includes('66.7%'));assert(box.innerHTML.includes('1 out of 2 paid purchases · 50.0%'));
+ assert(!box.innerHTML.includes('Funded outcomes'));assert(!box.innerHTML.includes('Not funded yet •'));
+ const foot=box.innerHTML.match(/<tfoot>([\s\S]*?)<\/tfoot>/)[1];assert.equal((foot.match(/<td>/g)||[]).length,6);
+ console.log('Four headline counts/percentages and only two payout journey metrics verified; Total row columns align.');})();

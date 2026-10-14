@@ -7,7 +7,7 @@ let timer;const calls=[];
 const payload=(from,to)=>{
  const sold=from==='2026-10-13'?2:4;
  const outcomes={awaiting_account:0,no_recorded_result:0,passed_not_funded:0,failed_before_funded:sold,funded_no_payout:0,funded_breached_no_payout:0,paid_no_funded_breach:0,paid_and_funded_breached:0,needs_review:0};
- return {success:true,from,to,summary:{sold,breached:sold,failed_before_funded:sold,not_funded_yet:0,funded:0,needs_review:0,collected_payout:0,paid_payout_count:0,payout_amount:0,outcomes},plans:[],rows:Array.from({length:sold},(_,i)=>({purchase_id:'purchase-'+i,sale_date:from,plan:'Legend',breached:true,passed:false,funded:false,funded_breached:false,collected_payout:false,assigned:true,paid_payout_count:0,payout_amount:0,outcome:'failed_before_funded',outcome_label:'Breached before funded'}))};
+ return {success:true,from,to,summary:{sold,breached:sold,failed_before_funded:sold,not_funded_yet:0,funded:0,needs_review:0,collected_payout:0,paid_payout_count:0,payout_amount:0,outcomes},plans:[],rows:Array.from({length:sold},(_,i)=>({purchase_id:'purchase-'+i,sale_date:from,plan:'Legend',breached:true,passed:false,funded:false,funded_breached:false,collected_payout:false,paid_then_breached_closed:false,assigned:true,paid_payout_count:0,payout_amount:0,outcome:'failed_before_funded',outcome_label:'Breached before funded'}))};
 };
 const ctx={window:{},document:{getElementById:id=>fields[id]},URLSearchParams,money:v=>'₦'+v,setTimeout:fn=>(timer=fn,1),clearTimeout:()=>{timer=null},api:async path=>{calls.push(path);const q=new URLSearchParams(path.split('?')[1]);return payload(q.get('from'),q.get('to'));}};
 vm.createContext(ctx);vm.runInContext(code,ctx);

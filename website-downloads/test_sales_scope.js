@@ -3,7 +3,7 @@ const html=fs.readFileSync(__dirname+'/admin_clean.html','utf8');
 for(const m of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi))if(m[1].trim())new vm.Script(m[1]);
 const code=html.slice(html.indexOf('let npSalesReportSequence=0;'),html.indexOf('function renderPurchases(skipLiveRefresh=false){'));
 const ctx={};vm.createContext(ctx);vm.runInContext(code,ctx);
-const row=(id,date,plan,paid=false)=>({purchase_id:id,sale_date:date,plan,assigned:true,breached:!paid,passed:paid,funded:paid,funded_breached:false,collected_payout:paid,paid_payout_count:paid?1:0,payout_amount:paid?100.25:0,outcome:paid?'paid_no_funded_breach':'failed_before_funded',outcome_label:'test'});
+const row=(id,date,plan,paid=false)=>({purchase_id:id,sale_date:date,plan,assigned:true,breached:!paid,passed:paid,funded:paid,funded_breached:false,collected_payout:paid,paid_then_breached_closed:false,paid_payout_count:paid?1:0,payout_amount:paid?100.25:0,outcome:paid?'paid_no_funded_breach':'failed_before_funded',outcome_label:'test'});
 const rows=[row('old','2026-09-01','Old',true),row('1','2026-10-10','Legend'),row('2','2026-10-11','Legend',true),row('3','2026-10-13','Ruby',true),row('future','2026-10-14','Future',true)];
 // Deliberately wrong global cards/plan totals must never reach the dated report.
 const report={summary:{sold:999,breached:999,payout_amount:999999},plans:[{plan:'Wrong',sold:999}],rows};
