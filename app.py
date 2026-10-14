@@ -14196,6 +14196,7 @@ def close_ticket():
 # Trader dashboard receives only public notices + notices targeted to itself.
 # Opening a private compliance report creates a server-side timestamped audit.
 # ============================================================
+@app.route("/trader_announcements_v159", methods=["GET", "OPTIONS"])
 @app.route("/trader_announcements", methods=["GET", "OPTIONS"])
 def trader_announcements():
     if request.method == "OPTIONS":
