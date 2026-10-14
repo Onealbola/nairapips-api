@@ -3,6 +3,8 @@ import json
 import threading
 import weakref
 import time
+import re
+import sys
 
 _instances = weakref.WeakSet()
 
@@ -23,6 +25,7 @@ class RequestAdmissionMiddleware:
         self.application = application
         self._state_lock = threading.Lock()
         self._active = {}
+        self._executions = {}
         self.reserved_paths = tuple(dict.fromkeys(reserved_paths))
         self.configure_capacity(capacity)
         _instances.add(self)
@@ -42,9 +45,22 @@ class RequestAdmissionMiddleware:
             lanes = {name: {'active': len(started),
                 'oldest_seconds': round(max((now - t for t in started.values()), default=0), 1)}
                 for name, started in self._active.items() if started}
+            executions = list(self._executions.values())
+        frames = sys._current_frames()
+        stuck = []
+        for route, started, thread in executions:
+            if now - started < 30:
+                continue
+            frame = frames.get(thread)
+            stack = []
+            while frame is not None and len(stack) < 12:
+                stack.append(frame.f_code.co_name)
+                frame = frame.f_back
+            stuck.append({'route': route, 'seconds': round(now-started, 1), 'waiting_stack': stack})
         return {'business_slots': self.capacity,
             'ordinary_slots': self.capacity - len(self.reserved_slots),
-            'reserved_paths': list(self.reserved_slots), 'active_lanes': lanes}
+            'reserved_paths': list(self.reserved_slots), 'active_lanes': lanes,
+            'long_requests': stuck}
 
     def __call__(self, environ, start_response):
         path = str(environ.get('PATH_INFO') or '')
@@ -67,8 +83,12 @@ class RequestAdmissionMiddleware:
             yield body
             return
         token = object()
+        # Static first route segment only; never include account IDs or queries.
+        segment = path.strip('/').split('/')[0]
+        route = '/'+segment if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,79}', segment) else '/dynamic'
         with self._state_lock:
             self._active.setdefault(lane, {})[token] = time.monotonic()
+            self._executions[token] = (route, time.monotonic(), threading.get_ident())
         try:
             response = self.application(environ, start_response)
             try:
@@ -80,4 +100,5 @@ class RequestAdmissionMiddleware:
         finally:
             with self._state_lock:
                 self._active[lane].pop(token, None)
+                self._executions.pop(token, None)
             slots.release()

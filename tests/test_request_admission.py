@@ -57,6 +57,29 @@ class AdmissionTests(unittest.TestCase):
         finally:release.set();thread.join(3)
         self.assertEqual(app.capacity_snapshot()['active_lanes'],{})
 
+    def test_long_request_diagnostics_exclude_ids_tokens_and_local_values(self):
+        started=threading.Event();release=threading.Event()
+        def handler(env,start):
+            private_local='sensitive-business-value'
+            started.set();release.wait(2)
+            return [b'ok']
+        app=RequestAdmissionMiddleware(handler,1)
+        env={'PATH_INFO':'/trader_current_account/private-account-id',
+             'HTTP_AUTHORIZATION':'private-token','QUERY_STRING':'private-query'}
+        thread=threading.Thread(target=lambda:list(app(env,lambda *a:None)))
+        thread.start();self.assertTrue(started.wait(1))
+        try:
+            with app._state_lock:
+                for key,(route,when,ident) in list(app._executions.items()):
+                    app._executions[key]=(route,when-31,ident)
+            snapshot=app.capacity_snapshot()
+            self.assertEqual(snapshot['long_requests'][0]['route'],'/trader_current_account')
+            self.assertIn('handler',snapshot['long_requests'][0]['waiting_stack'])
+            for secret in ('private-account-id','private-token','private-query','sensitive-business-value'):
+                self.assertNotIn(secret,json.dumps(snapshot))
+        finally:release.set();thread.join(3)
+        self.assertEqual(app.capacity_snapshot()['long_requests'],[])
+
 class ReservedAdminReadTests(unittest.TestCase):
     def test_busy_general_and_operations_cannot_consume_bootstrap_lane(self):
         general=threading.Event();ops=threading.Event();release=threading.Event()

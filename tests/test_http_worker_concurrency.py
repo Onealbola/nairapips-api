@@ -39,9 +39,10 @@ def slow():
 def read_stats():return jsonify(stats)
 app.wsgi_app=SerialMutationMiddleware(app.wsgi_app, serial_paths={'/slow'})
 if ENABLE_ADMISSION:
- app.wsgi_app=RequestAdmissionMiddleware(app.wsgi_app, reserved_paths=('/admin_bootstrap','/admin_operations_center','/approve_challenge_purchase') if ENABLE_RESERVED else ())
+ app.wsgi_app=RequestAdmissionMiddleware(app.wsgi_app, reserved_paths=('/admin_bootstrap','/admin_operations_center','/approve_challenge_purchase','/admin/sales_outcomes') if ENABLE_RESERVED else ())
 app.add_url_rule('/admin_operations_center','slow_ops',slow,methods=['GET'])
 app.add_url_rule('/approve_challenge_purchase','private_approval_fixture',slow,methods=['POST'])
+app.add_url_rule('/admin/sales_outcomes','private_report_fixture',lambda: jsonify(ok=True),methods=['GET'])
 @app.get('/admin_bootstrap')
 def bootstrap():return jsonify(ok=True)
 @app.get('/healthz/http')
@@ -158,8 +159,9 @@ class HTTPWorkerTests(unittest.TestCase):
             capacity=self.http.get(url+'/healthz/http',timeout=1).json()['capacity']
             self.assertEqual(capacity['business_slots'],8)
             self.assertIn('/approve_challenge_purchase',capacity['reserved_paths'])
-            active=[self.slow(url,'general-'+str(i)) for i in range(5)]
-            for i in range(5):self.wait_started(path,'general-'+str(i))
+            self.assertIn('/admin/sales_outcomes',capacity['reserved_paths'])
+            active=[self.slow(url,'general-'+str(i)) for i in range(4)]
+            for i in range(4):self.wait_started(path,'general-'+str(i))
             outcomes=[]
             def run_ops():
                 with requests.Session() as session:
@@ -171,6 +173,7 @@ class HTTPWorkerTests(unittest.TestCase):
             self.assertEqual(self.login(url).status_code,200)
             self.assertLess(time.monotonic()-started,.7)
             self.assertEqual(self.http.get(url+'/slow',timeout=.7).status_code,503)
+            self.assertEqual(self.http.get(url+'/admin/sales_outcomes',timeout=.7).status_code,200)
             approval=self.http.post(url+'/approve_challenge_purchase?marker=approval',json={'id':'private-test'},timeout=3)
             self.assertEqual(approval.status_code,200)
             self.assertTrue((path/'approval').exists())
