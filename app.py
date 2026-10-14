@@ -59648,7 +59648,7 @@ app.wsgi_app = _NPSerialMutationsV217(app.wsgi_app,
 @app.get("/healthz/http")
 def _np_http_readiness_v218():
     # Public operational metadata only: never include credentials or business rows.
-    response = jsonify({"status": "ok", "http_release": "V218_NONBLOCKING_ADMIN_SCHEDULING",
+    response = jsonify({"status": "ok", "http_release": "V220_RESERVED_LOGIN_CAPACITY",
         "commit": os.getenv("RENDER_GIT_COMMIT")})
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -59708,3 +59708,8 @@ def _np_sales_outcomes_v219():
             future.cancel()
         print("V219 SALES REPORT ERROR:", type(exc).__name__, flush=True)
         return jsonify({"success": False, "error": "The complete report could not be loaded. Please retry; partial totals are not shown."}), 503
+
+
+# V220: ordinary slow requests must leave threads for sign-in and readiness.
+from request_admission import RequestAdmissionMiddleware as _NPAdmissionV220
+app.wsgi_app = _NPAdmissionV220(app.wsgi_app)

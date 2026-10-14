@@ -402,3 +402,28 @@ Validation: 141 Python regression tests passed before adding two endpoint
 validation/auth tests; all eight focused report tests then passed. All inline
 admin scripts parse and mocked UI success/error/escaping checks pass. Read-only
 live validation loaded 481 purchases and 1,927 accounts without mutations.
+
+### V220 — reserve HTTP capacity for admin login
+
+14 October: live website responded HTTP 200 in 1.48 seconds, but separate
+healthz/http and empty-body staff_login probes repeatedly timed out at 6–12
+seconds. These checks do not use production credentials or perform business
+writes. This establishes API unresponsiveness, not its precise Render runtime
+cause; restart/memory/worker configuration requires Render logs to distinguish.
+
+The V218 write lock does not prevent concurrent slow GETs from occupying every
+Gunicorn thread. Add outer read/write admission middleware: six ordinary requests
+per eight-thread worker; staff_login, healthz/http and preflight bypass admission.
+Gunicorn post_worker_init derives capacity from its actual configured thread
+count, reserving two where available. Overflow returns 503 with no-store, CORS,
+Retry-After and operation_started:false BEFORE invoking any business handler.
+No automatic write retry, lifecycle rule change, auth bypass or new account
+assignment. Held slots release on handler/stream errors and response close.
+The existing serial admin mutation middleware remains inside this boundary.
+
+Real Gunicorn test: six overlapping slow reads + twelve overflow reads; overflow
+503 without execution, authenticated test login <0.7 seconds, wrong password401,
+readiness200; existing mutation serialization tests pass. Additional middleware
+checks cover rejected financial writes, CORS, stream failures and actual worker
+capacity. Tests use private fixture credentials and AST-extracted auth, never
+import production app.py or send notifications.

@@ -21,3 +21,10 @@ def on_starting(server):
     server.log.info("NP HTTP V217 worker_class=%s threads=%s workers=%s preload=%s",
         server.cfg.worker_class.__name__, server.cfg.threads,
         server.cfg.workers, server.cfg.preload_app)
+
+
+def post_worker_init(worker):
+    from request_admission import configure_worker_capacity
+    slots = configure_worker_capacity(worker.cfg.threads)
+    worker.log.info("NP HTTP V220 threads=%s ordinary_request_slots=%s",
+                    worker.cfg.threads, slots)

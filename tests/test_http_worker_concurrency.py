@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from flask import Flask,request,jsonify
 from request_serialization import SerialMutationMiddleware
+from request_admission import RequestAdmissionMiddleware
 app=Flask(__name__)
 source=Path(SOURCE_PATH).read_text()
 functions={n.name:n for n in ast.parse(source).body if isinstance(n,ast.FunctionDef)}
@@ -37,6 +38,10 @@ def slow():
 @app.get('/stats')
 def read_stats():return jsonify(stats)
 app.wsgi_app=SerialMutationMiddleware(app.wsgi_app, serial_paths={'/slow'})
+if ENABLE_ADMISSION:
+ app.wsgi_app=RequestAdmissionMiddleware(app.wsgi_app)
+@app.get('/healthz/http')
+def priority_health():return jsonify(ok=True)
 '''
 
 class HTTPWorkerTests(unittest.TestCase):
@@ -44,10 +49,10 @@ class HTTPWorkerTests(unittest.TestCase):
         self.http=requests.Session();self.http.trust_env=False
     def tearDown(self):self.http.close()
     @contextlib.contextmanager
-    def server(self,configured):
+    def server(self,configured,admission=False):
         with tempfile.TemporaryDirectory(prefix='np-http-worker-') as tmp:
             path=Path(tmp)
-            code=FIXTURE.replace('SOURCE_PATH',repr(str(ROOT/'app.py'))).replace('MARKER_DIR',repr(tmp))
+            code=FIXTURE.replace('ENABLE_ADMISSION',repr(admission)).replace('SOURCE_PATH',repr(str(ROOT/'app.py'))).replace('MARKER_DIR',repr(tmp))
             (path/'http_fixture.py').write_text(code)
             with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
             env=dict(os.environ,PYTHONPATH=str(ROOT)+os.pathsep+tmp,PYTHONDONTWRITEBYTECODE='1')
@@ -124,6 +129,22 @@ class HTTPWorkerTests(unittest.TestCase):
                 thread.join(3);self.assertEqual(outcomes,[503])
             first.join(3);self.assertEqual(one,[200])
             self.assertEqual(self.http.get(url+'/stats',timeout=2).json()['maximum'],1)
+
+    def test_slow_read_wave_leaves_login_and_health_capacity(self):
+        with self.server(True,admission=True) as (url,path):
+            active=[self.slow(url,'read-'+str(i)) for i in range(6)]
+            for i in range(6):self.wait_started(path,'read-'+str(i))
+            wave=[self.slow(url,'overflow-'+str(i)) for i in range(12)]
+            started=time.monotonic();result=self.login(url)
+            self.assertEqual(result.status_code,200)
+            self.assertLess(time.monotonic()-started,.7)
+            self.assertEqual(self.login(url,'wrong').status_code,401)
+            self.assertEqual(self.http.get(url+'/healthz/http',timeout=.7).status_code,200)
+            for thread,outcomes in wave:
+                thread.join(3);self.assertEqual(outcomes,[503])
+            for thread,outcomes in active:
+                thread.join(3);self.assertEqual(outcomes,[200])
+            self.assertEqual(self.http.get(url+'/stats',timeout=2).json()['maximum'],6)
 
 class MiddlewareTests(unittest.TestCase):
     def test_failed_response_releases_mutation_lock(self):
