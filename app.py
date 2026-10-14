@@ -59645,6 +59645,25 @@ app.wsgi_app = _NPSerialMutationsV217(app.wsgi_app,
         "/update_trader", "/delete_trader", "/remove_trader", "/recall_"))
 
 
+# Independent, read-only forensic view: never waits for the monitoring service.
+from breach_intelligence import build_breach_report as _np_breach_report_v235
+from breach_intelligence import BreachReader as _NPBreachReaderV235, BreachReadUnavailable as _NPBreachUnavailableV235, BreachRecordError as _NPBreachRecordErrorV235
+@app.get("/admin/breach_intelligence")
+def _np_breach_intelligence_v235():
+    admin, error = _require_admin()
+    if error is not None:
+        return error
+    try:
+        result = _np_breach_report_v235(str(request.args.get("account_id") or "").strip(), str(request.args.get("trader_id") or "").strip(), _NPBreachReaderV235(SUPABASE_URL, SUPABASE_KEY))
+        response = jsonify({"success": True, "data": result})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except _NPBreachRecordErrorV235 as exc:
+        return jsonify({"success": False, "error": str(exc)}), exc.status
+    except _NPBreachUnavailableV235:
+        return jsonify({"success": False, "error": "Complete breach evidence could not be loaded. Please retry."}), 503
+
+
 @app.get("/admin/auth_check")
 def _np_admin_auth_check_v234():
     admin, error = _require_admin()
@@ -59724,4 +59743,4 @@ def _np_sales_outcomes_v219():
 # V220: ordinary slow requests must leave threads for sign-in and readiness.
 from request_admission import RequestAdmissionMiddleware as _NPAdmissionV220
 app.wsgi_app = _NPAdmissionV220(app.wsgi_app,
-    reserved_paths=("/admin_bootstrap", "/admin_operations_center", "/approve_challenge_purchase", "/admin/sales_outcomes"))
+    reserved_paths=("/admin_bootstrap", "/admin_operations_center", "/approve_challenge_purchase", "/admin/sales_outcomes", "/admin/breach_intelligence"))
