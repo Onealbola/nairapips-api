@@ -16363,6 +16363,7 @@ function showModal(html){
   div.onclick = e => { if(e.target===div) div.remove(); };
   div.innerHTML = `<div class="modal-card" onclick="event.stopPropagation()">${html}</div>`;
   document.body.appendChild(div);
+  return div;
 }
 
 // Convenience wrapper for Traders League V1: modal(title, html) -> showModal.
@@ -16397,13 +16398,17 @@ async function copyField(id){
 <script>
 
 window.adminOpenIntelligence=async function(traderId,accountId){
+  if(!accountId){ toast('Black Box requires the exact breached account.','err'); return; }
+  const dialog=modal('Breach Intelligence', `<div role="status">Loading the exact account’s breach evidence…</div><button class="btn btn-sm" onclick="this.closest('.modal-bg').remove()">Close</button>`);
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),25000);
   try{
-    if(!accountId){ toast('Black Box requires the exact breached account.','err'); return; }
+    if(!SESSION.token) throw new Error('Your admin session has expired. Please sign in again.');
     const base=npMonitoringApiUrl().replace(/\/$/,'');
     const headers={'Accept':'application/json'};
     if(SESSION.token) headers['Authorization']='Bearer '+SESSION.token;
-    const resp=await fetch(base+'/breach_black_box?trader_id='+encodeURIComponent(traderId)+'&account_id='+encodeURIComponent(accountId),{headers});
-    const j=await resp.json().catch(()=>({}));
+    const resp=await fetch(base+'/breach_black_box?trader_id='+encodeURIComponent(traderId)+'&account_id='+encodeURIComponent(accountId),{headers,signal:controller.signal,cache:'no-store'});
+    const j=await resp.json();
     if(!resp.ok || j.success===false) throw new Error(j.error||j.message||('HTTP '+resp.status));
     const x=j.data||j,a=x.account||{},r=x.rule||{},f=x.first_crossing||{},low=x.lowest_observed||{},rec=x.recovery_after_breach||{};
     const fmtTime=v=>{if(!v)return '—';const d=new Date(v);return isNaN(d)?String(v):d.toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false,timeZone:'UTC'})+' UTC';};
@@ -16438,8 +16443,11 @@ window.adminOpenIntelligence=async function(traderId,accountId){
       <div class="npbb-panel" style="margin-top:12px"><h4>Forensic Timeline</h4><div class="npbb-timeline"><table><thead><tr><th>UTC Time</th><th>Record</th><th>Balance</th><th>Equity</th><th>DD</th><th>State</th></tr></thead><tbody>${timeline||'<tr><td colspan="6" style="text-align:center;color:#71717a">Legacy record — detailed timeline was not stored.</td></tr>'}</tbody></table></div></div>
       <div class="npbb-foot"><div>Official NairaPips breach evidence · ${esc(fmtTime(x.generated_at))}</div><div class="npbb-actions"><button class="npbb-btn" onclick="navigator.clipboard?.writeText('${esc(String(x.event_id||''))}').then(()=>toast('Evidence reference copied','ok'))">Copy Reference</button><button class="npbb-btn" onclick="window.print()">Print Evidence</button></div></div>
     </div></div>`;
-    modal('Breach Intelligence',html);
-  }catch(e){toast('Black Box failed: '+(e.message||e),'err')}
+    if(dialog.isConnected) dialog.querySelector('.modal-card').innerHTML=`<button class="btn btn-sm" onclick="this.closest('.modal-bg').remove()">Close</button>`+html;
+  }catch(e){
+    const message=e.name==='AbortError'?'The monitoring service did not respond within 25 seconds. Please retry.':String(e.message||e);
+    if(dialog.isConnected) dialog.querySelector('.modal-card').innerHTML=`<h3>Breach Intelligence unavailable</h3><div role="alert" style="margin:16px 0;color:#fca5a5">${esc(message)}</div><button class="btn btn-gold" onclick="this.closest('.modal-bg').remove();adminOpenIntelligence('${esc(String(traderId))}','${esc(String(accountId))}')">Retry</button> <button class="btn" onclick="this.closest('.modal-bg').remove()">Close</button>`;
+  }finally{clearTimeout(timer)}
 };
 
 
