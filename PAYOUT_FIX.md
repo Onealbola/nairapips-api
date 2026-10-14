@@ -542,3 +542,32 @@ assignment. Assignment-status polling now uses supported fields (including
 removing nonexistent assigned_at from trader_accounts). All eight corrected
 projections returned HTTP200 against live PostgREST with read-only limit1 queries.
 A fixture contains column names only, no account values or credentials.
+
+### V229 — purchase approval capacity and visible assignment results
+
+After V228, the exact pending purchase still had no account. Read-only execution
+of the actual base assigner, with every mutation stopped before any HTTP write,
+verified 15 structurally eligible 1m Phase rows, full never-used/history checks,
+exact-purchase and login guards, plan/target payload creation and supported insert
+fields. This is not a completed production assignment; the screenshot obscured
+the error, so the remaining individual failure reason is not yet established.
+
+Previously approval shared ordinary request capacity. Reserve a separate lane
+for /approve_challenge_purchase alongside bootstrap and operations, keeping auth
+checks and per-worker serialized financial mutations. Ten Gunicorn threads allow
+five ordinary requests + three essential lanes + two auth/readiness capacity;
+external reads remain bounded. Actual real-Gunicorn regression submits approval
+while ordinary reads and operations are busy and proves the handler still runs.
+
+Website preserves the real error inside the manual dialog; no automatic repeated
+POST. Blank selection is correctly labelled Auto-select matching Phase account
+now, not Auto-assign later. API waiting status is shown as payment approved /
+waiting, never assigned. Success displays actual server-returned login (server
+may safely replace a stale browser candidate), and a failed table reload cannot
+turn a confirmed assignment into a failed mutation. Manual submit coalesces
+same-purchase clicks. Browser freshness follows server max_age_days instead of
+hardcoded seven days. Existing safety checks and report/date fixes retained.
+
+Validation: all 163 Python tests; JS result/waiting/error/double-submit/freshness
+checks plus existing report/date/admin-load tests. Production diagnosis read-only;
+no payment approvals, live account inserts or credential emails sent by tests.

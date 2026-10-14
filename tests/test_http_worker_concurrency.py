@@ -39,8 +39,9 @@ def slow():
 def read_stats():return jsonify(stats)
 app.wsgi_app=SerialMutationMiddleware(app.wsgi_app, serial_paths={'/slow'})
 if ENABLE_ADMISSION:
- app.wsgi_app=RequestAdmissionMiddleware(app.wsgi_app, reserved_paths=('/admin_bootstrap','/admin_operations_center') if ENABLE_RESERVED else ())
+ app.wsgi_app=RequestAdmissionMiddleware(app.wsgi_app, reserved_paths=('/admin_bootstrap','/admin_operations_center','/approve_challenge_purchase') if ENABLE_RESERVED else ())
 app.add_url_rule('/admin_operations_center','slow_ops',slow,methods=['GET'])
+app.add_url_rule('/approve_challenge_purchase','private_approval_fixture',slow,methods=['POST'])
 @app.get('/admin_bootstrap')
 def bootstrap():return jsonify(ok=True)
 @app.get('/healthz/http')
@@ -135,8 +136,8 @@ class HTTPWorkerTests(unittest.TestCase):
 
     def test_slow_read_wave_leaves_login_and_health_capacity(self):
         with self.server(True,admission=True) as (url,path):
-            active=[self.slow(url,'read-'+str(i)) for i in range(6)]
-            for i in range(6):self.wait_started(path,'read-'+str(i))
+            active=[self.slow(url,'read-'+str(i)) for i in range(8)]
+            for i in range(8):self.wait_started(path,'read-'+str(i))
             wave=[self.slow(url,'overflow-'+str(i)) for i in range(12)]
             started=time.monotonic();result=self.login(url)
             self.assertEqual(result.status_code,200)
@@ -147,12 +148,12 @@ class HTTPWorkerTests(unittest.TestCase):
                 thread.join(3);self.assertEqual(outcomes,[503])
             for thread,outcomes in active:
                 thread.join(3);self.assertEqual(outcomes,[200])
-            self.assertEqual(self.http.get(url+'/stats',timeout=2).json()['maximum'],6)
+            self.assertEqual(self.http.get(url+'/stats',timeout=2).json()['maximum'],8)
 
     def test_admin_bootstrap_and_login_survive_busy_general_and_ops_requests(self):
         with self.server(True,admission=True,reserved=True) as (url,path):
-            active=[self.slow(url,'general-'+str(i)) for i in range(4)]
-            for i in range(4):self.wait_started(path,'general-'+str(i))
+            active=[self.slow(url,'general-'+str(i)) for i in range(5)]
+            for i in range(5):self.wait_started(path,'general-'+str(i))
             outcomes=[]
             def run_ops():
                 with requests.Session() as session:
@@ -164,6 +165,9 @@ class HTTPWorkerTests(unittest.TestCase):
             self.assertEqual(self.login(url).status_code,200)
             self.assertLess(time.monotonic()-started,.7)
             self.assertEqual(self.http.get(url+'/slow',timeout=.7).status_code,503)
+            approval=self.http.post(url+'/approve_challenge_purchase?marker=approval',json={'id':'private-test'},timeout=3)
+            self.assertEqual(approval.status_code,200)
+            self.assertTrue((path/'approval').exists())
             for thread,result in active:thread.join(3);self.assertEqual(result,[200])
             ops.join(3);self.assertEqual(outcomes,[200])
 

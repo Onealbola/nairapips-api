@@ -5,7 +5,7 @@ Keep its configured worker count (including Render's command-line override).
 Do not preload: this application starts background workers during import.
 """
 worker_class = "gthread"
-threads = 8
+threads = 10
 preload_app = False
 # Gthread workers keep reporting liveness while requests wait on I/O. Raising
 # timeout is not the remedy; keep the usual thirty-second worker watchdog.
