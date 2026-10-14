@@ -499,3 +499,19 @@ login responsive under 0.7 seconds; overflow rejected before execution. JS check
 cover cached state preservation, first-load unavailable rendering, core refresh
 coalescing, two-read fallback concurrency; date/report checks still pass. No
 production imports, notifications or financial writes during verification.
+
+### V227 — simplified paid-account journey
+
+User-requested first row: total bought, total breached, total reached funded,
+total got payout, figures first with percentages of selected-cohort purchases.
+Next card contains only Got paid and Got paid → breached → closed. The closed
+figure is a subset of Got paid and requires a paid_at strictly before breached_at
+on the SAME funded account and an explicit terminal breached/closed/archived
+state. Missing dates, reversed/equal order, active state and another account's
+breach do not establish this sequence. Original paid amounts remain preserved;
+no account closure or lifecycle/payment changes occur.
+
+Adds paid_then_breached_closed count/rate to backend report and per-plan totals.
+Website keeps strict DD/MM/YYYY handling, date-scoped recalculation, Total row,
+and admin failed-load safeguards. 16 report/auth/date/payment tests passed plus
+JS date scope, input refresh, failed-load and operations preservation checks.

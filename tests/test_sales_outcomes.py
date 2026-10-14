@@ -89,6 +89,22 @@ class SalesOutcomesTests(unittest.TestCase):
         self.assertEqual(r['summary']['failed_before_funded'],0)
         self.assertEqual(r['rows'][0]['outcome'],'funded_no_payout')
 
+    def test_paid_then_breached_closed_requires_recorded_order_on_same_account(self):
+        account=self.a(stage='funded',account_status='breached',breached_at='2026-10-10T12:00:00Z')
+        payout=dict(id='paid',trader_id='t',trader_account_id='a',status='paid',paid_at='2026-10-09T12:00:00Z',amount=100)
+        r=build_report([self.p()],[account],'','',[payout])
+        self.assertTrue(r['rows'][0]['paid_then_breached_closed'])
+        self.assertEqual(r['summary']['paid_then_breached_closed'],1)
+        for date in ('2026-10-11T12:00:00Z','2026-10-10T12:00:00Z',None):
+            r=build_report([self.p()],[account],'','',[dict(payout,paid_at=date)])
+            self.assertFalse(r['rows'][0]['paid_then_breached_closed'])
+            self.assertEqual(r['summary']['collected_payout'],1)
+        active=dict(account,account_status='assigned_active')
+        self.assertFalse(build_report([self.p()],[active],'','',[payout])['rows'][0]['paid_then_breached_closed'])
+        other=self.a('other',stage='funded',account_status='breached',breached_at='2026-10-10T12:00:00Z')
+        original=self.a(stage='funded',account_status='archived_reset_funded')
+        self.assertFalse(build_report([self.p()],[original,other],'','',[payout])['rows'][0]['paid_then_breached_closed'])
+
 class SalesOutcomesRouteTests(unittest.TestCase):
     def route(self, auth):
         import ast
