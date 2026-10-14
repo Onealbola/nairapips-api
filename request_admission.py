@@ -2,6 +2,7 @@
 import json
 import threading
 import weakref
+import time
 
 _instances = weakref.WeakSet()
 
@@ -20,6 +21,8 @@ class RequestAdmissionMiddleware:
 
     def __init__(self, application, capacity=6, reserved_paths=()):
         self.application = application
+        self._state_lock = threading.Lock()
+        self._active = {}
         self.reserved_paths = tuple(dict.fromkeys(reserved_paths))
         self.configure_capacity(capacity)
         _instances.add(self)
@@ -32,12 +35,24 @@ class RequestAdmissionMiddleware:
         self.reserved_slots = {path: threading.BoundedSemaphore(1) for path in reserved}
         self.slots = threading.BoundedSemaphore(self.capacity - len(reserved))
 
+    def capacity_snapshot(self):
+        """Operational counts only; exclude URLs, identities and request bodies."""
+        now = time.monotonic()
+        with self._state_lock:
+            lanes = {name: {'active': len(started),
+                'oldest_seconds': round(max((now - t for t in started.values()), default=0), 1)}
+                for name, started in self._active.items() if started}
+        return {'business_slots': self.capacity,
+            'ordinary_slots': self.capacity - len(self.reserved_slots),
+            'reserved_paths': list(self.reserved_slots), 'active_lanes': lanes}
+
     def __call__(self, environ, start_response):
         path = str(environ.get('PATH_INFO') or '')
         if path in self.PRIORITY_PATHS or environ.get('REQUEST_METHOD') == 'OPTIONS':
             yield from self.application(environ, start_response)
             return
         slots = self.reserved_slots.get(path, self.slots)
+        lane = path if path in self.reserved_slots else 'ordinary'
         if not slots.acquire(blocking=False):
             body = json.dumps({'success': False, 'code': 'NP_REQUEST_CAPACITY_BUSY',
                 'operation_started': False,
@@ -51,6 +66,9 @@ class RequestAdmissionMiddleware:
             start_response('503 Service Unavailable', headers)
             yield body
             return
+        token = object()
+        with self._state_lock:
+            self._active.setdefault(lane, {})[token] = time.monotonic()
         try:
             response = self.application(environ, start_response)
             try:
@@ -60,4 +78,6 @@ class RequestAdmissionMiddleware:
                 if close:
                     close()
         finally:
+            with self._state_lock:
+                self._active[lane].pop(token, None)
             slots.release()

@@ -39,6 +39,24 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(app.capacity,2)
         self.assertEqual(configure_worker_capacity(8),6)
 
+    def test_snapshot_identifies_busy_lane_without_request_details(self):
+        started=threading.Event();release=threading.Event()
+        def handler(env,start):
+            started.set();release.wait(2)
+            return [b'ok']
+        app=RequestAdmissionMiddleware(handler,4,reserved_paths=('/approve_challenge_purchase',))
+        env={'PATH_INFO':'/approve_challenge_purchase','QUERY_STRING':'secret=private',
+             'HTTP_AUTHORIZATION':'private-token','REQUEST_METHOD':'POST'}
+        thread=threading.Thread(target=lambda:list(app(env,lambda *a:None)))
+        thread.start();self.assertTrue(started.wait(1))
+        try:
+            snapshot=app.capacity_snapshot()
+            self.assertEqual(snapshot['ordinary_slots'],3)
+            self.assertEqual(snapshot['active_lanes']['/approve_challenge_purchase']['active'],1)
+            self.assertNotIn('private',json.dumps(snapshot))
+        finally:release.set();thread.join(3)
+        self.assertEqual(app.capacity_snapshot()['active_lanes'],{})
+
 class ReservedAdminReadTests(unittest.TestCase):
     def test_busy_general_and_operations_cannot_consume_bootstrap_lane(self):
         general=threading.Event();ops=threading.Event();release=threading.Event()
