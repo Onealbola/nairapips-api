@@ -472,3 +472,30 @@ parsing and UI rendering/error/escaping checks pass. Read-only full-history samp
 336 sold = 121 breached before funded + 52 not yet funded + 163 funded + 0 review.
 Funded: 25 no payout/no funded breach + 50 no payout/funded breach + 17 paid/no
 funded breach + 71 paid/funded breach = 163. 88 recorded payout recipients.
+
+### V226 — reserved essential admin reads and failed-load honesty
+
+User's overview displayed registered count but zero business data after request
+admission reported capacity busy. Two independent problems: generic slow traffic
+could take all six non-auth HTTP slots; website fallback converted core HTTP
+failures to empty arrays then displayed them as zero totals.
+
+Reserve one request lane each for /admin_bootstrap and /admin_operations_center,
+separate from each other and ordinary requests, within the same existing bounded
+business capacity. With eight Gunicorn threads: four ordinary requests, one
+bootstrap, one operations; sign-in/readiness keep their remaining capacity. Auth
+checks still run normally and database/financial CAS guards are unchanged. No
+queued mutation or automatic mutation replay is introduced.
+
+Website coalesces overlapping core refreshes, caps fallback feed concurrency at
+two, requires core feeds to succeed, preserves previous data on failure and
+propagates failure instead of announcing successful refresh. Missing initial data
+renders unavailable rather than zero cards. Operations refreshes likewise share
+one in-flight request and preserve previously loaded data.
+
+Validation: all 156 Python tests passed, including real Gunicorn test with four
+slow ordinary requests plus slow operations: bootstrap and authenticated fixture
+login responsive under 0.7 seconds; overflow rejected before execution. JS checks
+cover cached state preservation, first-load unavailable rendering, core refresh
+coalescing, two-read fallback concurrency; date/report checks still pass. No
+production imports, notifications or financial writes during verification.

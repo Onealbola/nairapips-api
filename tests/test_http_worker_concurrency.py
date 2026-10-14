@@ -39,7 +39,10 @@ def slow():
 def read_stats():return jsonify(stats)
 app.wsgi_app=SerialMutationMiddleware(app.wsgi_app, serial_paths={'/slow'})
 if ENABLE_ADMISSION:
- app.wsgi_app=RequestAdmissionMiddleware(app.wsgi_app)
+ app.wsgi_app=RequestAdmissionMiddleware(app.wsgi_app, reserved_paths=('/admin_bootstrap','/admin_operations_center') if ENABLE_RESERVED else ())
+app.add_url_rule('/admin_operations_center','slow_ops',slow,methods=['GET'])
+@app.get('/admin_bootstrap')
+def bootstrap():return jsonify(ok=True)
 @app.get('/healthz/http')
 def priority_health():return jsonify(ok=True)
 '''
@@ -49,10 +52,10 @@ class HTTPWorkerTests(unittest.TestCase):
         self.http=requests.Session();self.http.trust_env=False
     def tearDown(self):self.http.close()
     @contextlib.contextmanager
-    def server(self,configured,admission=False):
+    def server(self,configured,admission=False,reserved=False):
         with tempfile.TemporaryDirectory(prefix='np-http-worker-') as tmp:
             path=Path(tmp)
-            code=FIXTURE.replace('ENABLE_ADMISSION',repr(admission)).replace('SOURCE_PATH',repr(str(ROOT/'app.py'))).replace('MARKER_DIR',repr(tmp))
+            code=FIXTURE.replace('ENABLE_RESERVED',repr(reserved)).replace('ENABLE_ADMISSION',repr(admission)).replace('SOURCE_PATH',repr(str(ROOT/'app.py'))).replace('MARKER_DIR',repr(tmp))
             (path/'http_fixture.py').write_text(code)
             with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
             env=dict(os.environ,PYTHONPATH=str(ROOT)+os.pathsep+tmp,PYTHONDONTWRITEBYTECODE='1')
@@ -145,6 +148,24 @@ class HTTPWorkerTests(unittest.TestCase):
             for thread,outcomes in active:
                 thread.join(3);self.assertEqual(outcomes,[200])
             self.assertEqual(self.http.get(url+'/stats',timeout=2).json()['maximum'],6)
+
+    def test_admin_bootstrap_and_login_survive_busy_general_and_ops_requests(self):
+        with self.server(True,admission=True,reserved=True) as (url,path):
+            active=[self.slow(url,'general-'+str(i)) for i in range(4)]
+            for i in range(4):self.wait_started(path,'general-'+str(i))
+            outcomes=[]
+            def run_ops():
+                with requests.Session() as session:
+                    session.trust_env=False
+                    outcomes.append(session.get(url+'/admin_operations_center?marker=ops',timeout=4).status_code)
+            ops=threading.Thread(target=run_ops);ops.start();self.wait_started(path,'ops')
+            started=time.monotonic()
+            self.assertEqual(self.http.get(url+'/admin_bootstrap',timeout=.7).status_code,200)
+            self.assertEqual(self.login(url).status_code,200)
+            self.assertLess(time.monotonic()-started,.7)
+            self.assertEqual(self.http.get(url+'/slow',timeout=.7).status_code,503)
+            for thread,result in active:thread.join(3);self.assertEqual(result,[200])
+            ops.join(3);self.assertEqual(outcomes,[200])
 
 class MiddlewareTests(unittest.TestCase):
     def test_failed_response_releases_mutation_lock(self):

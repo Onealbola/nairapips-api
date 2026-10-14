@@ -38,3 +38,23 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(configure_worker_capacity(4),2)
         self.assertEqual(app.capacity,2)
         self.assertEqual(configure_worker_capacity(8),6)
+
+class ReservedAdminReadTests(unittest.TestCase):
+    def test_busy_general_and_operations_cannot_consume_bootstrap_lane(self):
+        general=threading.Event();ops=threading.Event();release=threading.Event()
+        def handler(env,start):
+            path=env['PATH_INFO']
+            if path=='/ordinary':general.set();release.wait(2)
+            if path=='/admin_operations_center':ops.set();release.wait(2)
+            return [b'ok']
+        app=RequestAdmissionMiddleware(handler,3,reserved_paths=('/admin_bootstrap','/admin_operations_center'))
+        one=threading.Thread(target=lambda:list(app({'PATH_INFO':'/ordinary'},lambda *a:None)))
+        two=threading.Thread(target=lambda:list(app({'PATH_INFO':'/admin_operations_center'},lambda *a:None)))
+        one.start();two.start();self.assertTrue(general.wait(1));self.assertTrue(ops.wait(1))
+        try:
+            self.assertEqual(list(app({'PATH_INFO':'/admin_bootstrap'},lambda *a:None)),[b'ok'])
+            self.assertEqual(list(app({'PATH_INFO':'/staff_login'},lambda *a:None)),[b'ok'])
+            headers=[]
+            list(app({'PATH_INFO':'/ordinary'},lambda status,h:headers.append(status)))
+            self.assertTrue(headers[0].startswith('503'))
+        finally:release.set();one.join(3);two.join(3)

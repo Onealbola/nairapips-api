@@ -10,8 +10,7 @@ def configure_worker_capacity(threads):
     # Called before Gunicorn admits requests; never swap a semaphore in use.
     capacity = max(1, int(threads) - 2)
     for instance in list(_instances):
-        instance.slots = threading.BoundedSemaphore(capacity)
-        instance.capacity = capacity
+        instance.configure_capacity(capacity)
     return capacity
 
 
@@ -19,18 +18,26 @@ class RequestAdmissionMiddleware:
     PRIORITY_PATHS = frozenset({'/staff_login', '/healthz/http'})
     ALLOWED_ORIGINS = frozenset({'https://nairapips.com', 'https://www.nairapips.com'})
 
-    def __init__(self, application, capacity=6):
+    def __init__(self, application, capacity=6, reserved_paths=()):
         self.application = application
-        self.capacity = max(1, int(capacity))
-        self.slots = threading.BoundedSemaphore(self.capacity)
+        self.reserved_paths = tuple(dict.fromkeys(reserved_paths))
+        self.configure_capacity(capacity)
         _instances.add(self)
+
+    def configure_capacity(self, capacity):
+        self.capacity = max(1, int(capacity))
+        # One separate lane for each essential read. Operations traffic cannot
+        # take the bootstrap lane. No new auth authority is introduced.
+        reserved = self.reserved_paths[:max(0, self.capacity - 1)]
+        self.reserved_slots = {path: threading.BoundedSemaphore(1) for path in reserved}
+        self.slots = threading.BoundedSemaphore(self.capacity - len(reserved))
 
     def __call__(self, environ, start_response):
         path = str(environ.get('PATH_INFO') or '')
         if path in self.PRIORITY_PATHS or environ.get('REQUEST_METHOD') == 'OPTIONS':
             yield from self.application(environ, start_response)
             return
-        slots = self.slots
+        slots = self.reserved_slots.get(path, self.slots)
         if not slots.acquire(blocking=False):
             body = json.dumps({'success': False, 'code': 'NP_REQUEST_CAPACITY_BUSY',
                 'operation_started': False,
