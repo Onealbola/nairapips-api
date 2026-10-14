@@ -12387,10 +12387,19 @@ function exportPurchaseSalesCSV(){
 
 
 let npSalesReportSequence=0;
+let npSalesDateTimer=null;
+function npSalesDatesChanged(){
+ ++npSalesReportSequence;
+ clearTimeout(npSalesDateTimer);
+ const box=document.getElementById('np-sales-result');
+ if(box)box.textContent='Dates changed. Updating results…';
+ npSalesDateTimer=setTimeout(()=>{if(document.getElementById('np-sales-result'))loadSalesOutcomes();},300);
+}
 function renderSalesOutcomes(){
- document.getElementById('content').innerHTML=`<div class="vault mb-6"><div class="badge">SALES OUTCOMES</div><h1 style="font-size:28px;font-weight:900;margin:12px 0">Where your sold accounts ended up</h1><p class="text-gray-400">Each approved original purchase appears once in the outcome totals. Follow its journey from challenge to funded to payout.</p></div><div class="card mb-4"><div class="flex flex-wrap gap-3 items-end"><label>Sold from<br><input id="np-sales-from" type="date" class="input" value="${window.npSalesFrom||''}"></label><label>Sold through<br><input id="np-sales-to" type="date" class="input" value="${window.npSalesTo||''}"></label><button class="btn btn-gold" onclick="loadSalesOutcomes()">Show results</button><button class="btn btn-ghost" onclick="document.getElementById('np-sales-from').value='';document.getElementById('np-sales-to').value='';loadSalesOutcomes()">All time</button></div><p class="text-gray-400 text-sm mt-3">Dates select when purchases were made, using Nigerian dates. Results include their linked history up to today. Resets do not count as new sales.</p></div><div id="np-sales-result" aria-live="polite">Choose a period, then Show results.</div>`;
+ document.getElementById('content').innerHTML=`<div class="vault mb-6"><div class="badge">SALES OUTCOMES</div><h1 style="font-size:28px;font-weight:900;margin:12px 0">Where your sold accounts ended up</h1><p class="text-gray-400">Each approved original purchase appears once in the outcome totals. Follow its journey from challenge to funded to payout.</p></div><div class="card mb-4"><div class="flex flex-wrap gap-3 items-end"><label>Sold from<br><input id="np-sales-from" type="date" onchange="npSalesDatesChanged()" class="input" value="${window.npSalesFrom||''}"></label><label>Sold through<br><input id="np-sales-to" type="date" onchange="npSalesDatesChanged()" class="input" value="${window.npSalesTo||''}"></label><button class="btn btn-gold" onclick="loadSalesOutcomes()">Show results</button><button class="btn btn-ghost" onclick="document.getElementById('np-sales-from').value='';document.getElementById('np-sales-to').value='';loadSalesOutcomes()">All time</button></div><p class="text-gray-400 text-sm mt-3">Dates select when purchases were made, using Nigerian dates. Results include their linked history up to today. Resets do not count as new sales.</p></div><div id="np-sales-result" aria-live="polite">Choose a period, then Show results.</div>`;
 }
 async function loadSalesOutcomes(){
+ clearTimeout(npSalesDateTimer);
  const sequence=++npSalesReportSequence;
  const from=document.getElementById('np-sales-from').value,to=document.getElementById('np-sales-to').value;
  const box=document.getElementById('np-sales-result');
@@ -12401,11 +12410,13 @@ async function loadSalesOutcomes(){
   const r=await api('/admin/sales_outcomes?'+new URLSearchParams({from,to}));
   if(sequence!==npSalesReportSequence||!box.isConnected)return;
   if(r.success===false||!r.summary||!r.summary.outcomes)throw new Error(r.error||'The updated report is not available yet. Please retry shortly.');
+  if(r.from!==from||r.to!==to)throw new Error('The server returned a different date period. Please retry; old totals are not shown.');
   const e=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const t=r.summary,o=t.outcomes;
   const card=(label,value,note,color)=>`<div class="card"><div class="text-gray-400 text-sm">${label}</div><div style="font-size:32px;font-weight:950;color:${color||'#ffda5c'}">${value}</div><div class="text-gray-400 text-sm">${note}</div></div>`;
   const line=(label,count,tone)=>`<div style="display:flex;justify-content:space-between;gap:18px;padding:12px 0;border-bottom:1px solid #ffffff16"><span>${label}</span><strong style="color:${tone||'#fff'}">${count}</strong></div>`;
   box.innerHTML=`
+   <div class="card mb-4" style="border-color:#b69b36"><strong>REPORT PERIOD: ${from||to?e(from||'Beginning')+' → '+e(to||'Latest sales'):'ALL TIME'}</strong><div class="text-gray-400 text-sm">Only purchases sold during this period are included. Their outcomes are followed up to today.</div></div>
    <div class="grid md:grid-cols-3 gap-3 mb-4">
     ${card('BOUGHT',t.sold,'Original approved purchases','#ffda5c')}
     ${card('HAD A BREACH',t.breached,'Purchases with a recorded breach at any stage','#ef4444')}
