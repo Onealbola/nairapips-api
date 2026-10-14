@@ -841,7 +841,7 @@ window.approveAndAssign = async function(pid, planName, accountSize){
     // 2. Auto-assign — single click
     npSetPurchaseAssignBusy(pid,true,`⏳ ASSIGNING MT5 ${match.mt5_login||''}…`);
     try{
-      await api('/approve_challenge_purchase','POST',{
+      const result=await api('/approve_challenge_purchase','POST',{
         id: pid,
         mt5_id: String(match.id),
         assignment_mode: 'auto_after_payment_approval',
@@ -850,15 +850,19 @@ window.approveAndAssign = async function(pid, planName, accountSize){
         admin_name: SESSION.admin?.name||SESSION.admin?.username,
         admin_username: SESSION.admin?.username
       });
-      audit('challenge_purchases','challenge_purchase_approved',`purchase=${pid} mt5=${match.mt5_login}`,pid).catch(()=>{});
-      toast(`Approved + auto-assigned MT5 ${match.mt5_login} to ${planName||'purchase'}`, 'ok');
       npReleaseAssignBusy();
-      setTimeout(()=>reload(),80);
+      await npFinishPurchaseApprovalV229(pid,result);
     }catch(e){
       toast('Auto-assign failed: '+e.message, 'err');
       npReleaseAssignBusy();
-      // fall back to manual picker
-      approvePurchase(pid);
+      const verified=await npCheckPurchaseAssignmentV147(pid);
+      if(verified.assigned&&verified.mt5){
+        await npFinishPurchaseApprovalV229(pid,{data:{mt5_login:verified.mt5}});
+      }else if(verified.waiting){
+        await npFinishPurchaseApprovalV229(pid,{data:{waiting_for_mt5:true}});
+      }else{
+        approvePurchase(pid,e?.message||String(e));
+      }
     }
     return;
   }
@@ -936,6 +940,8 @@ async function npRefreshFullMT5Pool(targetStage){
       let payload={};
       try{ payload=rawText?JSON.parse(rawText):{}; }catch(_e){ throw new Error('Assignable MT5 feed returned invalid data'); }
       if(!resp.ok || payload?.success===false) throw new Error(payload?.error||payload?.message||('HTTP '+resp.status));
+      const maximumAge=Number(payload.max_age_days??payload.data?.max_age_days);
+      if(Number.isFinite(maximumAge)&&maximumAge>0)window.NP_MT5_SAFE_ASSIGN_MAX_AGE_DAYS=Math.min(7,maximumAge);
       const raw=Array.isArray(payload)?payload:(payload?.mt5_pool||payload?.accounts||payload?.data||[]);
       const seen=new Set();
       (raw||[]).forEach(m=>{
@@ -10235,7 +10241,7 @@ async function bulkResendPass(){
 }
 
 
-function npMT5Freshness(m){const used=!!(m.assigned_trader_id||m.trader_id||m.trader_account_id)||String(m.status||'').toLowerCase()==='assigned';if(used)return{state:'used',label:'USED',age:null,auto:false};const d=m.created_at?new Date(m.created_at):null;const age=d&&!Number.isNaN(d.getTime())?Math.max(0,(Date.now()-d.getTime())/86400000):null;if(age===null)return{state:'review',label:'REVIEW',age,auto:false};if(age>7)return{state:'stale',label:'STALE · MANUAL',age,auto:false};if(age>=5)return{state:'expiring',label:'EXPIRING SOON',age,auto:true};return{state:'ready',label:'AUTO READY',age,auto:true};}
+function npMT5Freshness(m){const used=!!(m.assigned_trader_id||m.trader_id||m.trader_account_id)||String(m.status||'').toLowerCase()==='assigned';if(used)return{state:'used',label:'USED',age:null,auto:false};const d=m.created_at?new Date(m.created_at):null;const age=d&&!Number.isNaN(d.getTime())?Math.max(0,(Date.now()-d.getTime())/86400000):null;if(age===null)return{state:'review',label:'REVIEW',age,auto:false};if(age>(window.NP_MT5_SAFE_ASSIGN_MAX_AGE_DAYS||4))return{state:'stale',label:'STALE · MANUAL',age,auto:false};if(age>=5)return{state:'expiring',label:'EXPIRING SOON',age,auto:true};return{state:'ready',label:'AUTO READY',age,auto:true};}
 function npMT5PoolClass(m){return String((m&&m.pool_class)||'phase').toLowerCase()==='funded'?'funded':'phase';}
 function npMT5PoolAvailable(m){
   if(!m) return false;
@@ -12816,7 +12822,24 @@ window.repairApprovedPurchaseAssignmentV146 = async function(id){
     toast('Assignment repair could not be verified: '+(e.message||e),'err');
   }
 };
-window.approvePurchase = async function(id){
+async function npFinishPurchaseApprovalV229(id,result){
+  const data=result?.data??result??{};
+  const purchase=Array.isArray(data)?data[0]:(data.purchase||data);
+  const waiting=!!data.waiting_for_mt5||String(purchase?.status||'').toLowerCase()==='approved_waiting_mt5';
+  const mt5=String(purchase?.mt5_login||data.account?.mt5_login||'').trim();
+  if(waiting){toast('Payment approved. Waiting for an eligible matching Phase account; no MT5 assigned yet.','warn');}
+  else if(mt5){toast('Approved and assigned MT5 '+mt5,'ok');}
+  else{
+    const verified=await npCheckPurchaseAssignmentV147(id);
+    if(verified.assigned&&verified.mt5)toast('Approved and assigned MT5 '+verified.mt5,'ok');
+    else if(verified.waiting)toast('Payment approved. Waiting for an eligible matching Phase account; no MT5 assigned yet.','warn');
+    else throw new Error('The server response did not confirm an MT5 assignment. Refresh this exact purchase before trying again.');
+  }
+  document.querySelector('.modal-bg')?.remove();
+  try{await npRefreshPurchaseOperationsData(true);}catch(e){toast('Approval result confirmed, but the table could not refresh: '+(e?.message||e),'warn');}
+}
+
+window.approvePurchase = async function(id, previousError=""){
   const purchase=(SESSION.purchases||[]).find(p=>String(p.id||'')===String(id))||{};
   if(
     String(purchase.payment_status||'').toLowerCase()==='rejected' ||
@@ -12848,11 +12871,12 @@ window.approvePurchase = async function(id){
   npShowResetModalSafe(`
     <button onclick="this.closest('.modal-bg').remove()" style="position:absolute;top:8px;right:14px;background:0;border:0;color:#fff;font-size:24px">&times;</button>
     <h2 style="font-size:20px;font-weight:900;margin:6px 0 12px">Approve Purchase</h2>
+    <div id="ap-error" role="alert" style="${previousError?'':'display:none;'}margin:10px 0;padding:12px;border:1px solid #ef4444;border-radius:8px;color:#fca5a5">${previousError?esc('Last attempt: '+previousError):''}</div>
     <div class="kpi-sub">Pick MT5 from complete available PHASE vault (optional) · ${available.length} loaded</div>
-    <select class="select mb-3" id="ap-mt5"><option value="">Auto-assign later</option>${opts}</select>
+    <select class="select mb-3" id="ap-mt5"><option value="">Auto-select a matching Phase account now</option>${opts}</select>
     <div class="kpi-sub">Admin note</div>
     <input class="input mb-3" id="ap-note" placeholder="Approved. MT5 will be assigned.">
-    <button class="btn btn-gold" onclick="confirmApprovePurchase('${esc(String(id))}')">✓ Approve + Assign</button>
+    <button id="ap-confirm-btn" class="btn btn-gold" onclick="confirmApprovePurchase('${esc(String(id))}')">✓ Approve + Assign</button>
   `);
 };
 
@@ -12868,21 +12892,29 @@ window.confirmApprovePurchase = async function(id){
     return;
   }
 
+  if(window.NP_PURCHASE_ASSIGN_BUSY.has(String(id))){toast('This purchase is already being processed.','warn');return;}
+  window.NP_PURCHASE_ASSIGN_BUSY.add(String(id));
+  const button=document.getElementById('ap-confirm-btn');
+  if(button){button.disabled=true;button.textContent='Approving and assigning…';}
   const mt5_id = document.getElementById('ap-mt5').value || null;
   const note = document.getElementById('ap-note').value || 'Approved';
   try{
-    await api('/approve_challenge_purchase','POST',{
-      id, mt5_id,
+    const result=await api('/approve_challenge_purchase','POST',{
+      id, mt5_id, assignment_mode:mt5_id?'manual':'auto_after_payment_approval',
       admin_note: note,
       approved_by: SESSION.admin?.username||'admin',
       admin_name: SESSION.admin?.name||SESSION.admin?.username,
       admin_username: SESSION.admin?.username
     });
-    await audit('challenge_purchases','approve','',id);
-    toast('Approved','ok');
-    document.querySelector('.modal-bg')?.remove();
-    await npRefreshPurchaseOperationsData(true);
-  }catch(e){toast('Failed: '+e.message,'err');}
+    await npFinishPurchaseApprovalV229(id,result);
+  }catch(e){
+    const error=document.getElementById('ap-error');
+    if(error){error.style.display='block';error.textContent='Approval did not complete: '+(e?.message||e);}
+    toast('Approval did not complete: '+(e?.message||e),'err');
+  }finally{
+    window.NP_PURCHASE_ASSIGN_BUSY.delete(String(id));
+    if(button&&button.isConnected){button.disabled=false;button.textContent='✓ Approve + Assign';}
+  }
 };
 
 window.rejectPurchase = async function(id){

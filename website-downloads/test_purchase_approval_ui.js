@@ -1,0 +1,17 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const html=fs.readFileSync(__dirname+'/admin_clean.html','utf8');
+const a=html.indexOf('async function npFinishPurchaseApprovalV229('),b=html.indexOf('window.rejectPurchase =',a),code=html.slice(a,b);
+const elements={'ap-mt5':{value:''},'ap-note':{value:'Approved'},'ap-error':{style:{},textContent:''},'ap-confirm-btn':{isConnected:true,disabled:false,textContent:''}};
+const messages=[],calls=[];
+const ctx={window:{NP_PURCHASE_ASSIGN_BUSY:new Set()},SESSION:{purchases:[{id:'purchase',account_size:1000,status:'pending'}],admin:{username:'private-test'}},document:{getElementById:id=>elements[id],querySelector:()=>({remove(){}})},esc:s=>String(s).replaceAll('<','&lt;'),toast:(s,type)=>messages.push({s,type}),npRefreshPurchaseOperationsData:async()=>{},npCheckPurchaseAssignmentV147:async()=>({assigned:false,waiting:false}),npRefreshFullMT5Pool:async()=>[],npMT5PickerSort:x=>x,npMT5RowAvailable:()=>true,npMT5PoolClass:()=> 'phase',npMT5PickerOptions:()=>'',npShowResetModalSafe:s=>{ctx.dialog=s},api:async(...args)=>{calls.push(args);return {success:true,data:[{mt5_login:'server-picked-account'}]}}};
+vm.createContext(ctx);vm.runInContext(code,ctx);vm.runInContext(html.slice(html.indexOf('function npMT5Freshness('),html.indexOf('function npMT5PoolClass(')),ctx);
+const old={created_at:new Date(Date.now()-5*86400000).toISOString(),status:'available'};assert.equal(ctx.npMT5Freshness(old).auto,false);ctx.window.NP_MT5_SAFE_ASSIGN_MAX_AGE_DAYS=7;assert.equal(ctx.npMT5Freshness(old).auto,true);assert.equal(ctx.npMT5Freshness({...old,assigned_trader_id:'already-used'}).auto,false);
+(async()=>{
+ await ctx.window.confirmApprovePurchase('purchase');assert.equal(calls.length,1);assert.equal(calls[0][2].assignment_mode,'auto_after_payment_approval');assert(messages.some(m=>m.s==='Approved and assigned MT5 server-picked-account'));
+ ctx.npRefreshPurchaseOperationsData=async()=>{throw Error('refresh delayed')};await ctx.window.confirmApprovePurchase('purchase');assert(messages.some(m=>m.s.includes('Approval result confirmed')));ctx.npRefreshPurchaseOperationsData=async()=>{};
+ messages.length=0;ctx.api=async()=>({success:true,data:{waiting_for_mt5:true}});await ctx.window.confirmApprovePurchase('purchase');assert(!messages.some(m=>m.type==='ok'));assert(messages.some(m=>m.s.includes('no MT5 assigned yet')));
+ messages.length=0;ctx.api=async()=>{throw Error('private test database failure')};await ctx.window.confirmApprovePurchase('purchase');assert(elements['ap-error'].textContent.includes('private test database failure'));assert.equal(elements['ap-error'].style.display,'block');assert(!elements['ap-confirm-btn'].disabled);
+ let release;calls.length=0;ctx.api=(...args)=>{calls.push(args);return new Promise(r=>{release=r})};const first=ctx.window.confirmApprovePurchase('purchase');await ctx.window.confirmApprovePurchase('purchase');assert.equal(calls.length,1);release({success:true,data:[{mt5_login:'one-account'}]});await first;
+ await ctx.window.approvePurchase('purchase','<error from prior attempt>');assert(ctx.dialog.includes('&lt;error'));assert(ctx.dialog.includes('ap-error'));assert(ctx.dialog.includes('Auto-select a matching Phase account now'));
+ console.log('Approval UI uses actual server identity, never labels waiting as assigned, preserves errors, and blocks duplicate submissions.');
+})();

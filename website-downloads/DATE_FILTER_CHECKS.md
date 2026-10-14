@@ -42,3 +42,12 @@ one in-flight request and retain old data on failure or invalid responses. The
 backend separately reserves capacity for bootstrap and Action Centre, so normal
 traffic and operations reads cannot consume the bootstrap's request lane. The
 DD/MM/YYYY sales report, date-scope checks and totals row remain preserved.
+
+Purchase approval V229: last failure remains visible in the Approve Purchase
+modal instead of disappearing behind a transient toast. Blank MT5 choice is
+labelled Auto-select a matching Phase account now. Same-purchase submit clicks
+are guarded; no mutation is automatically repeated. Waiting-for-inventory cannot
+be labelled assigned, and success uses the real server-returned MT5 rather than
+a rejected browser candidate. A successful mutation with failed table refresh
+retains its confirmed result. Browser auto age threshold follows the server's
+max_age_days. Existing report/date and failed-load safeguards remain intact.
