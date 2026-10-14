@@ -57,7 +57,9 @@ def _recorded_time(value):
 
 
 def _paid_then_breached_closed(journey, paid_times):
-    """Same account, recorded chronology, and explicit terminal state only."""
+    """Exact purchase journey, recorded chronology, and terminal account state."""
+    journey_paid_times = [when for account in journey for when in paid_times.get(
+        (str(account.get("id") or ""), str(account.get("trader_id") or "")), [])]
     for account in journey:
         stage = str(account.get("stage") or account.get("phase") or "").lower()
         state = " ".join(str(account.get(key) or "").lower() for key in ("status", "account_status", "lifecycle_state"))
@@ -70,8 +72,7 @@ def _paid_then_breached_closed(journey, paid_times):
         closed = _recorded_time(account.get("closed_at"))
         if closed and closed < breached:
             continue
-        times = paid_times.get((str(account.get("id") or ""), str(account.get("trader_id") or "")), [])
-        if any(when < breached for when in times):
+        if any(when < breached for when in journey_paid_times):
             return True
     return False
 

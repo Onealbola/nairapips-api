@@ -89,7 +89,7 @@ class SalesOutcomesTests(unittest.TestCase):
         self.assertEqual(r['summary']['failed_before_funded'],0)
         self.assertEqual(r['rows'][0]['outcome'],'funded_no_payout')
 
-    def test_paid_then_breached_closed_requires_recorded_order_on_same_account(self):
+    def test_paid_then_breached_closed_requires_recorded_order_in_exact_journey(self):
         account=self.a(stage='funded',account_status='breached',breached_at='2026-10-10T12:00:00Z')
         payout=dict(id='paid',trader_id='t',trader_account_id='a',status='paid',paid_at='2026-10-09T12:00:00Z',amount=100)
         r=build_report([self.p()],[account],'','',[payout])
@@ -103,7 +103,9 @@ class SalesOutcomesTests(unittest.TestCase):
         self.assertFalse(build_report([self.p()],[active],'','',[payout])['rows'][0]['paid_then_breached_closed'])
         other=self.a('other',stage='funded',account_status='breached',breached_at='2026-10-10T12:00:00Z')
         original=self.a(stage='funded',account_status='archived_reset_funded')
-        self.assertFalse(build_report([self.p()],[original,other],'','',[payout])['rows'][0]['paid_then_breached_closed'])
+        self.assertTrue(build_report([self.p()],[original,other],'','',[payout])['rows'][0]['paid_then_breached_closed'])
+        unrelated=dict(other,purchase_id='another-purchase')
+        self.assertFalse(build_report([self.p()],[original,unrelated],'','',[payout])['rows'][0]['paid_then_breached_closed'])
 
 class SalesOutcomesRouteTests(unittest.TestCase):
     def route(self, auth):

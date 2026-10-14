@@ -506,9 +506,10 @@ User-requested first row: total bought, total breached, total reached funded,
 total got payout, figures first with percentages of selected-cohort purchases.
 Next card contains only Got paid and Got paid → breached → closed. The closed
 figure is a subset of Got paid and requires a paid_at strictly before breached_at
-on the SAME funded account and an explicit terminal breached/closed/archived
-state. Missing dates, reversed/equal order, active state and another account's
-breach do not establish this sequence. Original paid amounts remain preserved;
+within the SAME exact purchase journey and an explicit terminal breached/closed/archived
+state. Missing dates, reversed/equal order, active state and another purchase's
+breach do not establish this sequence. A later closed Funded replacement in the
+exact original purchase journey counts after its parent account's paid payout. Original paid amounts remain preserved;
 no account closure or lifecycle/payment changes occur.
 
 Adds paid_then_breached_closed count/rate to backend report and per-plan totals.
