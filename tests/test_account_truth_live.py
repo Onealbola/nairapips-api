@@ -45,3 +45,29 @@ class TruthTests(unittest.TestCase):
             saved=self.live[key];self.live[key]='other'
             self.assertEqual(self.truth()['highest_equity'],500000)
             self.live[key]=saved
+
+    def test_database_repair_time_is_not_a_broker_observation(self):
+        self.history=[];self.live={}
+        self.a['last_sync_at']=None
+        self.a['updated_at']='2026-10-15T08:18:04+00:00'
+        t=self.truth()
+        self.assertIsNone(t['last_monitored_at'])
+        self.assertIsNone(t['lowest_equity_at'])
+        self.assertIsNone(t['highest_equity_at'])
+        self.assertFalse(t['monitoring_observation_present'])
+
+    def test_record_update_does_not_replace_older_real_observation_time(self):
+        self.live={};self.a['updated_at']='2026-10-15T08:18:04+00:00'
+        t=self.truth()
+        self.assertEqual(t['last_monitored_at'],self.a['last_sync_at'])
+        self.assertTrue(t['monitoring_observation_present'])
+
+    def test_invalid_snapshot_cannot_supply_freshness(self):
+        self.live={};self.history=[dict(equity=0,created_at='2026-10-15T08:18:04Z')]
+        self.a['last_sync_at']=None
+        self.assertIsNone(self.truth()['last_monitored_at'])
+
+    def test_latest_observation_is_selected_by_actual_time(self):
+        self.live={};self.a['last_sync_at']=None
+        self.history=[dict(equity=510000,created_at='2026-10-15T11:00:00+03:00'),dict(equity=520000,created_at='2026-10-15T08:30:00Z')]
+        self.assertEqual(self.truth()['last_monitored_at'],'2026-10-15T08:30:00Z')

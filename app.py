@@ -57139,6 +57139,20 @@ def account_truth_v122_compat():
         valid = [(r, _np_ht_equity_v122(r)) for r in snapshots]
         valid = [(r, eq) for r, eq in valid if eq > 0]
 
+        # Database repairs change updated_at but are not broker observations.
+        # Pick freshness only from valid financial evidence or the sync marker.
+        from datetime import datetime as _HTDateTime, timezone as _HTTimezone
+        observed_times = []
+        for raw in [r.get("observed_at") or r.get("created_at") for r, eq in valid] + [account.get("last_sync_at")]:
+            try:
+                parsed = _HTDateTime.fromisoformat(str(raw or "").replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=_HTTimezone.utc)
+                observed_times.append((parsed, raw))
+            except (ValueError, TypeError):
+                continue
+        last_monitored_at = max(observed_times, key=lambda pair: pair[0])[1] if observed_times else None
+
         snap_low_row = min(valid, key=lambda p: p[1]) if valid else (None, 0.0)
         snap_high_row = max(valid, key=lambda p: p[1]) if valid else (None, 0.0)
 
@@ -57185,22 +57199,22 @@ def account_truth_v122_compat():
         elif low_event and abs(_low_event_value_v189 - lowest) <= _eps_v189:
             lowest_at = (low_event or {}).get("created_at")
         elif stored_low and abs(stored_low - lowest) <= _eps_v189:
-            lowest_at = account.get("last_sync_at") or account.get("updated_at")
+            lowest_at = account.get("last_sync_at")
         elif current and abs(current - lowest) <= _eps_v189:
-            lowest_at = account.get("last_sync_at") or account.get("updated_at")
+            lowest_at = account.get("last_sync_at")
         else:
-            lowest_at = account.get("last_sync_at") or account.get("updated_at")
+            lowest_at = account.get("last_sync_at")
 
         if snap_high_row[0] and abs(snap_high_row[1] - highest) <= _eps_v189:
             highest_at = (snap_high_row[0] or {}).get("created_at")
         elif high_event and abs(_high_event_value_v189 - highest) <= _eps_v189:
             highest_at = (high_event or {}).get("created_at")
         elif stored_high and abs(stored_high - highest) <= _eps_v189:
-            highest_at = account.get("last_sync_at") or account.get("updated_at")
+            highest_at = account.get("last_sync_at")
         elif current and abs(current - highest) <= _eps_v189:
-            highest_at = account.get("last_sync_at") or account.get("updated_at")
+            highest_at = account.get("last_sync_at")
         else:
-            highest_at = account.get("last_sync_at") or account.get("updated_at")
+            highest_at = account.get("last_sync_at")
 
         first_cross_at = None
         if ever_crossed:
@@ -57241,7 +57255,8 @@ def account_truth_v122_compat():
                 "first_crossed_dd_limit_at": first_cross_at,
                 # V191: newest monitoring observation for trader-dashboard live freshness.
                 # Read-only telemetry only; no DD/target/breach/lifecycle behaviour changes.
-                "last_monitored_at": ((snapshots[0] or {}).get("created_at") if snapshots else (account.get("last_sync_at") or account.get("updated_at"))),
+                "last_monitored_at": last_monitored_at,
+                "monitoring_observation_present": last_monitored_at is not None,
                 "recovery_never_erases_low": True,
             }
         })
