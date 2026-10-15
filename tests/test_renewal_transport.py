@@ -23,6 +23,18 @@ class TransportTests(unittest.TestCase):
   self.http.get.return_value.json.return_value=[dict(q.payload,trader_id='other')]
   with self.assertRaises(RuntimeError):q.execute()
   self.assertEqual(self.http.request.call_count,1)
+ def test_explicit_insert_rejection_preserves_optional_column_error(self):
+  self.http.request.return_value.status_code=400
+  self.http.request.return_value.text="Could not find the 'phase' column"
+  with self.assertRaisesRegex(RuntimeError,"Could not find the 'phase' column"):
+   self.query().insert({'phase':'phase1'}).execute()
+  self.http.get.assert_not_called()
+ def test_explicit_server_rejection_does_not_retry_insert(self):
+  self.http.request.return_value.status_code=503
+  self.http.request.return_value.text='database busy'
+  with self.assertRaisesRegex(RuntimeError,'database busy'):
+   self.query().insert({'trader_id':'t'}).execute()
+  self.assertEqual(self.http.request.call_count,1);self.http.get.assert_not_called()
  def test_context_isolated_from_other_threads_and_default_paths(self):
   helper=self.ns['_np_renewal_db_v211'];self.assertIs(helper(),self.sdk)
   token=self.ctx.set(True)

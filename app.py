@@ -50833,6 +50833,17 @@ def _np_ur_v87_num(value):
 NP_UR_RECALL_MAX_AGE_DAYS = 7.0
 
 
+def _np_ur_v87_db():
+    """Use the bounded REST transport for exact recall reads and writes.
+
+    The shared Supabase client can raise EAGAIN during verification. Keep
+    verification uncached and fail closed; never infer usage from a transport
+    failure. Mutation recovery uses the same stable UUID as payout renewal.
+    """
+    from types import SimpleNamespace
+    return SimpleNamespace(table=_NPRenewalRestQueryV211)
+
+
 def _np_ur_v89_pool_scan(account_size, target_stage):
     size = clean(account_size)
     stage = _normalize_lifecycle_stage(target_stage)
@@ -50868,7 +50879,7 @@ def _np_ur_v89_pool_scan(account_size, target_stage):
     while start < max_rows:
         try:
             page = (
-                supabase.table("mt5_pool").select("*")
+                _np_ur_v87_db().table("mt5_pool").select("*")
                 .eq("account_size", size)
                 .order("created_at", desc=True)
                 .range(start, min(start + page_size - 1, max_rows - 1))
@@ -51021,7 +51032,7 @@ def _np_ur_v87_account_by_id(account_id):
     if not aid:
         return None
     rows = (
-        supabase.table("trader_accounts").select("*")
+        _np_ur_v87_db().table("trader_accounts").select("*")
         .eq("id", aid).limit(1).execute().data or []
     )
     return rows[0] if rows else None
@@ -51031,7 +51042,7 @@ def _np_ur_v87_accounts_by_login(mt5_login, expected_trader_id=None):
     login = _np_ur_v87_s(mt5_login)
     if not login:
         return []
-    q = supabase.table("trader_accounts").select("*").eq("mt5_login", login)
+    q = _np_ur_v87_db().table("trader_accounts").select("*").eq("mt5_login", login)
     if _np_ur_v87_s(expected_trader_id):
         q = q.eq("trader_id", _np_ur_v87_s(expected_trader_id))
     return q.order("created_at", desc=True).limit(20).execute().data or []
@@ -51041,7 +51052,7 @@ def _np_ur_v87_trader(trader_id):
     tid = _np_ur_v87_s(trader_id)
     if not tid:
         return None
-    rows = supabase.table("traders").select("*").eq("id", tid).limit(1).execute().data or []
+    rows = _np_ur_v87_db().table("traders").select("*").eq("id", tid).limit(1).execute().data or []
     return rows[0] if rows else None
 
 
@@ -51050,7 +51061,7 @@ def _np_ur_v87_purchase(purchase_id):
     if not pid:
         return None
     try:
-        rows = supabase.table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
+        rows = _np_ur_v87_db().table("challenge_purchases").select("*").eq("id", pid).limit(1).execute().data or []
         return rows[0] if rows else None
     except Exception:
         return None
@@ -51062,11 +51073,11 @@ def _np_ur_v87_pool_for_account(account):
     login = _np_ur_v87_s(account.get("mt5_login"))
     try:
         if pool_id:
-            rows = supabase.table("mt5_pool").select("*").eq("id", pool_id).limit(1).execute().data or []
+            rows = _np_ur_v87_db().table("mt5_pool").select("*").eq("id", pool_id).limit(1).execute().data or []
             if rows:
                 return rows[0]
         if login:
-            rows = supabase.table("mt5_pool").select("*").eq("mt5_login", login).limit(10).execute().data or []
+            rows = _np_ur_v87_db().table("mt5_pool").select("*").eq("mt5_login", login).limit(10).execute().data or []
             if rows:
                 return rows[0]
     except Exception:
@@ -51092,13 +51103,13 @@ def _np_ur_v87_use_check(account):
 
     try:
         trades = (
-            supabase.table("trader_trades").select("id")
+            _np_ur_v87_db().table("trader_trades").select("id")
             .eq("trader_account_id", aid).limit(1).execute().data or []
         )
         if not trades:
             # Compatibility guard for old rows that were linked only by trader + MT5.
             trades = (
-                supabase.table("trader_trades").select("id")
+                _np_ur_v87_db().table("trader_trades").select("id")
                 .eq("trader_id", tid).eq("mt5_login", login)
                 .limit(1).execute().data or []
             )
@@ -51111,18 +51122,19 @@ def _np_ur_v87_use_check(account):
 
     try:
         payouts = (
-            supabase.table("payouts").select("id,status")
+            _np_ur_v87_db().table("payouts").select("id,status")
             .eq("trader_account_id", aid).limit(1).execute().data or []
         )
         if not payouts:
             try:
                 payouts = (
-                    supabase.table("payouts").select("id,status")
+                    _np_ur_v87_db().table("payouts").select("id,status")
                     .eq("trader_id", tid).eq("mt5_login", login)
                     .limit(1).execute().data or []
                 )
-            except Exception:
-                payouts = []
+            except Exception as exc:
+                out["reason"] = "payout_verification_failed:" + str(exc)
+                return out
         if payouts:
             out.update({"reason": "account_has_payout_history", "payout_found": True})
             return out
@@ -51180,14 +51192,14 @@ def _np_ur_v87_prior_same_purchase(account, purchase_id, trader_id):
         return []
     try:
         rows = (
-            supabase.table("trader_accounts").select("*")
+            _np_ur_v87_db().table("trader_accounts").select("*")
             .eq("purchase_id", pid).eq("trader_id", tid)
             .order("created_at", desc=False).limit(500).execute().data or []
         )
     except Exception:
         try:
             rows = (
-                supabase.table("trader_accounts").select("*")
+                _np_ur_v87_db().table("trader_accounts").select("*")
                 .eq("challenge_purchase_id", pid).eq("trader_id", tid)
                 .order("created_at", desc=False).limit(500).execute().data or []
             )
@@ -51397,7 +51409,7 @@ def _np_ur_v87_active_sibling(account, target):
         return None
     try:
         rows = (
-            supabase.table("trader_accounts").select("*")
+            _np_ur_v87_db().table("trader_accounts").select("*")
             .eq("purchase_id", pid).eq("trader_id", tid)
             .order("created_at", desc=True).limit(200).execute().data or []
         )
@@ -51447,7 +51459,7 @@ def _np_ur_v87_update_compat(table, payload, column, value, optional_keys=()):
     last = None
     for _ in range(max(3, len(optional) + 2)):
         try:
-            return supabase.table(table).update(data).eq(column, value).execute().data or []
+            return _np_ur_v87_db().table(table).update(data).eq(column, value).execute().data or []
         except Exception as exc:
             last = exc
             msg = str(exc)
@@ -51469,10 +51481,12 @@ def _np_ur_v87_insert_account(payload):
         "payout_split", "lifecycle_state", "target_percent", "dd_limit_percent",
     }
     data = dict(payload or {})
+    import uuid
+    data.setdefault("id", str(uuid.uuid4()))
     last = None
     for _ in range(len(optional) + 3):
         try:
-            rows = supabase.table("trader_accounts").insert(data).execute().data or []
+            rows = _np_ur_v87_db().table("trader_accounts").insert(data).execute().data or []
             if not rows:
                 raise RuntimeError("replacement trader account insert returned no row")
             return rows[0]
@@ -51619,6 +51633,16 @@ def _np_ur_v87_create_replacement(account, target, pool, reason_code, note=""):
     return new_account
 
 
+def _np_ur_v87_set_pointer(trader_id, account, stage):
+    # Keep the existing schema-compatible pointer authority on the same bounded
+    # transport. Context is reset even if persistence fails.
+    token = _NP_RENEWAL_REST_V211.set(True)
+    try:
+        return _np_update_trader_current_pointer_v59(trader_id, account, stage)
+    finally:
+        _NP_RENEWAL_REST_V211.reset(token)
+
+
 def _np_ur_v87_update_pointers(account, target, replacement):
     """Only swap pointers that refer to the exact bad delivery. No entitlement fields are touched."""
     account = account or {}
@@ -51665,13 +51689,13 @@ def _np_ur_v87_update_pointers(account, target, replacement):
     old_cur_id = _np_ur_v87_s(old_trader.get("current_account_id") or old_trader.get("trader_account_id"))
     old_cur_login = _np_ur_v87_s(old_trader.get("mt5_login"))
     if old_tid == target_tid and (old_cur_id == old_id or (old_login and old_cur_login == old_login)):
-        _np_update_trader_current_pointer_v59(target_tid, replacement, target.get("target_stage"))
+        _np_ur_v87_set_pointer(target_tid, replacement, target.get("target_stage"))
     elif old_tid != target_tid and (old_cur_id == old_id or (old_login and old_cur_login == old_login)):
         # Wrong-owner correction: remove only this mistaken compatibility pointer.
         # If another genuine active account exists, promote it; otherwise clear only MT5 pointer fields.
         try:
             remaining = (
-                supabase.table("trader_accounts").select("*")
+                _np_ur_v87_db().table("trader_accounts").select("*")
                 .eq("trader_id", old_tid).in_("account_status", list(ACTIVE_ACCOUNT_STATUSES))
                 .order("updated_at", desc=True).limit(20).execute().data or []
             )
@@ -51680,7 +51704,7 @@ def _np_ur_v87_update_pointers(account, target, replacement):
         remaining = [r for r in remaining if _np_ur_v87_s(r.get("id")) != old_id]
         if remaining:
             r = remaining[0]
-            _np_update_trader_current_pointer_v59(old_tid, r, _normalize_lifecycle_stage(r.get("stage") or r.get("phase")))
+            _np_ur_v87_set_pointer(old_tid, r, _normalize_lifecycle_stage(r.get("stage") or r.get("phase")))
         else:
             clear = {
                 "current_account_id": None,
@@ -51997,7 +52021,11 @@ def admin_universal_recall_v87_execute():
             return _np_ok({
                 "success": False,
                 "reason": use.get("reason"),
-                "message": "Recall stopped because the exact account is no longer unused.",
+                "message": (
+                    "Recall verification is temporarily unavailable. No replacement was started. Please retry."
+                    if "verification_failed:" in str(use.get("reason") or "")
+                    else "Recall stopped because the exact account has recorded trades or payouts."
+                ),
             }, 409)
 
         # Quarantine first; if the replacement insert unexpectedly fails, the old
@@ -59210,6 +59238,7 @@ class _NPRenewalRestQueryV211:
         base, headers = _np_v184_rest_headers()
         headers = dict(headers, Prefer="return=representation")
         url = base + "/rest/v1/" + self.table_name
+        response = None
         try:
             response = requests.request(self.method, url, headers=headers,
                 params=self.params, json=self.payload, timeout=(2, 7))
@@ -59220,7 +59249,11 @@ class _NPRenewalRestQueryV211:
                 raise RuntimeError("Invalid renewal database response")
             return SimpleNamespace(data=rows)
         except Exception:
-            if self.method != "POST" or "id" not in (self.payload or {}):
+            # An explicit database rejection (including an optional missing
+            # column) is not a lost response. Preserve it for schema-compatible
+            # callers; only uncertain transport/response failures need recovery.
+            if (self.method != "POST" or "id" not in (self.payload or {})
+                    or (response is not None and response.status_code >= 400)):
                 raise
             # A committed insert with a lost HTTP response must not be repeated.
             response = requests.get(url, headers=headers,
