@@ -6745,6 +6745,33 @@ def send_admin_alert(subject, message):
             print("ADMIN ALERT EMAIL ERROR:", _addr, str(_admin_email_exc))
     return sent_any
 
+def send_transaction_email_with_owner_copy(to_email, subject, message, reference=""):
+    """Deliver a transaction notice and its independent operational admin copy.
+
+    Provider acceptance is not inbox-delivery confirmation. A failed trader send
+    must not suppress the owner copy; neither notification changes money/account
+    state. Existing explicit admin alerts and OTP/security emails are untouched.
+    """
+    trader_sent = False
+    try:
+        trader_sent = bool(send_email_safe(to_email, subject, message))
+    except Exception as exc:
+        print("TRANSACTION TRADER EMAIL FAILED:", type(exc).__name__, flush=True)
+    owner_sent = False
+    try:
+        owner_sent = bool(send_admin_alert(
+            "ADMIN COPY — " + str(subject or ""),
+            "NAIRAPIPS TRANSACTION — ADMIN COPY\n\n"
+            f"Trader email: {str(to_email or '').strip() or 'Not recorded'}\n"
+            f"{reference}\n\n{message}",
+        ))
+    except Exception as exc:
+        print("TRANSACTION ADMIN COPY FAILED:", type(exc).__name__, flush=True)
+    print("TRANSACTION EMAIL RESULT:", "trader_accepted=", trader_sent,
+          "admin_accepted=", owner_sent, flush=True)
+    return trader_sent
+
+
 def email_money(value):
     try:
         return "₦" + f"{float(value or 0):,.0f}"
@@ -10631,7 +10658,7 @@ def admin_second_life_activate():
         adopted = _np_adopt_existing_phase1_as_second_life(p, trader_id, status, actor)
         if adopted:
             trader = get_trader_by_id(trader_id) or {}
-            send_email_safe(trader.get("email"), "NairaPips Second Life activated",
+            send_transaction_email_with_owner_copy(trader.get("email"), "NairaPips Second Life activated",
                 f"Hello {trader.get('name') or 'Trader'},\n\nYour existing fresh Phase 1 MT5 {adopted.get('mt5_login') or ''} has been confirmed as Life 2 of 2.\n\nYour breached Life 1 account remains locked as history.\n\nNairaPips Team")
             return _np_ok({
                 "success": True, "purchase_id": purchase_id, "trader_id": trader_id,
@@ -10703,7 +10730,7 @@ def admin_second_life_activate():
         )
 
         trader = get_trader_by_id(trader_id) or {}
-        send_email_safe(
+        send_transaction_email_with_owner_copy(
             trader.get("email"),
             "NairaPips Second Life activated",
             f"""Hello {trader.get('name') or 'Trader'},
@@ -10807,7 +10834,7 @@ def second_life_activate():
         )
         if adopted:
             trader = get_trader_by_id(authed_id) or {}
-            send_email_safe(trader.get("email"), "NairaPips Second Life activated",
+            send_transaction_email_with_owner_copy(trader.get("email"), "NairaPips Second Life activated",
                 f"Hello {trader.get('name') or 'Trader'},\n\nYour existing fresh Phase 1 MT5 {adopted.get('mt5_login') or ''} has been confirmed as Life 2 of 2.\n\nYour breached Life 1 account remains locked as history.\n\nNairaPips Team")
             return _np_ok({
                 "success": True, "purchase_id": purchase_id, "life_number": 2,
@@ -10847,7 +10874,7 @@ def second_life_activate():
             print("SECOND LIFE AUTO ASSIGN SKIPPED:", exc)
         _audit_safe("second_life", "activated", f"Purchase {purchase_id}; " + ("Life 2 auto-assigned" if auto_second_life else "Life 2 awaiting fresh MT5"), {"name":"trader","username":str(authed_id)[:12],"role":"trader"}, purchase_id)
         trader = get_trader_by_id(authed_id) or {}
-        send_email_safe(
+        send_transaction_email_with_owner_copy(
             trader.get("email"),
             "NairaPips Second Life activated",
             f"""Hello {trader.get('name') or 'Trader'},
@@ -13409,7 +13436,7 @@ def approve_payout():
         except Exception as e:
             print("APPROVED PAYOUT LOCK STATE UPDATE:", e)
 
-        send_email_safe(
+        send_transaction_email_with_owner_copy(
             payout.get("email"),
             "NairaPips payout approved",
             f"""Hello {payout.get("trader_name") or "Trader"},
@@ -13419,7 +13446,8 @@ Your payout request has been approved.
 Amount: {email_money(payout.get("amount"))}
 Admin Note: {note or "Approved after review."}
 
-NairaPips Team"""
+NairaPips Team""",
+            reference=f"Payout ID: {pid} | MT5: {payout.get('mt5_login') or 'Not recorded'}",
         )
 
         _audit_safe("payouts", "payout_approved", f"Payout {pid} approved", _admin_from_payload(d))
@@ -13793,7 +13821,7 @@ def mark_paid():
         # only an APPROVED payout that has now been successfully marked PAID earns it.
         # The certificate itself is rendered from the paid payout record in the trader dashboard;
         # no lifecycle, MT5, drawdown, reset, profit-share or funded-cycle state is changed here.
-        send_email_safe(
+        send_transaction_email_with_owner_copy(
             payout.get("email"),
             "NairaPips payout received - your certificate is ready",
             f"""Hello {payout.get("trader_name") or "Trader"},
@@ -13809,7 +13837,8 @@ Your official NairaPips Payout Certificate is now available in your Trader Dashb
 TRADED. PROFITED. REWARDED.
 
 NairaPips Team
-Rewarding Nigerian Traders. Changing Trading Stories."""
+Rewarding Nigerian Traders. Changing Trading Stories.""",
+            reference=f"Payout ID: {pid} | MT5: {payout.get('mt5_login') or 'Not recorded'}",
         )
 
         # ZERO-COST AUTOMATION: PAID is the financial authority. Only after the
@@ -56016,10 +56045,11 @@ def _np_v122_mark_paid_route():
                 print("V122 PAID SOURCE STAMP WARNING:",pid,exc,flush=True)
 
         try:
-            send_email_safe(
+            send_transaction_email_with_owner_copy(
                 payout.get("email"),
                 "NairaPips payout received - your certificate is ready",
-                f"""Hello {payout.get('trader_name') or 'Trader'},\n\nYour NairaPips payout has been completed successfully.\n\nAmount Received: {email_money(payout.get('amount'))}\nStatus: PAID\nAdmin Note: {note or 'Payment completed.'}\n\nYour official NairaPips Payout Certificate is now available in your Trader Dashboard under Payouts. You can view, download and share it from there.\n\nTRADED. PROFITED. REWARDED.\n\nNairaPips Team\nRewarding Nigerian Traders. Changing Trading Stories."""
+                f"""Hello {payout.get('trader_name') or 'Trader'},\n\nYour NairaPips payout has been completed successfully.\n\nAmount Received: {email_money(payout.get('amount'))}\nStatus: PAID\nAdmin Note: {note or 'Payment completed.'}\n\nYour official NairaPips Payout Certificate is now available in your Trader Dashboard under Payouts. You can view, download and share it from there.\n\nTRADED. PROFITED. REWARDED.\n\nNairaPips Team\nRewarding Nigerian Traders. Changing Trading Stories.""",
+                reference=f"Payout ID: {pid} | MT5: {payout.get('mt5_login') or 'Not recorded'}",
             )
         except Exception as exc:
             print("V122 PAYOUT EMAIL WARNING:",pid,exc,flush=True)
