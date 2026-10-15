@@ -12059,8 +12059,46 @@ V164 PAYOUT EXACT ACCOUNT FIX — 06 OCT 2026
 function htMoney(v){const n=Number(v||0);return '₦'+n.toLocaleString('en-NG',{maximumFractionDigits:2})}
 function htWhen(v){if(!v)return 'Timestamp not retained';const d=new Date(v);return isNaN(d)?String(v):d.toLocaleString('en-GB')}
 function htAcct(){const r=typeof npGlobalSelectableAccounts==='function'?npGlobalSelectableAccounts():(SESSION.allAccounts||[]);return r.find(x=>String(x.id||'')===String(SESSION.selectedAccountId||SESSION.data?.current_account?.id||''))||SESSION.data?.current_account||{}}
-function htCard(a){const s=Number(a.start_balance||a.account_size||0),l=Number(a.lowest_equity||a.current_equity||a.equity||s),h=Number(a.highest_equity||a.current_equity||a.equity||s),lim=Number(a.dd_limit_percent||20),dd=s?Math.max(0,(s-l)/s*100):0,c=!!(s&&l<=s*(1-lim/100));return `<section id="np-historic-truth-card" class="np-smart-panel" style="margin:16px 0;border:1px solid ${c?'rgba(239,68,68,.55)':'rgba(212,175,55,.32)'}"><div class="np-smart-panel-head"><b>🧾 ACCOUNT TRUTH · MT5 ${esc(a.mt5_login||'—')}</b><span class="pill ${c?'pill-red':'pill-green'}">${c?'LIMIT CROSSED':'WITHIN LIMIT'}</span></div><div style="padding:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px"><div class="np-smart-card"><small>LOWEST EQUITY OBSERVED</small><strong>${htMoney(l)}</strong><span id="ht-low">Loading timestamp…</span></div><div class="np-smart-card"><small>HIGHEST EQUITY OBSERVED</small><strong>${htMoney(h)}</strong><span id="ht-high">Loading timestamp…</span></div><div class="np-smart-card"><small>MAX HISTORICAL DD</small><strong class="${c?'bad':'good'}">${dd.toFixed(2)}%</strong><span>Limit ${lim.toFixed(2)}%</span></div><div class="np-smart-card"><small>HISTORICAL VERDICT</small><strong>${c?'CROSSED LIMIT':'NO CROSS RECORDED'}</strong><span id="ht-cross">Observed evidence</span></div></div><div style="padding:0 14px 8px;color:#9ca3af;font-size:11px">Recovery never erases a previously observed low. Historic Truth reports MT5 equity actually observed by NairaPips monitoring.</div><div style="padding:0 14px 14px;color:#d4af37;font-size:11px;font-weight:800">LIVE MONITOR UPDATE: <span id="ht-live">Loading…</span></div></section>`}
-async function htLoad(a){if(!a?.id)return;const tid=SESSION.data?.trader?.id||a.trader_id||'';try{const d=await safeFetchJson(API+'/account_truth_v116?account_id='+encodeURIComponent(a.id)+'&trader_id='+encodeURIComponent(tid)+'&_t='+Date.now(),{cache:'no-store'},12000,false),x=d?.truth||d?.data?.truth||{};const card=document.getElementById('np-historic-truth-card'),lo=document.getElementById('ht-low'),hi=document.getElementById('ht-high'),cr=document.getElementById('ht-cross'),live=document.getElementById('ht-live');if(card){const boxes=card.querySelectorAll('.np-smart-card');if(boxes[0]){const v=boxes[0].querySelector('strong');if(v&&Number(x.lowest_equity)>0)v.textContent=htMoney(x.lowest_equity)}if(boxes[1]){const v=boxes[1].querySelector('strong');if(v&&Number(x.highest_equity)>0)v.textContent=htMoney(x.highest_equity)}if(boxes[2]){const v=boxes[2].querySelector('strong');if(v&&Number(x.max_historic_dd_percent)>=0)v.textContent=Number(x.max_historic_dd_percent).toFixed(2)+'%'}}if(lo)lo.textContent=htWhen(x.lowest_equity_at);if(hi)hi.textContent=htWhen(x.highest_equity_at);if(cr)cr.textContent=x.ever_crossed_dd_limit?'First crossed: '+htWhen(x.first_crossed_dd_limit_at||x.first_crossed_at):'No observed crossing';if(live)live.textContent=x.monitoring_observation_present===false?'Awaiting first broker update':htWhen(x.last_monitored_at);if(x.monitoring_observation_present===false){if(lo)lo.textContent='No broker observation recorded';if(hi)hi.textContent='No broker observation recorded';if(cr)cr.textContent='Awaiting first broker update';const badge=card?.querySelector('.np-smart-panel-head .pill');if(badge){badge.textContent='AWAITING BROKER UPDATE';badge.className='pill pill-yellow'}}}catch(e){['ht-low','ht-high','ht-cross','ht-live'].forEach(id=>{const el=document.getElementById(id);if(el)el.textContent='Truth service temporarily unavailable'})}}
+function htCard(a){const s=Number(a.start_balance||a.account_size||0),l=Number(a.lowest_equity||a.current_equity||a.equity||s),h=Number(a.highest_equity||a.current_equity||a.equity||s),lim=Number(a.dd_limit_percent||20),dd=s?Math.max(0,(s-l)/s*100):0,c=!!(s&&l<=s*(1-lim/100));return `<section id="np-historic-truth-card" data-account-id="${esc(a.id||'')}" class="np-smart-panel" style="margin:16px 0;border:1px solid ${c?'rgba(239,68,68,.55)':'rgba(212,175,55,.32)'}"><div class="np-smart-panel-head"><b>🧾 ACCOUNT TRUTH · MT5 ${esc(a.mt5_login||'—')}</b><span class="pill ${c?'pill-red':'pill-green'}">${c?'LIMIT CROSSED':'WITHIN LIMIT'}</span></div><div style="padding:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px"><div class="np-smart-card"><small>LOWEST EQUITY OBSERVED</small><strong>${htMoney(l)}</strong><span id="ht-low">Loading timestamp…</span></div><div class="np-smart-card"><small>HIGHEST EQUITY OBSERVED</small><strong>${htMoney(h)}</strong><span id="ht-high">Loading timestamp…</span></div><div class="np-smart-card"><small>MAX HISTORICAL DD</small><strong class="${c?'bad':'good'}">${dd.toFixed(2)}%</strong><span>Limit ${lim.toFixed(2)}%</span></div><div class="np-smart-card"><small>HISTORICAL VERDICT</small><strong>${c?'CROSSED LIMIT':'NO CROSS RECORDED'}</strong><span id="ht-cross">Observed evidence</span></div></div><div style="padding:0 14px 8px;color:#9ca3af;font-size:11px">Recovery never erases a previously observed low. Historic Truth reports MT5 equity actually observed by NairaPips monitoring.</div><div style="padding:0 14px 14px;color:#d4af37;font-size:11px;font-weight:800">LIVE MONITOR UPDATE: <span id="ht-live">Loading…</span></div></section>`}
+let htRequestVersion=0;
+async function htLoad(a){
+  if(!a?.id)return;
+  const tid=String(SESSION.data?.trader?.id||a.trader_id||'');
+  const accountId=String(a.id),login=String(a.mt5_login||'');
+  const card=document.getElementById('np-historic-truth-card');
+  const version=++htRequestVersion;
+  const ownsCard=()=>version===htRequestVersion && card &&
+    document.getElementById('np-historic-truth-card')===card &&
+    String(card.dataset.accountId||'')===accountId && String(htAcct()?.id||'')===accountId;
+  try{
+    const d=await safeFetchJson(API+'/account_truth_v116?account_id='+encodeURIComponent(accountId)+'&mt5_login='+encodeURIComponent(login)+'&trader_id='+encodeURIComponent(tid)+'&_t='+Date.now(),{cache:'no-store'},12000,false);
+    if(!ownsCard())return;
+    const x=d?.truth||d?.data?.truth;
+    if(!x || String(x.trader_account_id||'')!==accountId || String(x.trader_id||'')!==tid || String(x.mt5_login||'')!==login)throw new Error('Account history identity mismatch');
+    const lo=card.querySelector('#ht-low'),hi=card.querySelector('#ht-high'),cr=card.querySelector('#ht-cross'),live=card.querySelector('#ht-live');
+    const boxes=card.querySelectorAll('.np-smart-card');
+    const values=[x.lowest_equity,x.highest_equity,x.max_historic_dd_percent];
+    values.forEach((value,index)=>{
+      const strong=boxes[index]?.querySelector('strong');
+      if(strong && Number.isFinite(Number(value)) && Number(value)>=0)strong.textContent=index===2?Number(value).toFixed(2)+'%':htMoney(value);
+    });
+    if(lo)lo.textContent=htWhen(x.lowest_equity_at);
+    if(hi)hi.textContent=htWhen(x.highest_equity_at);
+    if(cr)cr.textContent=x.ever_crossed_dd_limit?'First crossed: '+htWhen(x.first_crossed_dd_limit_at||x.first_crossed_at):'No observed crossing';
+    if(live)live.textContent=x.monitoring_observation_present===false?'Awaiting first broker update':htWhen(x.last_monitored_at);
+    const badge=card.querySelector('.np-smart-panel-head .pill');
+    if(x.monitoring_observation_present===false){
+      if(lo)lo.textContent='No broker observation recorded';
+      if(hi)hi.textContent='No broker observation recorded';
+      if(cr)cr.textContent='Awaiting first broker update';
+      if(badge){badge.textContent='AWAITING BROKER UPDATE';badge.className='pill pill-yellow';}
+    }else if(badge){badge.textContent=x.ever_crossed_dd_limit?'LIMIT CROSSED':'WITHIN LIMIT';badge.className='pill '+(x.ever_crossed_dd_limit?'pill-red':'pill-green');}
+  }catch(e){
+    if(!ownsCard())return;
+    ['ht-low','ht-high','ht-cross','ht-live'].forEach(id=>{const el=card.querySelector('#'+id);if(el)el.textContent='Exact account history unavailable';});
+  }
+}
+
 if(typeof window.renderDashboard==='function'){const core=window.renderDashboard;window.renderDashboard=function(){const html=core(),a=htAcct();if(typeof html!=='string'||!a?.id)return html;const marker='<section class="np-smart-split">',out=html.includes(marker)?html.replace(marker,htCard(a)+marker):html+htCard(a);setTimeout(()=>htLoad(a),0);return out}}
 window.NAIRAPIPS_HISTORIC_TRUTH_RELEASE='V191_ACCOUNT_TRUTH_SINGLE_SOURCE_2026_10_07';
 })();

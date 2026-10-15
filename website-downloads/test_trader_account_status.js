@@ -13,11 +13,26 @@ for(const block of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi))if(blo
 console.log('Terminal warning follows exact account; active replacements remain active; terminal-history guard preserved; all scripts parse.');
 
 (async()=>{
- const elements={};for(const id of ['np-historic-truth-card','ht-low','ht-high','ht-cross','ht-live'])elements[id]={textContent:''};
- const badge={textContent:'WITHIN LIMIT'};elements['np-historic-truth-card'].querySelectorAll=()=>[];elements['np-historic-truth-card'].querySelector=()=>badge;
- const context={SESSION:{data:{trader:{id:'owner'}}},API:'https://fixture.invalid',Date,encodeURIComponent,htMoney:String,htWhen:v=>v||'Timestamp not retained',document:{getElementById:id=>elements[id]},safeFetchJson:async()=>({truth:{monitoring_observation_present:false,last_monitored_at:null}})};
- const a=html.indexOf('async function htLoad(a)'),b=html.indexOf('\nif(typeof window.renderDashboard',a);
- vm.createContext(context);vm.runInContext(html.slice(a,b),context);await context.htLoad({id:'new',trader_id:'owner'});
- assert.equal(elements['ht-live'].textContent,'Awaiting first broker update');assert.equal(badge.textContent,'AWAITING BROKER UPDATE');assert.equal(elements['ht-low'].textContent,'No broker observation recorded');
- console.log('No-observation response shows pending broker update instead of a fresh/healthy monitoring claim.');
+ let selected='old',card;const pending=[];
+ function makeCard(id){
+  const elements={};for(const id of ['ht-low','ht-high','ht-cross','ht-live'])elements[id]={textContent:''};
+  const badge={textContent:'CHECKING'},values=[{textContent:'initial'},{textContent:'initial'},{textContent:'initial'}];
+  return {dataset:{accountId:id},elements,badge,values,querySelectorAll:()=>values.map(v=>({querySelector:()=>v})),querySelector:s=>s.startsWith('#')?elements[s.slice(1)]:badge};
+ }
+ const context={SESSION:{data:{trader:{id:'owner'}}},API:'https://fixture.invalid',Date,encodeURIComponent,htAcct:()=>({id:selected}),htMoney:String,htWhen:v=>v||'Timestamp not retained',document:{getElementById:id=>id==='np-historic-truth-card'?card:null},safeFetchJson:url=>new Promise((resolve,reject)=>pending.push({url,resolve,reject}))};
+ const a=html.indexOf('let htRequestVersion=0;'),b=html.indexOf('\nif(typeof window.renderDashboard',a);
+ vm.createContext(context);vm.runInContext(html.slice(a,b),context);
+ const truth=(id,extra={})=>({truth:{trader_account_id:id,trader_id:'owner',mt5_login:id+'-login',lowest_equity:500,highest_equity:550,max_historic_dd_percent:0,last_monitored_at:'fresh-'+id,monitoring_observation_present:true,...extra}});
+ const account=id=>({id,trader_id:'owner',mt5_login:id+'-login'});
+ card=makeCard('old');const oldWork=context.htLoad(account('old'));const oldRequest=pending.shift();
+ selected='new';card=makeCard('new');const newCard=card;const newWork=context.htLoad(account('new'));const newRequest=pending.shift();
+ assert(newRequest.url.includes('mt5_login=new-login'));
+ newRequest.resolve(truth('new'));await newWork;assert.equal(newCard.elements['ht-live'].textContent,'fresh-new');
+ oldRequest.resolve(truth('old',{highest_equity:999}));await oldWork;assert.equal(newCard.values[1].textContent,'550');assert.equal(newCard.elements['ht-live'].textContent,'fresh-new');
+ const mismatched=context.htLoad(account('new'));pending.shift().resolve(truth('old',{highest_equity:999}));await mismatched;assert.equal(newCard.values[1].textContent,'550');assert.equal(newCard.elements['ht-live'].textContent,'Exact account history unavailable');
+ const waiting=context.htLoad(account('new'));pending.shift().resolve(truth('new',{monitoring_observation_present:false,last_monitored_at:null}));await waiting;
+ assert.equal(newCard.elements['ht-live'].textContent,'Awaiting first broker update');assert.equal(newCard.badge.textContent,'AWAITING BROKER UPDATE');assert.equal(newCard.elements['ht-low'].textContent,'No broker observation recorded');
+ const first=context.htLoad(account('new'));const firstRequest=pending.shift();const second=context.htLoad(account('new'));const secondRequest=pending.shift();secondRequest.resolve(truth('new',{highest_equity:600}));await second;firstRequest.resolve(truth('new',{highest_equity:999}));await first;assert.equal(newCard.values[1].textContent,'600');
+ const errorWork=context.htLoad(account('new'));const errorRequest=pending.shift();selected='third';card=makeCard('third');errorRequest.reject(Error('timeout'));await errorWork;assert.equal(card.elements['ht-live'].textContent,'');
+ console.log('Exact account/login/owner validation, delayed responses, same-account request races, stale failures and missing-observation displays verified.');
 })().catch(e=>{console.error(e);process.exitCode=1});
