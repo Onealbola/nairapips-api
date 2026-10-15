@@ -12956,7 +12956,7 @@ function npAdminPayoutDateTime(v){
   if(!v) return '—';
   const d=new Date(v);
   if(Number.isNaN(d.getTime())) return String(v);
-  try{return d.toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'});}catch(_e){return d.toLocaleString();}
+  try{return d.toLocaleString('en-GB',{timeZone:'Africa/Lagos',day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'});}catch(_e){return d.toLocaleString();}
 }
 
 /* ============================================================================
@@ -12976,6 +12976,54 @@ window.NP_PAYOUT_INTEL = window.NP_PAYOUT_INTEL || {
   lastRefresh:null,
   refreshing:false
 };
+
+// Shared payout scope: every card and table uses the same date/search result.
+function npPayoutExactRecord(p){
+  if(p.mt5_login) return p;
+  const id=p.trader_account_id||p.account_id;
+  const a=id && (SESSION.traderAccounts||[]).find(a=>String(a.id)===String(id) &&
+    p.trader_id && String(a.trader_id)===String(p.trader_id));
+  return a ? {...p,mt5_login:a.mt5_login||'',account_size:p.account_size||a.account_size} : p;
+}
+function npPayoutSearchMatch(p){
+  const q=String(window.NP_PAYOUT_INTEL.q||'').trim().toLowerCase();
+  if(!q) return true;
+  const t=(SESSION.traders||[]).find(t=>p.trader_id && String(t.id)===String(p.trader_id))||{};
+  return [p.trader_name,p.name,p.email,p.phone,t.name,t.full_name,t.email,t.phone,p.mt5_login]
+    .some(v=>String(v||'').toLowerCase().includes(q));
+}
+function npPayoutFiltered(list){
+  return (Array.isArray(list)?list:[]).map(npPayoutExactRecord)
+    .filter(p=>npPayoutIntelInRange(p) && npPayoutSearchMatch(p))
+    .sort((a,b)=>(npPayoutIntelWhen(b)?.getTime()||0)-(npPayoutIntelWhen(a)?.getTime()||0)||String(a.id||'').localeCompare(String(b.id||'')));
+}
+function npPayoutPage(rows,key){
+  const st=window.NP_PAYOUT_INTEL;
+  const size=[10,20,50].includes(Number(st.pageSize))?Number(st.pageSize):10;
+  st.pages=st.pages||{};
+  const count=Math.max(1,Math.ceil(rows.length/size));
+  const page=Math.min(count,Math.max(1,Number(st.pages[key])||1));
+  st.pages[key]=page;
+  const offset=(page-1)*size;
+  return {rows:rows.slice(offset,offset+size),offset,page,count,total:rows.length,size};
+}
+function npPayoutPager(pg,key){
+  return `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0">
+    <span class="text-xs">${pg.total?pg.offset+1:0}–${Math.min(pg.offset+pg.size,pg.total)} of ${pg.total} · Page ${pg.page} of ${pg.count}</span>
+    <button class="btn btn-sm btn-ghost" ${pg.page<=1?'disabled':''} onclick="npPayoutGoPage('${key}',${pg.page-1})">Previous</button>
+    <button class="btn btn-sm btn-ghost" ${pg.page>=pg.count?'disabled':''} onclick="npPayoutGoPage('${key}',${pg.page+1})">Next</button>
+    <label class="text-xs">Rows <select class="input" style="width:75px" onchange="npPayoutSetPageSize(this.value)">${[10,20,50].map(n=>`<option ${pg.size===n?'selected':''}>${n}</option>`).join('')}</select></label>
+  </div>`;
+}
+window.npPayoutGoPage=function(key,page){
+  const st=window.NP_PAYOUT_INTEL;st.pages=st.pages||{};st.pages[key]=page;renderPayouts();
+};
+window.npPayoutSetPageSize=function(size){
+  window.NP_PAYOUT_INTEL.pageSize=Number(size);window.NP_PAYOUT_INTEL.pages={};renderPayouts();
+};
+function npPayoutNigeriaInput(raw){
+  return raw ? new Date(raw+'+01:00') : null;
+}
 
 function npPayoutIntelStatus(p){
   const raw=String(p?.status||'pending').trim().toLowerCase();
@@ -13015,10 +13063,10 @@ function npPayoutIntelRangeLabel(range){
   if(range==='30d') return 'LAST 30 DAYS';
   if(range==='month') return 'THIS MONTH';
   if(range==='custom'){
-    const a=st.from ? new Date(st.from) : null;
-    const b=st.to ? new Date(st.to) : null;
+    const a=npPayoutNigeriaInput(st.from);
+    const b=npPayoutNigeriaInput(st.to);
     const fmt=d=>d && !Number.isNaN(d.getTime())
-      ? d.toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'})
+      ? d.toLocaleString('en-GB',{timeZone:'Africa/Lagos',day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'})
       : '—';
     return `CUSTOM · ${fmt(a)} → ${fmt(b)}`;
   }
@@ -13026,35 +13074,27 @@ function npPayoutIntelRangeLabel(range){
 }
 
 function npPayoutIntelBounds(){
-  const st=window.NP_PAYOUT_INTEL||{};
-  const now=new Date();
-  let from=null,to=null;
-
-  if(st.range==='24h'){
-    from=new Date(now.getTime()-24*60*60*1000); to=now;
-  }else if(st.range==='today'){
-    from=new Date(now); from.setHours(0,0,0,0); to=now;
-  }else if(st.range==='yesterday'){
-    from=new Date(now); from.setDate(from.getDate()-1); from.setHours(0,0,0,0);
-    to=new Date(from); to.setHours(23,59,59,999);
-  }else if(st.range==='7d'){
-    from=new Date(now.getTime()-7*24*60*60*1000); to=now;
-  }else if(st.range==='30d'){
-    from=new Date(now.getTime()-30*24*60*60*1000); to=now;
+  const st=window.NP_PAYOUT_INTEL||{},now=new Date();
+  const nigeria=new Date(now.getTime()+3600000);
+  const day=Date.UTC(nigeria.getUTCFullYear(),nigeria.getUTCMonth(),nigeria.getUTCDate())-3600000;
+  let fromMs=0,toMs=Infinity;
+  if(st.range==='24h'){fromMs=now.getTime()-86400000;toMs=now.getTime();}
+  else if(st.range==='today'){fromMs=day;toMs=now.getTime();}
+  else if(st.range==='yesterday'){fromMs=day-86400000;toMs=day-1;}
+  else if(st.range==='7d'||st.range==='30d'){
+    fromMs=now.getTime()-(st.range==='7d'?7:30)*86400000;toMs=now.getTime();
   }else if(st.range==='month'){
-    from=new Date(now.getFullYear(),now.getMonth(),1,0,0,0,0); to=now;
+    fromMs=Date.UTC(nigeria.getUTCFullYear(),nigeria.getUTCMonth(),1)-3600000;toMs=now.getTime();
   }else if(st.range==='custom'){
-    from=st.from ? new Date(st.from) : null;
-    to=st.to ? new Date(st.to) : null;
-    if(from && Number.isNaN(from.getTime())) from=null;
-    if(to && Number.isNaN(to.getTime())) to=null;
+    fromMs=st.from?npPayoutNigeriaInput(st.from).getTime():0;
+    toMs=st.to?npPayoutNigeriaInput(st.to).getTime()+59999:Infinity;
   }
-  return {fromMs:from?from.getTime():0,toMs:to?to.getTime():Number.POSITIVE_INFINITY};
+  return {fromMs,toMs};
 }
 
 function npPayoutIntelInRange(p){
   const d=npPayoutIntelWhen(p);
-  if(!d) return false;
+  if(!d) return (window.NP_PAYOUT_INTEL.range||'all')==='all';
   const {fromMs,toMs}=npPayoutIntelBounds();
   const ts=d.getTime();
   return ts>=fromMs && ts<=toMs;
@@ -13069,7 +13109,7 @@ function npPayoutIntelIdentity(p,t){
 
 function npPayoutIntelBuild(list){
   const st=window.NP_PAYOUT_INTEL||{};
-  const all=(Array.isArray(list)?list:[])
+  const all=npPayoutFiltered(list)
     .map(p=>({p,status:npPayoutIntelStatus(p),amount:npPayoutIntelAmount(p),when:npPayoutIntelWhen(p)}))
     .filter(x=>['paid','approved','pending'].includes(x.status) && x.when && npPayoutIntelInRange(x.p));
 
@@ -13188,30 +13228,40 @@ function npPayoutIntelBuild(list){
 
 window.npPayoutIntelSetRange=function(range){
   window.NP_PAYOUT_INTEL.range=range;
+  window.NP_PAYOUT_INTEL.pages={};
   renderPayouts();
 };
 
 window.npPayoutIntelSetSort=function(sort){
   window.NP_PAYOUT_INTEL.sort=sort;
+  window.NP_PAYOUT_INTEL.pages={};
   renderPayouts();
 };
 
 window.npPayoutIntelSetSearch=function(value){
   window.NP_PAYOUT_INTEL.q=String(value||'');
+  window.NP_PAYOUT_INTEL.pages={};
   clearTimeout(window._npPayoutIntelSearchTimer);
-  window._npPayoutIntelSearchTimer=setTimeout(()=>renderPayouts(),180);
+  const input=document.getElementById('np-payout-search');
+  const focused=document.activeElement===input,position=input?.selectionStart;
+  window._npPayoutIntelSearchTimer=setTimeout(()=>{
+    renderPayouts();
+    const next=document.getElementById('np-payout-search');
+    if(focused && next){next.focus();if(position!=null) next.setSelectionRange(position,position);}
+  },180);
 };
 
 window.npPayoutIntelApplyCustom=function(){
   const from=document.getElementById('np-payout-intel-from')?.value||'';
   const to=document.getElementById('np-payout-intel-to')?.value||'';
   if(!from||!to){toast('Choose both FROM and TO date/time.','err');return;}
-  const a=new Date(from),b=new Date(to);
+  const a=npPayoutNigeriaInput(from),b=npPayoutNigeriaInput(to);
   if(Number.isNaN(a.getTime())||Number.isNaN(b.getTime())){toast('Invalid custom date/time.','err');return;}
   if(a>b){toast('FROM date/time cannot be after TO.','err');return;}
   window.NP_PAYOUT_INTEL.from=from;
   window.NP_PAYOUT_INTEL.to=to;
   window.NP_PAYOUT_INTEL.range='custom';
+  window.NP_PAYOUT_INTEL.pages={};
   renderPayouts();
 };
 
@@ -13248,7 +13298,7 @@ function npPayoutIntelEnsureTimer(){
 }
 
 function renderPayouts(){
-  const list = SESSION.payouts || [];
+  const list = npPayoutFiltered(SESSION.payouts || []);
 
   // One-time cleanup of historical rejected payout admin notes.
   // The Payout screen no longer uses or displays this field.
@@ -13257,7 +13307,7 @@ function renderPayouts(){
     api('/admin/cleanup_rejected_payout_notes','POST',{})
       .catch(e=>console.warn('Rejected payout note cleanup:',e));
   }
-  const byStatus = rangeOf(list, p => String(p.status||'pending').toLowerCase());
+  const byStatus = rangeOf(list, p => npPayoutIntelStatus(p));
   const pendingRows = list.filter(npAdminPayoutPending);
 
   // V34 OWNER PAYOUT LIABILITY INTELLIGENCE — time-selectable and live.
@@ -13265,19 +13315,15 @@ function renderPayouts(){
   try{
     payoutIntel=npPayoutIntelBuild(list);
   }catch(npIntelErr){
-    console.error('V34.1 payout intelligence fallback:',npIntelErr);
-    const fallbackPaid=(Array.isArray(list)?list:[]).filter(p=>{
-      const st=String(p?.status||'').trim().toLowerCase();
-      return st==='paid'||!!p?.paid_at;
-    }).map(p=>({p,status:'paid',amount:Number(p?.amount||0)||0,when:npPayoutIntelWhen(p)}));
-    const fallbackTotal=fallbackPaid.reduce((s,x)=>s+x.amount,0);
-    payoutIntel={
-      all:fallbackPaid,rows:[],paidRows:fallbackPaid,approvedRows:[],pendingRows:[],
-      paidTotal:fallbackTotal,approvedTotal:0,pendingTotal:0,openTotal:0,exposureTotal:fallbackTotal,
-      repeatOwners:[],repeatPaid:0,top1:null,top5Exposure:0,concentration:0
-    };
+    console.error('Payout report unavailable:',npIntelErr);
+    document.getElementById('content').innerHTML='<div class="card">Payout report could not be calculated. Refresh payout data and try again. No totals are shown because they could be incomplete.</div>';
+    return;
   }
+
   const paidRows=payoutIntel.paidRows.map(x=>x.p);
+  const requestPage=npPayoutPage(list,'requests');
+  const ownerPage=npPayoutPage(payoutIntel.rows,'owners');
+  const paidPage=npPayoutPage(paidRows,'paid');
   const payoutOwners=payoutIntel.rows;
   const paidTotal=payoutIntel.paidTotal;
   const approvedTotal=payoutIntel.approvedTotal;
@@ -13307,13 +13353,13 @@ function renderPayouts(){
     </div>`:''}
     <div class="vault mb-6 tab-content">
       <div class="badge">PAYOUTS</div>
-      <div style="font-size:24px;font-weight:900;margin-top:6px">${list.length} payout(s)</div>
+      <div style="font-size:24px;font-weight:900;margin-top:6px">${list.length} matching payout(s) · ${esc(intelRangeLabel)}</div>
     </div>
     <div class="grid md:grid-cols-4 gap-3 mb-6 tab-content">
       ${kpi('Pending', pendingRows.length)}
       ${kpi('Approved', byStatus.approved||0)}
       ${kpi('Paid', byStatus.paid||0)}
-      ${kpi('Rejected', byStatus.rejected||0)}
+      ${kpi('Rejected / Cancelled', byStatus.rejected||0)}
     </div>
     <div class="card tab-content mb-6" style="border:1px solid rgba(239,68,68,.38);background:linear-gradient(135deg,rgba(239,68,68,.10),rgba(212,175,55,.035));box-shadow:0 0 28px rgba(239,68,68,.07)">
       <div style="display:flex;justify-content:space-between;gap:14px;align-items:flex-start;flex-wrap:wrap;margin-bottom:14px">
@@ -13349,12 +13395,13 @@ function renderPayouts(){
             ['exposure','Total Exposure'],['paid','Paid Out'],['open','Open Liability'],
             ['count','Repeat Count'],['latest','Most Recent']
           ].map(([v,l])=>`<button class="btn btn-sm ${activeIntelSort===v?'btn-gold':'btn-ghost'}" onclick="npPayoutIntelSetSort('${v}')">${l}</button>`).join('')}
-          <input class="input" style="max-width:280px;margin-left:auto" placeholder="Search trader, email, phone, MT5..." value="${esc(window.NP_PAYOUT_INTEL.q||'')}" oninput="npPayoutIntelSetSearch(this.value)">
+          <input class="input" style="max-width:280px;margin-left:auto" id="np-payout-search" placeholder="Search trader, email, phone, MT5..." value="${esc(window.NP_PAYOUT_INTEL.q||'')}" oninput="npPayoutIntelSetSearch(this.value)">
           <button class="btn btn-sm ${window.NP_PAYOUT_INTEL.auto?'btn-green':'btn-ghost'}" onclick="npPayoutIntelToggleLive()">${window.NP_PAYOUT_INTEL.auto?'● LIVE 60S':'○ LIVE OFF'}</button>
           <button class="btn btn-sm btn-ghost" onclick="npPayoutIntelRefreshNow(false)">↻ Refresh Now</button>
         </div>
       </div>
 
+      <p class="text-xs text-gray-400" style="margin-bottom:12px">All cards and tables use this period and search. Times are Nigerian time (WAT). Paid payouts use the paid date; approved payouts use the approval date; other requests use the request date. The ending minute is included.</p>
       <div class="grid md:grid-cols-3 gap-3 mb-4">
         ${kpi('PAID OUT · '+intelRangeLabel, money(paidTotal), payoutIntel.paidRows.length+' paid payout(s)', {color:'red'})}
         ${kpi('APPROVED · UNPAID', money(approvedTotal), payoutIntel.approvedRows.length+' approved payout(s) still open', {color:approvedTotal>0?'red':'green'})}
@@ -13372,7 +13419,8 @@ function renderPayouts(){
             <th>MT5 Used</th><th>Last Activity</th><th>Pattern</th><th>Journey</th>
           </tr></thead>
           <tbody>
-            ${payoutOwners.map((r,i)=>{
+            ${ownerPage.rows.map((r,index)=>{
+              const i=ownerPage.offset+index;
               const avg=r.paidCount?r.paid/r.paidCount:0;
               const mt5=[...r.mt5].slice(0,6).join(', ')||'—';
               const tags=r.patterns.map(tag=>{
@@ -13398,6 +13446,7 @@ function renderPayouts(){
         </table>
       </div>
 
+      ${npPayoutPager(ownerPage,'owners')}
       <div class="text-xs text-gray-500" style="margin-top:10px;line-height:1.5">
         <b>Paid Out</b> is cash already marked paid. <b>Open Liability</b> is approved-but-unpaid plus pending payout requests in the selected period.
         <b>Total Exposure</b> keeps those figures visible together without pretending they are the same accounting state.
@@ -13426,7 +13475,7 @@ function renderPayouts(){
       </div>
       <div style="overflow-x:auto"><table class="compact" style="min-width:1160px">
       <thead><tr><th>Trader / Contact</th><th>MT5</th><th>Amount</th><th>Payment Destination</th><th>Status</th><th>Requested</th><th>Actions</th></tr></thead>
-      <tbody>${list.map(p=>{
+      <tbody>${requestPage.rows.map(p=>{
         const t=SESSION.traders.find(x=>String(x.id)===String(p.trader_id))||{};
         const st=npAdminPayoutEffectiveStatus(p);
         const isPending=npAdminPayoutPending(p);
@@ -13456,8 +13505,18 @@ function renderPayouts(){
           `:''}
           ${st==='paid'&&p.id?`<button type="button" class="btn btn-sm btn-gold" onclick='npFireExactPayoutRenewal(${JSON.stringify(p.id)},${JSON.stringify(p.trader_id||'')})'>Retry Funded Renewal</button>`:''}
         </div></td>
-      </tr>`;}).join('')||'<tr><td colspan="7"><div class="empty">No payouts yet.</div></td></tr>'}</tbody>
-    </table></div></div>
+      </tr>`;}).join('')||'<tr><td colspan="7"><div class="empty">No payouts match this period and search.</div></td></tr>'}</tbody>
+    </table></div>${npPayoutPager(requestPage,'requests')}</div>
+    <div class="card tab-content" style="margin-top:20px">
+      <h2 style="font-size:18px;font-weight:950">Paid MT5 account history</h2>
+      <p class="text-xs text-gray-400">Same selected period and search. Original payout accounts are shown, including closed accounts. Each row is one paid payout.</p>
+      <div style="overflow-x:auto"><table class="compact"><thead><tr><th>Trader</th><th>Original MT5</th><th>Amount paid</th><th>Requested</th><th>Paid</th></tr></thead><tbody>
+      ${paidPage.rows.map(p=>{
+        const t=(SESSION.traders||[]).find(t=>p.trader_id && String(t.id)===String(p.trader_id))||{};
+        return `<tr><td>${esc(p.trader_name||p.name||t.name||t.full_name||p.email||t.email||'—')}<div class="text-xs">${esc(p.email||t.email||'')}</div></td><td class="mono">${esc(p.mt5_login||'Not recorded')}</td><td>${esc(money(npPayoutIntelAmount(p)))}</td><td>${esc(npAdminPayoutDateTime(p.requested_at||p.created_at))}</td><td>${esc(npAdminPayoutDateTime(p.paid_at))}</td></tr>`;
+      }).join('')||'<tr><td colspan="5">No paid payouts match this period and search.</td></tr>'}
+      </tbody></table></div>${npPayoutPager(paidPage,'paid')}
+    </div>
   `;
 }
 
