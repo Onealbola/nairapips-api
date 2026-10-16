@@ -42,3 +42,9 @@ assert.equal(ctx.npFriendlyAccountStatus(phase),'TARGET REACHED · VERIFICATION 
 assert.equal(ctx.npIsPassed(phase),false);
 assert.equal(ctx.npIsPassed(passed),true);
 console.log('Account status, friendly status and progression label consistently distinguish target reached from recorded pass.');
+const safeOld={...old,archive_reason:null,progression_completed:true,phase_pass_recorded:true,successor_account_id:funded.id};
+const safePhase={...phase,phase_pass_recorded:false,latest_monitoring_event:{event_type:'phase1_passed',trader_account_id:'old-account'}};
+ctx.SESSION.allAccounts=[safePhase,funded,safeOld];
+assert(!ctx.npIsPassed(safePhase));assert(ctx.npProgressionSourceConsumedForever(safeOld));
+assert.deepEqual(Array.from(ctx.npGlobalSelectableAccounts(),a=>a.id).sort(),['funded','phase']);
+console.log('Sanitized backend successor metadata hides completed history without private notes; explicit no-pass authority defeats stale pass events.');

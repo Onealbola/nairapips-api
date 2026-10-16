@@ -1724,6 +1724,7 @@ function npIsLiveSelectableAccount(a){
   return ['active','funded'].includes(mt5Bucket(a));
 }
 function npIsPassed(a){
+  if(a && a.phase_pass_recorded===false) return false;
   if(!a || npIsResetArchive(a) || npIsWaitingAccount(a)) return false;
   if(npIsTerminalHistory(a) && !npIsPassedArchive(a)) return false;
   const txt=[
