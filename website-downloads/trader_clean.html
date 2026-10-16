@@ -1769,6 +1769,7 @@ function npDisplayStatus(a){
   if(npIsWaitingAccount(a)){ const st=npStageRaw(a); return st.includes('funded')?'AWAITING FUNDED MT5':(st.includes('phase2')?'AWAITING PHASE 2 MT5':'AWAITING PHASE 1 MT5'); }
   if(npIsResetArchive(a)) return 'RESET · ARCHIVED';
   if(npIsBreached(a)) return 'BREACHED';
+  if(npTargetAwaitingPassVerification(a)) return 'TARGET REACHED · VERIFICATION PENDING';
   if(npIsPassed(a)) return npNextWaitingLabel(a) || 'PASSED';
   const st=npStageRaw(a);
   if(st.includes('phase2')) return 'PHASE 2 ACTIVE';
@@ -1796,6 +1797,7 @@ function npFriendlyAccountStatus(a){
   if(npIsWaitingAccount(a)) return npDisplayStatus(a);
   if(npIsResetArchive(a)) return 'ARCHIVED AFTER RESET';
   if(npIsBreached(a)) return 'BREACHED';
+  if(npTargetAwaitingPassVerification(a)) return 'TARGET REACHED · VERIFICATION PENDING';
   if(npIsPassed(a)) return npNextWaitingLabel(a) || 'PASSED';
   return npDisplayStatus(a);
 }
@@ -5209,6 +5211,23 @@ function npExactResetActionAccounts(){
   return rows;
 }
 
+function npUnresolvedPhaseSelectorAccount(a){
+  if(!a || !String(a.id||'').trim() || !String(a.mt5_login||'').trim()) return false;
+  if(!['phase1','phase2'].includes(npStageRaw(a))) return false;
+  if(npIsBreached(a) || npIsResetArchive(a) || !npIsPassed(a)) return false;
+  const status=String(a.account_status||a.status||'').trim().toLowerCase();
+  const markers=[a.archive_reason,a.admin_note,a.message].join(' ').toLowerCase();
+  if(status==='archived' || /closed|completed|recalled|disabled|breach|reset/.test(status)) return false;
+  if(a.successor_account_id || a.replacement_account_id || /np_consumed:|np_recall_replacement_mt5:/.test(markers)) return false;
+  if(npProgressionSourceConsumedForever(a)) return false;
+  return npIsOverviewSelectable(a);
+}
+function npTargetAwaitingPassVerification(a){
+  if(!npUnresolvedPhaseSelectorAccount(a)) return false;
+  const proof=[a.account_status,a.phase_pass_status,a.pass_status,a.risk_zone].join(' ').toLowerCase();
+  return !a.passed_at && !/passed|archived_phase[12]|phase[12]_passed/.test(proof);
+}
+
 function npGlobalSelectableAccounts(){
   const trader=SESSION.data?.trader||SESSION.trader||{};
   const isNnajiofor =
@@ -5264,11 +5283,16 @@ function npGlobalSelectableAccounts(){
     return bucket==='active' || bucket==='funded';
   });
 
+  // A target-reaching account remains visible until its exact journey has a
+  // successor. Numeric target achievement does not approve a backend pass.
+  const unresolvedProgression=base.filter(npUnresolvedPhaseSelectorAccount);
+
   // Breached/reset source accounts remain in PREVIOUS/HISTORY.
   // Only live/current/waiting lifecycles belong in the active account selector.
   const merged=[
     ...attachedReplacementRows,
     ...liveBase,
+    ...unresolvedProgression,
     ...explicitWaiting,
     ...(paidCycleBridge ? [paidCycleBridge] : [])
   ];
@@ -5303,6 +5327,7 @@ function npAccountContextLabel(a){
     const wait=String(a.lifecycle_state||a.challenge_state||a.account_status||'WAITING').toUpperCase().replace(/_/g,' ');
     return `🟡 ${wait} · ${stage} · ${moneyLabel}${login?' · MT5 '+login:''}`;
   }
+  if(npTargetAwaitingPassVerification(a)) return `🔵 TARGET REACHED · VERIFICATION PENDING · ${moneyLabel} · MT5 ${login}`;
   if(npIsPassed(a)){ const ps=npPassedStageLabel(a), nx=npNextWaitingLabel(a)||'WAITING FOR NEXT STAGE'; return `🔵 ${String(ps).toUpperCase()} · ${String(nx).toUpperCase()} · ${moneyLabel} · MT5 ${login||'PENDING'}`; }
   if(String(a.account_status||a.status||'').toLowerCase().includes('profit_protected')) return `🟡 FUNDED · PAYOUT UNDER REVIEW · ${moneyLabel} · MT5 ${login||'PENDING'}`;
   if(['payout_pending','approved_payout_pending','payment_processing'].some(x=>String(a.account_status||a.status||'').toLowerCase().includes(x))) return `🟡 FUNDED · PAYOUT IN PROGRESS · ${moneyLabel} · MT5 ${login||'PENDING'}`;
@@ -5316,7 +5341,7 @@ function npRenderGlobalAccountSelector(){
   const selected=rows.find(x=>String(x.id)===String(SESSION.selectedAccountId||SESSION.data?.current_account?.id||'')) || rows[0];
   const state=selected?._np_reset_action_source
     ? 'RESET ACTION'
-    : npIsResetWaiting(selected)?'RESET WAITING':npIsWaitingAccount(selected)?'WAITING':mt5Bucket(selected)==='funded'?'FUNDED':'ACTIVE';
+    : npUnresolvedPhaseSelectorAccount(selected)?'AWAITING NEXT STEP':npIsResetWaiting(selected)?'RESET WAITING':npIsWaitingAccount(selected)?'WAITING':mt5Bucket(selected)==='funded'?'FUNDED':'ACTIVE';
   return `<div class="np-global-account-selector">
     <span class="np-gas-label">Viewing Account</span>
     <select aria-label="Select account for all modules" onchange="selectAccount(this.value)">
