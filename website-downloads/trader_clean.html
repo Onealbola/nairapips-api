@@ -1640,9 +1640,14 @@ function npIsWaitingAccount(a){
 }
 
 function npProgressionSourceConsumedForever(a){
-  if(!a || !npIsPassed(a)) return false;
+  if(!a) return false;
   const all=(SESSION.allAccounts||[]).filter(Boolean);
   const sourceId=String(a.id||'').trim();
+  const raw=all.find(x=>String(x.id||'').trim()===sourceId)||{};
+  const receipt=[a.archive_reason,a.admin_note,raw.archive_reason,raw.admin_note].join(' ');
+  if(a.successor_account_id || a.replacement_account_id ||
+     (sourceId && receipt.includes('[NP_CONSUMED:PHASE_PASS:'+sourceId+']'))) return true;
+  if(!npIsPassed(a) && !npHasReachedPhaseTarget(a)) return false;
   const pid=String(a.purchase_id||a.challenge_purchase_id||'').trim();
   const sourceStage=npStageRaw(a);
   const target=String(a.next_stage||'').toLowerCase() ||
@@ -1731,12 +1736,17 @@ function npIsPassed(a){
   ].join(' ').toLowerCase();
   const passTxt = npIsPassedArchive(a) || txt.includes('passed') || txt.includes('profit_target') || txt.includes('archived_phase1') || txt.includes('archived_phase2') || txt.includes('waiting for phase') || txt.includes('waiting_for_phase') || txt.includes('waiting for funded');
   if(a._np_force_passed || a._np_forced_passed || a._np_display_passed_forced || passTxt) return !npIsBreached(a);
-  const target=npTargetFor(a);
-  return !!target && npProfitPct(a) >= (target - 0.0001) && !npIsBreached(a);
+  // Profit reaching its target is evidence to verify, not a recorded pass.
+  return false;
+}
+function npHasReachedPhaseTarget(a){
+  if(!a || !['phase1','phase2'].includes(npStageRaw(a)) || npIsBreached(a) || npIsResetArchive(a)) return false;
+  const target=Number(npTargetFor(a)), profit=Number(npProfitPct(a));
+  return Number.isFinite(target) && target>0 && Number.isFinite(profit) && profit >= target-0.0001;
 }
 function npNextWaitingLabel(a){
   if(npIsBreached(a)) return 'BREACHED';
-  if(!npIsPassed(a)) return '';
+  if(!npIsPassed(a)) return npHasReachedPhaseTarget(a)?'TARGET REACHED · VERIFICATION PENDING':'';
   if(npProgressionSourceConsumedForever(a)) return 'COMPLETED';
   const next=String((a&&a.next_stage)||'').toLowerCase();
   if(next.includes('funded')) return 'WAITING FOR FUNDED';
@@ -5214,7 +5224,7 @@ function npExactResetActionAccounts(){
 function npUnresolvedPhaseSelectorAccount(a){
   if(!a || !String(a.id||'').trim() || !String(a.mt5_login||'').trim()) return false;
   if(!['phase1','phase2'].includes(npStageRaw(a))) return false;
-  if(npIsBreached(a) || npIsResetArchive(a) || !npIsPassed(a)) return false;
+  if(npIsBreached(a) || npIsResetArchive(a) || (!npIsPassed(a) && !npHasReachedPhaseTarget(a))) return false;
   const status=String(a.account_status||a.status||'').trim().toLowerCase();
   const markers=[a.archive_reason,a.admin_note,a.message].join(' ').toLowerCase();
   if(status==='archived' || /closed|completed|recalled|disabled|breach|reset/.test(status)) return false;
@@ -5224,8 +5234,7 @@ function npUnresolvedPhaseSelectorAccount(a){
 }
 function npTargetAwaitingPassVerification(a){
   if(!npUnresolvedPhaseSelectorAccount(a)) return false;
-  const proof=[a.account_status,a.phase_pass_status,a.pass_status,a.risk_zone].join(' ').toLowerCase();
-  return !a.passed_at && !/passed|archived_phase[12]|phase[12]_passed/.test(proof);
+  return !npIsPassed(a);
 }
 
 function npGlobalSelectableAccounts(){
@@ -5298,6 +5307,9 @@ function npGlobalSelectableAccounts(){
   ];
   const byId=new Map();
   for(const row of merged){
+    // Apply the exact completion receipt to every selector source, including
+    // decorated/attached rows whose timestamps changed after the handover.
+    if(npProgressionSourceConsumedForever(row)) continue;
     const id=String(row?.id||'').trim();
     if(!id) continue;
     if(!byId.has(id)) byId.set(id,row);
@@ -7659,6 +7671,7 @@ function renderDashboard(){
   // Lifecycle stage and risk condition are independent.
   const accountStatusRaw=String(acct.account_status||acct.status||'').toLowerCase();
   const isCurrentPassed = npIsPassed(acct);
+  const verificationPending = npTargetAwaitingPassVerification(acct);
   const isTerminalBreach=accountStatusRaw.includes('breach')||accountStatusRaw.includes('locked')||accountStatusRaw.includes('disabled')||Boolean(acct.mt5_access_disabled);
   const riskZone = isTerminalBreach || dd>=ddLimit
     ? 'breached'
@@ -7667,7 +7680,7 @@ function renderDashboard(){
       : dd>=10
         ? 'warning'
         : 'safe';
-  const riskText = isCurrentPassed
+  const riskText = verificationPending ? 'VERIFICATION PENDING' : isCurrentPassed
     ? 'PASSED'
     : riskZone==='breached'
       ? 'BREACHED'
@@ -7676,9 +7689,9 @@ function renderDashboard(){
         : riskZone==='warning'
           ? 'WARNING'
           : 'SAFE';
-  const displayLifecycle = isCurrentPassed ? npNextWaitingLabel(acct) : stageLabel;
+  const displayLifecycle = verificationPending ? 'TARGET REACHED · VERIFICATION PENDING' : isCurrentPassed ? npNextWaitingLabel(acct) : stageLabel;
   const displayStageLine = isCurrentPassed ? npPassedStageLabel(acct) : stageLabel;
-  const riskPill = riskText==='PASSED'
+  const riskPill = verificationPending || riskText==='PASSED'
     ? 'pill-blue'
     : riskText==='SAFE'
       ? 'pill-green'
