@@ -1289,9 +1289,47 @@ def _trader_safe_monitoring_row(row):
     return _only_fields(row, _TRADER_MONITORING_RESPONSE_FIELDS)
 
 
+def _trader_account_progression_metadata(row):
+    """Expose exact completion evidence without exposing private audit notes."""
+    import re
+    import uuid
+    row = row or {}
+    aid = str(row.get("id") or row.get("trader_account_id") or "").strip()
+    status = str(row.get("account_status") or row.get("status") or "").strip().lower()
+    passed = str(row.get("phase_pass_status") or "").strip().lower()
+    if passed not in {"phase1_passed", "phase2_passed"}:
+        passed = {"archived_phase1": "phase1_passed", "archived_phase2": "phase2_passed",
+                  "phase1_passed": "phase1_passed", "phase2_passed": "phase2_passed"}.get(status, "")
+    result = {"phase_pass_recorded": bool(passed), "progression_completed": False}
+    if passed:
+        result["phase_pass_status"] = passed
+        if row.get("passed_at"):
+            result["passed_at"] = row["passed_at"]
+    if not aid or not passed:
+        return result
+    private = " ".join(str(row.get(k) or "") for k in ("archive_reason", "admin_note"))
+    match = re.search(r"\[NP_CONSUMED:PHASE_PASS:" + re.escape(aid)
+        + r"\]\s+replacement_account_id=([0-9a-fA-F-]{36})(?:\s+replacement_mt5=(\d+))?", private)
+    successor = match.group(1) if match else (
+        row.get("successor_account_id") if row.get("progression_completed") is True else None)
+    try:
+        successor = str(uuid.UUID(str(successor)))
+    except (ValueError, TypeError, AttributeError):
+        return result
+    if successor == aid:
+        return result
+    result.update({"progression_completed": True, "successor_account_id": successor})
+    login = match.group(2) if match else row.get("successor_mt5_login")
+    if login and str(login).isdigit():
+        result["successor_mt5_login"] = str(login)
+    return result
+
+
 def _trader_safe_account_row(row):
+    progression = _trader_account_progression_metadata(row)
     row = _only_fields(row, _TRADER_ACCOUNT_RESPONSE_FIELDS)
     if isinstance(row, dict):
+        row.update(progression)
         snap = row.get("latest_monitoring_snapshot")
         if isinstance(snap, dict):
             row["latest_monitoring_snapshot"] = _trader_safe_monitoring_row(snap)
