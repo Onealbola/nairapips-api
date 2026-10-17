@@ -59936,3 +59936,11 @@ _NPRegisterPackageApprovalV223(app, _np_package_approvals_v223, _require_admin)
 from package_fulfillment import PackageFulfillmentStore as _NPPackageFulfillmentStoreV223, register_package_fulfillment as _NPRegisterPackageFulfillmentV223
 _np_package_fulfillment_v223 = _NPPackageFulfillmentStoreV223(_np_package_approvals_v223)
 _NPRegisterPackageFulfillmentV223(app, _np_package_fulfillment_v223, _require_admin, _authenticated_trader_id_for_request)
+
+# V224: private owner test page, independent of customer package publication.
+from package_configuration import PackageStore as _NPLabPackageStoreV224, register_package_configuration as _NPRegisterLabConfigV224
+from package_lab import register_package_lab as _NPRegisterPackageLabV224
+_np_package_lab_store_v224 = globals().get("_np_package_store_v221") or _NPLabPackageStoreV224(requests, SUPABASE_URL, SUPABASE_KEY)
+if "package_configuration" not in app.view_functions:
+    _NPRegisterLabConfigV224(app, _np_package_lab_store_v224, _require_admin, _audit_safe)
+_NPRegisterPackageLabV224(app, _np_package_lab_store_v224, _require_admin)

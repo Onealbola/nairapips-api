@@ -1,0 +1,61 @@
+// Run with the installed Playwright environment; fixture never touches production.
+const {chromium}=require('playwright');
+const {spawn}=require('child_process');
+const path=require('path'),assert=require('assert');
+(async()=>{
+ const server=spawn('/workspace/.venvs/nairapips-api/bin/python',[path.join(__dirname,'package_lab_fixture.py')],{stdio:['ignore','pipe','pipe']});
+ let browser;
+ try{
+  const port=await new Promise((resolve,reject)=>{
+   const timer=setTimeout(()=>reject(Error('Local fixture did not start')),10000);
+   server.stdout.on('data',chunk=>{const match=String(chunk).match(/READY:(\d+)/);if(match){clearTimeout(timer);resolve(match[1]);}});
+   server.on('exit',()=>{clearTimeout(timer);reject(Error('Local fixture exited'));});
+  });
+  browser=await chromium.launch({executablePath:'/usr/bin/chromium',headless:true,args:['--no-sandbox']});
+  const page=await browser.newPage({viewport:{width:1280,height:960}}),errors=[];
+  page.on('pageerror',err=>errors.push(err.message));
+  await page.goto('http://127.0.0.1:'+port+'/package-lab');
+  await page.locator('#username').fill('fixture-owner');await page.locator('#password').fill('fixture-password');
+  await page.getByRole('button',{name:'Sign in',exact:true}).click();
+  await page.waitForFunction(()=>!document.getElementById('work').hidden);
+  assert.equal(await page.locator('#password').inputValue(),'');
+  await page.locator('#sample').click();
+  await page.waitForFunction(()=>!document.getElementById('results').hidden);
+  assert.equal(await page.locator('#save').isDisabled(),true,'Example tariff cannot be saved');
+  const selections={capital:'500000',drawdown:'10',phase1_target:'10',profit_share:'70',payout_cycles:'3',phase_resets:'1',funded_resets:'2'};
+  for(const [key,value] of Object.entries(selections))await page.locator('[data-choice="'+key+'"]').selectOption(value);
+  await page.locator('#start').click();await page.waitForFunction(()=>!document.getElementById('results').hidden);
+  await page.locator('#pass').click();await page.waitForFunction(()=>result?.state.stage==='funded');
+  await page.locator('#payout').click();await page.waitForFunction(()=>result?.usage.paid_cycles===1);
+  await page.locator('#payout').click();await page.waitForFunction(()=>result?.usage.paid_cycles===2);
+  assert.equal(await page.evaluate(()=>result.total_test_payout),'35000.00');
+  assert.equal(await page.evaluate(()=>result.usage.funded_resets),0);
+  for(let i=1;i<=2;i++){
+   await page.locator('#breach').click();await page.waitForFunction(()=>result.state.decision==='breached');
+   await page.locator('#reset').click();await page.waitForFunction(n=>result.usage.funded_resets===n,i);
+  }
+  await page.locator('#breach').click();await page.waitForFunction(()=>result.state.decision==='breached');
+  await page.locator('#reset').click();await page.waitForFunction(()=>document.getElementById('message').textContent.includes('No included funded resets'));
+  let writes=await (await page.request.get('http://127.0.0.1:'+port+'/fixture-writes')).json();
+  assert.deepEqual(writes.tables,[],'Rehearsals must not write to any table');
+  await page.locator('#load').click();await page.waitForFunction(()=>document.getElementById('mode').textContent.startsWith('Saved tariff'));
+  await page.locator('#minimum').fill('5000');
+  for(const key of await page.locator('[data-price]').evaluateAll(nodes=>nodes.map(n=>n.dataset.price))){
+   if(key==='phase2_target')continue;
+   await page.locator('[data-price="'+key+'"]').fill(key==='capital'?'25000':'0');
+   await page.locator('[data-enabled="'+key+'"]').check();
+  }
+  await page.locator('#save').click();await page.waitForFunction(()=>document.getElementById('message').textContent.startsWith('Prices and choices saved'));
+  writes=await (await page.request.get('http://127.0.0.1:'+port+'/fixture-writes')).json();
+  assert(writes.tables.every(name=>name==='business_settings'));
+  assert.equal(JSON.parse(writes.config_rows[0].value).enabled,false,'Saving tariff must not launch the product');
+  await page.locator('#start').click();await page.waitForFunction(()=>!document.getElementById('results').hidden);
+  assert.equal(await page.evaluate(()=>result.quote.total),25000);
+  await page.setViewportSize({width:390,height:844});
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,'Mobile layout overflows');
+  assert.deepEqual(errors,[]);
+  await page.locator('#logout').click();assert.equal(await page.locator('#login').isVisible(),true);
+  assert.equal(await page.evaluate(()=>localStorage.length+sessionStorage.length),0,'No credentials should persist');
+  console.log('Owner lab browser passed: real rule evaluation, repeated payouts, reset exhaustion, no financial writes, saved inactive tariff, mobile and logout.');
+ }finally{if(browser)await browser.close();server.kill('SIGTERM');}
+})().catch(err=>{console.error(err);process.exitCode=1;});
