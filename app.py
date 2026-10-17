@@ -59880,3 +59880,11 @@ def _np_sales_outcomes_v219():
 from request_admission import RequestAdmissionMiddleware as _NPAdmissionV220
 app.wsgi_app = _NPAdmissionV220(app.wsgi_app,
     reserved_paths=("/admin_bootstrap", "/admin_operations_center", "/approve_challenge_purchase", "/admin/sales_outcomes", "/admin/breach_intelligence"))
+
+# V224: private owner test page, independent of customer package publication.
+from package_configuration import PackageStore as _NPLabPackageStoreV224, register_package_configuration as _NPRegisterLabConfigV224
+from package_lab import register_package_lab as _NPRegisterPackageLabV224
+_np_package_lab_store_v224 = globals().get("_np_package_store_v221") or _NPLabPackageStoreV224(requests, SUPABASE_URL, SUPABASE_KEY)
+if "package_configuration" not in app.view_functions:
+    _NPRegisterLabConfigV224(app, _np_package_lab_store_v224, _require_admin, _audit_safe)
+_NPRegisterPackageLabV224(app, _np_package_lab_store_v224, _require_admin)
