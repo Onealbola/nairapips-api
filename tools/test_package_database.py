@@ -40,6 +40,8 @@ class PackageDatabaseTests(unittest.TestCase):
             cls.sql((ROOT/'tests/fixtures/package_schema.sql').read_text())
             migration=(ROOT/'migrations/20261017_package_contracts.sql').read_text()
             cls.sql(migration);cls.sql(migration) # Reapplication must preserve data/schema.
+            approval=(ROOT/'migrations/20261017_package_approval.sql').read_text()
+            cls.sql(approval);cls.sql(approval)
         except BaseException:
             subprocess.run(['docker','stop',cls.container],capture_output=True)
             raise
@@ -75,6 +77,32 @@ class PackageDatabaseTests(unittest.TestCase):
         return fixture
     def checkout(self,f):
         return json.loads(self.sql(f"select np_package_checkout({literal(f['tid'])},{literal(f['qid'])},{literal(f['key'])},'https://proof.invalid/fixture');"))
+    def approve(self,f,error=None):
+        raw=self.sql(f"select np_package_approve_purchase({literal(f['qid'])},'fixture-admin');",error)
+        return json.loads(raw) if raw else None
+    def test_admin_approval_is_atomic_and_simultaneous_retry_reserves_once(self):
+        f=self.prepare(approve=False);self.checkout(f)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results=list(pool.map(lambda _:self.approve(f),range(2)))
+        self.assertEqual(results[0]['entitlement_id'],results[1]['entitlement_id'])
+        self.assertEqual(self.sql(f"select count(*) from np_package_approval_events where purchase_id={literal(f['qid'])};"),'1')
+        self.assertEqual(self.sql(f"select payment_status||'|'||status from challenge_purchases where id={literal(f['qid'])};"),'approved|approved_waiting_mt5')
+    def test_approval_refuses_changed_price_and_rejected_payment(self):
+        f=self.prepare(approve=False);self.checkout(f)
+        self.sql(f"update challenge_purchases set fee=1 where id={literal(f['qid'])};")
+        self.approve(f,'frozen package price')
+        self.sql(f"update challenge_purchases set fee=5000,status='rejected' where id={literal(f['qid'])};")
+        self.approve(f,'Rejected, cancelled or refunded')
+        self.assertEqual(self.sql(f"select count(*) from np_package_approval_events where purchase_id={literal(f['qid'])};"),'0')
+    def test_approval_replay_returns_current_account_without_a_second_delivery(self):
+        f=self.prepare(approve=False);self.checkout(f);self.approve(f)
+        aid=self.account(f)
+        self.assertEqual(self.approve(f)['account_id'],aid)
+        self.assertEqual(self.sql(f"select count(*) from np_package_entitlements where contract_id={literal(f['cid'])};"),'1')
+    def test_client_roles_cannot_approve_payment(self):
+        f=self.prepare(approve=False);self.checkout(f)
+        self.sql(f"set role authenticated;select np_package_approve_purchase({literal(f['qid'])},'forged');",'permission denied')
+        self.assertEqual(self.sql(f"select payment_status from challenge_purchases where id={literal(f['qid'])};"),'pending')
     def account(self,f,stage='phase1',breached=False,passed=False):
         aid=str(uuid4())
         self.sql(f"insert into trader_accounts(id,trader_id,purchase_id,stage,account_status,package_contract_id,package_rules_hash,breached_at,passed_at,phase_pass_status) values({literal(aid)},{literal(f['tid'])},{literal(f['qid'])},{literal(stage)},{literal('breached_archived' if breached else 'assigned_active')},{literal(f['cid'])},{literal(f['hash'])},{'clock_timestamp()' if breached else 'null'},{'clock_timestamp()' if passed else 'null'},{literal('passed') if passed else 'null'}); update np_package_usage set current_account_id={literal(aid)} where contract_id={literal(f['cid'])};")

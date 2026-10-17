@@ -20,7 +20,10 @@ TABLES={'np_package_quotes','np_package_contracts','np_package_usage','np_packag
 
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--apply',action='store_true');p.add_argument('--plan',action='store_true');args=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--apply',action='store_true');p.add_argument('--plan',action='store_true')
+    p.add_argument('--migration',choices=['20261017_package_contracts.sql','20261017_package_approval.sql'],default=MIGRATION.name)
+    args=p.parse_args()
+    migration=ROOT/'migrations'/args.migration
     url=os.environ.get('SUPABASE_URL','').rstrip('/');key=os.environ.get('SUPABASE_KEY')
     host=urlsplit(url).hostname or ''
     if not re.fullmatch(r'[a-z0-9]+\.supabase\.co',host) or not key:
@@ -36,8 +39,8 @@ def main():
     cfg.raise_for_status();rows=cfg.json()
     if rows and json.loads(rows[0]['value']).get('enabled') is not False:
         raise RuntimeError('Package checkout must be switched off before applying this migration')
-    payload=MIGRATION.read_text();sha=hashlib.sha256(payload.encode()).hexdigest()
-    print('Migration:',MIGRATION.name);print('SHA256:',sha)
+    payload=migration.read_text();sha=hashlib.sha256(payload.encode()).hexdigest()
+    print('Migration:',migration.name);print('SHA256:',sha)
     print('Existing package tables:',len(TABLES & set(definitions)),'of',len(TABLES))
     print('Plan: add package-only tables/RPCs and nullable contract bindings; no legacy row migration or checkout activation.')
     if not args.apply:

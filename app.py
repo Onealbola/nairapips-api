@@ -45369,6 +45369,8 @@ def _np_auto_fulfill_exact_reset_v43(order):
 _np_assign_mt5_to_trader_v71_core = _assign_mt5_to_trader
 
 def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="MT5 assigned"):
+    if (purchase or {}).get("package_contract_id"):
+        raise RuntimeError("Package assignments require the exact immutable entitlement ledger; legacy assignment is blocked")
     actor = staff or {}
     role = str(actor.get("role") or "").strip().lower()
     username = str(actor.get("username") or actor.get("name") or "").strip().lower()
@@ -59925,3 +59927,12 @@ _np_package_store_v221.readiness = _np_package_release_readiness_v222
 _NPRegisterPackageCheckoutV222(app, _np_package_orders_v222, _np_package_store_v221,
                               _np_controls_v221, _authenticated_trader_id_for_request,
                               _np_package_release_readiness_v222)
+
+# V223: package purchase approvals use their own immutable entitlement ledger.
+from package_approval import PackageApprovalStore as _NPPackageApprovalStoreV223, register_package_approval as _NPRegisterPackageApprovalV223
+_np_package_approvals_v223 = _NPPackageApprovalStoreV223(_np_package_orders_v222)
+_NPRegisterPackageApprovalV223(app, _np_package_approvals_v223, _require_admin)
+
+from package_fulfillment import PackageFulfillmentStore as _NPPackageFulfillmentStoreV223, register_package_fulfillment as _NPRegisterPackageFulfillmentV223
+_np_package_fulfillment_v223 = _NPPackageFulfillmentStoreV223(_np_package_approvals_v223)
+_NPRegisterPackageFulfillmentV223(app, _np_package_fulfillment_v223, _require_admin, _authenticated_trader_id_for_request)
