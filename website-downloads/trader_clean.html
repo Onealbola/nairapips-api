@@ -8436,7 +8436,7 @@ function npProductMarketBlockV156(plans,key,mode='plans'){
 }
 
 function renderPlans(){
-  const plans=Array.isArray(SESSION.plansList)?SESSION.plansList:[];
+  const plans=(Array.isArray(SESSION.plansList)?SESSION.plansList:[]).filter(p=>String(p.status||'').toLowerCase()==='active');
   const loading=!!SESSION.moduleLoading?.plans;
   const err=String(SESSION.commerceLoadError||'');
   return `
@@ -8631,7 +8631,7 @@ window.requestAffiliatePayout = async function(){
 };
 
 function renderPurchase(){
-  const plans=Array.isArray(SESSION.plansList)?SESSION.plansList:[];
+  const plans=(Array.isArray(SESSION.plansList)?SESSION.plansList:[]).filter(p=>String(p.status||'').toLowerCase()==='active');
   const pa=(Array.isArray(SESSION.paymentAccounts)?SESSION.paymentAccounts:[])[0]||{};
   const loading=!!SESSION.moduleLoading?.purchase;
   const err=String(SESSION.commerceLoadError||'');
@@ -8666,6 +8666,7 @@ function renderPurchase(){
 function purchasePlan(planId, privateOfferCode=''){
   const p=SESSION.plansList.find(x=>String(x.id)===String(planId));
   if(!p){toast('Plan not found','err');return;}
+  if(String(p.status||'').toLowerCase()!=='active'){toast('This product is not open for new purchases.','err');return;}
   const route=npPlanRoute(p);
   const pa=SESSION.paymentAccounts[0]||{};
   const capturedRef = String(privateOfferCode||SESSION.pendingPrivateOfferCode||npCaptureReferralFromUrl()||'').trim();
@@ -8812,6 +8813,7 @@ async function applyPromoQuote(planId){
 async function submitPurchase(planId){
   const p=SESSION.plansList.find(x=>String(x.id)===String(planId));
   if(!p){toast('Plan not found','err');return;}
+  if(String(p.status||'').toLowerCase()!=='active'){toast('This product is not open for new purchases.','err');return;}
 
   const fileInput=document.getElementById('pur-file');
   const promoInput=document.getElementById('pur-promo');

@@ -12042,7 +12042,7 @@ window.showCreatePlan = function(){
       <div><div class="kpi-sub">Plan Name *</div><input class="input" id="pl-name" placeholder="₦500,000 Account"></div>
       <div><div class="kpi-sub">Product Market</div><select class="select" id="pl-category"><option value="standard">Standard Plans</option><option value="premium">Premium Plans</option></select></div>
       <div><div class="kpi-sub">Display Order</div><input class="input" id="pl-category-sort" type="number" min="1" value="10"></div>
-      <div><div class="kpi-sub">Drawdown Type</div><select class="select" id="pl-drawdown-type"><option value="STATIC">STATIC</option><option value="TRAILING">TRAILING</option></select></div>
+      <div><div class="kpi-sub">Drawdown Type</div><select class="select" id="pl-drawdown-type"><option value="STATIC">STATIC</option><option value="TRAILING" disabled>TRAILING — not released</option></select></div>
       <div><div class="kpi-sub">Payout Frequency</div><select class="select" id="pl-payout-frequency"><option value="Daily">Daily</option><option value="Weekly">Weekly</option><option value="Biweekly">Biweekly</option><option value="Monthly">Monthly</option><option value="On Demand">On Demand</option></select></div>
       <div><div class="kpi-sub">Account Size</div><input class="input" id="pl-size" type="number" placeholder="500000"></div>
       <div><div class="kpi-sub">Fee</div><input class="input" id="pl-fee" type="number" placeholder="25000" oninput="npSyncFundedResetDoubleV152('pl')"></div>
@@ -12052,12 +12052,13 @@ window.showCreatePlan = function(){
       <div id="pl-t2-wrap"><div class="kpi-sub">Phase 2 Target %</div><input class="input" id="pl-t2" type="number" placeholder="8"></div>
       <div><div class="kpi-sub">Daily DD</div><input class="input" id="pl-ddd" type="text" value="None" placeholder="None" readonly></div>
       <div><div class="kpi-sub">Max DD %</div><input class="input" id="pl-tdd" type="number" placeholder="10"></div>
-      <div><div class="kpi-sub">Payout Split %</div><input class="input" id="pl-split" type="number" min="0" max="100" step="0.01" placeholder="e.g. 60, 70, 80"></div>
+      <div><div class="kpi-sub">Payout Split %</div><input class="input" id="pl-split" type="number" min="0" max="100" step="0.01" placeholder="60 or 70"></div>
       <div><div class="kpi-sub">Phase Reset Price</div><input class="input" id="pl-reset-fee" type="number" min="0" step="1" placeholder="Enter exact Phase reset price"></div>
       <div><div class="kpi-sub">Funded Reset Price · AUTO 2× FEE</div><input class="input" id="pl-funded-reset-fee" type="number" min="0" step="1" readonly placeholder="Automatically double challenge fee"></div>
       <div><div class="kpi-sub">Public Card Badge</div><input class="input" id="pl-public-badge" maxlength="24" placeholder="NEW, POPULAR, BEST VALUE, LIMITED"></div>
       <div style="grid-column:1 / -1"><div class="kpi-sub">Description</div><textarea class="input" id="pl-desc" rows="2"></textarea></div>
     </div>
+    <label style="display:block;margin-top:12px"><input type="checkbox" id="pl-release"> Open this product for new purchases</label>
     <div class="flex gap-2 mt-3"><button class="btn btn-gold" onclick="createPlan()">＋ Create</button></div>
   `);
   setTimeout(()=>{npPlanRouteChanged('pl');npSyncFundedResetDoubleV152('pl');},0);
@@ -12073,6 +12074,7 @@ window.createPlan = async function(){
     account_size: Number(document.getElementById('pl-size').value),
     fee: Number(document.getElementById('pl-fee').value),
     phase1_target: Number(document.getElementById('pl-t1').value),
+    challenge_journey:document.getElementById('pl-route').value==='funded'?'one_phase':'two_phase',
     phase2_target: document.getElementById('pl-route').value === 'funded' ? 0 : Number(document.getElementById('pl-t2').value || 8),
     daily_drawdown: "None",
     max_drawdown: Number(document.getElementById('pl-tdd').value),
@@ -12084,7 +12086,7 @@ window.createPlan = async function(){
     mt5_server: document.getElementById('pl-server').value,
     default_server: document.getElementById('pl-server').value,
     description: document.getElementById('pl-desc').value,
-    status:'active'
+    status:document.getElementById('pl-release').checked?'active':'inactive'
   };
   if(!payload.name){toast('Plan name required','err');return;}
   try{await api('/create_challenge_plan','POST',payload);await audit('plans','create',payload.name);toast('Plan created','ok');reload();document.querySelector('.modal-bg')?.remove();}
@@ -12116,6 +12118,7 @@ window.editPlan = function(id){
       <div><div class="kpi-sub">Public Card Badge</div><input class="input" id="epl-public-badge" maxlength="24" value="${esc(p.public_badge||p.card_badge||'')}" placeholder="NEW, POPULAR, BEST VALUE, LIMITED"></div>
       <div style="grid-column:1 / -1"><div class="kpi-sub">Description</div><textarea class="input" id="epl-desc" rows="2">${esc(p.description||'')}</textarea></div>
     </div>
+    <label style="display:block;margin-top:12px"><input type="checkbox" id="epl-release" ${p.status==='active'?'checked':''}> Open this product for new purchases</label>
     <div class="flex gap-2 mt-3"><button class="btn btn-gold" onclick="savePlan('${esc(String(p.id))}')">💾 Save</button></div>
   `);
 };
@@ -12132,6 +12135,7 @@ window.savePlan = async function(id){
       account_size: Number(document.getElementById('epl-size').value),
       fee: Number(document.getElementById('epl-fee').value),
       phase1_target: Number(document.getElementById('epl-t1').value),
+      challenge_journey:document.getElementById('epl-route').value==='funded'?'one_phase':'two_phase',
       phase2_target: document.getElementById('epl-route').value === 'funded' ? 0 : Number(document.getElementById('epl-t2').value || 8),
       daily_drawdown: "None",
       max_drawdown: Number(document.getElementById('epl-tdd').value),
@@ -12143,7 +12147,7 @@ window.savePlan = async function(id){
       mt5_server: document.getElementById('epl-server').value,
       default_server: document.getElementById('epl-server').value,
       description: document.getElementById('epl-desc').value,
-      status:'active'
+      status:document.getElementById('epl-release').checked?'active':'inactive'
     });
     await audit('plans','update','',id);
     toast('Saved','ok'); reload(); document.querySelector('.modal-bg')?.remove();
@@ -16393,33 +16397,10 @@ function renderSettings(){
       <div class="kpi-sub mt-2">These defaults control automatic trader/marketer referral links. Existing special partner codes can still have their own custom percentages.</div>
     </div>    <div style="height:12px"></div>
     <div class="card tab-content">
-      <h3 style="font-weight:900;margin-bottom:8px">All 21 modules operational</h3>
-      <div class="grid md:grid-cols-3 gap-2 text-xs">
-        <div>✓ Overview — KPIs from <code>stageOf()</code></div>
-        <div>✓ Traders — search/bulk/activate/deactivate/delete/reset pwd/reset MT5</div>
-        <div>✓ Add Trader — full form, password gen, audit log</div>
-        <div>✓ Bulk Add — CSV paste</div>
-        <div>✓ Staff — create/edit/password/status/delete</div>
-        <div>✓ Accounts — list + KPIs</div>
-        <div>✓ Funded — list + totals</div>
-        <div>✓ Breached — list + one-click restore</div>
-        <div>✓ MT5 Pool — add/edit/delete/bulk, pwd gen + copy</div>
-        <div>✓ Phase Assignment — assign MT5 from queue</div>
-        <div>✓ Recovery Studio — 5 buckets, send offers</div>
-        <div>✓ Leads — mark contacted, send offer</div>
-        <div>✓ Plans — create/edit/delete with full form</div>
-        <div>✓ Purchases — approve (with MT5) / reject</div>
-        <div>✓ Payouts — approve / reject / mark paid</div>
-        <div>✓ Revenue — server summary endpoints</div>
-        <div>✓ Announcements — create / disable</div>
-        <div>✓ Private Offers — single-send with code</div>
-        <div>✓ Support — reply / close tickets</div>
-        <div>✓ Affiliates — partner+code create, deactivate, manual commission</div>
-        <div>✓ Timeline — combined recent events</div>
-        <div>✓ Audit — every action POSTs to <code>/audit_event</code></div>
-      </div>
+      <div id="np-production-settings"></div>
     </div>
   `;
+  npLoadProductionSettings();
 }
 
 /* ============================================================================
@@ -18038,6 +18019,98 @@ window.NAIRAPIPS_HISTORIC_TRUTH_RELEASE='V110_HISTORIC_TRUTH_2026_09_30';
 </script>
 <!-- V110 HISTORIC TRUTH · 30 SEP 2026 -->
 
+<script>
+/* Owner controls: real API persistence; no writes to issued account rules. */
+(function(){
+'use strict';
+let controls=null, catalog=[], packages=null;
+const e=x=>esc(String(x??''));
+const journey=r=>String(r.challenge_journey||'').includes('two')||String(r.challenge_journey||'').includes('phase2')?'two_phase':'one_phase';
+const message=(id,text)=>{const n=document.getElementById(id);if(n)n.textContent=text;};
+const input=(id,value,extra='')=>`<input class="input" id="${id}" value="${e(value)}" ${extra}>`;
+const choiceRow=(key,r,i)=>`<label style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:8px 0"><input type="checkbox" id="np-package-${key}-${i}-enabled" ${r.enabled?'checked':''}>${input(`np-package-${key}-${i}-value`,r.value,'aria-label="Option value"')}${input(`np-package-${key}-${i}-price`,r.price??'','type="number" min="0" step="0.01" aria-label="Option price"')}<span>${key==='capital'?'₦ base price':'% addition to base'}</span></label>`;
+window.npLoadProductionSettings=async function(){
+  const node=document.getElementById('np-production-settings');if(!node)return;
+  node.innerHTML='<h3>Production controls</h3><p>Loading saved settings…</p>';
+  try{
+    const results=await Promise.all([api('/admin/production_controls'),api('/admin/production_catalog'),api('/admin/package_configuration')]);
+    if(!document.getElementById('np-production-settings'))return;
+    const [c,p,f]=results;controls=c;catalog=p.plans;packages=f;
+    node.innerHTML=`<h3>Service release controls</h3><p>Tick to accept new requests. Unticking keeps history, issued account protection and existing settlement obligations.</p>
+      <div>${c.facilities.map(r=>`<label style="display:block;margin:12px 0"><input type="checkbox" id="np-control-${e(r.key)}" ${c.data.features[r.key]?'checked':''}> ${e(r.label)}</label>`).join('')}</div>
+      <button class="btn btn-gold" onclick="npSaveProductionControls(this)">Save service switches</button>
+      <p id="np-control-message" role="status"></p>
+      <p>Saved revision ${e(c.data.revision)} · Changes reach the server within ${e(c.propagation_seconds)} seconds.</p>
+      <p>Always protected: ${c.protected.map(e).join(' · ')}.</p>
+      <hr style="margin:24px 0"><h3>Products: available now or held for later</h3>
+      <p>Inactive products stay in production and can be opened for new sales later. Existing customers retain their purchased terms. Create a new version to change the commercial terms of a product already sold.</p>
+      <div>${catalog.map((r,i)=>`<div class="card" style="margin:12px 0"><h4>${e(r.name)} · ${e(r.account_size)}</h4>
+        <label><input type="checkbox" id="np-plan-active-${i}" ${r.status==='active'?'checked':''}> Open for new purchases</label>
+        <div class="grid md:grid-cols-3 gap-2" style="margin-top:12px">
+          ${[['name','Product name'],['fee','Purchase fee ₦'],['account_size','Account size ₦'],['phase1_target','Phase 1 target %'],['phase2_target','Phase 2 target % (0 for one phase)'],['max_drawdown','Maximum drawdown %'],['payout_split','Trader share % (60 or 70)'],['reset_fee','Phase reset fee ₦']].map(([key,label])=>`<label>${label}${input(`np-plan-${i}-${key}`,r[key]??'',key==='name'?'maxlength="100"':'type="number" min="0" step="0.01"')}</label>`).join('')}
+          <label>Evaluation route<select class="input" id="np-plan-${i}-challenge_journey"><option value="one_phase" ${journey(r)==='one_phase'?'selected':''}>One phase</option><option value="two_phase" ${journey(r)==='two_phase'?'selected':''}>Two phases</option></select></label>
+        </div><p>Drawdown: ${e(r.drawdown_type||'STATIC')}. Current funded reset pricing remains twice the challenge fee.</p>
+        <button class="btn btn-gold" onclick="npSaveProductionPlan(${i},this)">Save product</button>
+        <button class="btn" onclick="npCloneProductionPlan(${i},this)">Create new inactive version</button>
+        <p id="np-plan-message-${i}" role="status"></p></div>`).join('')}</div>
+      <hr style="margin:24px 0"><h3>New package product settings</h3>
+      <p>These settings belong to the new product only. Prices start empty and choices start off until you configure them. Saving does not change any old product or issued account.</p>
+      <p>${e(f.price_rule)}</p>
+      <label>Minimum purchase price ₦ ${input('np-package-minimum',f.data.minimum_price??'','type="number" min="0.01" step="0.01"')}</label>
+      ${Object.entries(f.data.options).map(([key,rows])=>`<div class="card" style="margin:12px 0"><h4>${e(f.labels[key])}</h4><div id="np-package-rows-${key}">${rows.map((r,i)=>choiceRow(key,r,i)).join('')}</div>${['phases','drawdown_type'].includes(key)?'':`<button class="btn" onclick="npAddPackageOption('${key}')">Add choice</button>`}</div>`).join('')}
+      <label><input type="checkbox" disabled ${f.data.enabled?'checked':''}> Release new package checkout</label>
+      <p>Release is locked until: ${f.release_blockers.map(e).join('; ')}. Saved prices and choices are real configuration; customers cannot purchase an unenforced contract.</p>
+      <button class="btn btn-gold" onclick="npSavePackageConfiguration(this)">Save new package settings</button>
+      <p id="np-package-message" role="status"></p>
+      <h4>Check a package price using saved settings</h4>
+      <div class="grid md:grid-cols-3 gap-2">${Object.entries(f.data.options).map(([key,rows])=>`<label>${e(f.labels[key])}<select class="input" id="np-package-preview-${key}">${rows.filter(r=>r.enabled).map(r=>`<option value="${e(r.value)}">${e(r.value)}</option>`).join('')}</select></label>`).join('')}</div>
+      <button class="btn" onclick="npPreviewPackageQuote(this)">Calculate saved price</button>
+      <p id="np-package-quote" role="status"></p>`;
+  }catch(err){node.innerHTML=`<h3>Production settings unavailable</h3><p>${e(err.message)}</p><button class="btn" onclick="npLoadProductionSettings()">Retry</button>`;}
+};
+window.npSaveProductionControls=async function(button){
+  button.disabled=true;message('np-control-message','Saving…');
+  try{const flags={};for(const r of controls.facilities)flags[r.key]=document.getElementById('np-control-'+r.key).checked;
+    const result=await api('/admin/production_controls','POST',{revision:controls.data.revision,features:flags});controls=result;message('np-control-message','Saved and confirmed.');
+  }catch(err){message('np-control-message',err.message);}finally{button.disabled=false;}
+};
+window.npSaveProductionPlan=async function(i,button){
+  button.disabled=true;message('np-plan-message-'+i,'Saving…');
+  try{const row=catalog[i],changes={},numeric=['fee','account_size','phase1_target','phase2_target','max_drawdown','payout_split','reset_fee'];
+    for(const key of ['name',...numeric,'challenge_journey']){const n=document.getElementById(`np-plan-${i}-${key}`);const baseline=key==='challenge_journey'?journey(row):String(row[key]??'');if(n.value===baseline)continue;if(numeric.includes(key)){if(!n.value.trim())throw Error('Set '+key);const value=Number(n.value);if(!Number.isFinite(value))throw Error('Enter a valid '+key);if(baseline!==''&&Number(baseline)===value)continue;changes[key]=value;}else{changes[key]=n.value;}}
+    const status=document.getElementById('np-plan-active-'+i).checked?'active':'inactive';if(status!==row.status)changes.status=status;
+    if(!Object.keys(changes).length){message('np-plan-message-'+i,'No changes to save.');return;}
+    const result=await api('/admin/production_catalog','POST',{id:row.id,updated_at:row.updated_at,changes});catalog[i]=result.plan;message('np-plan-message-'+i,'Saved. Existing purchase rules were not rewritten.');
+  }catch(err){message('np-plan-message-'+i,err.message);}finally{button.disabled=false;}
+};
+window.npCloneProductionPlan=async function(i,button){
+  const name=prompt('Name for the new inactive product version',catalog[i].name+' — new version');if(!name)return;
+  button.disabled=true;
+  try{await api('/admin/production_catalog/clone','POST',{id:catalog[i].id,name});await npLoadProductionSettings();}
+  catch(err){message('np-plan-message-'+i,err.message);}finally{button.disabled=false;}
+};
+window.npAddPackageOption=function(key){
+  const value=prompt('New '+(packages.labels[key]||key)+' choice');if(!value)return;
+  const rows=packages.data.options[key];if(rows.length>=30){message('np-package-message','Each facility supports up to 30 choices.');return;}
+  const i=rows.length,row={value:value.trim(),enabled:false,price:null};rows.push(row);
+  document.getElementById('np-package-rows-'+key).insertAdjacentHTML('beforeend',choiceRow(key,row,i));
+};
+window.npSavePackageConfiguration=async function(button){
+  button.disabled=true;message('np-package-message','Saving…');
+  try{const data=JSON.parse(JSON.stringify(packages.data));
+    for(const [key,rows] of Object.entries(data.options))for(let i=0;i<rows.length;i++){rows[i].value=document.getElementById(`np-package-${key}-${i}-value`).value.trim();rows[i].enabled=document.getElementById(`np-package-${key}-${i}-enabled`).checked;const value=document.getElementById(`np-package-${key}-${i}-price`).value;rows[i].price=value===''?null:Number(value);}
+    const minimum=document.getElementById('np-package-minimum').value;
+    const result=await api('/admin/package_configuration','POST',{revision:data.revision,enabled:false,minimum_price:minimum===''?null:Number(minimum),options:data.options});packages=result;message('np-package-message','Saved and confirmed. Reload settings to refresh the price-check choices.');
+  }catch(err){message('np-package-message',err.message);}finally{button.disabled=false;}
+};
+window.npPreviewPackageQuote=async function(button){
+  button.disabled=true;message('np-package-quote','Calculating…');
+  try{const choices={};for(const key of Object.keys(packages.data.options))choices[key]=document.getElementById('np-package-preview-'+key).value;if(choices.phases==='one')choices.phase2_target=null;
+    const r=await api('/admin/package_configuration/quote','POST',choices);message('np-package-quote','Saved catalog version '+r.data.catalog_revision+': ₦'+r.data.total.toLocaleString()+'. Checkout remains unreleased.');
+  }catch(err){message('np-package-quote',err.message);}finally{button.disabled=false;}
+};
+})();
+</script>
 </body>
 </html>
 
