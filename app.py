@@ -10168,7 +10168,7 @@ def create_plan():
         d=request.json or {}; name=str(d.get("name","")).strip()
         if not name: return bad("Plan name is required")
         mt5_server = d.get("mt5_server") or d.get("default_server") or ""
-        phase2_target = float(d.get("phase2_target") or 8)
+        phase2_target = float(d["phase2_target"]) if d.get("phase2_target") not in (None, "") else 8.0
         challenge_journey = _journey_source_value(
             d.get("challenge_journey"), d.get("journey_stages"), d.get("route"),
             d.get("progression_route"), "one_phase" if phase2_target <= 0 else "two_phase"
@@ -10189,7 +10189,7 @@ def create_plan():
              # V152: Funded reset price follows the commercial rule automatically.
              "funded_reset_fee":(clean(d.get("fee")) * 2 if clean(d.get("fee")) else 0),
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
-             "status":d.get("status","active"),"created_at":now_iso(),"updated_at":now_iso()}
+             "status":d.get("status","inactive"),"created_at":now_iso(),"updated_at":now_iso()}
         result = supabase.table("challenge_plans").insert(row).execute().data
         np_invalidate("public_plans_snapshot", "plans_list", "admin_bootstrap")
         return ok(result, "Challenge plan created")
@@ -10348,7 +10348,7 @@ def create_purchase():
         submitted_plan_id = str(d.get("plan_id") or "").strip()
         if not submitted_plan_id:
             return bad("Plan identity is missing. Please refresh the plan page and select the product again.", 400)
-        plan_row = _safe_plan_for_purchase({"plan_id": submitted_plan_id})
+        plan_row = request.environ.get("np_verified_checkout_plan_v221") or _safe_plan_for_purchase({"plan_id": submitted_plan_id})
         if not plan_row:
             return bad("Selected plan is no longer available. Please refresh and select a current product.", 400)
         challenge_journey = _journey_source_value(_journey_for_lifecycle({}, {}, plan_row, None))
@@ -59880,3 +59880,20 @@ def _np_sales_outcomes_v219():
 from request_admission import RequestAdmissionMiddleware as _NPAdmissionV220
 app.wsgi_app = _NPAdmissionV220(app.wsgi_app,
     reserved_paths=("/admin_bootstrap", "/admin_operations_center", "/approve_challenge_purchase", "/admin/sales_outcomes", "/admin/breach_intelligence"))
+
+
+# V221: owner-operated release controls; legacy account and risk obligations remain active.
+from production_controls import ControlsStore as _NPControlsStoreV221, register_controls as _NPRegisterControlsV221
+from catalog_controls import register_catalog_controls as _NPRegisterCatalogV221
+_np_controls_v221 = _NPControlsStoreV221(requests, SUPABASE_URL, SUPABASE_KEY)
+_NPRegisterControlsV221(app, _np_controls_v221, _require_admin, np_invalidate, _audit_safe)
+def _np_product_configuration_invalidate_v221(*keys):
+    np_invalidate(*keys)
+    _NP_COMMERCE_CACHE_V144["ts"] = 0.0
+    _NP_PLAN_SNAPSHOT_V181["at"] = 0.0
+
+_NPRegisterCatalogV221(app, requests, SUPABASE_URL, SUPABASE_KEY, _require_admin, _np_product_configuration_invalidate_v221, _audit_safe)
+
+from package_configuration import PackageStore as _NPPackageStoreV221, register_package_configuration as _NPRegisterPackageV221
+_np_package_store_v221 = _NPPackageStoreV221(requests, SUPABASE_URL, SUPABASE_KEY)
+_NPRegisterPackageV221(app, _np_package_store_v221, _require_admin, _audit_safe)
