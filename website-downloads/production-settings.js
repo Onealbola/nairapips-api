@@ -36,7 +36,7 @@ window.npLoadProductionSettings=async function(){
       <p>${e(f.price_rule)}</p>
       <label>Minimum purchase price ₦ ${input('np-package-minimum',f.data.minimum_price??'','type="number" min="0.01" step="0.01"')}</label>
       ${Object.entries(f.data.options).map(([key,rows])=>`<div class="card" style="margin:12px 0"><h4>${e(f.labels[key])}</h4><div id="np-package-rows-${key}">${rows.map((r,i)=>choiceRow(key,r,i)).join('')}</div>${['phases','drawdown_type'].includes(key)?'':`<button class="btn" onclick="npAddPackageOption('${key}')">Add choice</button>`}</div>`).join('')}
-      <label><input type="checkbox" disabled ${f.data.enabled?'checked':''}> Release new package checkout</label>
+      <label><input id="np-package-release" type="checkbox" ${f.release_ready?'':'disabled'} ${f.data.enabled?'checked':''}> Release new package checkout</label>
       <p>Release is locked until: ${f.release_blockers.map(e).join('; ')}. Saved prices and choices are real configuration; customers cannot purchase an unenforced contract.</p>
       <button class="btn btn-gold" onclick="npSavePackageConfiguration(this)">Save new package settings</button>
       <p id="np-package-message" role="status"></p>
@@ -78,7 +78,7 @@ window.npSavePackageConfiguration=async function(button){
   try{const data=JSON.parse(JSON.stringify(packages.data));
     for(const [key,rows] of Object.entries(data.options))for(let i=0;i<rows.length;i++){rows[i].value=document.getElementById(`np-package-${key}-${i}-value`).value.trim();rows[i].enabled=document.getElementById(`np-package-${key}-${i}-enabled`).checked;const value=document.getElementById(`np-package-${key}-${i}-price`).value;rows[i].price=value===''?null:Number(value);}
     const minimum=document.getElementById('np-package-minimum').value;
-    const result=await api('/admin/package_configuration','POST',{revision:data.revision,enabled:false,minimum_price:minimum===''?null:Number(minimum),options:data.options});packages=result;message('np-package-message','Saved and confirmed. Reload settings to refresh the price-check choices.');
+    const result=await api('/admin/package_configuration','POST',{revision:data.revision,enabled:document.getElementById('np-package-release').checked,minimum_price:minimum===''?null:Number(minimum),options:data.options});packages=result;message('np-package-message','Saved and confirmed. Reload settings to refresh the price-check choices.');
   }catch(err){message('np-package-message',err.message);}finally{button.disabled=false;}
 };
 window.npPreviewPackageQuote=async function(button){
