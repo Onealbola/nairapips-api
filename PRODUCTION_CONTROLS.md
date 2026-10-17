@@ -24,16 +24,23 @@ Existing services default to their current enabled behavior. A settings outage b
 
 Storage uses two distinct versioned JSON documents in the existing `business_settings` key/value table. No new database schema is necessary for these configuration controls. No real account, purchase or payout rows are written by configuration saves. The live database transport was checked read-only; an isolated non-configuration permission probe was cleaned up. Anonymous insert was denied and anonymous update did not modify the probe row.
 
+## Frozen contracts and checkout — staged, not deployed
+
+The new `package_contracts.py` validates immutable, hashed purchase terms and evaluates exact account observations using Decimal arithmetic. New contracts explicitly use equity targets with flat positions before passing; trailing DD uses highest observed equity minus a fixed initial-capital allowance. Legacy rules are unchanged.
+
+`package_checkout.py` adds authenticated, owner-bound quotes, single-submission checkout with a stable retry key, and paginated purchased-contract history. A browser cannot set the price or rules. The trader client retains history when sales are paused and does not automatically retry an uncertain payment submission.
+
+`migrations/20261017_package_contracts.sql` is an unapplied additive migration. It provides private quote/contract tables, cycle/reset ledgers, verified NGN pool evidence, and a notification outbox. Atomic RPCs check recorded payment and pass evidence, preserve separate legacy journeys, claim fresh verified stock once, and roll back assignment if monitoring activation fails. No existing purchase is backfilled. Repeated payouts on existing products retain their current behavior; the new product uses one paid cycle per fresh funded account.
+
+`tools/test_package_database.py` tests the migration and financial transitions against an isolated PostgreSQL container with no network or production data. `tools/apply_package_migration.py --plan` only inspects schema metadata; `--apply` requires a securely configured Supabase Management token and must not be automatically retried after an unconfirmed response.
+
 ## Release boundary — remaining work
 
-The master package checkout switch is locked server-side. The server rejects attempts to enable it until a subsequent implementation supplies:
+The master package checkout switch remains locked server-side until the actual assignment, payout and lifecycle consumers advertise compatible rule support, the database migration is present, and the DD runtime is verified. Saving a checkbox cannot bypass these checks.
 
-1. Immutable server-owned quote/order/contract storage and atomic checkout.
-2. Purchase-scoped cycle/reset entitlement and settlement ledgers, including replay-safe assignment and renewal.
-3. Contract bindings and rule readers in assignment, payout/reset processing, monitoring, live state and the running DD/VPS collectors.
-4. Trader package checkout and purchased-contract display with production end-to-end verification.
+Remaining integration includes authenticated broker stock verification and observation ingestion; dispatch from approved purchases, recorded passes, resets and paid settlements; notification outbox delivery; and contract rule consumers in monitoring, live state and the running Windows DD/VPS collectors. These components must be deployed and verified together before launch. Local API fixtures and database tests do not establish production end-to-end readiness.
 
-The deployment task must connect and verify these consumers before unlocking checkout. Merely copying the simulator, changing a label, or saving a price is not a production launch. This staged change does not modify the landing page, monitoring engine or VPS binaries, and does not migrate legacy accounts.
+Production deployment currently requires a Supabase Management token plus secure access to the Windows VPS and cPanel website. No new package migration, customer checkout, VPS binary or website file has been deployed by this staged work. The landing page is outside this change.
 
 ## Review and delivery
 

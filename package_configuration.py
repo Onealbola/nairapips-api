@@ -129,7 +129,8 @@ def quote(config, choices):
 
 
 class PackageStore(ControlsStore):
-    def __init__(self, transport, url, key):
+    def __init__(self, transport, url, key, readiness=None):
+        self.readiness = readiness
         def checked(doc):
             try:
                 return validate(doc)
@@ -145,7 +146,15 @@ class PackageStore(ControlsStore):
             raise Conflict('Package settings changed in another session. Reload before saving.')
         doc = validate({**body, 'updated_at': None, 'updated_by': None})
         if doc['enabled']:
-            raise Conflict('Package checkout remains locked until contracts, cycle/reset ledgers and running monitoring/DD consumers are verified.')
+            if self.readiness is None or not self.readiness()['ready']:
+                raise Conflict('Package checkout remains locked until contracts, cycle/reset ledgers and running monitoring/DD consumers are verified.')
+            if doc['minimum_price'] is None or doc['minimum_price'] <= 0:
+                raise ValueError('Set a minimum package price before release')
+            for facility, choices in doc['options'].items():
+                if facility == 'phase2_target' and not any(r['enabled'] and r['value']=='two' for r in doc['options']['phases']):
+                    continue
+                if not any(r['enabled'] for r in choices):
+                    raise ValueError('Enable at least one choice for ' + facility)
         doc.update(revision=old['revision'] + 1, updated_at=datetime.now(timezone.utc).isoformat(), updated_by=str(actor))
         return self.persist(doc, raw, actor)
 
@@ -171,11 +180,10 @@ def register_package_configuration(app, store, require_admin, audit):
                       str({'revision': doc['revision']}), admin, KEY)
             else:
                 doc, _ = store.read(fresh=True)
+            readiness = store.readiness() if store.readiness is not None else dict(ready=False, blockers=['Immutable contract checkout', 'Paid-cycle and reset entitlement ledgers', 'Verified monitoring and DD police consumers'])
             return jsonify(success=True, data=doc, labels=LABELS,
                            price_rule='Capital base + sum of option percentages of that base; round up to NGN100, then apply the minimum price.',
-                           release_ready=False,
-                           release_blockers=['Immutable contract checkout', 'Paid-cycle and reset entitlement ledgers',
-                                             'Verified monitoring and DD police consumers'])
+                           release_ready=readiness['ready'],release_blockers=readiness['blockers'])
         except Conflict as exc:
             return jsonify(success=False, error=str(exc)), 409
         except ValueError as exc:

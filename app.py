@@ -59897,3 +59897,31 @@ _NPRegisterCatalogV221(app, requests, SUPABASE_URL, SUPABASE_KEY, _require_admin
 from package_configuration import PackageStore as _NPPackageStoreV221, register_package_configuration as _NPRegisterPackageV221
 _np_package_store_v221 = _NPPackageStoreV221(requests, SUPABASE_URL, SUPABASE_KEY)
 _NPRegisterPackageV221(app, _np_package_store_v221, _require_admin, _audit_safe)
+
+# V222: immutable new-product quotes are isolated from legacy purchase flows.
+from package_checkout import PackageOrderStore as _NPPackageOrderStoreV222, register_package_checkout as _NPRegisterPackageCheckoutV222
+from package_contracts import RULES_VERSION as _NPPackageRulesVersionV222
+_np_package_orders_v222 = _NPPackageOrderStoreV222(requests, SUPABASE_URL, SUPABASE_KEY)
+
+def _np_package_release_readiness_v222():
+    # An admin checkbox cannot assert that an unimplemented runtime consumer works.
+    # Consumer adapters advertise this marker only after binding exact contracts.
+    consumers = {
+        "Package assignment and renewal": globals().get("_assign_mt5_to_trader"),
+        "Package payout verification": globals().get("_np_plan_payout_split_for_account"),
+        "Package reset allowances": globals().get("_np_v55_decision"),
+    }
+    blockers = [name for name, fn in consumers.items()
+                if getattr(fn, "np_package_rules_version", None) != _NPPackageRulesVersionV222]
+    if not _np_package_orders_v222.schema_available():
+        blockers.append("Production package contract migration")
+    # This is a real runtime requirement, not an owner-editable configuration flag.
+    dd_probe = globals().get("_np_verified_package_dd_runtime_v222")
+    if dd_probe is None or not dd_probe():
+        blockers.append("Verified running monitoring and DD fleet")
+    return {"ready": not blockers, "blockers": blockers}
+
+_np_package_store_v221.readiness = _np_package_release_readiness_v222
+_NPRegisterPackageCheckoutV222(app, _np_package_orders_v222, _np_package_store_v221,
+                              _np_controls_v221, _authenticated_trader_id_for_request,
+                              _np_package_release_readiness_v222)
