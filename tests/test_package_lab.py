@@ -86,7 +86,7 @@ class LabTests(unittest.TestCase):
         ast.parse(tail)
         scope={'app':app,'requests':transport,'SUPABASE_URL':'https://fixture.invalid',
                'SUPABASE_KEY':'fixture-only','_require_admin':lambda:({'role':'owner'},None),
-               '_audit_safe':lambda *args:None}
+               '_audit_safe':lambda *args:None,'np_invalidate':lambda *args:None}
         exec(compile(tail,'owner-lab-registration','exec'),scope)
         self.assertEqual(transport.mock_calls,[],'Registration must not start external work')
         paths={rule.rule for rule in app.url_map.iter_rules()}

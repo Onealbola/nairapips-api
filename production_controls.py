@@ -18,8 +18,12 @@ FEATURES = {
     'challenge_sales': ('New challenge purchases', True, ['/create_challenge_purchase']),
     'reset_sales': ('New paid reset purchases — phase and funded', True, ['/create_reset_purchase']),
     'payout_requests': ('New payout requests', True, ['/create_payout']),
-    'referral_withdrawals': ('New referral withdrawal requests', True, ['/request_affiliate_payout']),
+    'referral_withdrawals': ('New referral withdrawal requests', True, ['/request_affiliate_payout', '/np2_referral/payout_request']),
     'private_offers': ('Claiming private offers', True, ['/claim_private_offer']),
+    'affiliate_signup': ('New referral partner enrolment', True, ['/affiliate_signup']),
+    'lead_capture': ('New lead submissions', True, ['/register_lead']),
+    'fxblue_registration': ('New FXBlue connections', True, ['/register_fxblue']),
+    'announcements': ('Customer announcements', True, ['/trader_announcements', '/trader_announcements_v159']),
     'support_tickets': ('New support tickets', True, ['/create_support_ticket']),
 }
 # These are not releasable by a browser flag: they require contract, ledger and
@@ -54,8 +58,10 @@ def validate_document(value):
     if type(value['revision']) is not int or value['revision'] < 0:
         raise ControlsUnavailable('Invalid production settings revision')
     flags = value['features']
-    if not isinstance(flags, dict) or set(flags) != set(FEATURES) or any(type(v) is not bool for v in flags.values()):
+    if not isinstance(flags, dict) or set(flags) - set(FEATURES) or any(type(v) is not bool for v in flags.values()):
         raise ControlsUnavailable('Invalid production feature values')
+    value = copy.deepcopy(value)
+    value['features'] = {**defaults()['features'], **flags}
     return value
 
 
@@ -202,7 +208,7 @@ def register_controls(app, store, require_admin, invalidate, audit):
     def enforce_production_controls():
         if request.method == 'OPTIONS':
             return None
-        key = routes.get(request.path.rstrip('/')) if request.method == 'POST' else None
+        key = routes.get(request.path.rstrip('/')) if request.method == 'POST' or (request.method == 'GET' and routes.get(request.path.rstrip('/')) == 'announcements') else None
         if not key:
             return None
         try:
