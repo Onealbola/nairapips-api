@@ -18065,7 +18065,9 @@ window.npLoadProductionSettings=async function(){
       <h4>Check a package price using saved settings</h4>
       <div class="grid md:grid-cols-3 gap-2">${Object.entries(f.data.options).map(([key,rows])=>`<label>${e(f.labels[key])}<select class="input" id="np-package-preview-${key}">${rows.filter(r=>r.enabled).map(r=>`<option value="${e(r.value)}">${e(r.value)}</option>`).join('')}</select></label>`).join('')}</div>
       <button class="btn" onclick="npPreviewPackageQuote(this)">Calculate saved price</button>
-      <p id="np-package-quote" role="status"></p>`;
+      <p id="np-package-quote" role="status"></p>
+      <hr style="margin:24px 0"><h3>Package accounts awaiting delivery</h3><p>Approved package orders keep their purchased rules while waiting for matching verified stock.</p><div id="np-package-deliveries"></div>`;
+    npLoadPackageDeliveries(1);
   }catch(err){node.innerHTML=`<h3>Production settings unavailable</h3><p>${e(err.message)}</p><button class="btn" onclick="npLoadProductionSettings()">Retry</button>`;}
 };
 window.npSaveProductionControls=async function(button){
@@ -18108,6 +18110,58 @@ window.npPreviewPackageQuote=async function(button){
   try{const choices={};for(const key of Object.keys(packages.data.options))choices[key]=document.getElementById('np-package-preview-'+key).value;if(choices.phases==='one')choices.phase2_target=null;
     const r=await api('/admin/package_configuration/quote','POST',choices);message('np-package-quote','Saved catalog version '+r.data.catalog_revision+': ₦'+r.data.total.toLocaleString()+'. Checkout remains unreleased.');
   }catch(err){message('np-package-quote',err.message);}finally{button.disabled=false;}
+};
+let deliverySequence=0,deliveryPage=1;
+window.npLoadPackageDeliveries=async function(page=1){
+  const node=document.getElementById('np-package-deliveries');if(!node)return;
+  const sequence=++deliverySequence;node.textContent='Loading package deliveries…';
+  try{
+    const result=await api('/admin/package_fulfillment?page='+page);
+    if(sequence!==deliverySequence||!document.getElementById('np-package-deliveries'))return;
+    if(!Array.isArray(result.entitlements))throw Error('Package delivery response is invalid');
+    deliveryPage=page;
+    node.innerHTML=result.entitlements.length?result.entitlements.map(r=>`<div class="card" style="margin:10px 0;overflow-wrap:anywhere"><p>Contract ${e(r.contract_id)}</p><p>${e(r.kind)} → ${e(r.target_stage)} · Waiting for matching verified stock</p><button class="btn" data-entitlement="${e(r.id)}" onclick="npRetryPackageDelivery(this)">Retry package delivery</button><p role="status" class="np-delivery-result"></p></div>`).join(''):'<p>No package accounts are awaiting delivery on this page.</p>';
+    node.insertAdjacentHTML('beforeend',`<div style="display:flex;gap:12px;align-items:center"><button class="btn" ${page===1?'disabled':''} onclick="npLoadPackageDeliveries(${page-1})">Previous</button><span>Page ${e(page)}</span><button class="btn" ${result.has_more?'':'disabled'} onclick="npLoadPackageDeliveries(${page+1})">Next</button></div>`);
+  }catch(err){if(sequence===deliverySequence)node.innerHTML=`<p>${e(err.message)}</p><button class="btn" onclick="npLoadPackageDeliveries(${page})">Reload package deliveries</button>`;}
+};
+window.npRetryPackageDelivery=async function(button){
+  const id=button.dataset.entitlement,node=button.parentElement.querySelector('.np-delivery-result');
+  if(!/^[a-f0-9-]{36}$/i.test(id)){node.textContent='Invalid delivery identity. Reload the list.';return;}
+  button.disabled=true;node.textContent='Checking the same delivery entitlement…';
+  try{
+    const result=await api('/admin/package_fulfillment/retry','POST',{entitlement_id:id});
+    if(result.data?.waiting){node.textContent='Still waiting for matching verified stock. No account was assigned.';}
+    else if(result.data?.account_id){node.textContent='Account delivery is recorded. Refresh the trader account list.';button.textContent='Delivery recorded';return;}
+    else throw Error('Delivery was not confirmed. Reload before retrying.');
+  }catch(err){node.textContent=err.message;}finally{if(button.textContent!=='Delivery recorded')button.disabled=false;}
+};
+// Package approval must bypass the old browser-side MT5 picker. The server
+// selects verified stock from the immutable package terms, not a displayed plan.
+const packageApprovalBusy=new Set();
+const oldApproveAndAssign=window.approveAndAssign,oldApprovePurchase=window.approvePurchase;
+const packagePurchase=id=>(typeof SESSION!=='undefined'?(SESSION.purchases||[]):[]).find(p=>String(p.id)===String(id)&&p.package_contract_id);
+window.npApprovePackagePurchase=async function(id){
+  if(packageApprovalBusy.has(id))return;
+  packageApprovalBusy.add(id);
+  try{
+    const result=await api('/approve_challenge_purchase','POST',{id});
+    if(result.data?.waiting){toast('Payment approved. Waiting for matching verified package stock.','warn');}
+    else if(result.data?.account_id){toast('Package account delivery is recorded.','ok');}
+    else throw Error('Package delivery was not confirmed. Refresh this purchase before retrying.');
+    document.querySelector('.modal-bg')?.remove();
+    if(typeof npRefreshPurchaseOperationsData==='function')await npRefreshPurchaseOperationsData(true);
+  }catch(err){toast(err.message,'err');}
+  finally{packageApprovalBusy.delete(id);}
+};
+if(typeof oldApproveAndAssign==='function')window.approveAndAssign=function(id,...args){
+  if(packagePurchase(id))return npApprovePackagePurchase(id);
+  return oldApproveAndAssign.call(this,id,...args);
+};
+if(typeof oldApprovePurchase==='function')window.approvePurchase=function(id,...args){
+  const purchase=packagePurchase(id);
+  if(!purchase)return oldApprovePurchase.call(this,id,...args);
+  if(!/^[a-f0-9-]{36}$/i.test(String(id)))return toast('Invalid purchase identity','err');
+  npShowResetModalSafe(`<h2>Approve package payment</h2><p>${e(purchase.plan_name||'Build Your Package')} · ₦${e(purchase.fee)}</p><p>Approval uses the rules saved with this purchase. Delivery waits if matching verified stock is unavailable.</p><button class="btn btn-gold" onclick="npApprovePackagePurchase('${id}')">Approve package payment</button><button class="btn" onclick="this.closest('.modal-bg').remove()">Cancel</button>`);
 };
 })();
 </script>
