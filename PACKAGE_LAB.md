@@ -23,6 +23,16 @@ This is a rule/pricing acceptance screen, NOT a production checkout test or a
 claim that the Windows fleet enforces custom rules. Customer checkout stays
 unreleased until real runtime integration and delivery/settlement checks pass.
 
+## Card preview and live pricing
+
+The builder uses a choices card plus a package summary and prominent price.
+Option prices and enable checkboxes sit behind Show owner controls. Changing a
+benefit clears the old rehearsal and requests a debounced server-priced preview;
+a response sequence guard rejects delayed prices for older selections. The
+mobile preview keeps the current price and a summary link visible while scrolling.
+Example prices are explicitly temporary, cannot be saved, and include priced
+benefits rather than zero-cost upgrades. They do not set a real commercial tariff.
+
 ## Verification
 
 - `python -m unittest discover -s tests -p 'test_package_lab.py'`
