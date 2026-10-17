@@ -84,6 +84,7 @@ function renderChoices(){
  el('mode').textContent=sample?'Example prices: temporary test only; saving is disabled. Load saved settings to configure the actual future tariff.':'Saved tariff version '+config.revision+'. Edits stay local until you press Save. New package sales remain closed.';
  el('save-note').textContent='Saving changes the future product configuration only. It does not release purchases or change an existing account.';el('save').disabled=sample;
 }
+function canonicalOption(value){const text=String(value).trim();return text!==''&&Number.isFinite(Number(text))?String(Number(text)):text;}
 function renderOptionEditors(){
  const opened=new Set([...document.querySelectorAll('#option-editors details[open]')].map(n=>n.dataset.facility));
  el('option-editors').innerHTML=facilityOrder.map(key=>`<details data-facility="${key}" ${opened.has(key)?'open':''}><summary>${e(labels[key]||key)}</summary><div class="option-rows">${config.options[key].map((row,i)=>`<div class="grid" style="margin:12px 0"><label>Choice value<input data-option-key="${key}" data-option-index="${i}" data-option-field="value" value="${e(row.value)}" ${['phases','drawdown_type'].includes(key)?'readonly':''}></label><label>${key==='capital'?'Base price ₦':'Price addition %'}<input type="number" min="0" step="0.01" data-option-key="${key}" data-option-index="${i}" data-option-field="price" value="${e(row.price??'')}"></label><label><input type="checkbox" data-option-key="${key}" data-option-index="${i}" data-option-field="enabled" ${row.enabled?'checked':''}> Active</label></div>`).join('')}</div>${['phases','drawdown_type'].includes(key)?'':`<button type="button" data-add-option="${key}">Add choice</button>`}</details>`).join('');
@@ -110,7 +111,7 @@ el('choices').addEventListener('input',event=>{if(event.target.dataset.price)inv
 el('option-editors').addEventListener('change',event=>{
  const n=event.target,key=n.dataset.optionKey;if(!key)return;
  readForm();const row=config.options[key][Number(n.dataset.optionIndex)],old=row.value,field=n.dataset.optionField;
- row[field]=field==='enabled'?n.checked:field==='price'?(n.value===''?null:Number(n.value)):n.value.trim();
+ row[field]=field==='enabled'?n.checked:field==='price'?(n.value===''?null:Number(n.value)):canonicalOption(n.value);
  if(field==='value'&&selection[key]===old)selection[key]=row.value;
  invalidate();renderChoices();
 });
@@ -118,8 +119,8 @@ el('option-editors').addEventListener('click',event=>{
  const key=event.target.dataset.addOption;if(!key)return;
  readForm();if(config.options[key].length>=30){message('Each tool supports up to 30 choices.',true);return;}
  const value=prompt('New '+(labels[key]||key)+' value. Use none for no profit cap, or unlimited for payout cycles.');if(value===null||!value.trim())return;
- if(config.options[key].some(row=>row.value===value.trim())){message('That choice already exists.',true);return;}
- config.options[key].push({value:value.trim(),price:null,enabled:false});invalidate();renderChoices();
+ if(config.options[key].some(row=>row.value===canonicalOption(value))){message('That choice already exists.',true);return;}
+ config.options[key].push({value:canonicalOption(value),price:null,enabled:false});invalidate();renderChoices();
 });
 el('start').onclick=()=>task(()=>run([]));
 el('save').onclick=()=>task(async()=>{if(sample)throw Error('Load saved settings before saving actual prices');if(config.enabled)throw Error('Use production settings to change an already released product');readForm();const d=await api('/admin/package_configuration',{revision:config.revision,enabled:false,minimum_price:config.minimum_price,options:config.options});saved=structuredClone(d.data);config=structuredClone(saved);renderChoices();invalidate();message('Prices and choices saved. New package sales remain closed.');});
