@@ -39,7 +39,7 @@ def decimal_value(value, maximum):
     try:
         amount = Decimal(str(value))
         if not amount.is_finite() or amount < 0 or amount > maximum or amount.as_tuple().exponent < -2:
-            raise ValueError('Enter a non-negative amount with at most two decimal places')
+            raise ValueError('Enter a number from 0 to ' + str(maximum) + ', with no more than two decimal places')
         return float(amount)
     except InvalidOperation:
         raise ValueError('Enter a valid number')
@@ -73,7 +73,10 @@ def validate(doc):
     if type(doc['revision']) is not int or doc['revision'] < 0 or type(doc['enabled']) is not bool:
         raise ValueError('Invalid version or release checkbox')
     doc = copy.deepcopy(doc)
-    doc['minimum_price'] = decimal_value(doc['minimum_price'], 10000000)
+    try:
+        doc['minimum_price'] = decimal_value(doc['minimum_price'], 10000000)
+    except ValueError as exc:
+        raise ValueError('Minimum purchase price: ' + str(exc)) from exc
     options = doc['options']
     if not isinstance(options, dict) or set(options) != set(CHOICES):
         raise ValueError('All package facilities must be supplied')
@@ -85,7 +88,10 @@ def validate(doc):
         for row in rows:
             if not isinstance(row, dict) or set(row) not in ({'value', 'enabled', 'price'}, {'value', 'enabled', 'price', 'price_type'}):
                 raise ValueError('Invalid choice for ' + key)
-            row['value'] = option_value(key, row['value'])
+            try:
+                row['value'] = option_value(key, row['value'])
+            except ValueError as exc:
+                raise ValueError(LABELS[key] + ' — benefit value ' + str(row['value']) + ': ' + str(exc)) from exc
             if row['value'] in seen or type(row['enabled']) is not bool:
                 raise ValueError('Duplicate or invalid option for ' + key)
             seen.add(row['value'])
@@ -94,9 +100,13 @@ def validate(doc):
                 raise ValueError('Choose fixed or percent pricing; capital uses a fixed base price')
             if 'price_type' in row:
                 row['price_type'] = mode
-            row['price'] = decimal_value(row['price'], 10000000 if mode == 'fixed' else 1000)
+            try:
+                row['price'] = decimal_value(row['price'], 10000000 if mode == 'fixed' else 1000)
+            except ValueError as exc:
+                unit = '₦ amount' if mode == 'fixed' else '% of base price'
+                raise ValueError(LABELS[key] + ' — choice ' + row['value'] + ', charge ' + str(row['price']) + ' (' + unit + '): ' + str(exc)) from exc
             if row['enabled'] and row['price'] is None:
-                raise ValueError('Set a price before enabling ' + key + ': ' + row['value'])
+                raise ValueError(LABELS[key] + ' — choice ' + row['value'] + ': enter a charge (0 means included free), or untick Active')
             if key == 'capital' and row['enabled'] and row['price'] <= 0:
                 raise ValueError('Enabled capital needs a positive base price')
     return doc
