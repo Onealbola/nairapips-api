@@ -85,7 +85,7 @@ class LabTests(unittest.TestCase):
         tail=source[source.index('# V224: private owner test page'):].split('# V225:',1)[0]
         ast.parse(tail)
         scope={'app':app,'requests':transport,'SUPABASE_URL':'https://fixture.invalid',
-               'SUPABASE_KEY':'fixture-only','_require_admin':lambda:({'role':'owner'},None),
+               'SUPABASE_SERVICE_ROLE_KEY':'private-server-fixture','SUPABASE_KEY':'fixture-only','_require_admin':lambda:({'role':'owner'},None),
                '_audit_safe':lambda *args:None,'np_invalidate':lambda *args:None}
         exec(compile(tail,'owner-lab-registration','exec'),scope)
         self.assertEqual(transport.mock_calls,[],'Registration must not start external work')

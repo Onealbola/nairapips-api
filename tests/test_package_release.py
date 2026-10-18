@@ -14,7 +14,7 @@ class ReleaseTests(unittest.TestCase):
         source=(Path(__file__).resolve().parents[1]/'app.py').read_text()
         tail=source[source.index('# V224: private owner test page'):]
         scope={'app':app,'requests':transport,'SUPABASE_URL':'https://fixture.invalid',
-               'SUPABASE_KEY':'fixture','_require_admin':lambda:({'id':'owner','role':'owner'},None),
+               'SUPABASE_SERVICE_ROLE_KEY':'private-server-fixture','SUPABASE_KEY':'fixture','_require_admin':lambda:({'id':'owner','role':'owner'},None),
                '_authenticated_trader_id_for_request':lambda _:('', 'Authentication required'),
                '_audit_safe':lambda *args:None,'np_invalidate':lambda *args:None}
         exec(compile(tail,'actual-package-registration','exec'),scope)
