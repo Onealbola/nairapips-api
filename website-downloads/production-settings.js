@@ -47,6 +47,7 @@ window.npLoadProductionSettings=async function(){
       <button class="btn" onclick="npPreviewPackageQuote(this)">Calculate saved price</button>
       <p id="np-package-quote" role="status"></p>
       <hr style="margin:24px 0"><h3>Package accounts awaiting delivery</h3><p>Approved package orders keep their purchased rules while waiting for matching verified stock.</p><div id="np-package-deliveries"></div>`;
+    refreshPackagePreview();
     npLoadPackageDeliveries(1);
   }catch(err){node.innerHTML=`<h3>Production settings unavailable</h3><p>${e(err.message)}</p><button class="btn" onclick="npLoadProductionSettings()">Retry</button>`;}
 };
@@ -77,12 +78,24 @@ window.npAddPackageOption=function(key){
   const i=rows.length,row={value:value.trim(),enabled:false,price:null};rows.push(row);
   document.getElementById('np-package-rows-'+key).insertAdjacentHTML('beforeend',choiceRow(key,row,i));
 };
+function refreshPackagePreview(){
+  const missing=[];
+  for(const [key,rows] of Object.entries(packages.data.options)){
+    const select=document.getElementById('np-package-preview-'+key);if(!select)continue;
+    const previous=select.value,active=rows.filter(r=>r.enabled);
+    select.innerHTML=active.length?active.map(r=>`<option value="${e(r.value)}">${e(r.value)}</option>`).join(''):'<option value="">No active choices — enable a benefit above</option>';
+    select.disabled=!active.length;
+    if(active.some(r=>r.value===previous))select.value=previous;
+    if(!active.length&&!(key==='phase2_target'&&!packages.data.options.phases.some(r=>r.enabled&&r.value==='two')))missing.push(packages.labels[key]||key);
+  }
+  message('np-package-quote',missing.length?'To calculate a package, enable and save at least one choice for: '+missing.join(', ')+'.':'Choose your saved benefits, then calculate the price.');
+}
 window.npSavePackageConfiguration=async function(button){
   button.disabled=true;message('np-package-message','Saving…');
   try{const data=JSON.parse(JSON.stringify(packages.data));
     for(const [key,rows] of Object.entries(data.options))for(let i=0;i<rows.length;i++){rows[i].value=document.getElementById(`np-package-${key}-${i}-value`).value.trim();rows[i].enabled=document.getElementById(`np-package-${key}-${i}-enabled`).checked;const value=document.getElementById(`np-package-${key}-${i}-price`).value;rows[i].price=value===''?null:Number(value);if(key!=='capital')rows[i].price_type=document.getElementById(`np-package-${key}-${i}-price-type`).value;}
     const minimum=document.getElementById('np-package-minimum').value;
-    const result=await api('/admin/package_configuration','POST',{revision:data.revision,enabled:document.getElementById('np-package-release').checked,minimum_price:minimum===''?null:Number(minimum),options:data.options});packages=result;message('np-package-message','Saved and confirmed. Reload settings to refresh the price-check choices.');
+    const result=await api('/admin/package_configuration','POST',{revision:data.revision,enabled:document.getElementById('np-package-release').checked,minimum_price:minimum===''?null:Number(minimum),options:data.options});packages=result;refreshPackagePreview();message('np-package-message','Saved and confirmed. Price-check choices are updated below.');
   }catch(err){message('np-package-message',err.message);}finally{button.disabled=false;}
 };
 window.npPreviewPackageQuote=async function(button){
