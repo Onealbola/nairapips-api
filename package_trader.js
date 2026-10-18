@@ -9,12 +9,21 @@ const owner=()=>String(SESSION.trader?.id||SESSION.data?.trader?.id||'');
 const key=()=>`np-package-checkout-v1:${state.owner}`;
 function status(text){const n=document.getElementById('np-package-status');if(n)n.textContent=text;}
 let priceTimer=null;
-const pretty=(key,value)=>key==='capital'?money(value):key==='phases'?(value==='one'?'One phase':'Two phases'):key==='drawdown_type'?(value==='static'?'Static':'Trailing'):key==='profit_cap'&&value==='none'?'No cap':key==='payout_cycles'&&value==='unlimited'?'Unlimited':['drawdown','phase1_target','phase2_target','profit_share','profit_cap'].includes(key)?value+'%':value;
+const pretty=(key,value)=>{
+ if(value===null||value===undefined||value==='')return 'Coming soon';
+ if(key==='capital')return money(value);
+ if(key==='phases')return value==='one'?'One phase':'Two phases';
+ if(key==='drawdown_type')return value==='static'?'Static':'Trailing';
+ if(key==='profit_cap'&&value==='none')return 'No cap';
+ if(key==='payout_cycles')return value==='unlimited'?'Unlimited':value+' cycle'+(value==='1'?'':'s');
+ if(key.endsWith('_resets'))return value==='0'?'None included':value+' included';
+ return ['drawdown','phase1_target','phase2_target','profit_share','profit_cap'].includes(key)?value+'%':value;
+};
 function describePrice(){return state.price?'Base '+money(state.price.base)+(state.price.additions.some(a=>Number(a.percent)>0||Number(a.fixed)>0)?' · '+state.price.additions.filter(a=>Number(a.percent)>0||Number(a.fixed)>0).map(a=>labels[a.facility]+': '+(a.price_type==='fixed'?money(a.fixed):a.percent+'% of base')).join(' · '):' · No paid additions'):'';}
 function updatePrice(){
  const n=document.getElementById('np-package-live-price'),detail=document.getElementById('np-package-price-note');
  if(n)n.textContent=state.price?money(state.price.total):state.pricePending?'Price coming soon':'—';
- if(detail)detail.textContent=state.price?'Price based on your selected benefits. Confirm your package before payment.':'Choose your benefits to calculate the current price.';
+ if(detail)detail.textContent=state.price?'Price based on your selected benefits. Confirm your package before payment.':state.pricePending?'Prices are being prepared. You can save your choices for launch.':'Choose your benefits to calculate the current price.';
  const breakdown=document.getElementById('np-package-price-breakdown');if(breakdown)breakdown.textContent=describePrice();
  const mobile=document.getElementById('np-package-mobile-price');if(mobile)mobile.textContent=state.price?money(state.price.total):state.pricePending?'Price coming soon':'—';
 }
