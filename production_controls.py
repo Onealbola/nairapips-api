@@ -119,7 +119,7 @@ class ControlsStore:
         row = dict(key=self.setting_key, value=value, updated_at=now, updated_by='np-config-write:' + str(uuid4()))
         try:
             if raw is None:
-                r = self.transport.post(self.url, headers=headers, json=row, timeout=(2, 4))
+                r = self.transport.post(self.url, headers=headers, json=row, timeout=(3, 12))
                 if r.status_code == 409:
                     raise Conflict('Settings were created in another session. Reload before saving.')
             else:
@@ -131,7 +131,7 @@ class ControlsStore:
                 else:
                     compare['value'] = 'eq.' + raw['value']
                 r = self.transport.patch(self.url, headers=headers,
-                    params=compare, json=row, timeout=(2, 4))
+                    params=compare, json=row, timeout=(3, 12))
             r.raise_for_status()
             rows = r.json()
             if not rows:
@@ -139,9 +139,24 @@ class ControlsStore:
         except (Conflict, ValueError):
             raise
         except Exception as exc:
-            # Never retry an ambiguous mutation or announce success without readback.
+            # Read back an ambiguous write once; never repeat the mutation.
             self.cached = None
-            raise ControlsUnavailable('Save was not confirmed. Reload to check the saved state.') from exc
+            try:
+                confirmed, _ = self.read(fresh=True)
+                if confirmed == doc:
+                    return confirmed
+            except ControlsUnavailable:
+                pass
+            response = getattr(exc, 'response', None)
+            status = getattr(response, 'status_code', None)
+            if status is not None:
+                # Never include database response text, URLs, or credentials.
+                reason = {401: 'database authentication failed',
+                          403: 'database write access was denied',
+                          400: 'the database rejected the settings'}.get(status, 'database request failed')
+                raise ControlsUnavailable('Settings were not confirmed: ' + reason +
+                                          ' (HTTP ' + str(status) + '). Keep this page open; your entries have not been cleared.') from exc
+            raise ControlsUnavailable('The database save response timed out or was interrupted, and the changes could not be verified. Keep this page open and retry Save; do not reload.') from exc
         self.cached = None
         confirmed, _ = self.read(fresh=True)
         if confirmed != doc:

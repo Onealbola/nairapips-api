@@ -53,6 +53,27 @@ class ControlsTests(unittest.TestCase):
         for path in ['/create_challenge_purchase','/create_payout','/mark_payout_paid','/monitoring_update','/create_support_ticket','/update_challenge_plan','/delete_challenge_plan']:
             self.app.add_url_rule(path,path,lambda:self.actions.append(1) or jsonify(success=True),methods=['POST','OPTIONS'])
         self.client=self.app.test_client()
+    def test_committed_write_with_lost_response_is_confirmed_without_retry(self):
+        original = self.db.post
+        def lost_response(*args, **kwargs):
+            original(*args, **kwargs)
+            raise TimeoutError()
+        self.db.post = lost_response
+        saved = self.store.save(defaults()['features'], 0, 'owner')
+        self.assertEqual(saved['revision'], 1)
+        self.assertEqual(len(self.db.writes), 1)
+
+    def test_uncommitted_timeout_does_not_claim_success_or_retry(self):
+        calls = []
+        def failed(*args, **kwargs):
+            calls.append(1)
+            raise TimeoutError()
+        self.db.post = failed
+        with self.assertRaisesRegex(ControlsUnavailable, 'do not reload'):
+            self.store.save(defaults()['features'], 0, 'owner')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.db.rows['business_settings'], [])
+
     def test_every_switch_blocks_its_registered_actions(self):
         flags=defaults()['features']
         for key,(_,_,paths) in FEATURES.items():
