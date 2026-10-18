@@ -59894,7 +59894,7 @@ app.wsgi_app = _NPAdmissionV220(app.wsgi_app,
 # V224: private owner test page, independent of customer package publication.
 from package_configuration import PackageStore as _NPLabPackageStoreV224, register_package_configuration as _NPRegisterLabConfigV224
 from package_lab import register_package_lab as _NPRegisterPackageLabV224
-_np_package_lab_store_v224 = globals().get("_np_package_store_v221") or _NPLabPackageStoreV224(requests, SUPABASE_URL, SUPABASE_KEY)
+_np_package_lab_store_v224 = globals().get("_np_package_store_v221") or _NPLabPackageStoreV224(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
 if "package_configuration" not in app.view_functions:
     _NPRegisterLabConfigV224(app, _np_package_lab_store_v224, _require_admin, _audit_safe)
 _NPRegisterPackageLabV224(app, _np_package_lab_store_v224, _require_admin)
@@ -59903,7 +59903,7 @@ _NPRegisterPackageLabV224(app, _np_package_lab_store_v224, _require_admin)
 from production_controls import ControlsStore as _NPControlsStoreV225, register_controls as _NPRegisterControlsV225
 from catalog_controls import register_catalog_controls as _NPRegisterCatalogV225
 from owner_controls import register_owner_controls as _NPRegisterOwnerPageV225
-_np_controls_store_v225 = _NPControlsStoreV225(requests, SUPABASE_URL, SUPABASE_KEY)
+_np_controls_store_v225 = _NPControlsStoreV225(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
 _NPRegisterControlsV225(app, _np_controls_store_v225, _require_admin, np_invalidate, _audit_safe)
 def _np_owner_catalog_invalidate_v225(*keys):
     np_invalidate(*keys)
@@ -59912,12 +59912,12 @@ def _np_owner_catalog_invalidate_v225(*keys):
         if isinstance(cached, dict):
             cached[field] = 0.0
 
-_NPRegisterCatalogV225(app, requests, SUPABASE_URL, SUPABASE_KEY, _require_admin, _np_owner_catalog_invalidate_v225, _audit_safe)
+_NPRegisterCatalogV225(app, requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, _require_admin, _np_owner_catalog_invalidate_v225, _audit_safe)
 _NPRegisterOwnerPageV225(app)
 
 # V226: server-priced customer packages; publication requires verified runtime consumers.
 from package_release import register_package_production as _NPRegisterProductionPackagesV226
 from package_customer import register_package_customer as _NPRegisterPackageCustomerV226
-_np_package_orders_v226 = _NPRegisterProductionPackagesV226(app, requests, SUPABASE_URL, SUPABASE_KEY,
+_np_package_orders_v226 = _NPRegisterProductionPackagesV226(app, requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY,
     _np_package_lab_store_v224, _np_controls_store_v225, _require_admin, _authenticated_trader_id_for_request, globals())
 _NPRegisterPackageCustomerV226(app)
