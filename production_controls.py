@@ -29,10 +29,10 @@ FEATURES = {
 # These are not releasable by a browser flag: they require contract, ledger and
 # deployed consumer support. Advertising an available dropdown is insufficient.
 UNRELEASED = {
-    'package_builder': 'Custom package contracts and checkout are not integrated.',
+    'package_builder': 'Package checkout requires verified account lifecycle, payout and running DD integrations before release.',
     'equity_trailing': 'The running DD fleet has not been verified for equity trailing.',
-    'included_reset_budgets': 'Purchase-scoped reset allowance ledger is not integrated.',
-    'limited_payout_cycles': 'Purchase-scoped paid-cycle limits are not integrated.',
+    'included_reset_budgets': 'The reset allowance ledger is installed; account runtime integration is not yet verified.',
+    'limited_payout_cycles': 'The paid-cycle ledger is installed; payout and renewal runtime integration is not yet verified.',
 }
 PROTECTED = ['Live MT5 collection', 'DD police on issued accounts',
              'Recorded purchase rules', 'Existing payout review and settlement',
