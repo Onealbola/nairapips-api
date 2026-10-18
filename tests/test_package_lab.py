@@ -82,7 +82,7 @@ class LabTests(unittest.TestCase):
         app.add_url_rule('/legacy-purchase',view_func=lambda:'legacy unchanged')
         transport=Mock()
         source=(Path(__file__).resolve().parents[1]/'app.py').read_text()
-        tail=source[source.index('# V224: private owner test page'):]
+        tail=source[source.index('# V224: private owner test page'):].split('# V225:',1)[0]
         ast.parse(tail)
         scope={'app':app,'requests':transport,'SUPABASE_URL':'https://fixture.invalid',
                'SUPABASE_KEY':'fixture-only','_require_admin':lambda:({'role':'owner'},None),

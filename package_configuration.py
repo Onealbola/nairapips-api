@@ -83,13 +83,18 @@ def validate(doc):
             raise ValueError('Invalid option list for ' + key)
         seen = set()
         for row in rows:
-            if not isinstance(row, dict) or set(row) != {'value', 'enabled', 'price'}:
+            if not isinstance(row, dict) or set(row) not in ({'value', 'enabled', 'price'}, {'value', 'enabled', 'price', 'price_type'}):
                 raise ValueError('Invalid choice for ' + key)
             row['value'] = option_value(key, row['value'])
             if row['value'] in seen or type(row['enabled']) is not bool:
                 raise ValueError('Duplicate or invalid option for ' + key)
             seen.add(row['value'])
-            row['price'] = decimal_value(row['price'], 10000000 if key == 'capital' else 1000)
+            mode = row.get('price_type', 'fixed' if key == 'capital' else 'percent')
+            if mode not in ('fixed', 'percent') or (key == 'capital' and mode != 'fixed'):
+                raise ValueError('Choose fixed or percent pricing; capital uses a fixed base price')
+            if 'price_type' in row:
+                row['price_type'] = mode
+            row['price'] = decimal_value(row['price'], 10000000 if mode == 'fixed' else 1000)
             if row['enabled'] and row['price'] is None:
                 raise ValueError('Set a price before enabling ' + key + ': ' + row['value'])
             if key == 'capital' and row['enabled'] and row['price'] <= 0:
@@ -118,12 +123,13 @@ def quote(config, choices):
         if key == 'capital':
             base = Decimal(str(row['price']))
         else:
-            additions.append(dict(facility=key, value=value, percent=row['price']))
+            additions.append(dict(facility=key, value=value, percent=row['price'] if row.get('price_type', 'percent') == 'percent' else 0, fixed=row['price'] if row.get('price_type') == 'fixed' else 0, price_type=row.get('price_type', 'percent')))
     rate = sum((Decimal(str(a['percent'])) for a in additions), Decimal(0))
+    fixed = sum((Decimal(str(a['fixed'])) for a in additions), Decimal(0))
     # Match the documented private builder: aggregate percentage of capital base,
     # rounded UP to the next NGN100; the minimum is an independently saved floor.
     total = max(Decimal(str(config['minimum_price'])),
-                (base * (1 + rate / 100) / 100).to_integral_value(rounding=ROUND_CEILING) * 100)
+                ((base * (1 + rate / 100) + fixed) / 100).to_integral_value(rounding=ROUND_CEILING) * 100)
     return dict(selection=selected, base=float(base), additions=additions, total=float(total),
                 currency='NGN', catalog_revision=config['revision'], checkout_available=False)
 
@@ -182,7 +188,7 @@ def register_package_configuration(app, store, require_admin, audit):
                 doc, _ = store.read(fresh=True)
             readiness = store.readiness() if store.readiness is not None else dict(ready=False, blockers=['Immutable contract checkout', 'Paid-cycle and reset entitlement ledgers', 'Verified monitoring and DD police consumers'])
             return jsonify(success=True, data=doc, labels=LABELS,
-                           price_rule='Capital base + sum of option percentages of that base; round up to NGN100, then apply the minimum price.',
+                           price_rule='Capital base + percentage additions of that base + fixed NGN additions; round up to NGN100, then apply the minimum price.',
                            release_ready=readiness['ready'],release_blockers=readiness['blockers'])
         except Conflict as exc:
             return jsonify(success=False, error=str(exc)), 409

@@ -14,6 +14,8 @@ def auth():
     return {'id':'owner','role':'owner'},None
 register_controls(app,ControlsStore(db,'https://fixture.invalid','fixture'),auth,lambda *a:None,lambda *a:None)
 register_catalog_controls(app,db,'https://fixture.invalid','fixture',auth,lambda *a:None,lambda *a:None)
+from package_configuration import PackageStore,register_package_configuration
+register_package_configuration(app,PackageStore(db,'https://fixture.invalid','fixture'),auth,lambda *a:None)
 register_owner_controls(app)
 @app.post('/staff_login')
 def login():return jsonify(success=True,token='owner-fixture')

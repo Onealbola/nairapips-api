@@ -45369,6 +45369,8 @@ def _np_auto_fulfill_exact_reset_v43(order):
 _np_assign_mt5_to_trader_v71_core = _assign_mt5_to_trader
 
 def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="MT5 assigned"):
+    if (purchase or {}).get("package_contract_id"):
+        raise RuntimeError("Package assignments require the exact immutable entitlement ledger; legacy assignment is blocked")
     actor = staff or {}
     role = str(actor.get("role") or "").strip().lower()
     username = str(actor.get("username") or actor.get("name") or "").strip().lower()
@@ -59895,5 +59897,19 @@ from catalog_controls import register_catalog_controls as _NPRegisterCatalogV225
 from owner_controls import register_owner_controls as _NPRegisterOwnerPageV225
 _np_controls_store_v225 = _NPControlsStoreV225(requests, SUPABASE_URL, SUPABASE_KEY)
 _NPRegisterControlsV225(app, _np_controls_store_v225, _require_admin, np_invalidate, _audit_safe)
-_NPRegisterCatalogV225(app, requests, SUPABASE_URL, SUPABASE_KEY, _require_admin, np_invalidate, _audit_safe)
+def _np_owner_catalog_invalidate_v225(*keys):
+    np_invalidate(*keys)
+    for name, field in (("_NP_COMMERCE_CACHE_V144", "ts"), ("_NP_PLAN_SNAPSHOT_V181", "at")):
+        cached = globals().get(name)
+        if isinstance(cached, dict):
+            cached[field] = 0.0
+
+_NPRegisterCatalogV225(app, requests, SUPABASE_URL, SUPABASE_KEY, _require_admin, _np_owner_catalog_invalidate_v225, _audit_safe)
 _NPRegisterOwnerPageV225(app)
+
+# V226: server-priced customer packages; publication requires verified runtime consumers.
+from package_release import register_package_production as _NPRegisterProductionPackagesV226
+from package_customer import register_package_customer as _NPRegisterPackageCustomerV226
+_np_package_orders_v226 = _NPRegisterProductionPackagesV226(app, requests, SUPABASE_URL, SUPABASE_KEY,
+    _np_package_lab_store_v224, _np_controls_store_v225, _require_admin, _authenticated_trader_id_for_request, globals())
+_NPRegisterPackageCustomerV226(app)

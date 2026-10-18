@@ -207,6 +207,18 @@ class PackageTests(unittest.TestCase):
         with self.assertRaises(ValueError):quote(d,choices)
         d=frozen;d['minimum_price']=27000.01
         self.assertEqual(quote(d,choices)['total'],27000.01)
+    def test_fixed_and_percentage_benefits_share_one_authoritative_formula(self):
+        d,choices=self.configured()
+        next(r for r in d['options']['profit_share'] if r['value']=='70').update(price=20,price_type='percent')
+        next(r for r in d['options']['phase_resets'] if r['value']=='0').update(price=450,price_type='fixed')
+        result=quote(d,choices)
+        self.assertEqual(result['total'],12500)
+        fixed=next(a for a in result['additions'] if a['facility']=='phase_resets')
+        self.assertEqual(fixed['fixed'],450)
+        self.assertEqual(fixed['percent'],0)
+        next(r for r in d['options']['capital'] if r['value']=='250000')['price_type']='percent'
+        with self.assertRaises(ValueError):quote(d,choices)
+
     def test_owner_can_add_real_capital_and_percentage_choices(self):
         d,choices=self.configured()
         d['options']['capital'].append(dict(value='3000000',enabled=True,price=120000))
