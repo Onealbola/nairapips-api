@@ -59,7 +59,7 @@ class PackageCheckoutTests(unittest.TestCase):
         response=self.client.post('/trader/package_price',json={'choices':self.choices,'total':1})
         self.assertEqual(response.status_code,400)
         self.ready=False
-        self.assertEqual(self.client.post('/trader/package_price',json={'choices':self.choices}).status_code,409)
+        self.assertEqual(self.client.post('/trader/package_price',json={'choices':self.choices}).status_code,200)
         self.assertFalse(self.transport.calls)
 
     def test_auth_required_on_all_customer_package_routes(self):
@@ -67,11 +67,26 @@ class PackageCheckoutTests(unittest.TestCase):
         for method,path in [('GET','/trader/package_catalog'),('GET','/trader/package_contracts'),('POST','/trader/package_quote'),('POST','/trader/package_checkout')]:
             self.assertEqual(self.client.open(path,method=method,json={}).status_code,401)
         self.assertFalse(self.transport.calls)
-    def test_unreleased_catalog_and_unverified_fleet_do_not_expose_choices(self):
+    def test_unverified_fleet_allows_building_but_blocks_order_quotes(self):
         self.ready=False
-        r=self.client.get('/trader/package_catalog');self.assertFalse(r.json['available']);self.assertEqual(r.json['options'],{})
+        r=self.client.get('/trader/package_catalog');self.assertTrue(r.json['available']);self.assertFalse(r.json['checkout_open']);self.assertTrue(r.json['options'])
         self.assertEqual(self.client.post('/trader/package_quote',json={'choices':self.choices}).status_code,409)
         self.assertFalse(self.transport.calls)
+    def test_prelaunch_building_and_initial_unpriced_choices_never_create_order_records(self):
+        self.cfg['enabled']=False
+        catalog=self.client.get('/trader/package_catalog').json
+        self.assertTrue(catalog['available']);self.assertFalse(catalog['checkout_open'])
+        self.assertEqual(self.client.post('/trader/package_price',json={'choices':self.choices}).json['price']['total'],10000)
+        self.assertEqual(self.client.post('/trader/package_quote',json={'choices':self.choices}).status_code,409)
+        self.assertEqual(self.transport.calls,[])
+        self.cfg.clear();self.cfg.update(defaults())
+        catalog=self.client.get('/trader/package_catalog').json
+        self.assertTrue(all(catalog['options'].values()))
+        response=self.client.post('/trader/package_price',json={'choices':self.choices})
+        self.assertEqual(response.status_code,200,response.json)
+        self.assertTrue(response.json['price_pending']);self.assertIsNone(response.json['price'])
+        self.assertEqual(self.transport.calls,[])
+
     def test_quote_owner_and_price_are_server_owned_and_frozen(self):
         q=self.quote();self.assertEqual(q['document']['trader_id'],self.tid);self.assertEqual(q['price'],10000)
         self.cfg['minimum_price']=99999

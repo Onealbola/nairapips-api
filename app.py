@@ -279,6 +279,8 @@ def _effective_payout_split(*values):
         print("V187 PAYOUT SPLIT REJECTED:", raw, "allowed=60,70", flush=True)
     return DEFAULT_PAYOUT_PROFIT_SHARE_PERCENT
 
+from package_account_rules import has_package_binding as _np_has_package_binding_v227, load_package_rules as _np_load_package_rules_v227, PackageContractReader as _NPPackageContractReaderV227
+
 def _np_plan_payout_split_for_account(account, trader=None, request_payload=None):
     """Resolve payout share without allowing one product to borrow another's rules.
 
@@ -287,6 +289,8 @@ def _np_plan_payout_split_for_account(account, trader=None, request_payload=None
     excluded because they can cross-contaminate historical/new products.
     """
     account = account or {}
+    if account.get("package_contract_id") or account.get("package_rules_hash"):
+        return _np_load_package_rules_v227(account, _NPPackageContractReaderV227(SUPABASE_URL, SUPABASE_KEY))["profit_share_percent"]
     purchase = {}
     exact_plan = {}
     try:
@@ -59347,6 +59351,10 @@ def _np_live_pass_proof_v214(account, snapshot, purchase, now=None):
     import math
     from datetime import datetime, timezone
     a, live, p = account or {}, snapshot or {}, purchase or {}
+    if a.get("package_contract_id") or a.get("package_rules_hash") or p.get("package_contract_id"):
+        # Package passes must reserve their exact successor entitlement atomically.
+        # Never send them through the legacy target writer or assignment picker.
+        return None
     aid, tid = str(a.get("id") or ""), str(a.get("trader_id") or "")
     stage = str(a.get("stage") or "").lower()
     if not aid or not tid or stage not in {"phase1", "phase2"}:

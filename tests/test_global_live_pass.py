@@ -16,6 +16,9 @@ class ProofTests(unittest.TestCase):
   self.live=dict(trader_account_id='a',trader_id='t',mt5_login='123',stage='phase1',account_size=500000,balance=551000,equity=551000,dd_used_percent=0,observed_at=self.now.isoformat())
   self.ns={};extract(['_np_live_pass_proof_v214'],self.ns)
  def proof(self):return self.ns['_np_live_pass_proof_v214'](self.a,self.live,self.p,self.now)
+ def test_package_pass_cannot_enter_the_legacy_writer(self):
+  self.a['package_contract_id']='package';self.assertIsNone(self.proof())
+  self.a.pop('package_contract_id');self.p['package_contract_id']='package';self.assertIsNone(self.proof())
  def test_purchase_frozen_ten_percent_overrides_old_account_fifteen(self):self.assertEqual(self.proof()['target'],10)
  def test_below_exact_target_does_not_pass(self):
   self.live['equity']=549999;self.assertIsNone(self.proof())

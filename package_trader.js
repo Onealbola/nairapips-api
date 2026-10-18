@@ -3,7 +3,7 @@
 'use strict';
 const labels={capital:'Account size',phases:'Evaluation phases',drawdown:'Maximum drawdown %',drawdown_type:'Drawdown type',phase1_target:'Phase 1 target %',phase2_target:'Phase 2 target %',profit_share:'Your profit share %',profit_cap:'Gross profit cap per funded cycle %',payout_cycles:'Paid funded cycles',phase_resets:'Included phase resets',funded_resets:'Included funded resets'};
 const facilityOrder=['capital','phases','drawdown','drawdown_type','phase1_target','phase2_target','profit_share','profit_cap','payout_cycles','phase_resets','funded_resets'];
-const state={price:null,priceSequence:0,owner:'',catalog:null,choices:{},quote:null,contracts:[],historyError:'',historyPage:1,hasMore:false,sequence:0,historySequence:0,pending:null,receipt:null,loading:false,busy:false,operation:null,lastLoad:0};
+const state={pricePending:false,price:null,priceSequence:0,owner:'',catalog:null,choices:{},quote:null,contracts:[],historyError:'',historyPage:1,hasMore:false,sequence:0,historySequence:0,pending:null,receipt:null,loading:false,busy:false,operation:null,lastLoad:0};
 const e=x=>esc(String(x??'')), money=x=>'₦'+Number(x).toLocaleString('en-NG',{minimumFractionDigits:2,maximumFractionDigits:2});
 const owner=()=>String(SESSION.trader?.id||SESSION.data?.trader?.id||'');
 const key=()=>`np-package-checkout-v1:${state.owner}`;
@@ -13,19 +13,21 @@ const pretty=(key,value)=>key==='capital'?money(value):key==='phases'?(value==='
 function describePrice(){return state.price?'Base '+money(state.price.base)+(state.price.additions.some(a=>Number(a.percent)>0||Number(a.fixed)>0)?' · '+state.price.additions.filter(a=>Number(a.percent)>0||Number(a.fixed)>0).map(a=>labels[a.facility]+': '+(a.price_type==='fixed'?money(a.fixed):a.percent+'% of base')).join(' · '):' · No paid additions'):'';}
 function updatePrice(){
  const n=document.getElementById('np-package-live-price'),detail=document.getElementById('np-package-price-note');
- if(n)n.textContent=state.price?money(state.price.total):'—';
+ if(n)n.textContent=state.price?money(state.price.total):state.pricePending?'Price coming soon':'—';
  if(detail)detail.textContent=state.price?'Price based on your selected benefits. Confirm your package before payment.':'Choose your benefits to calculate the current price.';
  const breakdown=document.getElementById('np-package-price-breakdown');if(breakdown)breakdown.textContent=describePrice();
- const mobile=document.getElementById('np-package-mobile-price');if(mobile)mobile.textContent=state.price?money(state.price.total):'—';
+ const mobile=document.getElementById('np-package-mobile-price');if(mobile)mobile.textContent=state.price?money(state.price.total):state.pricePending?'Price coming soon':'—';
 }
 function schedulePrice(){
  clearTimeout(priceTimer);const sequence=++state.priceSequence,id=state.owner;
  if(!state.catalog?.available||state.pending)return;
- state.price=null;updatePrice();
+ state.price=null;state.pricePending=false;updatePrice();
  priceTimer=setTimeout(async()=>{
   const selection=JSON.stringify(state.choices);
   try{const r=await send('/trader/package_price','POST',{choices:state.choices});
    if(id!==owner()||sequence!==state.priceSequence||selection!==JSON.stringify(state.choices))return;
+   if(r.price_pending){state.pricePending=true;state.price=null;updatePrice();return;}
+   state.pricePending=false;
    if(!r.price||!Number.isFinite(r.price.total)||r.price.total<=0)throw Error('Price was not confirmed');
    state.price=r.price;updatePrice();
   }catch(err){if(id===owner()&&sequence===state.priceSequence)status(err.message);}
@@ -47,6 +49,7 @@ function syncOwner(){
  const id=owner();if(!id)return false;if(id===state.owner)return true;
  clearTimeout(priceTimer);
  Object.assign(state,{price:null,priceSequence:state.priceSequence+1,owner:id,catalog:null,choices:{},quote:null,contracts:[],historyError:'',historyPage:1,hasMore:false,sequence:state.sequence+1,historySequence:state.historySequence+1,pending:null,receipt:null,loading:false,busy:false,operation:null,lastLoad:0});
+ try{const draft=JSON.parse(localStorage.getItem('np-package-build-v1:'+id)||sessionStorage.getItem('np-package-build-v1:'+id)||'null');if(draft&&typeof draft==='object'&&!Array.isArray(draft))state.choices=draft;}catch(_){}
  try{const saved=JSON.parse(sessionStorage.getItem(key())||'null');if(saved?.quote?.document?.trader_id===id&&saved.checkout_key)state.pending=saved;}catch(_){}
  return true;
 }
@@ -58,6 +61,8 @@ window.npPackageMaybeLoadV222=async function(force=false){
   const result=await send('/trader/package_catalog');if(owner()!==id||state.owner!==id)return;
   if(typeof result.available!=='boolean'||(result.available&&(!result.options||typeof result.options!=='object')))throw Error('Package availability returned an invalid response.');
   state.catalog=result;
+  for(const key of Object.keys(state.choices))if(!Object.hasOwn(result.options||{},key))delete state.choices[key];
+  if(result.checkout_open!==true||(state.quote&&state.quote.catalog_revision!==result.catalog_revision))state.quote=null;
   if(result.available){
    for(const [k,rows] of Object.entries(result.options))if(!rows.some(r=>r.value===state.choices[k]))state.choices[k]=rows[0]?.value||'';
    if(state.choices.phases==='one')state.choices.phase2_target=null;
@@ -84,10 +89,10 @@ function terms(doc){
 window.npRenderPackageBuilderV222=function(){
  syncOwner();const pending=state.pending, q=pending?.quote||state.quote;
  const banks=(SESSION.paymentAccounts||[]).filter(b=>String(b.status||'active').toLowerCase()==='active');
- return `<div class="card"><h2>Build Your Package</h2><p>Choose your benefits and review the price before payment. Your purchase keeps its agreed rules. Account delivery follows payment verification and matching account availability.</p>
+ return `<div class="card"><h2>Build Your Package</h2><p>Choose your benefits and see your package price. ${state.catalog?.checkout_open===true?'Your purchase keeps its agreed rules.':'You can build your package now; payment and submission open at launch.'} Account delivery follows payment verification and matching account availability.</p>
  ${state.receipt?`<p role="status">Purchase ${e(state.receipt.purchase_id)} is recorded. Open Purchase Challenge history for its current approval and assignment status.</p>`:''}
  ${pending?'<p role="alert">A submission needs confirmation. Retry the same purchase or check its history before making another purchase. After refreshing, select the payment proof file again.</p>':''}
- ${state.catalog?.available&&!pending?`<div class="builder-layout"><section class="card"><h3>Choose your benefits</h3><div class="grid">${Object.entries(state.catalog.options).sort(([a],[b])=>facilityOrder.indexOf(a)-facilityOrder.indexOf(b)).map(([k,rows])=>`<label id="np-package-choice-wrap-${k}" style="${k==='phase2_target'&&state.choices.phases==='one'?'display:none':''}">${e(labels[k])}<select class="input" id="np-package-choice-${k}" onchange="npPackageChoiceChangedV222()">${rows.map(r=>`<option value="${e(r.value)}" ${state.choices[k]===r.value?'selected':''}>${e(pretty(k,r.value))}</option>`).join('')}</select></label>`).join('')}</div></section><aside class="card summary-card"><h3>Your package</h3><div id="np-package-live-price" class="price" aria-live="polite">${state.price?e(money(state.price.total)):'—'}</div><p id="np-package-price-note">Price based on your selected benefits.</p><details><summary>Price breakdown</summary><p id="np-package-price-breakdown">${e(describePrice())}</p></details><dl>${Object.entries(state.choices).sort(([a],[b])=>facilityOrder.indexOf(a)-facilityOrder.indexOf(b)).filter(([k])=>k!=='phase2_target'||state.choices.phases==='two').map(([k,v])=>`<div class="summary-line"><dt>${e(labels[k])}</dt><dd>${e(pretty(k,v))}</dd></div>`).join('')}</dl><button class="btn btn-gold" id="np-package-quote-button" ${state.busy?'disabled':''} onclick="npRequestPackageQuoteV222(this)">Review package and payment</button></aside></div><div class="mobile-summary"><div><small>Your package price</small><strong id="np-package-mobile-price">${state.price?e(money(state.price.total)):'—'}</strong></div><button class="secondary" onclick="document.querySelector('.summary-card').scrollIntoView()">View summary</button></div>`:(!pending?'<p>New package purchases are currently closed. Your purchased contracts remain available below.</p>':'')}
+ ${state.catalog?.available&&!pending?`<div class="builder-layout"><section class="card"><h3>Choose your benefits</h3><p>Try different combinations and save your draft on this browser.</p><div class="grid">${Object.entries(state.catalog.options).sort(([a],[b])=>facilityOrder.indexOf(a)-facilityOrder.indexOf(b)).map(([k,rows])=>`<label id="np-package-choice-wrap-${k}" style="${k==='phase2_target'&&state.choices.phases==='one'?'display:none':''}">${e(labels[k])}<select class="input" id="np-package-choice-${k}" onchange="npPackageChoiceChangedV222()">${rows.map(r=>`<option value="${e(r.value)}" ${state.choices[k]===r.value?'selected':''}>${e(pretty(k,r.value))}</option>`).join('')}</select></label>`).join('')}</div></section><aside class="card summary-card"><h3>Your package</h3><div id="np-package-live-price" class="price" aria-live="polite">${state.price?e(money(state.price.total)):'—'}</div><p id="np-package-price-note">Price based on your selected benefits.</p><details><summary>Price breakdown</summary><p id="np-package-price-breakdown">${e(describePrice())}</p></details><dl>${Object.entries(state.choices).sort(([a],[b])=>facilityOrder.indexOf(a)-facilityOrder.indexOf(b)).filter(([k])=>k!=='phase2_target'||state.choices.phases==='two').map(([k,v])=>`<div class="summary-line"><dt>${e(labels[k])}</dt><dd>${e(pretty(k,v))}</dd></div>`).join('')}</dl><button class="btn btn-gold" id="np-package-quote-button" ${state.busy||state.catalog?.checkout_open!==true?'disabled':''} onclick="npRequestPackageQuoteV222(this)">${state.catalog?.checkout_open===true?'Review package and payment':'Purchases open at launch'}</button><button class="btn secondary" id="np-package-save-draft" onclick="npSavePackageDraftV226()">Save my package</button></aside></div><div class="mobile-summary"><div><small>Your package price</small><strong id="np-package-mobile-price">${state.price?e(money(state.price.total)):'—'}</strong></div><button class="secondary" onclick="document.querySelector('.summary-card').scrollIntoView()">View summary</button></div>`:(!pending?'<p>New package purchases are currently closed. Your purchased contracts remain available below.</p>':'')}
  ${q?`<div class="card" style="margin-top:16px"><h3>Review your exact package</h3>${terms(q.document)}<p>Catalog version ${e(q.catalog_revision)} · Quote expires ${e(new Date(q.expires_at).toLocaleString())}</p>
  ${banks.map(b=>`<p>${e(b.bank_name)} · ${e(b.account_name)} · ${e(b.account_number)}</p>`).join('')}
  <label style="display:block;margin:12px 0"><input id="np-package-accepted" type="checkbox"> I accept these rules and the purchase price.</label>
@@ -98,15 +103,16 @@ window.npRenderPackageBuilderV222=function(){
  ${state.historyError?`<p>${e(state.historyError)}</p><button class="btn" onclick="npRefreshPackageHistoryV222()">Retry history</button>`:state.contracts.map(c=>`<details><summary>Purchase ${e(c.purchase_id)} · ${e(new Date(c.created_at).toLocaleDateString())}</summary>${terms(c.document)}<p>Rules version ${e(c.rules_version)} · Contract ${e(c.id)}</p></details>`).join('')||'<p>No purchased package contracts on this page.</p>'}
  <div style="display:flex;gap:12px;margin-top:12px"><button class="btn" ${state.historyPage<=1?'disabled':''} onclick="npPackageHistoryPageV222(-1)">Previous</button><span>Page ${state.historyPage}</span><button class="btn" ${!state.hasMore?'disabled':''} onclick="npPackageHistoryPageV222(1)">Next</button></div></div>`;
 };
+window.npSavePackageDraftV226=function(){if(!syncOwner())return;try{localStorage.setItem('np-package-build-v1:'+state.owner,JSON.stringify(state.choices));status('Package draft saved on this browser. '+(state.catalog?.checkout_open===true?'Review the package when you are ready.':'Purchases open at launch.'));}catch(_){status('Browser storage is unavailable. Keep this page open to retain your choices.');}};
 window.npPackageChoiceChangedV222=function(){
  if(state.pending||state.operation==='checkout')return;
  for(const k of Object.keys(state.catalog.options)){const n=document.getElementById('np-package-choice-'+k);if(n)state.choices[k]=n.value;}
  if(state.choices.phases==='one')state.choices.phase2_target=null;
  else if(!state.choices.phase2_target)state.choices.phase2_target=state.catalog.options.phase2_target?.[0]?.value||'';
- state.quote=null;state.sequence++;state.price=null;repaint();schedulePrice();
+ state.quote=null;state.sequence++;state.price=null;try{localStorage.setItem('np-package-build-v1:'+state.owner,JSON.stringify(state.choices));}catch(_){}repaint();schedulePrice();
 };
 window.npRequestPackageQuoteV222=async function(button){
- if(state.pending||state.busy)return;clearTimeout(priceTimer);state.priceSequence++;state.busy=true;state.operation='quote';button.disabled=true;
+ if(state.pending||state.busy||state.catalog?.checkout_open!==true)return;clearTimeout(priceTimer);state.priceSequence++;state.busy=true;state.operation='quote';button.disabled=true;
  const id=state.owner,sequence=++state.sequence,selection=JSON.stringify(state.choices);status('Saving your package quote…');
  try{const r=await send('/trader/package_quote','POST',{choices:state.choices});if(owner()!==id||sequence!==state.sequence||selection!==JSON.stringify(state.choices))return;if(!r.quote?.id||r.quote.document?.trader_id!==id||!Array.isArray(r.quote.document?.stages))throw Error('The saved quote could not be verified.');state.quote=r.quote;state.price=r.quote.price_breakdown;repaint();}
  catch(err){if(owner()===id&&sequence===state.sequence)status(err.message);}
@@ -123,7 +129,7 @@ async function upload(file){
  }finally{clearTimeout(timer);}
 }
 window.npSubmitPackageV222=async function(button){
- if(state.busy)return;const q=state.pending?.quote||state.quote,id=state.owner;
+ if(state.busy)return;if(!state.pending&&state.catalog?.checkout_open!==true){status('You can build your package now. Purchases open at launch.');return;}const q=state.pending?.quote||state.quote,id=state.owner;
  if(!q||!document.getElementById('np-package-accepted')?.checked){status('Review and accept the package rules first.');return;}
  const file=document.getElementById('np-package-proof')?.files?.[0];
  if(!file||file.size>10*1024*1024||!['image/jpeg','image/png','image/webp','application/pdf'].includes(file.type)){status('Choose a JPG, PNG, WEBP or PDF payment proof up to 10MB.');return;}

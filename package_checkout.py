@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 from uuid import uuid4
 from flask import jsonify, request
-from package_configuration import quote
+from package_configuration import quote, CHOICES
 from package_contracts import make_contract,validate_contract,identity
 from production_controls import ControlsUnavailable
 
@@ -103,29 +103,49 @@ def register_package_checkout(app,store,config_store,controls_store,authenticate
         if not readiness['ready']:
             raise PackageOrderRejected('The new package product is not open for purchases')
         return config
+    def preview_catalog():
+        config,_=config_store.read(fresh=True)
+        # Before the owner first saves a tariff, traders can plan with the
+        # known product choices. No example prices are exposed or substituted.
+        initial=config['revision']==0 and all(r.get('price') is None for rows in config['options'].values() for r in rows)
+        options={k:[r for r in rows if initial or r['enabled']] for k,rows in config['options'].items()}
+        return config,options
     @app.get('/trader/package_catalog')
     def trader_package_catalog():
         _,error=auth()
         if error is not None:return error
         try:
-            config=open_catalog()
-            # Saved owner metadata and disabled/pre-release choices stay private.
-            return jsonify(success=True,available=True,catalog_revision=config['revision'],minimum_price=config['minimum_price'],
-              options={k:[r for r in rows if r['enabled']] for k,rows in config['options'].items()})
-        except PackageOrderRejected:return jsonify(success=True,available=False,options={})
+            config,options=preview_catalog()
+            flags,_=controls_store.read()
+            checkout_open=bool(config['enabled'] and flags['features']['challenge_sales'] and release_readiness()['ready'])
+            return jsonify(success=True,available=True,checkout_open=checkout_open,
+              catalog_revision=config['revision'],minimum_price=config['minimum_price'],options=options)
         except (ControlsUnavailable,PackageStorageError):return jsonify(success=False,error='Package availability could not be verified'),503
     @app.post('/trader/package_price')
     def trader_package_price():
         _,error=auth()
         if error is not None:return error
         try:
-            config=open_catalog();body=request.get_json(silent=True)
+            config,options=preview_catalog();body=request.get_json(silent=True)
             if not isinstance(body,dict) or set(body)!={'choices'}:raise ValueError('Submit package choices only')
-            # Selection updates are read-only: freeze a quote only when the
-            # customer proceeds, rather than inserting rows on every change.
-            priced=quote(config,body['choices'])
-            return jsonify(success=True,price=priced)
-        except PackageOrderRejected as exc:return jsonify(success=False,error=str(exc)),409
+            choices=body['choices']
+            if not isinstance(choices,dict) or set(choices)-set(CHOICES):raise ValueError('Unknown package choices')
+            selected=[]
+            for key,rows in options.items():
+                if key=='phase2_target' and choices.get('phases')=='one':
+                    if choices.get(key) not in (None,''):raise ValueError('One phase cannot include a Phase 2 target')
+                    continue
+                row=next((r for r in rows if r['value']==choices.get(key)),None)
+                if row is None:
+                    if not rows:return jsonify(success=True,price=None,price_pending=True)
+                    raise ValueError('This choice is not available: '+key)
+                selected.append(row)
+            if not config.get('minimum_price') or any(r.get('price') is None for r in selected):
+                return jsonify(success=True,price=None,price_pending=True)
+            # Pricing before launch is read-only. Order and stored quote routes
+            # independently retain the publication and runtime gates below.
+            priced=quote(config,choices)
+            return jsonify(success=True,price=priced,price_pending=False)
         except ValueError as exc:return jsonify(success=False,error=str(exc)),400
         except (ControlsUnavailable,PackageStorageError) as exc:return jsonify(success=False,error=str(exc)),503
     @app.post('/trader/package_quote')

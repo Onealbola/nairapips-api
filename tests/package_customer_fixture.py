@@ -27,6 +27,9 @@ def login():return jsonify(success=True,data={'id':tid,'auth_token':'fixture-tra
 def banks():return jsonify([{'bank_name':'Fixture bank','account_name':'Fixture account','account_number':'fixture-only','status':'active'}])
 @app.post('/upload_payment_proof')
 def upload():return jsonify(success=True,url='https://proof.invalid/fixture.png')
+@app.post('/fixture-publish')
+def publish():
+    cfg['enabled']=request.get_json()['enabled'];return jsonify(success=True)
 @app.get('/fixture-counts')
 def counts():return jsonify(quotes=len(transport.quotes),submissions=sum(1 for call in transport.calls if call[1].endswith('/rpc/np_package_checkout')))
 server=make_server('127.0.0.1',0,app);print('READY:'+str(server.server_port),flush=True);server.serve_forever()
