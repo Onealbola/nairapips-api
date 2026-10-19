@@ -4501,7 +4501,13 @@ function npExplicitAttachedReplacementAccounts(){
       child.account_status,child.status,child.lifecycle_state,child.challenge_state,
       child.archive_reason,child.breach_reason
     ].join(' ').toLowerCase();
+    // An old replacement link is history, never authority to reopen a child.
+    const ownerId=String(SESSION.data?.trader?.id||SESSION.trader?.id||'').trim();
+    if(ownerId && child.trader_id && String(child.trader_id)!==ownerId) return;
     const terminal =
+      !!child.archived_at ||
+      blob.includes('archived') || blob.includes('completed') ||
+      blob.includes('history_only') || blob.includes('history only') ||
       !!child.breached_at || !!child.breach_at ||
       !!child.mt5_access_disabled ||
       blob.includes('breach') ||
