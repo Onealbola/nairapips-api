@@ -8422,6 +8422,7 @@ function npProductMarketBlockV156(plans,key,mode='plans'){
         <div style="font-size:11px;margin-top:6px;color:var(--text-mute);line-height:1.65">
           ${esc(p.drawdown_type||'STATIC')} DD · Max ${Number(p.max_drawdown||p.total_dd||20)}%<br>
           Payout: ${esc(p.payout_frequency||'Daily')} · Split ${Number(p.payout_split||60)}%<br>
+          Funded cycles: <b>${p.payout_cycles===0?'Unlimited':(p.payout_cycles??2)}</b> · Included in this plan’s purchase fee<br>
           Account Reset: <b>Available</b>
         </div>
       </div>`;
@@ -8440,6 +8441,7 @@ function npProductMarketBlockV156(plans,key,mode='plans'){
         <div><div class="rule-label">After Phase 1</div><div class="rule-value ${route.onePhase?'gold':''}">${route.nextLabel}</div></div>
         <div><div class="rule-label">Drawdown</div><div class="rule-value">${esc(p.drawdown_type||'STATIC')} · ${(p.max_drawdown||p.total_dd||20)}%</div></div>
         <div><div class="rule-label">Payout</div><div class="rule-value">${esc(p.payout_frequency||'Daily')} · ${Number(p.payout_split||60)}%</div></div>
+        <div><div class="rule-label">Funded payout cycles</div><div class="rule-value">${p.payout_cycles===0?'Unlimited':(p.payout_cycles??2)}</div></div>
         <div><div class="rule-label">Account Reset</div><div class="rule-value">Available</div></div>
       </div>
       <button class="btn btn-gold btn-block">Select Plan →</button>
@@ -11764,7 +11766,7 @@ window.npPackageMaybeLoadV222=async function(force=false){
   for(const key of Object.keys(state.choices))if(!Object.hasOwn(result.options||{},key))delete state.choices[key];
   if(result.checkout_open!==true||(state.quote&&state.quote.catalog_revision!==result.catalog_revision))state.quote=null;
   if(result.available){
-   for(const [k,rows] of Object.entries(result.options))if(!rows.some(r=>r.value===state.choices[k]))state.choices[k]=rows[0]?.value||'';
+   for(const [k,rows] of Object.entries(result.options))if(!rows.some(r=>r.value===state.choices[k]))state.choices[k]=(k==='payout_cycles'&&rows.some(r=>r.value==='2'))?'2':(rows[0]?.value||'');
    if(state.choices.phases==='one')state.choices.phase2_target=null;
   }
   await loadHistory();

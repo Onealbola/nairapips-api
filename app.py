@@ -1238,7 +1238,7 @@ _TRADER_ACCOUNT_RESPONSE_FIELDS = {
 
 _TRADER_PURCHASE_RESPONSE_FIELDS = {
     "id", "trader_id", "trader_account_id", "plan_id", "plan_name", "product_category", "drawdown_type", "payout_frequency",
-    "phase1_target", "phase2_target", "max_drawdown", "payout_split", "reset_fee", "funded_reset_fee", "plan_snapshot_at",
+    "phase1_target", "phase2_target", "max_drawdown", "payout_split", "reset_fee", "funded_reset_fee", "plan_snapshot_at", "payout_cycles",
     "account_size", "fee", "original_fee", "discount_percent",
     "discount_amount", "final_fee", "amount_due", "payment_status",
     "status", "lifecycle_state", "stage", "phase", "active_stage",
@@ -10003,11 +10003,13 @@ def _np_plan_category_v156(value):
 
 
 def _np_plan_rule_snapshot_v156(plan):
+    from plan_cycles import cycle_limit
     plan = plan or {}
     return {
         "product_category": _np_plan_category_v156(plan.get("product_category")),
         "drawdown_type": str(plan.get("drawdown_type") or "STATIC").strip().upper(),
         "payout_frequency": str(plan.get("payout_frequency") or "Daily").strip(),
+        "payout_cycles": cycle_limit(plan.get("payout_cycles") if plan.get("payout_cycles") is not None else 2),
         "phase1_target": float(plan.get("phase1_target") or plan.get("profit_target") or 10),
         "phase2_target": float(plan.get("phase2_target") or 0),
         "max_drawdown": float(plan.get("max_drawdown") or plan.get("total_dd") or 20),
@@ -10169,6 +10171,7 @@ def plans_alias():
 @app.route("/create_challenge_plan", methods=["POST"])
 def create_plan():
     try:
+        from plan_cycles import cycle_limit
         d=request.json or {}; name=str(d.get("name","")).strip()
         if not name: return bad("Plan name is required")
         mt5_server = d.get("mt5_server") or d.get("default_server") or ""
@@ -10182,6 +10185,7 @@ def create_plan():
              "category_sort":int(d.get("category_sort") or 10),
              "drawdown_type":str(d.get("drawdown_type") or "STATIC").strip().upper(),
              "payout_frequency":str(d.get("payout_frequency") or "Daily").strip(),
+             "payout_cycles":cycle_limit(d.get("payout_cycles", 2)),
              "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":phase2_target,
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
              "challenge_journey": challenge_journey, "journey_source": "plan_create",
@@ -10202,6 +10206,7 @@ def create_plan():
 @app.route("/update_challenge_plan", methods=["POST"])
 def update_plan():
     try:
+        from plan_cycles import cycle_limit
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing plan id")
         upd={"updated_at":now_iso()}
@@ -10215,6 +10220,8 @@ def update_plan():
             upd["drawdown_type"] = str(d.get("drawdown_type") or "STATIC").strip().upper()
         if "payout_frequency" in d:
             upd["payout_frequency"] = str(d.get("payout_frequency") or "Daily").strip()
+        if "payout_cycles" in d:
+            upd["payout_cycles"] = cycle_limit(d["payout_cycles"])
         if "payout_split" in d:
             upd["payout_split"] = _effective_payout_split(d.get("payout_split"))
         # V123: Challenge Plans now use paid, admin-priced resets.
@@ -54152,6 +54159,14 @@ def _np_auto_post_payout_renewal(payout):
             return None
     except Exception:
         return None
+    try:
+        from plan_cycles import paid_cycle_decision
+        cycle = paid_cycle_decision(requests, SUPABASE_URL,
+            SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, str(p.get("id") or ""))
+        if cycle['state'] == 'completed':
+            return None
+    except Exception:
+        return None
     return _np_auto_post_payout_renewal_v102_core(payout)
 
 
@@ -55901,6 +55916,12 @@ def _np_v122_dryrun(pid):
     if not source:
         return {"ready":False,"reason":why,"payout_id":pid}
     tid = _np_v122_s(p.get("trader_id")); sid = _np_v122_s(source.get("id"))
+    from plan_cycles import paid_cycle_decision
+    cycle = paid_cycle_decision(requests, SUPABASE_URL,
+        SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, pid, complete=False)
+    if cycle['state'] == 'completed':
+        return {"ready":False,"reason":"purchased_funded_cycles_completed","payout_id":pid,
+                "paid_cycles":cycle['paid_cycles'],"cycle_limit":cycle['cycle_limit']}
     blocked = _np_v122_source_block_reason(source, p)
     if blocked:
         return {"ready":False,"reason":blocked,"payout_id":pid,"source_account_id":sid,"source_mt5":source.get("mt5_login")}
@@ -55958,6 +55979,18 @@ def _np_v122_process(pid, actor=None):
             return _np_v122_result(pid,state="blocked",reason=why)
         tid = _np_v122_s(p.get("trader_id")); sid = _np_v122_s(source.get("id"))
 
+        # New purchase cycle limits are frozen independently of today's plan.
+        from plan_cycles import paid_cycle_decision
+        cycle = paid_cycle_decision(requests, SUPABASE_URL,
+            SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, pid)
+        if cycle['state'] == 'completed':
+            try:
+                np_invalidate_admin_bootstrap("all")
+                _invalidate_trader_bootstrap_cache(tid)
+            except Exception:
+                pass
+            return _np_v122_result(pid,state="completed",reason="purchased_funded_cycles_completed",
+                paid_cycles=cycle['paid_cycles'],cycle_limit=cycle['cycle_limit'])
         blocked = _np_v122_source_block_reason(source, p)
         if blocked:
             return _np_v122_result(pid,state="blocked",reason=blocked,source_account_id=sid)

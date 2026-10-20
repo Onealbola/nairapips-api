@@ -16,7 +16,7 @@ CHOICES = {
     'phases': ['one', 'two'], 'drawdown': ['5', '10', '15', '20'],
     'drawdown_type': ['static', 'trailing'], 'phase1_target': ['5', '8', '10', '15', '20'],
     'phase2_target': ['5', '8', '10', '15', '20'], 'profit_share': ['60', '70', '80'],
-    'profit_cap': ['20', '30', '50', 'none'], 'payout_cycles': ['1', '3', '5', 'unlimited'],
+    'profit_cap': ['20', '30', '50', 'none'], 'payout_cycles': ['1', '2', '3', '4', '5', 'unlimited'],
     'phase_resets': ['0', '1', '2'], 'funded_resets': ['0', '1', '2'],
 }
 LABELS = dict(capital='Account size', phases='Evaluation phases', drawdown='Maximum drawdown %',
@@ -161,6 +161,9 @@ class PackageStore(ControlsStore):
         if body['revision'] != old['revision']:
             raise Conflict('Package settings changed in another session. Reload before saving.')
         doc = validate({**body, 'updated_at': None, 'updated_by': None})
+        for row in doc['options']['payout_cycles']:
+            if row['enabled'] and (row['value'] == 'unlimited' or int(row['value']) > 2) and not row['price']:
+                raise ValueError('Extra funded cycles (' + row['value'] + ') need a positive upfront charge')
         if doc['enabled']:
             if self.readiness is None or not self.readiness()['ready']:
                 raise Conflict('Package checkout remains locked until contracts, cycle/reset ledgers and running monitoring/DD consumers are verified.')

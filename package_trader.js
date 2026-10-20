@@ -73,7 +73,7 @@ window.npPackageMaybeLoadV222=async function(force=false){
   for(const key of Object.keys(state.choices))if(!Object.hasOwn(result.options||{},key))delete state.choices[key];
   if(result.checkout_open!==true||(state.quote&&state.quote.catalog_revision!==result.catalog_revision))state.quote=null;
   if(result.available){
-   for(const [k,rows] of Object.entries(result.options))if(!rows.some(r=>r.value===state.choices[k]))state.choices[k]=rows[0]?.value||'';
+   for(const [k,rows] of Object.entries(result.options))if(!rows.some(r=>r.value===state.choices[k]))state.choices[k]=(k==='payout_cycles'&&rows.some(r=>r.value==='2'))?'2':(rows[0]?.value||'');
    if(state.choices.phases==='one')state.choices.phase2_target=null;
   }
   await loadHistory();

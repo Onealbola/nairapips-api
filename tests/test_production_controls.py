@@ -202,8 +202,20 @@ class PackageTests(unittest.TestCase):
             for r in rows:r.update(enabled=True,price=10000 if key=='capital' else 0)
         choices=dict(capital='250000',phases='one',drawdown='20',drawdown_type='static',phase1_target='8',phase2_target=None,profit_share='70',profit_cap='none',payout_cycles='5',phase_resets='0',funded_resets='0')
         return d,choices
+    def test_extra_cycles_require_upfront_charge_but_two_can_be_included(self):
+        d,_=self.configured();d.pop('updated_at');d.pop('updated_by')
+        self.assertEqual(self.client.post('/admin/package_configuration',json=d).status_code,400)
+        for row in d['options']['payout_cycles']:
+            if row['value'] in ('3','4','5','unlimited'):row.update(price=500,price_type='fixed')
+        response=self.client.post('/admin/package_configuration',json=d)
+        self.assertEqual(response.status_code,200,response.json)
+        two=next(r for r in response.json['data']['options']['payout_cycles'] if r['value']=='2')
+        self.assertEqual(two['price'],0)
+
     def test_real_saved_configuration_survives_restart_and_does_not_release(self):
         d,_=self.configured();d.pop('updated_at');d.pop('updated_by')
+        for row in d['options']['payout_cycles']:
+            if row['value'] in ('3','4','5','unlimited'):row['price']=1
         r=self.client.post('/admin/package_configuration',json=d)
         self.assertEqual(r.status_code,200,r.json)
         restarted=PackageStore(self.db,'https://db.invalid','not-secret')
@@ -211,6 +223,8 @@ class PackageTests(unittest.TestCase):
         self.assertFalse(r.json['release_ready']);self.assertFalse(r.json['data']['enabled'])
     def test_unpriced_enabled_choice_and_unverified_launch_rejected(self):
         d,_=self.configured();d.pop('updated_at');d.pop('updated_by')
+        for row in d['options']['payout_cycles']:
+            if row['value'] in ('3','4','5','unlimited'):row['price']=1
         d['enabled']=True
         self.assertEqual(self.client.post('/admin/package_configuration',json=d).status_code,409)
         d['enabled']=False;d['options']['capital'][0]['price']=None

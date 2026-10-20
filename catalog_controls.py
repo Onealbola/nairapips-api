@@ -9,10 +9,10 @@ from flask import jsonify, request
 FIELDS = {
     'name', 'description', 'status', 'fee', 'account_size', 'phase1_target',
     'phase2_target', 'max_drawdown', 'payout_split', 'reset_fee',
-    'challenge_journey', 'drawdown_type',
+    'challenge_journey', 'drawdown_type', 'payout_cycles',
 }
 RULE_FIELDS = {'fee', 'reset_fee', 'phase1_target', 'phase2_target', 'max_drawdown', 'payout_split',
-               'account_size', 'challenge_journey', 'drawdown_type'}
+               'account_size', 'challenge_journey', 'drawdown_type', 'payout_cycles'}
 
 
 def number(value, name, minimum, maximum):
@@ -36,7 +36,7 @@ def validated_plan(current, changes):
     if changes.get('status') == 'active' and current.get('status') != 'active':
         # Releasing an inactive draft validates its actual complete rules, not
         # just the status checkbox. An old unsupported draft cannot bypass this.
-        release_fields = {k: row.get(k) for k in RULE_FIELDS if k != 'challenge_journey'}
+        release_fields = {k: row.get(k) for k in RULE_FIELDS if k not in ('challenge_journey', 'payout_cycles')}
         release_fields['reset_fee'] = row.get('reset_fee') or 0
         raw_route = row.get('challenge_journey')
         release_fields['challenge_journey'] = 'two_phase' if 'phase2' in str(raw_route).lower() or 'two' in str(raw_route).lower() or (not raw_route and float(row.get('phase2_target') or 0) > 0) else 'one_phase'
@@ -44,6 +44,9 @@ def validated_plan(current, changes):
             release_fields['phase2_target'] = 0
         validated_plan({}, release_fields)
     result = dict(changes)
+    if "payout_cycles" in changes:
+        from plan_cycles import cycle_limit
+        result["payout_cycles"] = cycle_limit(changes["payout_cycles"])
     for name, lo, hi in [('fee', .01, 10000000), ('account_size', 1, 1000000000),
                          ('phase1_target', .01, 100), ('phase2_target', 0, 100),
                          ('max_drawdown', .01, 99.99), ('reset_fee', 0, 10000000)]:

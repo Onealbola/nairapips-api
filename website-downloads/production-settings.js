@@ -28,6 +28,7 @@ window.npLoadProductionSettings=async function(){
         <label><input type="checkbox" id="np-plan-active-${i}" ${r.status==='active'?'checked':''}> Open for new purchases</label>
         <div class="grid md:grid-cols-3 gap-2" style="margin-top:12px">
           ${[['name','Product name'],['fee','Purchase fee ₦'],['account_size','Account size ₦'],['phase1_target','Phase 1 target %'],['phase2_target','Phase 2 target % (0 for one phase)'],['max_drawdown','Maximum drawdown %'],['payout_split','Trader share % (60 or 70)'],['reset_fee','Phase reset fee ₦']].map(([key,label])=>`<label>${label}${input(`np-plan-${i}-${key}`,r[key]??'',key==='name'?'maxlength="100"':'type="number" min="0" step="0.01"')}</label>`).join('')}
+          <label>Funded payout cycles<select class="input" id="np-plan-${i}-payout_cycles"><option value="" ${r.payout_cycles==null?'selected':''}>Existing terms; new purchases: 2</option>${[1,2,3,4,5,0].map(n=>`<option value="${n}" ${r.payout_cycles!=null&&Number(r.payout_cycles)===n?'selected':''}>${n===0?'Unlimited (paid option)':n+' cycle'+(n===1?'':'s')}</option>`).join('')}</select></label>
           <label>Evaluation route<select class="input" id="np-plan-${i}-challenge_journey"><option value="one_phase" ${journey(r)==='one_phase'?'selected':''}>One phase</option><option value="two_phase" ${journey(r)==='two_phase'?'selected':''}>Two phases</option></select></label>
         </div><p>Drawdown: ${e(r.drawdown_type||'STATIC')}. Current funded reset pricing remains twice the challenge fee.</p>
         <button class="btn btn-gold" onclick="npSaveProductionPlan(${i},this)">Save product</button>
@@ -61,6 +62,8 @@ window.npSaveProductionPlan=async function(i,button){
   button.disabled=true;message('np-plan-message-'+i,'Saving…');
   try{const row=catalog[i],changes={},numeric=['fee','account_size','phase1_target','phase2_target','max_drawdown','payout_split','reset_fee'];
     for(const key of ['name',...numeric,'challenge_journey']){const n=document.getElementById(`np-plan-${i}-${key}`);const baseline=key==='challenge_journey'?journey(row):String(row[key]??'');if(n.value===baseline)continue;if(numeric.includes(key)){if(!n.value.trim())throw Error('Set '+key);const value=Number(n.value);if(!Number.isFinite(value))throw Error('Enter a valid '+key);if(baseline!==''&&Number(baseline)===value)continue;changes[key]=value;}else{changes[key]=n.value;}}
+    const cycleValue=document.getElementById(`np-plan-${i}-payout_cycles`).value;
+    if(cycleValue!==String(row.payout_cycles??''))changes.payout_cycles=cycleValue===''?null:Number(cycleValue);
     const status=document.getElementById('np-plan-active-'+i).checked?'active':'inactive';if(status!==row.status)changes.status=status;
     if(!Object.keys(changes).length){message('np-plan-message-'+i,'No changes to save.');return;}
     const result=await api('/admin/production_catalog','POST',{id:row.id,updated_at:row.updated_at,changes});catalog[i]=result.plan;message('np-plan-message-'+i,'Saved. Existing purchase rules were not rewritten.');

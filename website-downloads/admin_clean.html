@@ -10959,6 +10959,12 @@ window.npFireExactPayoutRenewal = async function(payoutId, traderId){
         const s=await api('/admin/payout_renewal_v35/status?payout_id='+encodeURIComponent(pid),'GET');
         const p=s?.data||s||{};
 
+        if(p.state==='completed' || p.reason==='purchased_funded_cycles_completed'){
+          toast(`Purchased funded cycles completed (${p.paid_cycles}/${p.cycle_limit}). No further renewal is due.`,'success');
+          window.NP_PAYOUT_RENEWAL_INFLIGHT.delete(pid);
+          return;
+        }
+
         if(p.assigned || p.already_fulfilled || p.state==='fulfilled'){
           toast(
             p.mt5_login
@@ -11976,7 +11982,7 @@ function renderPlans(){
         <span class="np-market-chip">${key.toUpperCase()}</span>
       </div>
       <div style="overflow-x:auto"><table class="compact">
-        <thead><tr><th>Name</th><th>Size</th><th>Fee</th><th>Target</th><th>DD Type</th><th>Total DD</th><th>Payout</th><th>Profit Split</th><th>Phase Reset</th><th>Funded Reset</th><th>Status</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Name</th><th>Size</th><th>Fee</th><th>Target</th><th>DD Type</th><th>Total DD</th><th>Payout</th><th>Funded cycles</th><th>Profit Split</th><th>Phase Reset</th><th>Funded Reset</th><th>Status</th><th>Actions</th></tr></thead>
         <tbody>${rows.map(p=>`<tr>
           <td><b>${esc(p.name||p.plan_name||'—')}</b></td>
           <td>${esc(money(p.account_size||p.size||0))}</td>
@@ -11985,6 +11991,7 @@ function renderPlans(){
           <td>${esc(p.drawdown_type||'STATIC')}</td>
           <td>${pct(p.max_drawdown||p.total_dd||0)}</td>
           <td>${esc(p.payout_frequency||'Daily')}</td>
+          <td>${p.payout_cycles===0?'Unlimited':(p.payout_cycles??2)}</td>
           <td>${pct(Number(p.payout_split ?? 60))}</td>
           <td>${money(Number(p.reset_fee||0))}</td>
           <td>${money(Number(p.fee||p.price||0)*2)} <span class="text-xs text-gray-400">(2× fee)</span></td>
@@ -11993,7 +12000,7 @@ function renderPlans(){
             <button class="btn btn-sm" onclick='editPlan(${JSON.stringify(p.id)})'>Edit</button>
             <button class="btn btn-sm btn-red" onclick='deletePlan(${JSON.stringify(p.id)},${JSON.stringify(p.name||p.plan_name)})'>Del</button>
           </div></td>
-        </tr>`).join('')||'<tr><td colspan="12"><div class="empty">No plans in this market yet.</div></td></tr>'}</tbody>
+        </tr>`).join('')||'<tr><td colspan="13"><div class="empty">No plans in this market yet.</div></td></tr>'}</tbody>
       </table></div>
     </section>`;
   };
@@ -12055,6 +12062,7 @@ window.showCreatePlan = function(){
       <div><div class="kpi-sub">Payout Split %</div><input class="input" id="pl-split" type="number" min="0" max="100" step="0.01" placeholder="60 or 70"></div>
       <div><div class="kpi-sub">Phase Reset Price</div><input class="input" id="pl-reset-fee" type="number" min="0" step="1" placeholder="Enter exact Phase reset price"></div>
       <div><div class="kpi-sub">Funded Reset Price · AUTO 2× FEE</div><input class="input" id="pl-funded-reset-fee" type="number" min="0" step="1" readonly placeholder="Automatically double challenge fee"></div>
+      <div><div class="kpi-sub">Funded payout cycles</div><select class="select" id="pl-cycles">${[1,2,3,4,5,0].map(n=>`<option value="${n}" ${Number(2)===n?'selected':''}>${n===0?'Unlimited (paid option)':n+' cycle'+(n===1?'':'s')+(n===2?' — included default':'')}</option>`).join('')}</select><div class="text-xs text-gray-400">Two cycles included by default. For 3–5 or unlimited, set the plan fee to include the paid upgrade. Paid at purchase.</div></div>
       <div><div class="kpi-sub">Public Card Badge</div><input class="input" id="pl-public-badge" maxlength="24" placeholder="NEW, POPULAR, BEST VALUE, LIMITED"></div>
       <div style="grid-column:1 / -1"><div class="kpi-sub">Description</div><textarea class="input" id="pl-desc" rows="2"></textarea></div>
     </div>
@@ -12071,6 +12079,7 @@ window.createPlan = async function(){
     category_sort: Number(document.getElementById('pl-category-sort').value || 10),
     drawdown_type: document.getElementById('pl-drawdown-type').value,
     payout_frequency: document.getElementById('pl-payout-frequency').value,
+    payout_cycles: Number(document.getElementById('pl-cycles').value),
     account_size: Number(document.getElementById('pl-size').value),
     fee: Number(document.getElementById('pl-fee').value),
     phase1_target: Number(document.getElementById('pl-t1').value),
@@ -12115,6 +12124,7 @@ window.editPlan = function(id){
       <div><div class="kpi-sub">Payout Split %</div><input class="input" id="epl-split" type="number" min="0" max="100" step="0.01" value="${p.payout_split ?? 60}"></div>
       <div><div class="kpi-sub">Phase Reset Price</div><input class="input" id="epl-reset-fee" type="number" min="0" step="1" value="${p.reset_fee||0}"></div>
       <div><div class="kpi-sub">Funded Reset Price · AUTO 2× FEE</div><input class="input" id="epl-funded-reset-fee" type="number" min="0" step="1" readonly value="${Number(p.fee||p.price||0)*2}"></div>
+      <div><div class="kpi-sub">Funded payout cycles</div><select class="select" id="epl-cycles"><option value="" ${p.payout_cycles==null?'selected':''}>Existing terms — new purchases default to 2</option>${[1,2,3,4,5,0].map(n=>`<option value="${n}" ${Number(p.payout_cycles)===n?'selected':''}>${n===0?'Unlimited (paid option)':n+' cycle'+(n===1?'':'s')+(n===2?' — included default':'')}</option>`).join('')}</select><div class="text-xs text-gray-400">Two cycles included by default. For 3–5 or unlimited, set the plan fee to include the paid upgrade. Paid at purchase.</div></div>
       <div><div class="kpi-sub">Public Card Badge</div><input class="input" id="epl-public-badge" maxlength="24" value="${esc(p.public_badge||p.card_badge||'')}" placeholder="NEW, POPULAR, BEST VALUE, LIMITED"></div>
       <div style="grid-column:1 / -1"><div class="kpi-sub">Description</div><textarea class="input" id="epl-desc" rows="2">${esc(p.description||'')}</textarea></div>
     </div>
@@ -12132,6 +12142,7 @@ window.savePlan = async function(id){
       category_sort: Number(document.getElementById('epl-category-sort').value || 10),
       drawdown_type: document.getElementById('epl-drawdown-type').value,
       payout_frequency: document.getElementById('epl-payout-frequency').value,
+      payout_cycles: document.getElementById('epl-cycles').value===''?null:Number(document.getElementById('epl-cycles').value),
       account_size: Number(document.getElementById('epl-size').value),
       fee: Number(document.getElementById('epl-fee').value),
       phase1_target: Number(document.getElementById('epl-t1').value),
@@ -18048,6 +18059,7 @@ window.npLoadProductionSettings=async function(){
         <label><input type="checkbox" id="np-plan-active-${i}" ${r.status==='active'?'checked':''}> Open for new purchases</label>
         <div class="grid md:grid-cols-3 gap-2" style="margin-top:12px">
           ${[['name','Product name'],['fee','Purchase fee ₦'],['account_size','Account size ₦'],['phase1_target','Phase 1 target %'],['phase2_target','Phase 2 target % (0 for one phase)'],['max_drawdown','Maximum drawdown %'],['payout_split','Trader share % (60 or 70)'],['reset_fee','Phase reset fee ₦']].map(([key,label])=>`<label>${label}${input(`np-plan-${i}-${key}`,r[key]??'',key==='name'?'maxlength="100"':'type="number" min="0" step="0.01"')}</label>`).join('')}
+          <label>Funded payout cycles<select class="input" id="np-plan-${i}-payout_cycles"><option value="" ${r.payout_cycles==null?'selected':''}>Existing terms; new purchases: 2</option>${[1,2,3,4,5,0].map(n=>`<option value="${n}" ${r.payout_cycles!=null&&Number(r.payout_cycles)===n?'selected':''}>${n===0?'Unlimited (paid option)':n+' cycle'+(n===1?'':'s')}</option>`).join('')}</select></label>
           <label>Evaluation route<select class="input" id="np-plan-${i}-challenge_journey"><option value="one_phase" ${journey(r)==='one_phase'?'selected':''}>One phase</option><option value="two_phase" ${journey(r)==='two_phase'?'selected':''}>Two phases</option></select></label>
         </div><p>Drawdown: ${e(r.drawdown_type||'STATIC')}. Current funded reset pricing remains twice the challenge fee.</p>
         <button class="btn btn-gold" onclick="npSaveProductionPlan(${i},this)">Save product</button>
@@ -18081,6 +18093,8 @@ window.npSaveProductionPlan=async function(i,button){
   button.disabled=true;message('np-plan-message-'+i,'Saving…');
   try{const row=catalog[i],changes={},numeric=['fee','account_size','phase1_target','phase2_target','max_drawdown','payout_split','reset_fee'];
     for(const key of ['name',...numeric,'challenge_journey']){const n=document.getElementById(`np-plan-${i}-${key}`);const baseline=key==='challenge_journey'?journey(row):String(row[key]??'');if(n.value===baseline)continue;if(numeric.includes(key)){if(!n.value.trim())throw Error('Set '+key);const value=Number(n.value);if(!Number.isFinite(value))throw Error('Enter a valid '+key);if(baseline!==''&&Number(baseline)===value)continue;changes[key]=value;}else{changes[key]=n.value;}}
+    const cycleValue=document.getElementById(`np-plan-${i}-payout_cycles`).value;
+    if(cycleValue!==String(row.payout_cycles??''))changes.payout_cycles=cycleValue===''?null:Number(cycleValue);
     const status=document.getElementById('np-plan-active-'+i).checked?'active':'inactive';if(status!==row.status)changes.status=status;
     if(!Object.keys(changes).length){message('np-plan-message-'+i,'No changes to save.');return;}
     const result=await api('/admin/production_catalog','POST',{id:row.id,updated_at:row.updated_at,changes});catalog[i]=result.plan;message('np-plan-message-'+i,'Saved. Existing purchase rules were not rewritten.');
