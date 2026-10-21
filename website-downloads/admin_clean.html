@@ -3080,7 +3080,7 @@ window.npFastTraderSearch = function(value){
       : npBuildTraderSearchCache();
     let visible = 0;
     for(const item of cache){
-      const show = !needle || item.hay.includes(needle);
+      const show = !needle || needle.split(/\s+/).every(term=>item.hay.includes(term));
       item.card.hidden = !show;
       if(show) visible++;
     }
