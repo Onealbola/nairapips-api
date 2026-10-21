@@ -2947,7 +2947,13 @@ renderLoginForm();
 }
 }
 
+if (document.readyState === "loading") {
+document.addEventListener("DOMContentLoaded", npRestoreAdminSessionAfterBoot, {
+once: true
+});
+} else {
 setTimeout(npRestoreAdminSessionAfterBoot, 0);
+}
 
 function logout() {
 npClearAdminSession();

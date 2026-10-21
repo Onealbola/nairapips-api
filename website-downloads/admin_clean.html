@@ -3284,7 +3284,13 @@ function npRestoreAdminSessionAfterBoot(){
 
 // Critical: restore only AFTER this entire script has finished initializing.
 // The old immediate IIFE could call loadAll() before ADMIN_INFLIGHT and other consts existed.
-setTimeout(npRestoreAdminSessionAfterBoot, 0);
+// Later inline modules must exist before restoring the saved screen. A timer
+// can fire while a large HTML document is still being parsed on hard refresh.
+if(document.readyState === 'loading'){
+  document.addEventListener('DOMContentLoaded', npRestoreAdminSessionAfterBoot, {once:true});
+}else{
+  setTimeout(npRestoreAdminSessionAfterBoot, 0);
+}
 
 function logout(){
   npClearAdminSession();
