@@ -58603,7 +58603,7 @@ def _np_v198_is_live_row(row):
     return bool(str(row.get("mt5_login") or "").strip()) and status in _NP_V198_LIVE_STATUSES
 
 
-def _np_v198_overlay_latest(row, trader_id=""):
+def _np_v198_overlay_latest(row, trader_id="", batch_observations=None):
     if not isinstance(row, dict) or not _np_v198_is_live_row(row):
         return row
     out = dict(row)
@@ -58615,10 +58615,12 @@ def _np_v198_overlay_latest(row, trader_id=""):
         # It is written directly by the V3.20 DD telemetry path and contains one
         # monotonic newest row per account.  Do NOT fall back to the old
         # monitoring_snapshots table: that was the stale dashboard source.
-        if account_id and not account_id.startswith("purchase:"):
+        if batch_observations is not None:
+            snap = batch_observations.get(account_id)
+        elif account_id and not account_id.startswith("purchase:"):
             rows = _np_query_rows_v173("np_live_account_state", filters=[("eq", "trader_account_id", account_id)], limit=1)
             snap = rows[0] if rows else None
-        if not snap and login and (not account_id or account_id.startswith("purchase:")):
+        if batch_observations is None and not snap and login and (not account_id or account_id.startswith("purchase:")):
             q = supabase.table("np_live_account_state").select("*").eq("mt5_login", login)
             if trader_id:
                 q = q.eq("trader_id", trader_id)
@@ -58628,6 +58630,8 @@ def _np_v198_overlay_latest(row, trader_id=""):
         print("V198 BOOTSTRAP LIVE SNAPSHOT WARNING:", account_id, login, exc, flush=True)
         return out
     if not snap:
+        if batch_observations is not None:
+            out["latest_monitoring_snapshot"] = {}  # confirmed absence; no N+1 payout re-query
         return out
 
     out["latest_monitoring_snapshot"] = snap
@@ -58687,6 +58691,18 @@ def _np_v198_trader_bootstrap():
 
         # Cache per account so the same row repeated across bootstrap arrays causes
         # only one Supabase exact-latest query during this request.
+        from dashboard_live_batch import load_observations
+        batch_rows=[]
+        for collection in ("current_account", "active_accounts", "accounts", "all_accounts"):
+            value=root.get(collection)
+            batch_rows.extend(value if isinstance(value,list) else [value])
+        try:
+            observations=load_observations(requests,SUPABASE_URL,
+                SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY,trader_id,
+                [row for row in batch_rows if isinstance(row,dict) and _np_v198_is_live_row(row)])
+        except Exception as exc:
+            observations={}
+            print("DASHBOARD LIVE BATCH UNAVAILABLE:",type(exc).__name__,flush=True)
         cache = {}
         def overlay(row):
             if not isinstance(row, dict):
@@ -58708,7 +58724,7 @@ def _np_v198_trader_bootstrap():
                     if k in live:
                         merged[k] = live[k]
                 return merged
-            live = _np_v198_overlay_latest(row, trader_id)
+            live = _np_v198_overlay_latest(row, trader_id, observations)
             cache[key] = live
             return live
 
