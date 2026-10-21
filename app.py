@@ -10198,7 +10198,7 @@ def create_plan():
              "funded_reset_fee":(clean(d.get("fee")) * 2 if clean(d.get("fee")) else 0),
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
              "status":d.get("status","inactive"),"created_at":now_iso(),"updated_at":now_iso()}
-        result = supabase.table("challenge_plans").insert(row).execute().data
+        result = _NPRenewalRestQueryV211("challenge_plans").insert(row).execute().data
         np_invalidate("public_plans_snapshot", "plans_list", "admin_bootstrap")
         return ok(result, "Challenge plan created")
     except Exception as e: return bad(e)
@@ -10238,7 +10238,7 @@ def update_plan():
         if not _v152_fee:
             try:
                 _v152_rows = (
-                    supabase.table("challenge_plans").select("fee")
+                    _NPRenewalRestQueryV211("challenge_plans").select("fee")
                     .eq("id", pid).limit(1).execute().data or []
                 )
                 _v152_fee = clean((_v152_rows[0] if _v152_rows else {}).get("fee"))
@@ -10264,7 +10264,7 @@ def update_plan():
                 d.get("progression_route"), route_hint
             )
             upd["journey_source"] = "plan_update"
-        result = supabase.table("challenge_plans").update(upd).eq("id",pid).execute().data
+        result = _NPRenewalRestQueryV211("challenge_plans").update(upd).eq("id",pid).execute().data
         np_invalidate("public_plans_snapshot", "plans_list", "admin_bootstrap")
         return ok(result, "Challenge plan updated")
     except Exception as e: return bad(e)

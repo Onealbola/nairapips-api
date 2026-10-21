@@ -23,7 +23,9 @@ Another independently purchased account remains untouched.
   prices are retained; new unpriced choices remain inactive.
 - The purchased cycle count is snapshotted from the server plan, never the
   browser, and protected against later edits by a database trigger.
-- A sold plan's changed terms require cloning it as an inactive new version.
+- Owners can edit current standard and premium plans. The plan-edit trigger freezes
+  missing historical snapshots before applying new terms; existing purchases keep
+  their original cycle limits. Copying a plan is optional.
 - Package checkout retains its existing launch lock. This feature does not
   certify or enable the unfinished package engine integration.
 

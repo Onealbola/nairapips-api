@@ -18054,7 +18054,7 @@ window.npLoadProductionSettings=async function(){
       <p>Saved revision ${e(c.data.revision)} · Changes reach the server within ${e(c.propagation_seconds)} seconds.</p>
       <p>Always protected: ${c.protected.map(e).join(' · ')}.</p>
       </details><details><summary>Existing products: edit, pause or reopen</summary><h3>Products: available now or held for later</h3>
-      <p>Inactive products stay in production and can be opened for new sales later. Existing customers retain their purchased terms. Create a new version to change the commercial terms of a product already sold.</p>
+      <p>Inactive products stay in production and can be opened for new sales later. Existing customers retain their purchased terms. Edit current plans whenever needed. Saved changes apply to future purchases; existing purchases retain their terms.</p>
       <div>${catalog.map((r,i)=>`<div class="card" style="margin:12px 0"><h4>${e(r.name)} · ${e(r.account_size)}</h4>
         <label><input type="checkbox" id="np-plan-active-${i}" ${r.status==='active'?'checked':''}> Open for new purchases</label>
         <div class="grid md:grid-cols-3 gap-2" style="margin-top:12px">
@@ -18063,7 +18063,7 @@ window.npLoadProductionSettings=async function(){
           <label>Evaluation route<select class="input" id="np-plan-${i}-challenge_journey"><option value="one_phase" ${journey(r)==='one_phase'?'selected':''}>One phase</option><option value="two_phase" ${journey(r)==='two_phase'?'selected':''}>Two phases</option></select></label>
         </div><p>Drawdown: ${e(r.drawdown_type||'STATIC')}. Current funded reset pricing remains twice the challenge fee.</p>
         <button class="btn btn-gold" onclick="npSaveProductionPlan(${i},this)">Save product</button>
-        <button class="btn" onclick="npCloneProductionPlan(${i},this)">Create new inactive version</button>
+        <button class="btn" onclick="npCloneProductionPlan(${i},this)">Copy as inactive product</button>
         <p id="np-plan-message-${i}" role="status"></p></div>`).join('')}</div>
       </details><hr style="margin:24px 0"><h3 id="np-package-pricing-section">Package prices & benefits</h3>
       <p>Every choice has its own editable price and active status. Enter 0 for an included benefit. Leave future choices inactive. Saving changes future quotes and preserves existing purchase terms.</p>

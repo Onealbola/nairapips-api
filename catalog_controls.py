@@ -1,7 +1,7 @@
 """Validated owner plan editing against real production plan rows.
 
-Commercial rule changes require complete purchase snapshots for that plan.
-Old purchases are never silently migrated to new terms.
+A database trigger freezes missing old purchase snapshots atomically on edit.
+Owners can edit current plans; existing customers retain their purchased terms.
 """
 from decimal import Decimal, InvalidOperation
 from flask import jsonify, request
@@ -141,12 +141,7 @@ def register_catalog_controls(app, transport, url, key, require_admin, invalidat
             if current.get('updated_at') != body['updated_at']:
                 return jsonify(success=False, error='Plan changed in another session. Reload before editing.'), 409
             changes = validated_plan(current, body['changes'])
-            changed_rules = {k for k in changes if not same_value(k, changes[k], current.get(k))} & RULE_FIELDS
-            if changed_rules:
-                purchases = read('challenge_purchases', {'select': 'id',
-                                 'plan_id': 'eq.' + str(body['id']), 'limit': '1001'})
-                if purchases:
-                    return jsonify(success=False, error='Earlier purchases rely on this plan’s original rules. Create a separate plan for the new terms.'), 409
+            # np_preserve_sold_plan_terms freezes historical snapshots atomically.
             if 'fee' in changes:
                 # Current funded-reset rule is explicitly twice current fee.
                 changes['funded_reset_fee'] = round(changes['fee'] * 2, 2)
@@ -231,13 +226,20 @@ def register_catalog_controls(app, transport, url, key, require_admin, invalidat
                     validated_plan(current, changes)
             else:
                 changes = {'delete': True}
-            # The legacy handler rewrites additional rule columns even for a status-only edit.
-            # Sold plans must use the new narrow Settings endpoint.
-            if current:
+            # Editing is supported for sold products; deleting their history is not.
+            if current and request.path == '/delete_challenge_plan':
                 purchases = read('challenge_purchases', {'select': 'id', 'plan_id': 'eq.' + str(body['id']), 'limit': '1'})
                 if purchases:
-                    return jsonify(success=False, error='This product has purchase history. Use Settings to pause/reopen sales or create a new inactive version for changed terms.'), 409
+                    return jsonify(success=False, error='This product has purchase history and cannot be deleted. Pause new purchases instead.'), 409
         except ValueError as exc:
             return jsonify(success=False, error=str(exc)), 400
         except Exception:
             return jsonify(success=False, error='Plan safety checks could not be completed. Please retry.'), 503
+
+    @app.after_request
+    def refresh_saved_plan_catalog(response):
+        if request.method == 'POST' and request.path in {'/create_challenge_plan', '/update_challenge_plan'} and 200 <= response.status_code < 300:
+            data = response.get_json(silent=True)
+            if isinstance(data, dict) and data.get('success') is True:
+                invalidate('public_plans_snapshot', 'plans_list', 'admin_bootstrap')
+        return response

@@ -163,30 +163,37 @@ class ControlsTests(unittest.TestCase):
         r=self.client.post('/admin/production_catalog',json={'id':'p','updated_at':r.json['plan']['updated_at'],'changes':{'status':'active'}})
         self.assertEqual(r.status_code,200,r.json)
         self.assertEqual(self.db.rows['challenge_purchases'],old)
-    def test_sold_rules_cannot_be_changed_create_new_inactive_version(self):
-        self.db.rows['challenge_purchases']=[{'id':'old','plan_id':'p'}]
-        for field in ['fee','phase1_target','payout_split']:
-            value=70 if field=='payout_split' else 15
-            r=self.client.post('/admin/production_catalog',json={'id':'p','updated_at':'v1','changes':{field:value}})
-            self.assertEqual(r.status_code,409,r.json)
-        r=self.client.post('/admin/production_catalog/clone',json={'id':'p','name':'Next product'})
+    def test_sold_plan_can_be_edited_for_future_buyers_without_purchase_writes(self):
+        self.db.rows['challenge_purchases']=[{'id':'old','plan_id':'p','max_drawdown':10}]
+        before=copy.deepcopy(self.db.rows['challenge_purchases'])
+        r=self.client.post('/admin/production_catalog',json={'id':'p','updated_at':'v1','changes':{'max_drawdown':20,'payout_cycles':3}})
         self.assertEqual(r.status_code,200,r.json)
-        clone=self.db.rows['challenge_plans'][-1]
-        self.assertNotEqual(clone['id'],'p');self.assertEqual(clone['status'],'inactive')
-        self.assertEqual(self.db.rows['challenge_plans'][0]['fee'],20000)
+        self.assertEqual(self.db.rows['challenge_plans'][0]['max_drawdown'],20)
+        self.assertEqual(self.db.rows['challenge_plans'][0]['payout_cycles'],3)
+        self.assertEqual(self.db.rows['challenge_purchases'],before)
         self.assertTrue(all(table=='challenge_plans' for table,_ in self.db.writes))
+
+    def test_both_standard_and_premium_sold_plans_allow_owner_edits(self):
+        for category in ('standard','premium'):
+            self.setUp()
+            self.db.rows['challenge_plans'][0]['product_category']=category
+            self.db.rows['challenge_purchases']=[{'id':'old','plan_id':'p','max_drawdown':10}]
+            response=self.client.post('/admin/production_catalog',json={'id':'p','updated_at':'v1','changes':{'max_drawdown':20}})
+            self.assertEqual(response.status_code,200,response.json)
+            self.assertEqual(self.db.rows['challenge_plans'][0]['max_drawdown'],20)
+
     def test_plan_validation_rejects_unsupported_trailing_nan_and_conflicting_routes(self):
         for changes in [{'drawdown_type':'TRAILING'},{'payout_split':80},{'fee':'NaN'},{'max_drawdown':0},{'phase2_target':8},{'fee':True}]:
             r=self.client.post('/admin/production_catalog',json={'id':'p','updated_at':'v1','changes':changes})
             self.assertEqual(r.status_code,400,r.json)
         self.assertFalse(self.db.writes)
-    def test_old_editor_cannot_bypass_owner_and_sold_product_protection(self):
+    def test_old_editor_retains_owner_gate_and_protects_sold_plan_deletion(self):
         self.role=None
         self.assertEqual(self.client.post('/update_challenge_plan',json={'id':'p','fee':1}).status_code,401)
         self.role='owner';self.db.rows['challenge_purchases']=[{'id':'old','plan_id':'p'}]
-        self.assertEqual(self.client.post('/update_challenge_plan',json={'id':'p','fee':1}).status_code,409)
+        self.assertEqual(self.client.post('/update_challenge_plan',json={'id':'p','fee':1}).status_code,200)
         self.assertEqual(self.client.post('/delete_challenge_plan',json={'id':'p'}).status_code,409)
-        self.assertFalse(self.actions)
+        self.assertEqual(self.actions,[1])
 
     def test_new_unsold_product_saves_zero_second_phase_and_real_fee(self):
         r=self.client.post('/admin/production_catalog',json={'id':'p','updated_at':'v1','changes':{'fee':25000,'phase2_target':0,'reset_fee':0}})
@@ -271,6 +278,34 @@ class PackageTests(unittest.TestCase):
 
 
 class LegacyPlanCreationTests(unittest.TestCase):
+    def test_real_plan_update_uses_bounded_rest_transport_and_accepts_dd_change(self):
+        import ast
+        from pathlib import Path
+        from types import SimpleNamespace
+        from flask import request
+        node=next(n for n in ast.parse(Path('app.py').read_bytes()).body if isinstance(n,ast.FunctionDef) and n.name=='update_plan')
+        node.decorator_list=[];writes=[]
+        class Query:
+            def __init__(self,table):self.table=table;self.body=None
+            def select(self,*args):return self
+            def eq(self,*args):return self
+            def limit(self,*args):return self
+            def update(self,body):self.body=body;return self
+            def execute(self):
+                if self.body is not None:writes.append((self.table,self.body))
+                return SimpleNamespace(data=[self.body or {'fee':20000}])
+        scope=dict(request=request,clean=lambda x:float(x or 0),now_iso=lambda:'now',
+                   _NPRenewalRestQueryV211=Query,supabase=object(),
+                   _journey_source_value=lambda *v:next(x for x in v if x),
+                   np_invalidate=lambda *a:None,ok=lambda data,message:dict(success=True),
+                   bad=lambda error:dict(success=False,error=str(error)))
+        exec(compile(ast.Module(body=[node],type_ignores=[]),'isolated-plan-edit','exec'),scope)
+        with Flask(__name__).test_request_context(json={'id':'fixture-plan','max_drawdown':20}):
+            response=scope['update_plan']()
+        self.assertTrue(response['success'],response)
+        self.assertEqual(len(writes),1);self.assertEqual(writes[0][0],'challenge_plans')
+        self.assertEqual(writes[0][1]['max_drawdown'],20)
+
     def test_real_legacy_create_preserves_one_phase_zero_and_starts_unreleased(self):
         import ast
         from pathlib import Path
@@ -286,7 +321,7 @@ class LegacyPlanCreationTests(unittest.TestCase):
                    _np_plan_category_v156=lambda v:v or 'standard',
                    _journey_source_value=lambda *v:next(x for x in v if x),
                    _effective_payout_split=lambda v:v or 60,
-                   supabase=SimpleNamespace(table=lambda table:Query()),np_invalidate=lambda *a:None,
+                   _NPRenewalRestQueryV211=lambda table:Query(),np_invalidate=lambda *a:None,
                    ok=lambda data,message:dict(success=True,data=data),bad=lambda error:dict(success=False,error=str(error)))
         exec(compile(ast.Module(body=[node],type_ignores=[]),'app.py','exec'),scope)
         app=Flask(__name__)

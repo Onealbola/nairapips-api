@@ -9,3 +9,5 @@ Trader: **Business → Build Your Package**. This uses the preferred black-and-g
 Before launch, the purchase button says **Purchases open at launch** and is disabled. The backend independently rejects new order quotes and submissions. Previewing or saving a draft creates no payment, purchase, broker account or payout. Existing purchase history remains available during a sales pause.
 
 Package sales remain closed until the owner launches the product and engine readiness checks pass. Copying these HTML files does not deploy Windows VPS workers or verify engine integration.
+
+Current standard and premium plans can be edited directly. Plan changes apply to new purchases. The backend preserves historical purchase terms automatically; copying a product is optional.
