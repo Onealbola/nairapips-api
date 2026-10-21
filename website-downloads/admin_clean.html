@@ -3751,7 +3751,7 @@ function admAccountBreachAuthority(a,t){
 function admComputedAbsoluteDd(a){
   a=a||{};
   const start=Number(a.start_balance||a.initial_balance||a.account_size||0);
-  const equity=Number(a.current_equity||a.equity||a.current_balance||a.balance||start);
+  const equity=Number(a.current_equity??a.equity??a.current_balance??a.balance??start);
   if(start>0 && Number.isFinite(equity)) return Math.max(0,((start-equity)/start)*100);
   return Math.max(0,Number(a.absolute_drawdown_percent||0),Number(a.drawdown_percent||0));
 }
@@ -4296,6 +4296,7 @@ function setMod(name){
     return;
   }
   SESSION.currentMod = name;
+  if(['accounts','funded'].includes(name) && (!SESSION.accountMetricsLoadedAt || Date.now()-SESSION.accountMetricsLoadedAt>30000))admRefreshAccountMetrics();
   document.querySelectorAll('.nav').forEach(b => b.classList.toggle('active', b.getAttribute('data-mod') === name));
   const fullModules = new Set(['traders','purchases','payouts','accounts','mt5pool','funded','breached','phase2','phaseAssign','recovery','revenue','announcements','offers','timeline','staff','support','affiliates','leads']);
   SESSION.moduleLoaded = SESSION.moduleLoaded || {};
@@ -4465,7 +4466,7 @@ async function loadHeavyModuleData(name){
       SESSION.fastTraderRowsCount=Number(fast.trader_count);
     }
   }else if(['accounts','funded','breached','phase2','timeline'].includes(name)){
-    const r = await api('/trader_accounts?limit=5000');
+    const r = await api('/admin/account_state');
     SESSION.traderAccounts = Array.isArray(r)?r:(r.accounts||r.data||r.trader_accounts||[]);
     if(['funded','breached','phase2'].includes(name)){
       SESSION.traders = (SESSION.traders||[]).map(t=>{
@@ -9778,8 +9779,20 @@ function admAccountMatchesFilter(a, filter){
   return true;
 }
 
+function admCurrentAccountRows(rows){
+  const unique=new Map();
+  for(const a of rows||[]){
+    if(admAccountLifecycle(a)!=='live'||(a.archived_at&&!a.live_monitoring_registered))continue;
+    const key=[a.trader_id,a.mt5_server,a.mt5_login||a.id].join('|');
+    const old=unique.get(key);
+    if(!old||(a.live_monitoring_registered&&!old.live_monitoring_registered)||
+      (!!a.live_monitoring_registered===!!old.live_monitoring_registered&&Date.parse(a.created_at||0)>Date.parse(old.created_at||0)))unique.set(key,a);
+  }
+  return [...unique.values()];
+}
 function admAccountFilterCount(rows, filter){
-  return (rows || []).filter(a => admAccountMatchesFilter(a, filter)).length;
+  const source=['assigned','phase1','phase2','funded'].includes(filter)?admCurrentAccountRows(rows):rows;
+  return (source||[]).filter(a=>admAccountMatchesFilter(a,filter)).length;
 }
 
 function admAccountAssignedTs(a){
@@ -9808,35 +9821,58 @@ function admWeekStart(d){
   return x;
 }
 function admAccountDateRange(filter){
-  const now=new Date();
-  const todayStart=admDayStart(now);
-  const todayEnd=admDayEnd(now);
-
-  if(filter==='today') return [todayStart.getTime(), todayEnd.getTime()];
-
-  if(filter==='yesterday'){
-    const y=new Date(todayStart);
-    y.setDate(y.getDate()-1);
-    return [admDayStart(y).getTime(), admDayEnd(y).getTime()];
+  // Assignment cohorts use Nigerian business dates, independent of the device timezone.
+  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Africa/Lagos',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());
+  const part=k=>parts.find(p=>p.type===k).value;
+  const key=part('year')+'-'+part('month')+'-'+part('day');
+  const today=new Date(key+'T00:00:00+01:00').getTime(), day=86400000, end=today+day-1;
+  if(filter==='today')return [today,end];
+  if(filter==='yesterday')return [today-day,today-1];
+  if(filter==='week')return [today-((new Date(key+'T12:00:00Z').getUTCDay()+6)%7)*day,end];
+  if(filter==='last7')return [today-6*day,end];
+  if(filter==='last14')return [today-13*day,end];
+  if(filter==='month')return [new Date(key.slice(0,7)+'-01T00:00:00+01:00').getTime(),end];
+  if(filter==='custom'){
+    const from=window.ACCT_DATE_FROM||'',to=window.ACCT_DATE_TO||'';
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(from)||!/^\d{4}-\d{2}-\d{2}$/.test(to)||from>to)return [NaN,NaN];
+    return [Date.parse(from+'T00:00:00+01:00'),Date.parse(to+'T00:00:00+01:00')+day-1];
   }
-
-  if(filter==='week'){
-    return [admWeekStart(now).getTime(), todayEnd.getTime()];
-  }
-
-  if(filter==='last7'){
-    const s=new Date(todayStart);
-    s.setDate(s.getDate()-6);
-    return [s.getTime(), todayEnd.getTime()];
-  }
-
-  if(filter==='month'){
-    const s=new Date(now.getFullYear(),now.getMonth(),1,0,0,0,0);
-    return [s.getTime(), todayEnd.getTime()];
-  }
-
-  return [Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY];
+  return [-Infinity,Infinity];
 }
+function admAccountDateControls(){
+  const filters=[['all','All Time'],['today','Today'],['yesterday','Yesterday'],['week','This Week'],['last7','Last 7 Days'],['last14','Last 2 Weeks'],['month','This Month'],['custom','Choose Dates']];
+  return `<div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0;align-items:center"><span class="muted">MT5 assigned date · Nigeria time</span>${filters.map(([key,label])=>`<button class="btn btn-sm ${(window.ACCT_DATE_FILTER||'all')===key?'btn-gold':'btn-ghost'}" onclick="ACCT_DATE_FILTER='${key}';admRenderAccountView()">${label}</button>`).join('')}<label>From <input type="date" value="${esc(window.ACCT_DATE_FROM||'')}" onchange="ACCT_DATE_FROM=this.value;ACCT_DATE_FILTER='custom';admRenderAccountView()"></label><label>To <input type="date" value="${esc(window.ACCT_DATE_TO||'')}" onchange="ACCT_DATE_TO=this.value;ACCT_DATE_FILTER='custom';admRenderAccountView()"></label></div>`;
+}
+function admRenderAccountView(){if(SESSION.currentMod==='funded')renderFunded();else renderAccounts();}
+function admLiveMetrics(a){
+  const snap=a.latest_monitoring_snapshot||{};
+  const observed=a.live_monitor_update_at||snap.observed_at;
+  const age=(Date.now()-Date.parse(observed))/1000;
+  const known=['live','stale'].includes(a.live_data_status)&&Number.isFinite(age)&&age>=-60;
+  const equity=known?Number(a.current_equity):NaN;
+  const start=Number(a.start_balance||a.account_size||0);
+  const valid=known&&Number.isFinite(equity)&&equity>=0;
+  return {known:valid,fresh:valid&&age<=180,equity:valid?equity:null,profit:valid?equity-start:null,observed,
+    label:valid?(age<=180?'Live':'Stale update'):(a.live_data_status==='unavailable'?'Feed unavailable':'Awaiting update')};
+}
+async function admRefreshAccountMetrics(){
+  if(!SESSION.token||SESSION.accountMetricsLoading)return;
+  SESSION.accountMetricsLoading=true;
+  try{
+    const response=await api('/admin/account_state');
+    const rows=Array.isArray(response)?response:(response.accounts||response.data||response.trader_accounts);
+    if(!Array.isArray(rows))throw new Error('Invalid account response');
+    SESSION.traderAccounts=rows;SESSION.accountMetricsError='';SESSION.accountMetricsLoadedAt=Date.now();
+  }catch(error){
+    SESSION.accountMetricsError='Account updates are delayed. Displaying the last received data.';
+  }finally{
+    SESSION.accountMetricsLoading=false;
+    if(['accounts','funded'].includes(SESSION.currentMod))admRenderAccountView();
+  }
+}
+setInterval(()=>{
+  if(!document.hidden&&['accounts','funded'].includes(SESSION.currentMod))admRefreshAccountMetrics();
+},30000);
 
 function admAccountMatchesDate(a, filter){
   if(!filter || filter==='all') return true;
@@ -9847,7 +9883,8 @@ function admAccountMatchesDate(a, filter){
 }
 
 function admAccountDateCount(rows, dateFilter, stageFilter){
-  return (rows||[]).filter(a=>
+  const source=['assigned','phase1','phase2','funded'].includes(stageFilter)?admCurrentAccountRows(rows):rows;
+  return (source||[]).filter(a=>
     admAccountMatchesFilter(a,stageFilter||'all') &&
     admAccountMatchesDate(a,dateFilter)
   ).length;
@@ -9859,7 +9896,8 @@ function renderAccounts(){
   const dateFilter = window.ACCT_DATE_FILTER || 'all';
   const search = (window.acctSearch||'').toLowerCase().trim();
 
-  const filtered = allRows.filter(a => {
+  const displayRows=['assigned','phase1','phase2','funded'].includes(filter)?admCurrentAccountRows(allRows):allRows;
+  const filtered = displayRows.filter(a => {
     if(!admAccountMatchesFilter(a, filter)) return false;
     if(!admAccountMatchesDate(a, dateFilter)) return false;
 
@@ -9898,6 +9936,7 @@ function renderAccounts(){
     {k:'yesterday', label:'Yesterday'},
     {k:'week', label:'This Week'},
     {k:'last7', label:'Last 7 Days'},
+    {k:'last14', label:'Last 2 Weeks'},
     {k:'month', label:'This Month'},
   ];
 
@@ -9932,26 +9971,19 @@ function renderAccounts(){
         `).join('')}
       </div>
 
-      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.06)">
-        <span style="font-size:10px;font-weight:900;letter-spacing:.1em;text-transform:uppercase;color:var(--t3);margin-right:2px">MT5 Assigned Date</span>
-        ${dateFilters.map(f=>{
-          const count=admAccountDateCount(allRows,f.k,filter);
-          const active=dateFilter===f.k;
-          return `<button onclick="ACCT_DATE_FILTER='${f.k}';renderAccounts();" style="display:inline-flex;align-items:center;gap:7px;padding:7px 11px;border-radius:9px;font-size:12px;font-weight:800;cursor:pointer;border:1px solid ${active?'rgba(212,175,55,.85)':'rgba(255,255,255,.08)'};background:${active?'rgba(212,175,55,.16)':'rgba(255,255,255,.02)'};color:${active?'#f7c948':'var(--t2)'}">
-            <span>${esc(f.label)}</span>
-            <span style="min-width:20px;padding:1px 6px;border-radius:999px;background:${active?'rgba(212,175,55,.22)':'rgba(255,255,255,.06)'};font-size:10px;text-align:center">${count}</span>
-          </button>`;
-        }).join('')}
-      </div>
+      ${admAccountDateControls()}
+      <button class="btn btn-sm btn-gold" onclick="admRefreshAccountMetrics()">Refresh live data</button>
+      <span class="muted">${esc(SESSION.accountMetricsError||'Refreshes every 30 seconds. Missing telemetry is shown as unavailable.')}</span>
     </div>
 
     <div class="card tab-content"><div style="overflow-x:auto"><table class="compact">
       <thead><tr><th>Trader</th><th>Stage</th><th>Status</th><th>MT5</th><th>Size</th><th>Equity</th><th>P&L</th><th>DD</th><th>Risk Zone</th><th>MT5 Assigned</th><th>Updated</th></tr></thead>
       <tbody>${filtered.length ? filtered.slice(0,500).map(a=>{
-        const t=SESSION.traders.find(x=>String(x.id)===String(a.trader_id));
+        const t=SESSION.traders.find(x=>String(x.id)===String(a.trader_id)) || {name:a.trader_name};
         const start=Number(a.start_balance||a.account_size||0);
-        const eq=Number(a.current_equity||a.current_balance||start);
-        const profit=eq-start;
+        const live=admLiveMetrics(a), isCurrent=admAccountLifecycle(a)==='live';
+        const eq=isCurrent?live.equity:Number(a.current_equity??a.current_balance??start);
+        const profit=eq===null?null:eq-start;
         const dd=admDdUsagePercent(a,t||{});
         const ddLimit=100;
         const zone=admRiskZone(a,t||{});
@@ -9961,12 +9993,12 @@ function renderAccounts(){
           <td class="text-xs">${esc(a.account_status||'—')}</td>
           <td style="color:var(--gold);font-weight:700;font-family:monospace">${esc(a.mt5_login||'—')}</td>
           <td>${esc(money(a.account_size||0))}</td>
-          <td style="font-weight:700">${esc(money(eq))}</td>
-          <td style="color:${profit>=0?'#22c55e':'#dc2626'};font-weight:900">${profit>=0?'+':''}${esc(money(profit))}</td>
-          <td><span style="color:${dd>=ddLimit*0.7?'#dc2626':dd>=ddLimit*0.5?'#eab308':'#22c55e'};font-weight:700">${pct(dd)}</span></td>
-          <td>${admRiskPill(zone)}</td>
+          <td style="font-weight:700">${eq===null?'—':esc(money(eq))}</td>
+          <td style="color:${profit>=0?'#22c55e':'#dc2626'};font-weight:900">${profit===null?'—':(profit>=0?'+':'')+esc(money(profit))}</td>
+          <td><span style="color:${dd>=ddLimit*0.7?'#dc2626':dd>=ddLimit*0.5?'#eab308':'#22c55e'};font-weight:700">${isCurrent&&!live.known?'—':pct(dd)}</span></td>
+          <td>${isCurrent&&!live.known?'UNVERIFIED':admRiskPill(zone)}</td>
           <td class="text-xs" style="white-space:nowrap">${esc(admAssignedDateTime(a,t))}</td>
-          <td class="text-xs">${esc(String(a.updated_at||'').slice(0,10))}</td>
+          <td class="text-xs">${esc(isCurrent?live.label:'Historical')}<div>${esc(live.observed?new Date(live.observed).toLocaleString('en-GB',{timeZone:'Africa/Lagos'}):'No broker observation')}</div></td>
         </tr>`;
       }).join('') : '<tr><td colspan="11"><div class="empty">No accounts match this status/date filter.</div></td></tr>'}</tbody>
     </table></div></div>
@@ -9980,6 +10012,7 @@ function admAccountRowAsTrader(a){
   const trader = (SESSION.traders || []).find(t => String(t.id) === String(a && a.trader_id)) || {};
   return Object.assign({}, trader, {
     id: trader.id || (a && a.trader_id),
+    name: trader.name || (a && a.trader_name),
     current_account: a || {},
     _account_row_authority: true
   });
@@ -9997,7 +10030,7 @@ function admTraderMatchesModuleFilter(t, filter){
 function admAccountModuleList(filter){
   const seen = new Set();
   const keyOf = a => String((a && a.id) || (a && a.mt5_login) || '').trim();
-  return (SESSION.traderAccounts || [])
+  return (filter==='funded'?admCurrentAccountRows(SESSION.traderAccounts):SESSION.traderAccounts||[])
     .filter(a => admAccountMatchesFilter(a, filter))
     .filter(a => {
       const k = keyOf(a);
@@ -10008,52 +10041,27 @@ function admAccountModuleList(filter){
     .map(a => admAccountRowAsTrader(a));
 }
 function renderFunded(){
-  const list = admAccountModuleList('funded');
-  // Compute REAL current P&L from equity vs start_balance
-  let totCap=0, totEq=0, totProfit=0, atRisk=0;
-  list.forEach(t=>{
-    const a=t.current_account||{};
-    const start = Number(a.start_balance||a.account_size||0);
-    const eq = Number(a.current_equity||a.current_balance||start);
-    const dd = admDdUsagePercent(a,t);
-    const ddLimit = 100;
-    totCap += start;
-    totEq += eq;
-    totProfit += (eq - start);
-    if(dd >= ddLimit*0.5) atRisk++;
-  });
-  const peakTotal = list.reduce((a,t)=>a+Number(t.current_account?.highest_equity||0),0);
-  document.getElementById('content').innerHTML = `
-    <div class="vault mb-6 tab-content">
-      <div class="flex items-center justify-between flex-wrap gap-3">
-        <div>
-          <div class="badge">FUNDED / LIVE</div>
-          <div style="font-size:28px;font-weight:900;margin-top:6px">${list.length} funded account${list.length===1?'':'s'}</div>
-        </div>
-      </div>
+  const list=admAccountModuleList('funded').filter(t=>admAccountMatchesDate(t.current_account,window.ACCT_DATE_FILTER||'all'));
+  const rows=list.map(t=>({t,a:t.current_account,m:admLiveMetrics(t.current_account)}));
+  const fresh=rows.filter(x=>x.m.fresh);
+  const sum=key=>fresh.reduce((total,x)=>total+x.m[key],0);
+  const capital=rows.reduce((total,x)=>total+Number(x.a.account_size||x.a.start_balance||0),0);
+  document.getElementById('content').innerHTML=`
+    <div class="vault mb-6 tab-content"><div class="badge">FUNDED / LIVE</div><h2>${list.length} funded accounts</h2>
+      ${admAccountDateControls()}
+      <button class="btn btn-gold" onclick="admRefreshAccountMetrics()">Refresh live data</button>
+      <p class="muted">${esc(SESSION.accountMetricsError||'Refreshes every 30 seconds. Dates filter accounts by assignment date; figures show their latest trading state.')}</p>
+      <p>${fresh.length} live · ${rows.filter(x=>x.m.known&&!x.m.fresh).length} stale · ${rows.filter(x=>!x.m.known).length} awaiting updates. Totals below include only fresh observations, except allocated capital.</p>
     </div>
-    <div class="grid md:grid-cols-5 gap-3 mb-6 tab-content">
-      ${kpi('Total Capital', money(totCap))}
-      ${kpi('Current Equity', money(totEq))}
-      ${kpi('Floating P&L', money(totProfit), totProfit>=0?'On track':'⚠ Negative')}
-      ${kpi('Peak Equity', money(peakTotal))}
-      ${kpi('At Risk', atRisk+' / '+list.length, atRisk>0?'⚠ Needs review':'All safe')}
+    <div class="grid md:grid-cols-4 gap-3 mb-6 tab-content">
+      ${kpi('Allocated Capital',money(capital))}
+      ${kpi('Live Equity',fresh.length?money(sum('equity')):'—',fresh.length+' verified accounts')}
+      ${kpi('Live Account P&L',fresh.length?money(sum('profit')):'—','Equity minus starting capital; not business revenue')}
+      ${kpi('Needs Data Review',String(rows.length-fresh.length),'Stale or unavailable observations')}
     </div>
-    <div class="card tab-content"><div style="overflow-x:auto"><table class="compact">
-      <thead><tr><th>Trader</th><th>MT5</th><th>Account Size</th><th>Current Equity</th><th>Total Profit</th><th>Profit %</th><th>DD Used</th><th>Highest Equity</th><th>Payout Eligible</th></tr></thead>
-      <tbody>${list.length?list.map(t=>{const a=t.current_account||{};const start=Number(a.start_balance||a.account_size||0);const eq=Number(a.current_equity||a.current_balance||start);const profit=eq-start;const profitPct=start?(profit/start)*100:0;const dd=admDdUsagePercent(a,t);const ddLimit=100;const ddRem=admDdRemainingPercent(a,t);const peak=Number(a.highest_equity||eq);const eligible=profitPct>=5&&dd<ddLimit*0.5;return `<tr>
-        <td><div style="font-weight:700">${esc(t.name||t.email||'—')}</div><div class="text-xs" style="color:#9ca3af">${esc(t.email||'')}</div></td>
-        <td style="color:var(--gold);font-family:monospace;font-weight:700">${esc(a.mt5_login||'—')}</td>
-        <td>${esc(money(a.account_size||start))}</td>
-        <td style="font-weight:700">${esc(money(eq))}</td>
-        <td style="color:${profit>=0?'#22c55e':'#dc2626'};font-weight:900">${profit>=0?'+':''}${esc(money(profit))}</td>
-        <td style="color:${profit>=0?'#22c55e':'#dc2626'};font-weight:700">${profit>=0?'+':''}${pct(profitPct)}</td>
-        <td><span style="color:${dd>=ddLimit*0.7?'#dc2626':dd>=ddLimit*0.5?'#eab308':'#22c55e'};font-weight:700">${pct(dd)}</span><div class="text-xs" style="color:#9ca3af">${pct(ddRem)} left</div></td>
-        <td style="font-weight:700;color:#22c55e">${esc(money(peak))}</td>
-        <td>${eligible?'<span class="pill pill-green">✓ Eligible</span>':'<span class="pill pill-gray">Not yet</span>'}</td>
-      </tr>`;}).join(''):'<tr><td colspan="12"><div class="empty">None.</div></td></tr>'}</tbody>
-    </table></div></div>
-  `;
+    <div class="card tab-content"><div style="overflow-x:auto"><table class="compact"><thead><tr><th>Trader</th><th>MT5</th><th>Account Size</th><th>Current Equity</th><th>Account P&L</th><th>DD Used</th><th>Data Status</th><th>Last Broker Update</th><th>MT5 Assigned</th></tr></thead><tbody>
+    ${rows.map(({t,a,m})=>`<tr><td>${esc(t.name||t.email||a.trader_name||'—')}</td><td>${esc(a.mt5_login||'—')}</td><td>${esc(money(a.account_size||0))}</td><td>${m.known?esc(money(m.equity)):'—'}</td><td>${m.known?esc(money(m.profit)):'—'}</td><td>${m.known?pct(admDdUsagePercent(a,t)):'—'}</td><td>${esc(m.label)}</td><td>${esc(m.observed?new Date(m.observed).toLocaleString('en-GB',{timeZone:'Africa/Lagos'}):'No broker observation')}</td><td>${esc(admAssignedDateTime(a,t))}</td></tr>`).join('')||'<tr><td colspan="9">No funded accounts in this assignment-date range.</td></tr>'}
+    </tbody></table></div></div>`;
 }
 
 /* ============================================================================

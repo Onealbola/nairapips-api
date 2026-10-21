@@ -58988,6 +58988,16 @@ def _np_v204_live_refresh_response(resp):
     data = response.get_json(silent=True)
     if not isinstance(data, dict):
         return response
+    # Admin compatibility responses repeat rows under data/accounts/trader_accounts.
+    # Decorate every alias in batches; the browser prefers accounts over data.
+    if isinstance(data.get("data"), list):
+        from admin_account_live import overlay_account_lists
+        data = overlay_account_lists(data, requests, SUPABASE_URL,
+            SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, _np_v198_is_live_row)
+        response.set_data(json.dumps(data, default=str))
+        response.content_type = "application/json"
+        response.headers["Cache-Control"] = "no-store"
+        return response
     root = data.get("data", data)
     trader = root.get("trader", {}) if isinstance(root, dict) else {}
     cache = {}
@@ -59970,3 +59980,8 @@ from package_customer import register_package_customer as _NPRegisterPackageCust
 _np_package_orders_v226 = _NPRegisterProductionPackagesV226(app, requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY,
     _np_package_lab_store_v224, _np_controls_store_v225, _require_admin, _authenticated_trader_id_for_request, globals())
 _NPRegisterPackageCustomerV226(app)
+
+# Complete Admin fleet and exact-account broker telemetry; read-only.
+from admin_account_live import register_admin_account_state as _np_register_admin_account_state
+_np_register_admin_account_state(app, requests, SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, _require_admin, _np_v198_is_live_row)
