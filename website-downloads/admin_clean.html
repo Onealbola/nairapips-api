@@ -4466,7 +4466,12 @@ async function loadHeavyModuleData(name){
       SESSION.fastTraderRowsCount=Number(fast.trader_count);
     }
   }else if(['accounts','funded','breached','phase2','timeline'].includes(name)){
-    const r = await api('/admin/account_state');
+    let r;
+    if(['accounts','funded'].includes(name)){
+      await admRefreshAccountMetrics();
+      if(SESSION.accountMetricsError)throw new Error(SESSION.accountMetricsError);
+      r={accounts:SESSION.traderAccounts};
+    }else{r=await api('/trader_accounts?limit=5000');}
     SESSION.traderAccounts = Array.isArray(r)?r:(r.accounts||r.data||r.trader_accounts||[]);
     if(['funded','breached','phase2'].includes(name)){
       SESSION.traders = (SESSION.traders||[]).map(t=>{
@@ -9855,8 +9860,11 @@ function admLiveMetrics(a){
   return {known:valid,fresh:valid&&age<=180,equity:valid?equity:null,profit:valid?equity-start:null,observed,
     label:valid?(age<=180?'Live':'Stale update'):(a.live_data_status==='unavailable'?'Feed unavailable':'Awaiting update')};
 }
-async function admRefreshAccountMetrics(){
-  if(!SESSION.token||SESSION.accountMetricsLoading)return;
+let npAccountMetricsPromise=null;
+function admRefreshAccountMetrics(){
+  if(!SESSION.token)return Promise.resolve();
+  if(npAccountMetricsPromise)return npAccountMetricsPromise;
+  npAccountMetricsPromise=(async()=>{
   SESSION.accountMetricsLoading=true;
   try{
     const response=await api('/admin/account_state');
@@ -9869,6 +9877,8 @@ async function admRefreshAccountMetrics(){
     SESSION.accountMetricsLoading=false;
     if(['accounts','funded'].includes(SESSION.currentMod))admRenderAccountView();
   }
+  })().finally(()=>{npAccountMetricsPromise=null;});
+  return npAccountMetricsPromise;
 }
 setInterval(()=>{
   if(!document.hidden&&['accounts','funded'].includes(SESSION.currentMod))admRefreshAccountMetrics();
@@ -9941,7 +9951,7 @@ function renderAccounts(){
   ];
 
   const activeFilter = filters.find(f => f.k === filter) || filters[0];
-  const activeDate = dateFilters.find(f => f.k === dateFilter) || dateFilters[0];
+  const activeDate = dateFilter==='custom'?{label:(window.ACCT_DATE_FROM||'Choose start')+' to '+(window.ACCT_DATE_TO||'Choose end')}:dateFilters.find(f=>f.k===dateFilter)||dateFilters[0];
 
   document.getElementById('content').innerHTML = `
     <div class="tab-content" style="background:linear-gradient(135deg,rgba(212,175,55,.06),rgba(212,175,55,.02));border:1px solid rgba(212,175,55,.25);border-radius:18px;padding:20px 24px;margin-bottom:20px">

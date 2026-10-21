@@ -4070,7 +4070,16 @@ if (Number.isFinite(Number(fast?.trader_count)) && Number(fast.trader_count) >= 
 SESSION.fastTraderRowsCount = Number(fast.trader_count);
 }
 } else if ([ "accounts", "funded", "breached", "phase2", "timeline" ].includes(name)) {
-const r = await api("/admin/account_state");
+let r;
+if ([ "accounts", "funded" ].includes(name)) {
+await admRefreshAccountMetrics();
+if (SESSION.accountMetricsError) throw new Error(SESSION.accountMetricsError);
+r = {
+accounts: SESSION.traderAccounts
+};
+} else {
+r = await api("/trader_accounts?limit=5000");
+}
 SESSION.traderAccounts = Array.isArray(r) ? r : r.accounts || r.data || r.trader_accounts || [];
 if ([ "funded", "breached", "phase2" ].includes(name)) {
 SESSION.traders = (SESSION.traders || []).map(t => {
@@ -8441,8 +8450,12 @@ label: valid ? age <= 180 ? "Live" : "Stale update" : a.live_data_status === "un
 };
 }
 
-async function admRefreshAccountMetrics() {
-if (!SESSION.token || SESSION.accountMetricsLoading) return;
+let npAccountMetricsPromise = null;
+
+function admRefreshAccountMetrics() {
+if (!SESSION.token) return Promise.resolve();
+if (npAccountMetricsPromise) return npAccountMetricsPromise;
+npAccountMetricsPromise = (async () => {
 SESSION.accountMetricsLoading = true;
 try {
 const response = await api("/admin/account_state");
@@ -8457,6 +8470,10 @@ SESSION.accountMetricsError = "Account updates are delayed. Displaying the last 
 SESSION.accountMetricsLoading = false;
 if ([ "accounts", "funded" ].includes(SESSION.currentMod)) admRenderAccountView();
 }
+})().finally(() => {
+npAccountMetricsPromise = null;
+});
+return npAccountMetricsPromise;
 }
 
 setInterval(() => {
@@ -8562,7 +8579,9 @@ k: "month",
 label: "This Month"
 } ];
 const activeFilter = filters.find(f => f.k === filter) || filters[0];
-const activeDate = dateFilters.find(f => f.k === dateFilter) || dateFilters[0];
+const activeDate = dateFilter === "custom" ? {
+label: (window.ACCT_DATE_FROM || "Choose start") + " to " + (window.ACCT_DATE_TO || "Choose end")
+} : dateFilters.find(f => f.k === dateFilter) || dateFilters[0];
 document.getElementById("content").innerHTML = `\n    <div class="tab-content" style="background:linear-gradient(135deg,rgba(212,175,55,.06),rgba(212,175,55,.02));border:1px solid rgba(212,175,55,.25);border-radius:18px;padding:20px 24px;margin-bottom:20px">\n      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:14px">\n        <div>\n          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">\n            <span class="badge" style="background:rgba(212,175,55,.18);border-color:rgba(212,175,55,.5)">📂 TRADER ACCOUNTS</span>\n            <span style="font-size:11px;color:var(--t3);font-weight:700;letter-spacing:.1em;text-transform:uppercase">Showing ${filtered.length} of ${allRows.length}</span>\n            <span style="font-size:10px;color:#f7c948;font-weight:900;letter-spacing:.08em;text-transform:uppercase">ASSIGNED · ${esc(activeDate.label)}</span>\n          </div>\n          <div style="font-size:20px;font-weight:900;color:#fff">${activeFilter.label} <span style="color:var(--t3);font-weight:700;font-size:14px">· ${filtered.length} ${filtered.length === 1 ? "account" : "accounts"}</span></div>\n        </div>\n        <div style="display:flex;gap:8px;align-items:center">\n          <div style="position:relative">\n            <input id="acct-search" type="text" placeholder="🔍 Search MT5 / name / ref..." value="${esc(window.acctSearch || "")}" style="background:rgba(0,0,0,.4);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:8px 14px;color:#fff;font-size:13px;width:240px;outline:none" oninput="window.acctSearch=this.value;npDebouncedRender('_acctSearchTimer',()=>{renderAccounts();npKeepTypingFocus('acct-search');});">\n          </div>\n          ${filter !== "all" || dateFilter !== "all" ? `<button class="btn btn-ghost btn-sm" onclick="ACCT_FILTER='all';ACCT_DATE_FILTER='all';renderAccounts();">✕ Clear</button>` : ""}\n        </div>\n      </div>\n\n      <div style="display:flex;gap:8px;flex-wrap:wrap;padding-top:14px;border-top:1px solid rgba(255,255,255,.06)">\n        ${filters.map(f => `\n          <button onclick="ACCT_FILTER='${f.k}';renderAccounts();" style="display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;border:1.5px solid ${filter === f.k ? f.color : "rgba(255,255,255,.08)"};background:${filter === f.k ? f.color + "22" : "rgba(255,255,255,.02)"};color:${filter === f.k ? f.color : "var(--t2)"};transition:all .15s ease" onmouseover="this.style.borderColor='${f.color}'" onmouseout="this.style.borderColor='${filter === f.k ? f.color : "rgba(255,255,255,.08)"}'">\n            <span style="width:22px;height:22px;border-radius:6px;background:${f.color}33;color:${f.color};display:grid;place-items:center;font-size:11px;font-weight:900">${f.count}</span>\n            <span>${f.label.replace(/^[^\w]+/, "").trim()}</span>\n          </button>\n        `).join("")}\n      </div>\n\n      ${admAccountDateControls()}\n      <button class="btn btn-sm btn-gold" onclick="admRefreshAccountMetrics()">Refresh live data</button>\n      <span class="muted">${esc(SESSION.accountMetricsError || "Refreshes every 30 seconds. Missing telemetry is shown as unavailable.")}</span>\n    </div>\n\n    <div class="card tab-content"><div style="overflow-x:auto"><table class="compact">\n      <thead><tr><th>Trader</th><th>Stage</th><th>Status</th><th>MT5</th><th>Size</th><th>Equity</th><th>P&L</th><th>DD</th><th>Risk Zone</th><th>MT5 Assigned</th><th>Updated</th></tr></thead>\n      <tbody>${filtered.length ? filtered.slice(0, 500).map(a => {
 const t = SESSION.traders.find(x => String(x.id) === String(a.trader_id)) || {
 name: a.trader_name
