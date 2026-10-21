@@ -2,7 +2,7 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
 (async()=>{
  const b=await chromium.launch({executablePath:'/usr/bin/chromium',headless:true,args:['--no-sandbox']});
  try{
-  const p=await b.newPage();await p.setContent('<div id="content"><div class="trader-card" data-trader-search="abdullah olamide abass ibnabass103@gmail.com 81906199"></div><div class="trader-card" data-trader-search="other customer"></div></div><span id="np-trader-visible-count"></span>');
+  const p=await b.newPage();await p.setContent('<div id="content"><div class="trader-card" data-trader-search="abdullah olamide abass ibnabass103@gmail.com 81906199">Trader match</div><div class="trader-card" data-trader-search="other customer">Other trader</div></div><span id="np-trader-visible-count"></span>');
   await p.evaluate(()=>window.TF={q:''});
   const html=fs.readFileSync(__dirname+'/../website-downloads/admin_clean.html','utf8');const start=html.indexOf('let __npTraderSearchTimer = 0;'),end=html.indexOf('window.MT5_PLAN_FILTER',start);
   await p.addScriptTag({content:html.slice(start,end)});
