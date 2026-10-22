@@ -8695,14 +8695,27 @@ function npBuyerRender(catalog, cycles=2){
   select.innerHTML=(catalog.cycle_options||[]).map(o=>`<option value="${o.cycles}" ${o.available?'':'disabled'}>${o.cycles===0?'Unlimited':o.cycles+' cycle'+(o.cycles===1?'':'s')}${!o.available?' — Not available':o.extra>0?' — +'+fmt.money(o.extra):o.cycles===2?' — included default':' — no extra cost'}</option>`).join('');
   select.value=String(cycles);
   NP_BUYER_CHECKOUT.ready=true;
-  select.disabled=false;
+  const toggle=document.getElementById('pur-cycle-toggle');
+  toggle.checked=Number(cycles)!==2; toggle.disabled=false;
+  document.getElementById('pur-cycle-options').hidden=!toggle.checked;
+  select.disabled=!toggle.checked;
   document.getElementById('pur-file').disabled=false;
   document.getElementById('pur-submit').disabled=false;
+  npBuyerCycleChanged();
+}
+function npBuyerToggleCycles(){
+  const state=NP_BUYER_CHECKOUT, toggle=document.getElementById('pur-cycle-toggle');
+  if(!state?.ready || state.busy || state.element!==document.getElementById('pur-cycles')) return;
+  const select=state.element;
+  document.getElementById('pur-cycle-options').hidden=!toggle.checked;
+  select.disabled=!toggle.checked;
+  if(!toggle.checked) select.value='2';
   npBuyerCycleChanged();
 }
 function npBuyerCycleChanged(){
   const state=NP_BUYER_CHECKOUT, select=document.getElementById('pur-cycles');
   if(!state || !state.ready || select!==state.element) return;
+  if(!document.getElementById('pur-cycle-toggle').checked) select.value='2';
   const option=state.catalog.cycle_options.find(o=>String(o.cycles)===select.value && o.available);
   if(!option) return;
   state.plan={...state.catalog,payout_cycles:option.cycles,payout_cycle_extra:option.extra,fee:option.fee};
@@ -8710,6 +8723,7 @@ function npBuyerCycleChanged(){
   clearTimeout(PROMO_QUOTE_TIMER);
   document.getElementById('pur-base-display').textContent=fmt.money(state.plan.base_fee);
   document.getElementById('pur-extra-display').textContent=fmt.money(option.extra);
+  document.getElementById('pur-extra-row').style.display=option.extra>0?'flex':'none';
   resetPurchaseQuoteDisplay(state.plan);
   document.getElementById('promo-result').textContent='';
   if(document.getElementById('pur-promo').value.trim()) applyPromoQuote(state.plan.id);
@@ -8720,7 +8734,7 @@ async function npBuyerLoad(planId, token){
     if(token!==NP_BUYER_CHECKOUT_SEQ || !document.getElementById('pur-cycles') || NP_BUYER_CHECKOUT.element!==document.getElementById('pur-cycles')) return;
     if(!result?.success) throw Error(result?.error||'Could not load current cycle prices');
     npBuyerRender(result.data);
-    document.getElementById('pur-price-status').textContent='Choose your funded payout cycles. Extra cost is added to the base fee.';
+    document.getElementById('pur-price-status').textContent='';
   }catch(e){
     if(token===NP_BUYER_CHECKOUT_SEQ && NP_BUYER_CHECKOUT?.element===document.getElementById('pur-cycles')) document.getElementById('pur-price-status').textContent=(e.message||'Prices unavailable')+'. Close and reopen to retry.';
   }
@@ -8738,13 +8752,13 @@ function purchasePlan(planId, privateOfferCode=''){
   showModal(`
     <button onclick="this.closest('.modal-bg').remove()" style="position:absolute;top:10px;right:14px;background:0;border:0;color:#fff;font-size:24px;cursor:pointer">&times;</button>
     <div class="np-product-market-chip" style="display:inline-block;margin-bottom:8px">${npProductCategoryV156(p).toUpperCase()}</div><h2>${esc(p.name||p.plan_name||'Plan')}</h2>
-    <div class="field-label">Funded payout cycles</div>
-    <select class="input" id="pur-cycles" disabled onchange="npBuyerCycleChanged()"><option>Loading current prices…</option></select>
+    <label style="display:flex;align-items:center;gap:8px;font-size:12px;margin:8px 0;cursor:pointer"><input type="checkbox" id="pur-cycle-toggle" disabled onchange="npBuyerToggleCycles()" style="width:14px;height:14px;margin:0;accent-color:var(--gold)"> Change payout cycles (2 included)</label>
+    <div id="pur-cycle-options" hidden><select class="input" id="pur-cycles" disabled aria-label="Funded payout cycles" onchange="npBuyerCycleChanged()"><option>Loading current prices…</option></select></div>
     <div id="pur-price-status" style="font-size:12px;margin-bottom:12px">Verifying current prices before payment…</div>
     <div style="background:rgba(212,175,55,.05);padding:14px;border-radius:10px;margin-bottom:14px">
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-mute);font-size:11px">Account Size</span><span style="font-weight:900;color:var(--gold);font-size:18px">${fmt.money(p.account_size||p.size||0)}</span></div>
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span>Base plan fee</span><b id="pur-base-display">—</b></div>
-      <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span>Payout-cycle extra</span><b id="pur-extra-display">—</b></div>
+      <div id="pur-extra-row" style="display:none;justify-content:space-between;margin-bottom:6px"><span>Payout-cycle extra</span><b id="pur-extra-display">—</b></div>
       <div id="pur-fee-row" style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-mute);font-size:11px">Total before discounts</span><span id="pur-fee-display" style="font-weight:900">Verifying…</span></div>
       <div id="pur-discount-row" style="display:none;justify-content:space-between;margin-bottom:6px"><span style="color:var(--green);font-size:11px;font-weight:800">Private Offer</span><span id="pur-discount-display" style="font-weight:900;color:var(--green)"></span></div>
       <div id="pur-amount-row" style="display:none;justify-content:space-between;margin-bottom:8px;padding-top:7px;border-top:1px solid rgba(34,197,94,.28)"><span style="color:#fff;font-size:11px;font-weight:900">AMOUNT TO PAY</span><span id="pur-amount-display" style="font-weight:950;color:var(--gold);font-size:18px"></span></div>
@@ -8929,7 +8943,7 @@ async function submitPurchase(planId){
   if(checkoutState.busy) return;
   checkoutState.busy=true;
   let purchasePromo=null;
-  document.getElementById('pur-cycles').disabled=true; promoInput.disabled=true;
+  document.getElementById('pur-cycles').disabled=true; document.getElementById('pur-cycle-toggle').disabled=true; promoInput.disabled=true;
   const displayedFinal=Number(PROMO_QUOTE?.valid ? PROMO_QUOTE.final_fee : p.fee);
   ++PROMO_QUOTE_SEQ; clearTimeout(PROMO_QUOTE_TIMER);
   sessionStorage.setItem(idemKey,String(Date.now()));
@@ -9066,7 +9080,7 @@ async function submitPurchase(planId){
     },900);
 
   }catch(e){
-    if(NP_BUYER_CHECKOUT===checkoutState && checkoutState.element===document.getElementById('pur-cycles')){ checkoutState.busy=false; document.getElementById('pur-cycles').disabled=false; promoInput.disabled=false; }
+    if(NP_BUYER_CHECKOUT===checkoutState && checkoutState.element===document.getElementById('pur-cycles')){ checkoutState.busy=false; document.getElementById('pur-cycle-toggle').disabled=false; document.getElementById('pur-cycles').disabled=!document.getElementById('pur-cycle-toggle').checked; promoInput.disabled=false; }
     sessionStorage.removeItem(idemKey);
     const message=e?.name==='AbortError'
       ? 'Payment proof upload timed out. Please try again.'

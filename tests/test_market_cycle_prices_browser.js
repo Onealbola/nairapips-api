@@ -36,13 +36,19 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
   await page.evaluate(()=>document.getElementById('cards').innerHTML=npProductMarketBlockV156(SESSION.plansList,'standard','purchase')+npProductMarketBlockV156(SESSION.plansList,'premium','purchase'));
   const purchaseCards=await page.locator('#cards').innerText();
   assert(!purchaseCards.includes('cycle'));assert(!purchaseCards.includes('Base '));
-  const open=async id=>{await page.evaluate(id=>purchasePlan(id),id);await page.waitForFunction(()=>!document.getElementById('pur-cycles').disabled);};
+  const open=async id=>{await page.evaluate(id=>purchasePlan(id),id);await page.waitForFunction(()=>!document.getElementById('pur-submit').disabled);};
   await open('s');assert.equal(await page.locator('#pur-cycles').inputValue(),'2');
   assert((await page.locator('#pur-amount-display').innerText()).includes('20,000'));
+  assert(!await page.locator('#pur-cycle-toggle').isChecked());assert(!await page.locator('#pur-cycles').isVisible());
   assert(await page.locator('#pur-cycles option[value="0"]').isDisabled());
+  await page.locator('#pur-cycle-toggle').check();assert(await page.locator('#pur-cycles').isVisible());
   await page.selectOption('#pur-cycles','3');assert((await page.locator('#pur-extra-display').innerText()).includes('5,000'));assert((await page.locator('#pur-amount-display').innerText()).includes('25,000'));
+  await page.locator('#pur-cycle-toggle').uncheck();
+  assert.equal(await page.locator('#pur-cycles').inputValue(),'2');assert(!await page.locator('#pur-cycles').isVisible());
+  assert((await page.locator('#pur-amount-display').innerText()).includes('20,000'));
+  await page.locator('#pur-cycle-toggle').check();
   await page.selectOption('#pur-cycles','1');assert((await page.locator('#pur-amount-display').innerText()).includes('20,000'));
-  await open('p');await page.selectOption('#pur-cycles','3');assert((await page.locator('#pur-amount-display').innerText()).includes('58,000'));
+  await open('p');await page.locator('#pur-cycle-toggle').check();await page.selectOption('#pur-cycles','3');assert((await page.locator('#pur-amount-display').innerText()).includes('58,000'));
   await page.locator('#pur-promo').fill('TEN');await page.evaluate(()=>applyPromoQuote('p'));
   assert((await page.locator('#pur-amount-display').innerText()).includes('52,200'));
   // An old promo response must not overwrite a later cycle selection.
@@ -57,7 +63,7 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
   const sold=await page.evaluate(()=>submitted[0]);assert.equal(sold.payout_cycles,3);assert.equal(sold.fee,58000);assert.equal(sold.final_fee,52200);
   assert.equal(await page.evaluate(()=>uploads),1);
   // A price change must stop submission before any proof upload.
-  await open('p');await page.selectOption('#pur-cycles','3');
+  await open('p');await page.locator('#pur-cycle-toggle').check();await page.selectOption('#pur-cycles','3');
   await page.locator('#pur-file').setInputFiles({name:'proof.png',mimeType:'image/png',buffer:Buffer.from('fixture')});
   await page.evaluate(()=>{rates.p[3]=19000;});await page.evaluate(()=>submitPurchase('p'));
   assert.equal(await page.evaluate(()=>uploads),1);assert.equal(await page.evaluate(()=>submitted.length),1);
