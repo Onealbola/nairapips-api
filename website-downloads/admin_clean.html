@@ -51,6 +51,59 @@ function startClock(){
 }
 
 /* ---------- Mobile nav active sync ---------- */
+/* COMPLETE_MOBILE_ADMIN_MENU_START */
+function npAdminFilterMenu(query=''){
+  const aside=document.getElementById('np-admin-sidebar');if(!aside)return;
+  const q=String(query).trim().toLowerCase();
+  aside.querySelectorAll('.nav').forEach(b=>b.dataset.menuFiltered=q&&!b.textContent.toLowerCase().includes(q)?'1':'0');
+  aside.querySelectorAll('.nav-section').forEach(section=>{
+    let node=section.nextElementSibling,visible=false;
+    while(node&&!node.classList.contains('nav-section')){
+      if(node.matches('.nav')&&node.style.display!=='none'&&node.dataset.menuFiltered!=='1')visible=true;
+      node=node.nextElementSibling;
+    }
+    section.dataset.menuFiltered=visible?'0':'1';
+  });
+}
+function npAdminOpenMenu(){
+  if(!window.matchMedia('(max-width:900px)').matches)return;
+  const aside=document.getElementById('np-admin-sidebar');if(!aside||aside.classList.contains('np-admin-menu-open'))return;
+  window.NP_ADMIN_MENU_FOCUS=document.activeElement;window.NP_ADMIN_MENU_OVERFLOW=document.body.style.overflow;
+  aside.classList.add('np-admin-menu-open');aside.setAttribute('role','dialog');aside.setAttribute('aria-modal','true');
+  document.getElementById('np-admin-menu-backdrop').hidden=false;
+  document.querySelectorAll('[aria-controls="np-admin-sidebar"]').forEach(b=>b.setAttribute('aria-expanded','true'));
+  document.querySelector('.app>main').inert=true;document.querySelector('.mobile-nav').inert=true;document.body.style.overflow='hidden';
+  const input=document.getElementById('np-admin-menu-search');input.value='';npAdminFilterMenu();input.focus();
+}
+function npAdminCloseMenu(restoreFocus=true){
+  const aside=document.getElementById('np-admin-sidebar');if(!aside||!aside.classList.contains('np-admin-menu-open'))return;
+  aside.classList.remove('np-admin-menu-open');aside.removeAttribute('role');aside.removeAttribute('aria-modal');
+  document.getElementById('np-admin-menu-backdrop').hidden=true;
+  document.querySelectorAll('[aria-controls="np-admin-sidebar"]').forEach(b=>b.setAttribute('aria-expanded','false'));
+  document.querySelector('.app>main').inert=false;document.querySelector('.mobile-nav').inert=false;
+  document.body.style.overflow=window.NP_ADMIN_MENU_OVERFLOW||'';
+  document.getElementById('np-admin-menu-search').value='';npAdminFilterMenu();
+  if(!restoreFocus&&aside.contains(document.activeElement)){const title=document.getElementById('topbar-title');if(title){title.tabIndex=-1;title.focus({preventScroll:true});}}
+  if(restoreFocus&&window.NP_ADMIN_MENU_FOCUS?.isConnected)window.NP_ADMIN_MENU_FOCUS.focus();
+}
+function npAdminBindMenu(){
+  document.body.style.overflow=window.NP_ADMIN_MENU_OVERFLOW||'';
+  const aside=document.getElementById('np-admin-sidebar');
+  aside?.addEventListener('click',e=>{const button=e.target.closest('button');if(button&&(button.matches('.nav')||/logout\(|reload\(/.test(button.getAttribute('onclick')||'')))npAdminCloseMenu(false);},true);
+  if(window.NP_ADMIN_MENU_BOUND)return;window.NP_ADMIN_MENU_BOUND=true;
+  document.addEventListener('keydown',e=>{
+    const menu=document.querySelector('#np-admin-sidebar.np-admin-menu-open');if(!menu)return;
+    if(e.key==='Escape'){e.preventDefault();npAdminCloseMenu();return;}
+    if(e.key!=='Tab')return;
+    const nodes=Array.from(menu.querySelectorAll('button,input,a[href],[tabindex="0"]')).filter(n=>!n.disabled&&n.getClientRects().length);
+    const first=nodes[0],last=nodes[nodes.length-1];
+    if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus();}
+    else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus();}
+  });
+  window.addEventListener('resize',()=>{if(!window.matchMedia('(max-width:900px)').matches)npAdminCloseMenu(false);});
+}
+/* COMPLETE_MOBILE_ADMIN_MENU_END */
+
 function bindMobileNav(){
   document.querySelectorAll('.mnav').forEach(b=>{
     if((b.getAttribute('onclick')||'').includes('logout')) return;
@@ -3001,6 +3054,27 @@ input::placeholder, textarea::placeholder{
 .np-market-section.standard thead th{color:#FFD978}
 </style>
 
+
+<style id="np-admin-complete-mobile-menu">
+.np-admin-menu-trigger,.np-admin-drawer-head{display:none}
+#np-admin-menu-backdrop[hidden]{display:none!important}
+#np-admin-sidebar [data-menu-filtered="1"]{display:none!important}
+@media(max-width:900px){
+ .np-admin-menu-trigger{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-width:44px;min-height:44px;padding:8px 10px;border:1px solid var(--line-gold);border-radius:9px;background:#151106;color:var(--gold);font-size:12px;font-weight:800;flex-shrink:0}
+ .app>.np-admin-sidebar.np-admin-menu-open{display:block!important;position:fixed!important;inset:0 auto 0 0!important;width:min(86vw,340px)!important;height:100vh!important;height:100dvh!important;max-width:100%;overflow-y:auto!important;overscroll-behavior:contain;z-index:1001!important;padding:0 12px calc(24px + env(safe-area-inset-bottom));box-shadow:18px 0 45px #0009;background:#080808!important}
+ .np-admin-drawer-head{display:block;position:sticky;top:0;z-index:2;background:#080808;padding:14px 0 10px;border-bottom:1px solid var(--line-gold);margin-bottom:14px}
+ .np-admin-drawer-title{display:flex;justify-content:space-between;align-items:center;gap:10px;color:var(--gold);font-size:16px;font-weight:900;margin-bottom:10px}
+ #np-admin-menu-close{min-width:44px;min-height:44px;border:1px solid var(--line-gold);border-radius:8px;background:#151106;color:#fff;font-size:25px}
+ #np-admin-menu-search{width:100%;min-height:44px}
+ #np-admin-sidebar .nav{min-height:44px;width:calc(100% - 16px);font-size:14px}
+ #np-admin-menu-backdrop{position:fixed;inset:0;z-index:1000;background:#0009;border:0;width:100%;height:100%;touch-action:none}
+ .topbar{padding-left:10px;padding-right:10px;gap:9px}
+ .topbar h1{font-size:13px}.topbar h1 small{display:none}.topbar .tb-clock{display:none}
+ .mobile-nav{padding-bottom:calc(8px + env(safe-area-inset-bottom))}
+ .content{padding-bottom:calc(90px + env(safe-area-inset-bottom))!important}
+}
+</style>
+
 </head>
 <body>
 <div id="root"></div>
@@ -4183,7 +4257,12 @@ function reload(){
 function renderApp(){
   document.getElementById('root').innerHTML = `
     <div class="app">
-      <aside>
+      <button id="np-admin-menu-backdrop" aria-label="Close modules menu" hidden onclick="npAdminCloseMenu()"></button>
+      <aside id="np-admin-sidebar" class="np-admin-sidebar" aria-label="Admin modules">
+        <div class="np-admin-drawer-head">
+          <div class="np-admin-drawer-title"><span>All modules</span><button id="np-admin-menu-close" type="button" aria-label="Close modules menu" onclick="npAdminCloseMenu()">×</button></div>
+          <input id="np-admin-menu-search" class="input" type="search" placeholder="Find a module…" aria-label="Find an admin module" oninput="npAdminFilterMenu(this.value)">
+        </div>
         <div class="sidebar-inner">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px">
           <div style="font-size:30px;color:var(--gold)">♛</div>
@@ -4254,6 +4333,7 @@ function renderApp(){
       </aside>
       <main>
         <div class="topbar" id="topbar">
+          <button type="button" class="np-admin-menu-trigger" aria-controls="np-admin-sidebar" aria-expanded="false" onclick="npAdminOpenMenu()">☰ Menu</button>
           <div>
             <div class="crumbs" id="topbar-crumbs"><span>Workspace</span><span>·</span><span>Overview</span></div>
             <h1 id="topbar-title">NairaPips Command <small>v9 · OBSIDIAN</small></h1>
@@ -4266,19 +4346,19 @@ function renderApp(){
         </div>
         <div class="content"><div id="content"></div></div>
       </main>
-      <nav class="mobile-nav">
+      <nav class="mobile-nav" aria-label="Quick modules">
         <button class="mnav active" data-mod="overview" onclick="setMod('overview')"><span class="ico">⌂</span><span>Home</span></button>
-        <button class="mnav" data-mod="traders" onclick="setMod('traders')"><span class="ico">👥</span><span>Traders</span></button>
-        <button class="mnav" data-mod="league" onclick="setMod('league')"><span class="ico">🏆</span><span>League</span></button>
-        <button class="mnav" data-mod="mt5pool" onclick="setMod('mt5pool')"><span class="ico">🔑</span><span>MT5</span></button>
-        <button class="mnav" data-mod="payouts" onclick="setMod('payouts')"><span class="ico">⇩</span><span>Money</span></button>
-        <button class="mnav" onclick="logout()"><span class="ico">⎋</span><span>Out</span></button>
+        <button class="mnav" data-mod="actions" onclick="setMod('actions')"><span class="ico">⚡</span><span>Actions</span></button>
+        <button class="mnav" data-mod="purchases" onclick="setMod('purchases')"><span class="ico">◇</span><span>Purchases</span></button>
+        <button class="mnav" data-mod="payouts" onclick="setMod('payouts')"><span class="ico">⇩</span><span>Payouts</span></button>
+        <button class="mnav" aria-label="All modules" aria-controls="np-admin-sidebar" aria-expanded="false" onclick="npAdminOpenMenu()"><span class="ico">☰</span><span>All modules</span></button>
       </nav>
     </div>
   `;
   startClock();
   bindMobileNav();
   npApplyNavigationPermissions();
+  npAdminBindMenu();
   const requested = SESSION.currentMod || 'overview';
   setMod(npStaffCanAccess(requested) ? requested : npFirstAllowedModule());
 }

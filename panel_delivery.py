@@ -5,7 +5,7 @@ Financial APIs retain their authentication and authorization; no session is embe
 from pathlib import Path
 from flask import send_file
 
-RELEASE='hosted-admin-recovery-2026-10-22'
+RELEASE='hosted-admin-mobile-navigation-2026-10-22'
 
 def register_panel_delivery(app, root=None):
     assets=Path(root) if root else Path(__file__).resolve().parent/'website-downloads'
