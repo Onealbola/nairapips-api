@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from flask import Flask, jsonify
 from plan_commercial import (CyclePriceStore, defaults, priced_plan, reset_price,
-                             register_cycle_prices, money)
+                             register_cycle_prices, money, purchase_catalog)
 from production_controls import register_controls, ControlsStore, Conflict
 from test_production_controls import Database
 
@@ -129,12 +129,13 @@ class CommercialTests(unittest.TestCase):
         node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_np_public_plan_snapshot_rows')
         rows = [dict(id='p', product_category='standard', status='active', fee=40000, payout_cycles=3)]
         prices = dict(self.prices)
-        env = dict(np_cached_read=lambda *a: rows, _np_priced_plan=priced_plan,
+        env = dict(np_cached_read=lambda *a: rows, _np_priced_plan=priced_plan, _np_purchase_catalog=purchase_catalog,
                    _np_market_cycle_stores={'standard': SimpleNamespace(read=lambda: ({'prices': prices}, None))})
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'public-prices', 'exec'), env)
-        self.assertEqual(env[node.name]()[0]['fee'], 45000)
+        self.assertEqual(env[node.name]()[0]['fee'], 40000)
+        self.assertEqual(env[node.name]()[0]['cycle_options'][2]['fee'], 45000)
         prices['3'] = 8000
-        self.assertEqual(env[node.name]()[0]['fee'], 48000)
+        self.assertEqual(env[node.name]()[0]['cycle_options'][2]['fee'], 48000)
         self.assertEqual(rows[0]['fee'], 40000)
 
     def test_premium_prices_are_independent_and_cannot_bypass_checkout(self):

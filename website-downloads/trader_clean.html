@@ -8399,6 +8399,10 @@ function npProductMarketRowsV156(plans,key){
     Number(a.account_size||a.size||0)-Number(b.account_size||b.size||0)
   );
 }
+function npBuyerCycleSummary(plan){
+  const paid=(plan.cycle_options||[]).filter(o=>o.available && o.extra>0);
+  return '2 cycles included · 1 cycle also available at no extra cost.<br>'+(paid.length?paid.map(o=>(o.cycles===0?'Unlimited':o.cycles+' cycles')+': +'+fmt.money(o.extra)).join(' · '):'Choose available upgrades at checkout.');
+}
 function npProductMarketBlockV156(plans,key,mode='plans'){
   const rows=npProductMarketRowsV156(plans,key);
   const label=key==='premium'?'Premium':'Standard';
@@ -8407,6 +8411,7 @@ function npProductMarketBlockV156(plans,key,mode='plans'){
     : 'Standard market · core NairaPips challenge plans';
   if(!rows.length) return '';
   const cards=rows.map((p,i)=>{
+    p={...p,fee:p.base_fee??p.fee,payout_cycles:2,payout_cycle_extra:0};
     const route=npPlanRoute(p);
     if(mode==='purchase'){
       return `<div class="plan-card" onclick="purchasePlan('${esc(String(p.id))}')" style="cursor:pointer;padding:18px">
@@ -8416,13 +8421,13 @@ function npProductMarketBlockV156(plans,key,mode='plans'){
         </div>
         <div style="font-weight:900;font-size:16px;margin:4px 0">${esc(p.name||p.plan_name||'—')}</div>
         <div style="font-size:22px;font-weight:900;color:${key==='premium'?'#c7d2fe':'var(--gold)'};font-family:'JetBrains Mono',monospace;margin:6px 0">${fmt.money(p.account_size||p.size||0)}</div>
-        <div style="font-size:12px;color:var(--text-dim)">Total fee: <b>${fmt.money(p.fee||p.price||0)}</b></div>${p.base_fee!=null?`<div style="font-size:11px;color:var(--text-mute);margin-top:4px">Base ${fmt.money(p.base_fee)} + cycle extra ${fmt.money(p.payout_cycle_extra??0)}</div>`:''}
+        <div style="font-size:12px;color:var(--text-dim)">Fee with 2 cycles: <b>${fmt.money(p.fee||p.price||0)}</b></div>${p.base_fee!=null?`<div style="font-size:11px;color:var(--text-mute);margin-top:4px">Base ${fmt.money(p.base_fee)} + cycle extra ${fmt.money(p.payout_cycle_extra??0)}</div>`:''}
         <div style="font-size:11px;margin-top:8px;color:${route.onePhase?'var(--gold)':'var(--info-text)'};font-weight:800">${route.phase1Target}% Phase 1 → ${route.nextLabel}${route.onePhase?'':' '+route.phase2Target+'%'}</div>
         <div style="font-size:11px;margin-top:6px;color:var(--text-mute);line-height:1.65">
           ${esc(p.drawdown_type||'STATIC')} DD · Max ${Number(p.max_drawdown||p.total_dd||20)}%<br>
           Payout: ${esc(p.payout_frequency||'Daily')} · Split ${Number(p.payout_split||60)}%<br>
-          Funded cycles: <b>${p.payout_cycles===0?'Unlimited':(p.payout_cycles??2)}</b> · Included in the total shown<br>
-          Phase 1 Reset: <b>${Number(p.reset_fee||0)>0?'Available':'Not available'}</b><br>Funded Reset: <b>${p.funded_reset_fee===0?'Not available':'Available'}</b>
+          Funded cycles: <b>${p.payout_cycles===0?'Unlimited':(p.payout_cycles??2)}</b> · Choose cycles when buying<br>
+          ${npBuyerCycleSummary(p)}<br>Phase 1 Reset: <b>${Number(p.reset_fee||0)>0?'Available':'Not available'}</b><br>Funded Reset: <b>${p.funded_reset_fee===0?'Not available':'Available'}</b>
         </div>
       </div>`;
     }
@@ -8434,7 +8439,7 @@ function npProductMarketBlockV156(plans,key,mode='plans'){
       </div>
       <div class="name">${esc(p.name||p.plan_name||'—')}</div>
       <div class="size">${fmt.money(p.account_size||p.size||0)}</div>
-      <div class="fee">Fee: <b style="color:${key==='premium'?'#c7d2fe':'var(--gold)'}">${fmt.money(p.fee||p.price||0)}</b></div>
+      <div class="fee">Fee with 2 cycles: <b style="color:${key==='premium'?'#c7d2fe':'var(--gold)'}">${fmt.money(p.fee||p.price||0)}</b></div>
       ${p.base_fee!=null?`<p style="font-size:11px;color:var(--text-mute)">Base ${fmt.money(p.base_fee)} + cycle extra ${fmt.money(p.payout_cycle_extra??0)} = total ${fmt.money(p.fee)}</p>`:''}
       <div class="rules">
         <div><div class="rule-label">Phase 1 Target</div><div class="rule-value gold">${route.phase1Target}%</div></div>
@@ -8444,7 +8449,8 @@ function npProductMarketBlockV156(plans,key,mode='plans'){
         <div><div class="rule-label">Funded payout cycles</div><div class="rule-value">${p.payout_cycles===0?'Unlimited':(p.payout_cycles??2)}</div></div>
         <div><div class="rule-label">Phase 1 Reset</div><div class="rule-value">${Number(p.reset_fee||0)>0?fmt.money(p.reset_fee):'Not available'}</div></div><div><div class="rule-label">Funded Reset</div><div class="rule-value">${p.funded_reset_fee===0?'Not available':fmt.money(p.funded_reset_fee??Number(p.base_fee??p.fee??0)*2)}</div></div>
       </div>
-      <button class="btn btn-gold btn-block">Select Plan →</button>
+      <p style="font-size:12px">${npBuyerCycleSummary(p)}</p>
+      <button class="btn btn-gold btn-block">Select Plan &amp; Cycles →</button>
     </div>`;
   }).join('');
   return `<section class="np-product-market ${key}">
@@ -8684,19 +8690,70 @@ function renderPurchase(){
   `;
 }
 
+let NP_BUYER_CHECKOUT=null;
+let NP_BUYER_CHECKOUT_SEQ=0;
+function npBuyerSelected(planId){
+  const state=NP_BUYER_CHECKOUT;
+  return state && state.ready && String(state.plan.id)===String(planId) && state.element===document.getElementById('pur-cycles') ? state.plan : null;
+}
+function npBuyerRender(catalog, cycles=2){
+  const select=document.getElementById('pur-cycles');
+  if(!select || !NP_BUYER_CHECKOUT || select!==NP_BUYER_CHECKOUT.element) return;
+  NP_BUYER_CHECKOUT.catalog=catalog;
+  select.innerHTML=(catalog.cycle_options||[]).map(o=>`<option value="${o.cycles}" ${o.available?'':'disabled'}>${o.cycles===0?'Unlimited':o.cycles+' cycle'+(o.cycles===1?'':'s')}${!o.available?' — Not available':o.extra>0?' — +'+fmt.money(o.extra):o.cycles===2?' — included default':' — no extra cost'}</option>`).join('');
+  select.value=String(cycles);
+  NP_BUYER_CHECKOUT.ready=true;
+  select.disabled=false;
+  document.getElementById('pur-file').disabled=false;
+  document.getElementById('pur-submit').disabled=false;
+  npBuyerCycleChanged();
+}
+function npBuyerCycleChanged(){
+  const state=NP_BUYER_CHECKOUT, select=document.getElementById('pur-cycles');
+  if(!state || !state.ready || select!==state.element) return;
+  const option=state.catalog.cycle_options.find(o=>String(o.cycles)===select.value && o.available);
+  if(!option) return;
+  state.plan={...state.catalog,payout_cycles:option.cycles,payout_cycle_extra:option.extra,fee:option.fee};
+  PROMO_QUOTE=null; ++PROMO_QUOTE_SEQ;
+  clearTimeout(PROMO_QUOTE_TIMER);
+  document.getElementById('pur-base-display').textContent=fmt.money(state.plan.base_fee);
+  document.getElementById('pur-extra-display').textContent=fmt.money(option.extra);
+  resetPurchaseQuoteDisplay(state.plan);
+  document.getElementById('promo-result').textContent='';
+  if(document.getElementById('pur-promo').value.trim()) applyPromoQuote(state.plan.id);
+}
+async function npBuyerLoad(planId, token){
+  try{
+    const result=await safeFetchJson(API+'/plan_purchase_options?plan_id='+encodeURIComponent(planId),{},15000,false);
+    if(token!==NP_BUYER_CHECKOUT_SEQ || !document.getElementById('pur-cycles') || NP_BUYER_CHECKOUT.element!==document.getElementById('pur-cycles')) return;
+    if(!result?.success) throw Error(result?.error||'Could not load current cycle prices');
+    npBuyerRender(result.data);
+    document.getElementById('pur-price-status').textContent='Choose your funded payout cycles. Extra cost is added to the base fee.';
+  }catch(e){
+    if(token===NP_BUYER_CHECKOUT_SEQ && NP_BUYER_CHECKOUT?.element===document.getElementById('pur-cycles')) document.getElementById('pur-price-status').textContent=(e.message||'Prices unavailable')+'. Close and reopen to retry.';
+  }
+}
+
 function purchasePlan(planId, privateOfferCode=''){
   const p=SESSION.plansList.find(x=>String(x.id)===String(planId));
   if(!p){toast('Plan not found','err');return;}
   if(String(p.status||'').toLowerCase()!=='active'){toast('This product is not open for new purchases.','err');return;}
   const route=npPlanRoute(p);
+  const token=++NP_BUYER_CHECKOUT_SEQ;
+  NP_BUYER_CHECKOUT=null; PROMO_QUOTE=null; ++PROMO_QUOTE_SEQ; clearTimeout(PROMO_QUOTE_TIMER);
   const pa=SESSION.paymentAccounts[0]||{};
   const capturedRef = String(privateOfferCode||SESSION.pendingPrivateOfferCode||npCaptureReferralFromUrl()||'').trim();
   showModal(`
     <button onclick="this.closest('.modal-bg').remove()" style="position:absolute;top:10px;right:14px;background:0;border:0;color:#fff;font-size:24px;cursor:pointer">&times;</button>
     <div class="np-product-market-chip" style="display:inline-block;margin-bottom:8px">${npProductCategoryV156(p).toUpperCase()}</div><h2>${esc(p.name||p.plan_name||'Plan')}</h2>
+    <div class="field-label">Funded payout cycles</div>
+    <select class="input" id="pur-cycles" disabled onchange="npBuyerCycleChanged()"><option>Loading current prices…</option></select>
+    <div id="pur-price-status" style="font-size:12px;margin-bottom:12px">Verifying current prices before payment…</div>
     <div style="background:rgba(212,175,55,.05);padding:14px;border-radius:10px;margin-bottom:14px">
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-mute);font-size:11px">Account Size</span><span style="font-weight:900;color:var(--gold);font-size:18px">${fmt.money(p.account_size||p.size||0)}</span></div>
-      <div id="pur-fee-row" style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-mute);font-size:11px">Fee</span><span id="pur-fee-display" style="font-weight:900">${fmt.money(p.fee||p.price||0)}</span></div>
+      <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span>Base plan fee</span><b id="pur-base-display">—</b></div>
+      <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span>Payout-cycle extra</span><b id="pur-extra-display">—</b></div>
+      <div id="pur-fee-row" style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-mute);font-size:11px">Total before discounts</span><span id="pur-fee-display" style="font-weight:900">Verifying…</span></div>
       <div id="pur-discount-row" style="display:none;justify-content:space-between;margin-bottom:6px"><span style="color:var(--green);font-size:11px;font-weight:800">Private Offer</span><span id="pur-discount-display" style="font-weight:900;color:var(--green)"></span></div>
       <div id="pur-amount-row" style="display:none;justify-content:space-between;margin-bottom:8px;padding-top:7px;border-top:1px solid rgba(34,197,94,.28)"><span style="color:#fff;font-size:11px;font-weight:900">AMOUNT TO PAY</span><span id="pur-amount-display" style="font-weight:950;color:var(--gold);font-size:18px"></span></div>
       <div style="display:flex;justify-content:space-between;margin-bottom:6px"><span style="color:var(--text-mute);font-size:11px">Profit Target</span><span style="font-weight:700;color:var(--green)">${route.phase1Target}%</span></div>
@@ -8710,17 +8767,17 @@ function purchasePlan(planId, privateOfferCode=''){
       <div class="mono" style="font-size:16px;color:var(--gold);font-weight:900;letter-spacing:.1em;margin-top:4px">${esc(pa.account_number||'—')}</div>
     </div>`:''}
 
-    ${p.payout_cycle_extra>0?`<div style="margin-bottom:12px;font-size:12px">Base plan fee: <b>${fmt.money(p.base_fee)}</b><br>${p.payout_cycles===0?'Unlimited':p.payout_cycles} payout cycles · extra: <b>${fmt.money(p.payout_cycle_extra)}</b><br>Total before discounts: <b>${fmt.money(p.fee)}</b></div>`:''}
     <div class="field-label">Promo / Affiliate Code (optional)</div>
     <input class="input" id="pur-promo" value="${esc(capturedRef)}" placeholder="COMEBACK50, PHASEHELP, FLASH20..." oninput="schedulePromoQuote('${esc(String(p.id))}')" onpaste="setTimeout(()=>schedulePromoQuote('${esc(String(p.id))}',true),0)" onblur="applyPromoQuote('${esc(String(p.id))}')">
     <div id="promo-result" style="font-size:12px;margin-bottom:10px"></div>
 
 
     <div class="field-label">Upload Payment Proof (image or PDF)</div>
-    <input type="file" id="pur-file" accept="image/*,.pdf" class="input" style="padding:10px">
-    <button class="btn btn-gold btn-block" onclick="submitPurchase('${esc(String(p.id))}')">📨 Submit Purchase</button>
+    <input type="file" id="pur-file" disabled accept="image/*,.pdf" class="input" style="padding:10px">
+    <button id="pur-submit" disabled class="btn btn-gold btn-block" onclick="submitPurchase('${esc(String(p.id))}')">📨 Submit Purchase</button>
   `);
-  if(capturedRef) setTimeout(()=>applyPromoQuote(String(p.id)), 50);
+  NP_BUYER_CHECKOUT={ready:false,element:document.getElementById('pur-cycles')};
+  npBuyerLoad(p.id,token);
   if(privateOfferCode){
     SESSION.pendingPrivateOfferCode=String(privateOfferCode||'').trim();
   }
@@ -8741,7 +8798,8 @@ function resetPurchaseQuoteDisplay(plan){
     feeEl.style.textDecoration='';
   }
   if(discRow) discRow.style.display='none';
-  if(amtRow) amtRow.style.display='none';
+  if(amtRow) amtRow.style.display='flex';
+  const amount=document.getElementById('pur-amount-display'); if(amount) amount.textContent=fmt.money(base);
 }
 
 function schedulePromoQuote(planId,immediate=false){
@@ -8754,8 +8812,9 @@ async function applyPromoQuote(planId){
   if(!input) return;
   const code=input.value.trim();
   const result=document.getElementById('promo-result');
-  const p=SESSION.plansList.find(x=>String(x.id)===String(planId));
+  const p=npBuyerSelected(planId);
   if(!p) return;
+  const seq=++PROMO_QUOTE_SEQ;
   if(!code){
     if(result) result.innerHTML='';
     PROMO_QUOTE=null;
@@ -8764,7 +8823,6 @@ async function applyPromoQuote(planId){
   }
 
   const t=SESSION.data?.trader || SESSION.trader || {};
-  const seq=++PROMO_QUOTE_SEQ;
   if(result) result.innerHTML='<span style="color:var(--text-mute)">Checking offer...</span>';
 
   try{
@@ -8779,6 +8837,7 @@ async function applyPromoQuote(planId){
         partner_code:code,
         fee:Number(p.fee||p.price||0),
         plan_id:p.id,
+        payout_cycles:p.payout_cycles,
         plan_name:p.name||p.plan_name||'',
         account_size:p.account_size||p.size||0,
         email:t.email||'',
@@ -8833,8 +8892,8 @@ async function applyPromoQuote(planId){
 }
 
 async function submitPurchase(planId){
-  const p=SESSION.plansList.find(x=>String(x.id)===String(planId));
-  if(!p){toast('Plan not found','err');return;}
+  const p=npBuyerSelected(planId);
+  if(!p){toast('Wait for current prices to load before submitting','err');return;}
   if(String(p.status||'').toLowerCase()!=='active'){toast('This product is not open for new purchases.','err');return;}
 
   const fileInput=document.getElementById('pur-file');
@@ -8856,7 +8915,7 @@ async function submitPurchase(planId){
     return;
   }
 
-  const idemKey='pur_'+planId+'_'+(code||'nocode');
+  const idemKey='pur_'+planId+'_'+p.payout_cycles+'_'+(code||'nocode');
   const lastSubmit=Number(sessionStorage.getItem(idemKey)||0);
   if(lastSubmit && (Date.now()-lastSubmit)<15000){
     toast('Your purchase is already being submitted. Please wait.','info');
@@ -8874,6 +8933,13 @@ async function submitPurchase(planId){
     btn.textContent=label;
   };
 
+  const checkoutState=NP_BUYER_CHECKOUT;
+  if(checkoutState.busy) return;
+  checkoutState.busy=true;
+  let purchasePromo=null;
+  document.getElementById('pur-cycles').disabled=true; promoInput.disabled=true;
+  const displayedFinal=Number(PROMO_QUOTE?.valid ? PROMO_QUOTE.final_fee : p.fee);
+  ++PROMO_QUOTE_SEQ; clearTimeout(PROMO_QUOTE_TIMER);
   sessionStorage.setItem(idemKey,String(Date.now()));
   setButton('Uploading payment proof...',true);
 
@@ -8881,19 +8947,29 @@ async function submitPurchase(planId){
     const t=SESSION.data?.trader || SESSION.trader;
     if(!t?.id) throw new Error('Trader session is unavailable. Reload and try again.');
 
+    const current=await safeFetchJson(API+'/plan_purchase_options?plan_id='+encodeURIComponent(p.id)+'&payout_cycles='+p.payout_cycles,{},15000,false);
+    if(!current?.success) throw Error(current?.error||'Current prices could not be verified');
+    if(Number(current.data.fee)!==Number(p.fee)){
+      npBuyerRender(current.data,p.payout_cycles);
+      throw Error('The price has changed. Check the updated total before submitting payment proof.');
+    }
     if(code){
       const qd=await safeFetchJson(API+'/quote_challenge_price',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({
           code,promo_code:code,affiliate_code:code,referral_code:code,
-          fee:p.fee,email:t.email,phone:t.phone,trader_id:t.id
+          fee:p.fee,plan_id:p.id,payout_cycles:p.payout_cycles,email:t.email,phone:t.phone,trader_id:t.id
         })
       },15000,false);
       if(!qd?.success || !qd?.data?.valid){
         throw new Error(qd?.error || qd?.data?.message || 'Invalid promo or affiliate code');
       }
-      PROMO_QUOTE=qd.data;
+      if(Number(qd.data.final_fee)!==displayedFinal){
+        await applyPromoQuote(p.id);
+        throw Error('Your offer total changed. Confirm the updated amount before submitting.');
+      }
+      purchasePromo=qd.data;
     }
 
     const fd=new FormData();
@@ -8953,6 +9029,7 @@ async function submitPurchase(planId){
       plan_name:p.name,
       account_size:p.account_size,
       fee:p.fee,
+      payout_cycles:p.payout_cycles,
       payment_proof_url:proofUrl,
       status:'pending',
       payment_status:'pending',
@@ -8963,12 +9040,12 @@ async function submitPurchase(planId){
       payload.affiliate_code=code;
       payload.referral_code=code;
       payload.partner_code=code;
-      if(PROMO_QUOTE?.valid){
-        payload.original_fee=Number(PROMO_QUOTE.original_fee ?? p.fee ?? 0);
-        payload.discount_percent=Number(PROMO_QUOTE.discount_percent ?? 0);
-        payload.discount_amount=Number(PROMO_QUOTE.discount_amount ?? 0);
-        payload.final_fee=Number(PROMO_QUOTE.final_fee ?? PROMO_QUOTE.fee ?? p.fee ?? 0);
-        payload.amount_due=Number(PROMO_QUOTE.final_fee ?? PROMO_QUOTE.fee ?? p.fee ?? 0);
+      if(purchasePromo?.valid){
+        payload.original_fee=Number(purchasePromo.original_fee ?? p.fee ?? 0);
+        payload.discount_percent=Number(purchasePromo.discount_percent ?? 0);
+        payload.discount_amount=Number(purchasePromo.discount_amount ?? 0);
+        payload.final_fee=Number(purchasePromo.final_fee ?? purchasePromo.fee ?? p.fee ?? 0);
+        payload.amount_due=Number(purchasePromo.final_fee ?? purchasePromo.fee ?? p.fee ?? 0);
       }
     }
 
@@ -8987,7 +9064,7 @@ async function submitPurchase(planId){
     toast('Payment proof uploaded successfully. Purchase submitted for review.','ok');
 
     setTimeout(()=>{
-      document.querySelector('.modal-bg')?.remove();
+      modal?.closest('.modal-bg')?.remove();
       try{
         SESSION.purchases = Array.isArray(SESSION.purchases) ? SESSION.purchases : [];
         const created=d?.data || d?.purchase;
@@ -8997,6 +9074,7 @@ async function submitPurchase(planId){
     },900);
 
   }catch(e){
+    if(NP_BUYER_CHECKOUT===checkoutState && checkoutState.element===document.getElementById('pur-cycles')){ checkoutState.busy=false; document.getElementById('pur-cycles').disabled=false; promoInput.disabled=false; }
     sessionStorage.removeItem(idemKey);
     const message=e?.name==='AbortError'
       ? 'Payment proof upload timed out. Please try again.'

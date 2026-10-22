@@ -10060,7 +10060,7 @@ def _np_public_plan_snapshot_rows():
         row = dict(raw)
         category = str(row.get("product_category") or "standard").lower()
         try:
-            row = _np_priced_plan(row, prices[category], category=category)
+            row = _np_purchase_catalog(row, prices[category])
         except ValueError:
             row["status"] = "inactive"
             row["cycle_price_available"] = False
@@ -18081,6 +18081,12 @@ def quote_challenge_price():
         else:
             d = request.json or {}
         base_fee = clean(d.get("fee") or d.get("challenge_fee") or d.get("amount"))
+        if d.get("plan_id"):
+            try:
+                selected, _ = _np_resolve_purchase_plan(_np_market_cycle_stores, d["plan_id"], d.get("payout_cycles", 2))
+                base_fee = selected["fee"]
+            except ValueError as exc:
+                return bad(str(exc), 400)
         if base_fee <= 0:
             return bad("Challenge fee is required")
         quote = _affiliate_quote_details(d, base_fee)
@@ -59972,7 +59978,8 @@ _np_register_admin_account_state(app, requests, SUPABASE_URL,
 
 # Standard and Premium fixed plans use independent cycle upgrade prices.
 from plan_commercial import (CyclePriceStore as _NPCyclePriceStore,
-    register_cycle_prices as _NPRegisterCyclePrices, priced_plan as _np_priced_plan)
+    register_cycle_prices as _NPRegisterCyclePrices, priced_plan as _np_priced_plan,
+    purchase_plan as _np_purchase_plan, purchase_catalog as _np_purchase_catalog, resolve_purchase_plan as _np_resolve_purchase_plan)
 _np_cycle_price_store = _NPCyclePriceStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
 _np_premium_cycle_price_store = _NPCyclePriceStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, category="premium")
 _np_market_cycle_stores = {"standard": _np_cycle_price_store, "premium": _np_premium_cycle_price_store}
@@ -59984,6 +59991,12 @@ def _np_price_standard_plan(plan):
 _NPRegisterCyclePrices(app, _np_cycle_price_store, _require_admin,
     _np_owner_catalog_invalidate_v225, _audit_safe, premium_store=_np_premium_cycle_price_store)
 app.config["NP_STANDARD_PLAN_PRICER"] = _np_price_standard_plan
+
+def _np_price_buyer_plan(plan, cycles=2):
+    category = _np_plan_category_v156(plan.get("product_category"))
+    return _np_purchase_plan(plan, _np_market_cycle_stores[category].read(fresh=True)[0]["prices"], cycles)
+
+app.config["NP_PURCHASE_PLAN_PRICER"] = _np_price_buyer_plan
 
 # Read-only production overview; complete paged source reads, no lifecycle writes.
 from business_overview import register_business_overview as _np_register_business_overview

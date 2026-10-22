@@ -7,7 +7,7 @@ from plan_cycles import cycle_limit
 
 KEY = 'standard_plan_cycle_prices_v1'
 PAID = ('3', '4', '5', '0')
-RELEASE = 'plan-market-cycle-prices-2026-10-22'
+RELEASE = 'buyer-cycle-selection-2026-10-22'
 
 
 def money(value):
@@ -73,6 +73,44 @@ def priced_plan(plan, prices, category='standard'):
     return row
 
 
+def purchase_plan(plan, prices, cycles=2):
+    """Price a buyer's selection without changing the saved product or past sales."""
+    cycles = cycle_limit(2 if cycles is None else cycles)
+    category = str(plan.get('product_category') or 'standard').lower()
+    if category not in {'standard', 'premium'}:
+        raise ValueError('Unknown plan market')
+    return priced_plan({**plan, 'payout_cycles': cycles}, prices, category=category)
+
+
+def purchase_catalog(plan, prices):
+    row = purchase_plan(plan, prices, 2)
+    options = []
+    for cycles in (1, 2, 3, 4, 5, 0):
+        try:
+            selected = purchase_plan(plan, prices, cycles)
+            options.append(dict(cycles=cycles, available=True, extra=selected['payout_cycle_extra'], fee=selected['fee']))
+        except ValueError:
+            options.append(dict(cycles=cycles, available=False, extra=None, fee=None))
+    return {**row, 'cycle_options': options, 'default_cycles': 2}
+
+
+def resolve_purchase_plan(stores, plan_id, cycles=2):
+    if not plan_id or len(str(plan_id)) > 100:
+        raise ValueError('Choose a plan')
+    store = stores['standard']
+    response = store.transport.get(store.url.rsplit('/', 1)[0] + '/challenge_plans',
+        headers=store.headers, params={'id': 'eq.' + str(plan_id), 'select': '*', 'limit': '1'}, timeout=(2, 4))
+    response.raise_for_status()
+    rows = response.json()
+    if not rows or str(rows[0].get('status') or '').lower() != 'active':
+        raise ValueError('This product is not open for new purchases')
+    category = str(rows[0].get('product_category') or 'standard').lower()
+    if category not in stores:
+        raise ValueError('Unknown plan market')
+    prices = stores[category].read(fresh=True)[0]['prices']
+    return purchase_plan(rows[0], prices, cycles), purchase_catalog(rows[0], prices)
+
+
 def reset_price(plan, stage):
     if not plan:
         return 0.0
@@ -89,7 +127,19 @@ def register_cycle_prices(app, store, require_admin, invalidate, audit, premium_
         stores['premium'] = premium_store
     @app.get('/plan_commercial_version')
     def plan_commercial_version():
-        return jsonify(success=True, release=RELEASE, markets=sorted(stores), default_cycles=2, free_cycle_options=[1, 2], paid_cycle_options=[3, 4, 5, 0])
+        return jsonify(success=True, release=RELEASE, buyer_selectable=True, markets=sorted(stores), default_cycles=2, free_cycle_options=[1, 2], paid_cycle_options=[3, 4, 5, 0])
+
+    @app.get('/plan_purchase_options')
+    def plan_purchase_options():
+        try:
+            selected, catalog = resolve_purchase_plan(stores, request.args.get('plan_id'), request.args.get('payout_cycles', 2))
+            response = jsonify(success=True, data={**catalog, **selected})
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+        except ValueError as exc:
+            return jsonify(success=False, error=str(exc)), 400
+        except Exception:
+            return jsonify(success=False, error='Current purchase prices could not be verified. Please retry.'), 503
 
     @app.route('/admin/<category>_cycle_prices', methods=['GET', 'POST'])
     def standard_cycle_prices(category):
