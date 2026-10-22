@@ -14,12 +14,11 @@ Another independently purchased account remains untouched.
 
 ## Prices and publication
 
-- For a standard challenge plan, Fee is the base plan price. Business Settings
-  stores separate fixed naira extra costs for 3, 4, 5 and unlimited cycles. The
+- For Standard and Premium challenge plans, Fee is the base plan price. Business Settings
+  stores independent Standard and Premium fixed naira extra costs for 3, 4, 5 and unlimited cycles. The
   saved charge is added automatically to the base fee at purchase and checked
   server-side. 2 cycles is the default; 1 cycle remains available without an
-  extra charge. Blank paid options cannot be sold until priced. Premium fixed
-  plans retain their existing fee behavior. There is no later extension charge.
+  extra charge. Blank paid options cannot be sold until priced. Each market uses its own saved prices. There is no later extension charge.
 - For Build Your Package, set the charge for each cycle choice in Business
   settings. Two cycles can be included at zero additional charge. Active choices
   above two or unlimited must have a positive upfront charge. Existing configured
@@ -63,11 +62,10 @@ cover challenge stages on two-phase products. Already approved reset orders and
 historical included Second Life entitlements keep their existing fulfillment.
 
 Cycle prices use the existing versioned business_settings key/value storage,
-under standard_plan_cycle_prices_v1. No guessed prices are installed. Configure
+under standard_plan_cycle_prices_v1 and premium_plan_cycle_prices_v1. No guessed prices are installed. Configure
 3, 4, 5 and unlimited separately; blank means that upgrade is unavailable.
 These are additional upfront charges, not a charge each time a payout is made.
-They apply to the cycle count selected on the plan card. Premium fixed-plan and
-Build Your Package pricing remain separate. Recorded purchase fees and cycle
+They apply to the cycle count selected on the plan card. Standard, Premium and Build Your Package pricing remain separate. Recorded purchase fees and cycle
 snapshots are not rewritten. Existing promo/affiliate rules apply to the full
 quoted purchase price, including the cycle charge.
 
@@ -76,3 +74,23 @@ website-downloads/admin_clean.html and website-downloads/trader_clean.html in
 cPanel. production-settings.js is synchronized for standalone consumers.
 This change reuses existing reset price and business_settings columns. Existing
 cycle/snapshot migrations listed above must already be installed.
+
+## Standard and Premium cycle pricing visibility
+
+Business Settings shows independent Standard and Premium price sections before
+other production settings, with explicit Not set placeholders. Each market can
+load or retry independently; a package configuration failure cannot hide them.
+The product catalog includes product_category, market badges and market filters.
+Each product previews the base fee, selected cycle extra and total. Both trader
+market cards and checkout show the same server-supplied price breakdown.
+
+The original Standard setting key and route are retained unchanged. Premium
+uses premium_plan_cycle_prices_v1 and /admin/premium_cycle_prices. No rate is
+invented or copied between markets. Paid upgrades remain unavailable until the
+owner saves a positive price. Existing purchases retain their saved terms.
+
+The regular Plans list and New/Edit Plan modal also load the matching saved
+market prices. They show cycle extra and total at purchase without changing the
+base fee. Editing a legacy NULL cycle limit selects existing terms/default 2,
+never unlimited. Saving extra prices does not by itself select a paid cycle
+option: choose 3, 4, 5 or unlimited on the plan and save to offer that entitlement.

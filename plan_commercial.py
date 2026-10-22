@@ -1,4 +1,4 @@
-"""Server-owned standard-plan cycle surcharges and reset prices."""
+"""Server-owned Standard/Premium cycle surcharges and reset prices."""
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from flask import jsonify, request
@@ -7,7 +7,7 @@ from plan_cycles import cycle_limit
 
 KEY = 'standard_plan_cycle_prices_v1'
 PAID = ('3', '4', '5', '0')
-RELEASE = 'plan-reset-cycle-prices-2026-10-22'
+RELEASE = 'plan-market-cycle-prices-2026-10-22'
 
 
 def money(value):
@@ -38,13 +38,16 @@ def validate(doc):
 
 
 class CyclePriceStore(ControlsStore):
-    def __init__(self, transport, url, key):
+    def __init__(self, transport, url, key, category='standard'):
+        if category not in {'standard', 'premium'}:
+            raise ValueError('Choose Standard or Premium')
+        self.category = category
         def checked(doc):
             try:
                 return validate(doc)
             except ValueError as exc:
                 raise ControlsUnavailable('Saved cycle prices are invalid') from exc
-        super().__init__(transport, url, key, KEY, defaults, checked)
+        super().__init__(transport, url, key, category + '_plan_cycle_prices_v1', defaults, checked)
 
     def save(self, body, actor):
         if not isinstance(body, dict) or set(body) != {'revision', 'prices'}:
@@ -57,9 +60,9 @@ class CyclePriceStore(ControlsStore):
         return self.persist(doc, raw, actor)
 
 
-def priced_plan(plan, prices):
+def priced_plan(plan, prices, category='standard'):
     row = dict(plan)
-    if str(row.get('product_category') or 'standard').lower() != 'standard':
+    if str(row.get('product_category') or 'standard').lower() != category:
         return row
     cycles = cycle_limit(row.get('payout_cycles') if row.get('payout_cycles') is not None else 2)
     extra = 0 if cycles in (1, 2) else prices[str(cycles)]
@@ -80,13 +83,19 @@ def reset_price(plan, stage):
     return money(value) if value is not None else round(money(plan.get('base_fee', plan.get('fee') or plan.get('price') or 0)) * 2, 2)
 
 
-def register_cycle_prices(app, store, require_admin, invalidate, audit):
+def register_cycle_prices(app, store, require_admin, invalidate, audit, premium_store=None):
+    stores = {'standard': store}
+    if premium_store is not None:
+        stores['premium'] = premium_store
     @app.get('/plan_commercial_version')
     def plan_commercial_version():
-        return jsonify(success=True, release=RELEASE, default_cycles=2, free_cycle_options=[1, 2], paid_cycle_options=[3, 4, 5, 0])
+        return jsonify(success=True, release=RELEASE, markets=sorted(stores), default_cycles=2, free_cycle_options=[1, 2], paid_cycle_options=[3, 4, 5, 0])
 
-    @app.route('/admin/standard_cycle_prices', methods=['GET', 'POST'])
-    def standard_cycle_prices():
+    @app.route('/admin/<category>_cycle_prices', methods=['GET', 'POST'])
+    def standard_cycle_prices(category):
+        if category not in stores:
+            return jsonify(success=False, error='Unknown plan market'), 404
+        selected = stores[category]
         admin, error = require_admin()
         if error is not None:
             return error
@@ -94,11 +103,11 @@ def register_cycle_prices(app, store, require_admin, invalidate, audit):
             return jsonify(success=False, error='Owner or super admin access required'), 403
         try:
             if request.method == 'GET':
-                return jsonify(success=True, data=store.read(fresh=True)[0])
-            doc = store.save(request.get_json(silent=True), admin.get('id'))
+                return jsonify(success=True, data=selected.read(fresh=True)[0], category=category)
+            doc = selected.save(request.get_json(silent=True), admin.get('id'))
             invalidate('public_plans_snapshot', 'plans_list', 'admin_bootstrap')
-            audit('business_settings', 'standard_cycle_prices_update', str(doc), admin, KEY)
-            return jsonify(success=True, data=doc)
+            audit('business_settings', category + '_cycle_prices_update', str(doc), admin, selected.setting_key)
+            return jsonify(success=True, data=doc, category=category)
         except Conflict as exc:
             return jsonify(success=False, error=str(exc)), 409
         except ValueError as exc:

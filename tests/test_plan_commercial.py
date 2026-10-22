@@ -13,6 +13,7 @@ class CommercialTests(unittest.TestCase):
     def setUp(self):
         self.db = Database()
         self.store = CyclePriceStore(self.db, 'https://db.invalid', 'fixture')
+        self.premium = CyclePriceStore(self.db, 'https://db.invalid', 'fixture', category='premium')
         self.app = Flask(__name__)
         self.role = 'owner'
         self.actions = []
@@ -20,10 +21,10 @@ class CommercialTests(unittest.TestCase):
             if self.role is None:
                 return None, (jsonify(success=False), 401)
             return {'id': 'owner', 'role': self.role}, None
-        register_cycle_prices(self.app, self.store, auth, lambda *a: None, lambda *a: None)
+        register_cycle_prices(self.app, self.store, auth, lambda *a: None, lambda *a: None, premium_store=self.premium)
         register_controls(self.app, ControlsStore(self.db, 'https://db.invalid', 'fixture'), auth,
                           lambda *a: None, lambda *a: None)
-        self.app.config['NP_STANDARD_PLAN_PRICER'] = lambda p: priced_plan(p, self.store.read()[0]['prices'])
+        self.app.config['NP_STANDARD_PLAN_PRICER'] = lambda p: priced_plan(p, (self.premium if p.get('product_category')=='premium' else self.store).read()[0]['prices'], category=p.get('product_category') or 'standard')
         @self.app.post('/create_challenge_purchase')
         def purchase():
             from flask import request
@@ -129,12 +130,38 @@ class CommercialTests(unittest.TestCase):
         rows = [dict(id='p', product_category='standard', status='active', fee=40000, payout_cycles=3)]
         prices = dict(self.prices)
         env = dict(np_cached_read=lambda *a: rows, _np_priced_plan=priced_plan,
-                   _np_cycle_price_store=SimpleNamespace(read=lambda: ({'prices': prices}, None)))
+                   _np_market_cycle_stores={'standard': SimpleNamespace(read=lambda: ({'prices': prices}, None))})
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'public-prices', 'exec'), env)
         self.assertEqual(env[node.name]()[0]['fee'], 45000)
         prices['3'] = 8000
         self.assertEqual(env[node.name]()[0]['fee'], 48000)
         self.assertEqual(rows[0]['fee'], 40000)
+
+    def test_premium_prices_are_independent_and_cannot_bypass_checkout(self):
+        self.store.save(dict(revision=0, prices=self.prices), 'owner')
+        premium_prices = {**self.prices, '3': 18000}
+        saved = self.client.post('/admin/premium_cycle_prices', json=dict(revision=0, prices=premium_prices))
+        self.assertEqual(saved.status_code, 200, saved.json)
+        self.assertEqual(saved.json['category'], 'premium')
+        self.assertEqual(self.store.read(fresh=True)[0]['prices']['3'], 5000)
+        self.assertEqual(self.premium.read(fresh=True)[0]['prices']['3'], 18000)
+        plan = self.db.rows['challenge_plans'][0]
+        plan.update(product_category='premium', payout_cycles=3)
+        self.assertEqual(self.client.post('/create_challenge_purchase', json=dict(plan_id='p', fee=20000)).status_code,409)
+        self.assertEqual(self.client.post('/create_challenge_purchase', json=dict(plan_id='p', fee=25000)).status_code,409)
+        self.assertEqual(self.client.post('/create_challenge_purchase', json=dict(plan_id='p', fee=38000)).status_code,200)
+        self.assertEqual(self.actions[-1]['payout_cycle_extra'],18000)
+        self.assertEqual(len(self.actions),1)
+        self.role='admin'
+        self.assertEqual(self.client.get('/admin/premium_cycle_prices').status_code,403)
+        self.assertEqual(self.client.post('/admin/premium_cycle_prices',json={}).status_code,403)
+
+    def test_premium_default_is_two_and_paid_upgrades_require_prices(self):
+        plan=dict(product_category='premium',fee=40000,payout_cycles=None)
+        self.assertEqual(priced_plan(plan,defaults()['prices'],category='premium')['fee'],40000)
+        plan['payout_cycles']=3
+        with self.assertRaises(ValueError):priced_plan(plan,defaults()['prices'],category='premium')
+        self.assertEqual(priced_plan(plan,self.prices,category='premium')['fee'],45000)
 
 if __name__ == '__main__':
     unittest.main()

@@ -9,7 +9,7 @@ from flask import jsonify, request
 FIELDS = {
     'name', 'description', 'status', 'fee', 'account_size', 'phase1_target',
     'phase2_target', 'max_drawdown', 'payout_split', 'reset_fee', 'funded_reset_fee',
-    'challenge_journey', 'drawdown_type', 'payout_cycles',
+    'challenge_journey', 'drawdown_type', 'payout_cycles', 'product_category',
 }
 RULE_FIELDS = {'fee', 'reset_fee', 'phase1_target', 'phase2_target', 'max_drawdown', 'payout_split',
                'account_size', 'challenge_journey', 'drawdown_type', 'payout_cycles'}
@@ -43,6 +43,8 @@ def validated_plan(current, changes):
         if release_fields['challenge_journey'] == 'one_phase' and release_fields['phase2_target'] is None:
             release_fields['phase2_target'] = 0
         validated_plan({}, release_fields)
+    if 'product_category' in changes and changes['product_category'] not in {'standard', 'premium'}:
+        raise ValueError('Choose Standard or Premium')
     result = dict(changes)
     if 'funded_reset_fee' in changes:
         from plan_commercial import money

@@ -10051,19 +10051,19 @@ def _np_public_plan_snapshot_rows():
         ))
         return out
     # Cache product rows, but reprice against the current tariff on every read.
-    # A saved surcharge must not stay stale for the product cache's five minutes.
-    rows = np_cached_read("public_plans_snapshot", 300, _fetch)
-    prices = _np_cycle_price_store.read()[0]["prices"] if any(
-        r.get("product_category") == "standard" for r in rows) else {}
+    # Short product caching keeps selected cycles and saved prices aligned.
+    rows = np_cached_read("public_plans_snapshot", 5, _fetch)
+    categories = {str(r.get("product_category") or "standard").lower() for r in rows}
+    prices = {category: _np_market_cycle_stores[category].read()[0]["prices"] for category in categories}
     out = []
     for raw in rows:
         row = dict(raw)
-        if row.get("product_category") == "standard":
-            try:
-                row = _np_priced_plan(row, prices)
-            except ValueError:
-                row["status"] = "inactive"
-                row["cycle_price_available"] = False
+        category = str(row.get("product_category") or "standard").lower()
+        try:
+            row = _np_priced_plan(row, prices[category], category=category)
+        except ValueError:
+            row["status"] = "inactive"
+            row["cycle_price_available"] = False
         out.append(row)
     return out
 
@@ -10080,7 +10080,7 @@ def public_plan_snapshot():
             "published_at": now_iso(),
         })
         # Browser/edge may serve a warm snapshot immediately while revalidating.
-        response.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=300"
+        response.headers["Cache-Control"] = "public, max-age=5, must-revalidate"
         response.headers["X-NairaPips-Plan-Snapshot"] = "1"
         return response
     except Exception as e:
@@ -59970,18 +59970,19 @@ from admin_account_live import register_admin_account_state as _np_register_admi
 _np_register_admin_account_state(app, requests, SUPABASE_URL,
     SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, _require_admin, _np_v198_is_live_row)
 
-# Standard fixed-plan prices: base fee plus the saved cycle-option charge.
+# Standard and Premium fixed plans use independent cycle upgrade prices.
 from plan_commercial import (CyclePriceStore as _NPCyclePriceStore,
     register_cycle_prices as _NPRegisterCyclePrices, priced_plan as _np_priced_plan)
 _np_cycle_price_store = _NPCyclePriceStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
+_np_premium_cycle_price_store = _NPCyclePriceStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, category="premium")
+_np_market_cycle_stores = {"standard": _np_cycle_price_store, "premium": _np_premium_cycle_price_store}
 
 def _np_price_standard_plan(plan):
-    if str(plan.get("product_category") or "standard").lower() != "standard":
-        return dict(plan)
-    return _np_priced_plan(plan, _np_cycle_price_store.read()[0]["prices"])
+    category = _np_plan_category_v156(plan.get("product_category"))
+    return _np_priced_plan(plan, _np_market_cycle_stores[category].read()[0]["prices"], category=category)
 
 _NPRegisterCyclePrices(app, _np_cycle_price_store, _require_admin,
-    _np_owner_catalog_invalidate_v225, _audit_safe)
+    _np_owner_catalog_invalidate_v225, _audit_safe, premium_store=_np_premium_cycle_price_store)
 app.config["NP_STANDARD_PLAN_PRICER"] = _np_price_standard_plan
 
 # Read-only production overview; complete paged source reads, no lifecycle writes.
