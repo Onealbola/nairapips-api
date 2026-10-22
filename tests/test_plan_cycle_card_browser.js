@@ -10,8 +10,8 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
    window.calls=[];window.api=async(path,method,body)=>{calls.push({path,body});return {success:true}};
   });
   const html=fs.readFileSync(__dirname+'/../website-downloads/'+(process.env.NP_PANEL_FILE||'admin_clean.html'),'utf8');
-  await page.addScriptTag({content:html.slice(html.indexOf('window.npResetControl ='),html.indexOf('window.npPlanRouteChanged'))});
-  const start=html.indexOf('window.showCreatePlan ='),end=html.indexOf('window.editPlan =',start);
+  await page.addScriptTag({content:html.slice(html.search(/window\.npResetControl\s*=/),html.indexOf('window.npPlanRouteChanged'))});
+  const start=html.search(/window\.showCreatePlan\s*=/),end=html.indexOf('window.editPlan',start);
   await page.addScriptTag({content:html.slice(start,end)});
   for(const value of ['1','2','3','4','5','0']){
    await page.evaluate(()=>showCreatePlan());
