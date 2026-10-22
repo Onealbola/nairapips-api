@@ -56,19 +56,21 @@ class LimitedCycleSafety:
             if self.cas(claim['purchase'],current,restored):return
         raise RuntimeError('Purchase payout lock requires review; it was not forcibly cleared')
 
-    def inspect(self, purchase, account, payout_id=''):
+    def inspect(self, purchase, account, payout_id='', accounts=None, ledger=None):
         cap=purchase.get('payout_cycles')
         if type(cap) is not int or not 1<=cap<=5:raise CycleBlocked('Invalid purchased cycle limit. Review required.')
         owner=str(purchase.get('trader_id') or '')
         if not owner or owner!=str(account.get('trader_id') or '') or str(account.get('stage') or '').lower()!='funded':
             raise CycleBlocked('Funded purchase ownership could not be verified.')
-        accounts=self.rows('trader_accounts',{'purchase_id':'eq.'+str(purchase['id']),'select':'id,trader_id,stage,mt5_login'})
+        if accounts is None:
+            accounts=self.rows('trader_accounts',{'purchase_id':'eq.'+str(purchase['id']),'select':'id,trader_id,stage,mt5_login'})
         scope={str(a['id']):a for a in accounts}
         if str(account.get('id')) not in scope:raise CycleBlocked('Exact funded account is missing from its purchase.')
-        ledger=[]
-        ids=list(scope)
-        for offset in range(0,len(ids),100):
-            ledger.extend(self.rows('payouts',{'trader_account_id':'in.('+','.join(ids[offset:offset+100])+')','select':'id,trader_id,trader_account_id,mt5_login,status,paid_at'}))
+        if ledger is None:
+            ledger=[]
+            ids=list(scope)
+            for offset in range(0,len(ids),100):
+                ledger.extend(self.rows('payouts',{'trader_account_id':'in.('+','.join(ids[offset:offset+100])+')','select':'id,trader_id,trader_account_id,mt5_login,status,paid_at'}))
         paid=set();reserved=set();seen=set()
         for p in ledger:
             if str(p['id']) in seen:continue

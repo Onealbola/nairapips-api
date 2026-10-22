@@ -60025,3 +60025,6 @@ _np_register_business_overview(app, requests, SUPABASE_URL,
 from limited_cycle_safety import LimitedCycleSafety as _NPLimitedCycleSafety, register_cycle_safety as _np_register_cycle_safety
 _np_limited_cycle_guard = _NPLimitedCycleSafety(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
 _np_register_cycle_safety(app)
+
+from cycle_progress import register_cycle_progress as _np_register_cycle_progress
+_np_register_cycle_progress(app, _np_limited_cycle_guard, _require_admin)
