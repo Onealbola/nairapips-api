@@ -93,3 +93,27 @@ class GuardTests(unittest.TestCase):
         self.db.accounts[0]['archive_reason']+=' [paid:request]'
         self.env['_np_v206_release_payout_action'](a,claim)
         self.assertEqual(self.db.accounts[0]['archive_reason'],'[paid:request]')
+
+    def test_finite_purchase_cap_blocks_all_financial_checkpoints(self):
+        from unittest.mock import Mock
+        from limited_cycle_safety import CycleBlocked
+        guard=Mock();guard.acquire.side_effect=CycleBlocked('PURCHASE COMPLETED')
+        self.env['_np_limited_cycle_guard']=guard
+        self.db.payouts=[dict(id='new',trader_account_id='account',trader_id='owner',status='approved',amount=100)]
+        for action in ('create','approve','paid'):
+            self.db.payouts=[] if action=='create' else [dict(id='new',trader_account_id='account',trader_id='owner',status='approved',amount=100)]
+            self.assertEqual(self.invoke(self.handler(action,lambda:self.fail('Exhausted purchase authorized payment')),{'trader_id':'owner','id':'new','amount':100}),409)
+        self.assertEqual(guard.acquire.call_count,3)
+        self.assertIsNone(self.db.accounts[0]['archive_reason'])
+
+    def test_finite_amount_failure_releases_purchase_and_account_locks(self):
+        from unittest.mock import Mock
+        from limited_cycle_safety import CycleBlocked
+        guard=Mock();claim={'purchase':{'id':'finite'}};guard.acquire.return_value=claim
+        guard.check_amount.side_effect=CycleBlocked('Excessive payout')
+        self.env.update(_np_limited_cycle_guard=guard,_np_verified_payout_quote=lambda *a:{'verified':True},FUNDED_MAX_GROSS_PROFIT_PERCENT=50)
+        self.db.payouts=[dict(id='new',trader_account_id='account',trader_id='owner',status='approved',amount=100)]
+        self.assertEqual(self.invoke(self.handler('paid',lambda:self.fail('Amount check bypassed')),{'id':'new'}),409)
+        guard.check_amount.assert_called_once_with(claim,100,{'verified':True},50)
+        guard.release.assert_called_once_with(claim)
+        self.assertIsNone(self.db.accounts[0]['archive_reason'])

@@ -59083,12 +59083,15 @@ def _np_v206_broker_ledger(account, ids):
     return ledger
 
 def _np_v206_payout_guard(base, action):
+    from limited_cycle_safety import CycleBlocked
     def guarded(*args, **kwargs):
         if request.method == "OPTIONS":
             return base(*args, **kwargs)
         account = None
         lock_account = None
         claim = None
+        cycle_claim = None
+        payout = None
         try:
             payload = request.get_json(silent=True) or {}
             if action in {"create", "cancel"}:
@@ -59138,11 +59141,26 @@ def _np_v206_payout_guard(base, action):
             others = [row for row in ledger if str(row.get("id") or "") != pid and payout_status(row) in open_states]
             if action in {"create", "approve", "paid"} and others:
                 return bad("Another payout request already exists for this account. Review the existing request; no additional payout was authorized.", 409)
+            cycle_guard = globals().get("_np_limited_cycle_guard")
+            if cycle_guard and action in {"create", "approve", "paid"}:
+                cycle_claim = cycle_guard.acquire(account, pid, action)
+                if cycle_claim:
+                    value = payload.get("amount") if action == "create" else (payout or {}).get("amount")
+                    quote = (_np_verified_payout_quote(account, {"id":account.get("trader_id")})
+                             if action in {"approve", "paid"} else None)
+                    cycle_guard.check_amount(cycle_claim, value, quote, FUNDED_MAX_GROSS_PROFIT_PERCENT)
             return base(*args, **kwargs)
+        except CycleBlocked as exc:
+            return bad(str(exc), 409)
         except Exception as exc:
             print("GLOBAL PAYOUT GUARD ERROR:", action, exc, flush=True)
             return bad("Payout safety verification is temporarily unavailable. No additional payout was authorized.", 503)
         finally:
+            if cycle_claim:
+                try:
+                    _np_limited_cycle_guard.release(cycle_claim)
+                except Exception as exc:
+                    print("PURCHASE PAYOUT LOCK REQUIRES REVIEW:", exc, flush=True)
             if lock_account and claim:
                 try:
                     _np_v206_release_payout_action(lock_account, claim)
@@ -60002,3 +60020,8 @@ app.config["NP_PURCHASE_PLAN_PRICER"] = _np_price_buyer_plan
 from business_overview import register_business_overview as _np_register_business_overview
 _np_register_business_overview(app, requests, SUPABASE_URL,
     SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, _require_admin)
+
+# Additional finite-purchase financial protection. No legacy purchase backfill.
+from limited_cycle_safety import LimitedCycleSafety as _NPLimitedCycleSafety, register_cycle_safety as _np_register_cycle_safety
+_np_limited_cycle_guard = _NPLimitedCycleSafety(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
+_np_register_cycle_safety(app)
