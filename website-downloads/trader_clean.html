@@ -1343,6 +1343,22 @@ linear-gradient(145deg,#260608,#070707 72%);box-shadow:0 28px 85px rgba(0,0,0,.5
 .np-poster-cta:focus-visible{outline:3px solid #fff;outline-offset:4px}
 @media(max-width:1100px){.np-poster-grid,.np-poster-market.premium .np-poster-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.np-poster-size{font-size:39px}}
 @media(max-width:600px){.np-poster-grid,.np-poster-market.premium .np-poster-grid{grid-template-columns:minmax(0,1fr)}.np-poster-grid .np-plan-poster.plan-card{max-width:430px;width:100%;justify-self:center}.np-poster-size{font-size:clamp(30px,9vw,46px)}}
+
+/* Premium retains its own violet identity and a separate, compact section. */
+.np-poster-market.premium.np-product-market{max-width:440px;padding:18px!important;border:1px solid rgba(129,140,248,.55)!important;border-radius:24px;background:linear-gradient(145deg,rgba(99,102,241,.10),rgba(10,10,20,.6))!important;margin-top:32px!important}
+.np-poster-market.premium .np-product-market-title{color:#c7d2fe!important}
+.np-poster-market.premium .np-poster-grid{grid-template-columns:minmax(0,1fr)}
+.np-poster-market.premium .np-plan-poster.plan-card{border-color:#7774bd!important;background:radial-gradient(ellipse at 50% 0,rgba(99,102,241,.22),transparent 47%),linear-gradient(140deg,#141321,#050509 55%,#171429)!important;box-shadow:inset 0 1px 0 #c7d2fe44,0 12px 30px #0005!important}
+.premium .np-poster-brand>span:last-child,.premium .np-poster-name{color:#c1bde3}
+.premium .np-poster-phase{border-color:#9392df;color:#d9d8ff;background:linear-gradient(100deg,#6366f133,#0000)}
+.premium .np-poster-size{background-image:linear-gradient(#f3f1ff 8%,#d8dcff 40%,#a5b4fc 65%,#818cf8 96%);filter:drop-shadow(0 2px 6px #6366f122)}
+.premium .np-poster-price{border-color:#dddfff;background:linear-gradient(125deg,#818cf8,#c7d2fe 35%,#eeecff 49%,#a5b4fc 75%,#7875cc);color:#111022;box-shadow:0 0 18px #818cf822,inset 0 1px 1px #fff9}
+.premium .np-poster-metrics>div,.premium .np-poster-resets>div{border-color:#56517a;background:linear-gradient(145deg,#22203977,#05050999)}
+.premium .np-plan-poster svg:not(.np-poster-mark),.premium .np-poster-metrics strong,.premium .np-poster-resets strong,.premium .np-poster-payout b{color:#c7d2fe}
+.premium .np-poster-payout,.premium .np-poster-next{color:#c2bfd3}
+.premium .np-poster-cta{border-color:#dddfff;background:linear-gradient(110deg,#9098f3,#e2e5ff 50%,#a5a4ef);color:#111022;box-shadow:0 3px 15px #6366f122}
+@media(max-width:600px){.np-poster-market.premium.np-product-market{padding:12px!important}.premium .np-poster-size{font-size:clamp(26px,8vw,42px)}}
+
 </style>
 <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
