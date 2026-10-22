@@ -1307,6 +1307,43 @@ linear-gradient(145deg,#260608,#070707 72%);box-shadow:0 28px 85px rgba(0,0,0,.5
 }
 </style>
 
+<style>
+
+/* Black and gold plan posters. Pricing and rules remain live text. */
+.np-poster-market.np-product-market{padding:0!important;border:0!important;background:none!important;margin:0 0 28px!important}
+.np-poster-market .np-product-market-title{color:#f2d78a!important;font-size:20px}
+.np-poster-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;align-items:stretch}
+.np-poster-market.premium .np-poster-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+.np-poster-grid .np-plan-poster.plan-card{padding:24px 18px!important;gap:0!important;min-height:0!important;display:flex!important;flex-direction:column!important;text-align:center;border:1px solid #8d6b2c!important;border-radius:22px!important;background:radial-gradient(ellipse at 50% 0,rgba(202,150,35,.22),transparent 47%),linear-gradient(140deg,#14110a,#050505 55%,#191306)!important;box-shadow:inset 0 1px 0 #e6c66b55,0 12px 30px #0005!important;overflow:hidden;position:relative}
+.np-plan-poster:before{display:none!important}
+.np-poster-brand{display:flex;justify-content:center;align-items:center;gap:7px;font-size:13px;font-weight:800;letter-spacing:2px;color:#f4d477}
+.np-poster-brand>span:last-child{position:absolute;top:13px;right:13px;font-size:8px;letter-spacing:1px;color:#b9a579}
+.np-plan-poster svg.np-poster-mark{width:28px;height:28px;color:#ffcf50}
+.np-poster-name{font-size:12px;font-weight:800;letter-spacing:3px;color:#ddd3bc;margin:9px 0 17px}
+.np-poster-phase{align-self:center;border:1px solid #b79547;border-radius:30px;padding:7px 15px;font-size:12px;font-weight:900;letter-spacing:2px;color:#ffdb7b;background:linear-gradient(100deg,#6b451a55,#0000)}
+.np-poster-phase span{font-weight:400;color:#eee;letter-spacing:3px;margin-left:5px;font-size:10px}
+.np-poster-size{font-family:Inter,Arial,sans-serif;font-size:clamp(28px,3.1vw,47px);font-weight:950;line-height:1.15;letter-spacing:-2px;background:linear-gradient(#fff7bf 8%,#ffe297 40%,#efb63c 65%,#9d5c10 96%);background-clip:text;-webkit-background-clip:text;color:transparent;margin:19px 0 6px;white-space:nowrap;filter:drop-shadow(0 2px 6px #bd7f1620)}
+.np-poster-for{font-size:10px;letter-spacing:4px;color:#d8d5cc;margin-bottom:9px}
+.np-poster-price{font-family:Inter,Arial,sans-serif;font-size:clamp(25px,2.8vw,37px);font-weight:950;letter-spacing:-1px;color:#080704;border:1px solid #ffeca1;border-radius:14px;padding:12px 8px;background:linear-gradient(125deg,#d39824,#ffdf79 35%,#fff2b0 49%,#e5aa33 75%,#b77918);box-shadow:0 0 18px #edb44320,inset 0 1px 1px #fff9;margin:0 0 17px}
+.np-poster-metrics,.np-poster-resets{display:grid;gap:7px;grid-template-columns:repeat(3,minmax(0,1fr))}
+.np-poster-resets{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:8px}
+.np-poster-metrics>div,.np-poster-resets>div{border:1px solid #685631;border-radius:12px;padding:12px 5px;background:linear-gradient(145deg,#1e180d77,#05050599);display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:7px;min-width:0}
+.np-plan-poster svg{width:29px;height:29px;color:#f2cd67;flex-shrink:0}
+.np-poster-metrics span,.np-poster-resets span{font-size:8px;font-weight:700;letter-spacing:.7px;color:#e2dfd4;line-height:1.4}
+.np-poster-metrics strong{font-size:29px;line-height:1.05;color:#ffe69b;font-weight:900}
+.np-poster-metrics strong.np-poster-dd{font-size:13px;line-height:1.35;text-transform:uppercase;margin-top:2px;max-width:80px}
+.np-poster-resets strong{font-size:12px;color:#f7df9c;line-height:1.4}
+.np-poster-resets svg{width:24px;height:24px}
+.np-poster-payout{display:flex;justify-content:space-between;gap:8px;font-size:10px;color:#c4bda9;padding:15px 0;margin-top:auto}
+.np-poster-payout b{color:#f1d58f;font-weight:700}
+.np-poster-next{font-size:11px;color:#d4c59d;margin-top:10px}
+.np-poster-cta{width:100%;display:flex;align-items:center;justify-content:center;gap:25px;padding:12px 10px;border:1px solid #ffe48a;border-radius:30px;background:linear-gradient(110deg,#e6aa35,#ffe79c 50%,#e1a328);box-shadow:0 3px 15px #d29b2020;color:#080704;font-size:12px;font-weight:900;letter-spacing:.6px;cursor:pointer}
+.np-poster-cta span{font-size:24px;line-height:16px}
+.np-poster-cta:hover{filter:brightness(1.1)}
+.np-poster-cta:focus-visible{outline:3px solid #fff;outline-offset:4px}
+@media(max-width:1100px){.np-poster-grid,.np-poster-market.premium .np-poster-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.np-poster-size{font-size:39px}}
+@media(max-width:600px){.np-poster-grid,.np-poster-market.premium .np-poster-grid{grid-template-columns:minmax(0,1fr)}.np-poster-grid .np-plan-poster.plan-card{max-width:430px;width:100%;justify-self:center}.np-poster-size{font-size:clamp(30px,9vw,46px)}}
+</style>
 <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
@@ -8399,59 +8436,44 @@ function npProductMarketRowsV156(plans,key){
     Number(a.account_size||a.size||0)-Number(b.account_size||b.size||0)
   );
 }
+function npPlanPosterIcon(kind){
+  const paths={target:'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><path d="m12 12 9-9m-5 0h5v5"/>',chart:'<path d="M5 20v-6h3v6zm6 0V9h3v11zm6 0V3h3v17z"/>',shield:'<path d="M12 3 3 6v6c0 5 9 9 9 9s9-4 9-9V6z"/><path d="m8 12 3 3 5-6"/>',reset:'<path d="M20 8a8 8 0 0 0-14-3L3 8m0-5v5h5M4 16a8 8 0 0 0 14 3l3-3m0 5v-5h-5"/>',coins:'<ellipse cx="9" cy="6" rx="6" ry="3"/><path d="M3 6v9c0 4 12 4 12 0V6M3 11c0 4 12 4 12 0m-8 8c2 4 14 3 14-1V9c0-2-2-3-4-3m4 8c0 2-2 3-4 3"/>'};
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[kind]||paths.shield}</svg>`;
+}
 function npProductMarketBlockV156(plans,key,mode='plans'){
   const rows=npProductMarketRowsV156(plans,key);
-  const label=key==='premium'?'Premium':'Standard';
-  const sub=key==='premium'
-    ? 'Premium market · separate pricing and trading rules'
-    : 'Standard market · core NairaPips challenge plans';
   if(!rows.length) return '';
-  const cards=rows.map((p,i)=>{
-    p={...p,fee:p.base_fee??p.fee,payout_cycles:2,payout_cycle_extra:0};
+  const label=key==='premium'?'Premium':'Standard';
+  const cards=rows.map(raw=>{
+    const p={...raw,fee:raw.base_fee??raw.fee};
     const route=npPlanRoute(p);
-    if(mode==='purchase'){
-      return `<div class="plan-card" onclick="purchasePlan('${esc(String(p.id))}')" style="cursor:pointer;padding:18px">
-        <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
-          <div style="font-size:10px;color:var(--text-mute);text-transform:uppercase;letter-spacing:.1em;font-weight:700">${label.toUpperCase()}</div>
-          <span class="pill ${route.onePhase?'pill-gold':'pill-blue'}">${route.label}</span>
-        </div>
-        <div style="font-weight:900;font-size:16px;margin:4px 0">${esc(p.name||p.plan_name||'—')}</div>
-        <div style="font-size:22px;font-weight:900;color:${key==='premium'?'#c7d2fe':'var(--gold)'};font-family:'JetBrains Mono',monospace;margin:6px 0">${fmt.money(p.account_size||p.size||0)}</div>
-        <div style="font-size:12px;color:var(--text-dim)">Fee: <b>${fmt.money(p.fee||p.price||0)}</b></div>
-        <div style="font-size:11px;margin-top:8px;color:${route.onePhase?'var(--gold)':'var(--info-text)'};font-weight:800">${route.phase1Target}% Phase 1 → ${route.nextLabel}${route.onePhase?'':' '+route.phase2Target+'%'}</div>
-        <div style="font-size:11px;margin-top:6px;color:var(--text-mute);line-height:1.65">
-          ${esc(p.drawdown_type||'STATIC')} DD · Max ${Number(p.max_drawdown||p.total_dd||20)}%<br>
-          Payout: ${esc(p.payout_frequency||'Daily')} · Split ${Number(p.payout_split||60)}%<br>
-          Phase 1 Reset: <b>${Number(p.reset_fee||0)>0?'Available':'Not available'}</b><br>Funded Reset: <b>${p.funded_reset_fee===0?'Not available':'Available'}</b>
-        </div>
-      </div>`;
-    }
-    return `<div class="plan-card ${i===0?'popular':''}" onclick="purchasePlan('${esc(String(p.id))}')">
-      ${i===0?`<div class="pop-badge">${label.toUpperCase()}</div>`:''}
-      <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">
-        <div style="font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--text-mute);font-weight:700">${label} Plan</div>
-        <span class="pill ${route.onePhase?'pill-gold':'pill-blue'}">${route.label}</span>
+    const standard=key==='standard';
+    const phaseReset=standard?0:Number(p.reset_fee||0);
+    const fundedReset=standard?0:Number(p.funded_reset_fee??Number(p.fee||0)*2);
+    const drawdown=String(p.drawdown_type||'STATIC').toUpperCase();
+    const ddLabel=drawdown==='STATIC'?'Static balance':drawdown.replaceAll('_',' ');
+    return `<article class="plan-card np-plan-poster">
+      <div class="np-poster-brand"><svg class="np-poster-mark" viewBox="0 0 32 32" aria-hidden="true"><path fill="#f5ce62" stroke="none" d="M3 27 8 9h6l6 11 4-14-4 1L28 0l3 10-4-2-6 21h-6L9 18 6 29z"/></svg> NAIRAPIPS <span>${label}</span></div>
+      <div class="np-poster-name">${esc(p.name||p.plan_name||'Plan')}</div>
+      <div class="np-poster-phase">${route.onePhase?'1 PHASE':'2 PHASE'} <span>CHALLENGE</span></div>
+      <div class="np-poster-size">${fmt.money(p.account_size||p.size||0)}</div>
+      <div class="np-poster-for">ACCOUNT FOR</div>
+      <div class="np-poster-price">${fmt.money(p.fee||p.price||0)}</div>
+      <div class="np-poster-metrics">
+        <div>${npPlanPosterIcon('target')}<span>PHASE 1 TARGET</span><strong>${route.phase1Target}%</strong></div>
+        <div>${npPlanPosterIcon('chart')}<span>MAXIMUM DD</span><strong>${Number(p.max_drawdown||p.total_dd||20)}%</strong></div>
+        <div>${npPlanPosterIcon('shield')}<span>DRAWDOWN</span><strong class="np-poster-dd">${esc(ddLabel)}</strong></div>
       </div>
-      <div class="name">${esc(p.name||p.plan_name||'—')}</div>
-      <div class="size">${fmt.money(p.account_size||p.size||0)}</div>
-      <div class="fee">Fee: <b style="color:${key==='premium'?'#c7d2fe':'var(--gold)'}">${fmt.money(p.fee||p.price||0)}</b></div>
-      <div class="rules">
-        <div><div class="rule-label">Phase 1 Target</div><div class="rule-value gold">${route.phase1Target}%</div></div>
-        <div><div class="rule-label">After Phase 1</div><div class="rule-value ${route.onePhase?'gold':''}">${route.nextLabel}</div></div>
-        <div><div class="rule-label">Drawdown</div><div class="rule-value">${esc(p.drawdown_type||'STATIC')} · ${(p.max_drawdown||p.total_dd||20)}%</div></div>
-        <div><div class="rule-label">Payout</div><div class="rule-value">${esc(p.payout_frequency||'Daily')} · ${Number(p.payout_split||60)}%</div></div>
-        <div><div class="rule-label">Phase 1 Reset</div><div class="rule-value">${Number(p.reset_fee||0)>0?fmt.money(p.reset_fee):'Not available'}</div></div><div><div class="rule-label">Funded Reset</div><div class="rule-value">${p.funded_reset_fee===0?'Not available':fmt.money(p.funded_reset_fee??Number(p.base_fee??p.fee??0)*2)}</div></div>
+      <div class="np-poster-resets">
+        <div>${npPlanPosterIcon('reset')}<span>PHASE 1 RESET</span><strong>${phaseReset>0?fmt.money(phaseReset):'Not available'}</strong></div>
+        <div>${npPlanPosterIcon('coins')}<span>FUNDED RESET</span><strong>${fundedReset>0?fmt.money(fundedReset):'Not available'}</strong></div>
       </div>
-      <button class="btn btn-gold btn-block">Select Plan →</button>
-    </div>`;
+      ${route.onePhase?'':`<div class="np-poster-next">Phase 2 target <b>${route.phase2Target}%</b></div>`}
+      <div class="np-poster-payout"><span>${esc(p.payout_frequency||'Daily')} payouts</span><b>${Number(p.payout_split||60)}% profit split</b></div>
+      <button class="np-poster-cta" onclick="purchasePlan('${esc(String(p.id))}')">GET STARTED <span aria-hidden="true">›</span></button>
+    </article>`;
   }).join('');
-  return `<section class="np-product-market ${key}">
-    <div class="np-product-market-head">
-      <div><div class="np-product-market-title">${label} Plans</div><div class="np-product-market-sub">${sub}</div></div>
-      <span class="np-product-market-chip">${label.toUpperCase()}</span>
-    </div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(${mode==='purchase'?'260':'280'}px,1fr));gap:${mode==='purchase'?'12':'14'}px">${cards}</div>
-  </section>`;
+  return `<section class="np-product-market ${key} np-poster-market"><div class="np-product-market-head"><div class="np-product-market-title">${label} Plans</div></div><div class="np-poster-grid">${cards}</div></section>`;
 }
 
 function renderPlans(){

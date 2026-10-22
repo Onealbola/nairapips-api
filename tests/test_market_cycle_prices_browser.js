@@ -37,6 +37,9 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
   const purchaseCards=await page.locator('#cards').innerText();
   assert(!purchaseCards.includes('cycle'));assert(!purchaseCards.includes('Base '));
   const open=async id=>{await page.evaluate(id=>purchasePlan(id),id);await page.waitForFunction(()=>!document.getElementById('pur-submit').disabled);};
+  await page.locator('.standard .np-poster-cta').first().click();
+  await page.waitForFunction(()=>!document.getElementById('pur-submit').disabled);
+  assert.equal(await page.locator('#pur-cycles').inputValue(),'2');
   await open('s');assert.equal(await page.locator('#pur-cycles').inputValue(),'2');
   assert((await page.locator('#pur-amount-display').innerText()).includes('20,000'));
   assert(!await page.locator('#pur-cycle-toggle').isChecked());assert(!await page.locator('#pur-cycles').isVisible());
