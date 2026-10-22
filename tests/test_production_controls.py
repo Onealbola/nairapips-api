@@ -198,7 +198,7 @@ class ControlsTests(unittest.TestCase):
     def test_new_unsold_product_saves_zero_second_phase_and_real_fee(self):
         r=self.client.post('/admin/production_catalog',json={'id':'p','updated_at':'v1','changes':{'fee':25000,'phase2_target':0,'reset_fee':0}})
         self.assertEqual(r.status_code,200,r.json)
-        self.assertEqual(self.db.rows['challenge_plans'][0]['funded_reset_fee'],50000)
+        self.assertIsNone(self.db.rows['challenge_plans'][0].get('funded_reset_fee'))
         self.assertEqual(self.db.rows['challenge_plans'][0]['phase2_target'],0)
 
 class PackageTests(unittest.TestCase):

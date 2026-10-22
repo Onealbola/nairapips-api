@@ -14,9 +14,12 @@ Another independently purchased account remains untouched.
 
 ## Prices and publication
 
-- For a fixed challenge plan, its Fee is the full upfront purchase price for the
-  selected cycle entitlement. Set that fee to include the upgrade when offering
-  3–5 cycles or unlimited. There is no automatic later extension charge.
+- For a standard challenge plan, Fee is the base plan price. Business Settings
+  stores separate fixed naira extra costs for 3, 4, 5 and unlimited cycles. The
+  saved charge is added automatically to the base fee at purchase and checked
+  server-side. 2 cycles is the default; 1 cycle remains available without an
+  extra charge. Blank paid options cannot be sold until priced. Premium fixed
+  plans retain their existing fee behavior. There is no later extension charge.
 - For Build Your Package, set the charge for each cycle choice in Business
   settings. Two cycles can be included at zero additional charge. Active choices
   above two or unlimited must have a positive upfront charge. Existing configured
@@ -48,3 +51,28 @@ unlimited and legacy terms, duplicates/replays, read-only previews, final-source
 retirement, purchase isolation, immutable snapshots and exhausted-budget assignment
 rejection. The unit and browser tests verify actual checkout snapshots, renewal
 hooks, upfront upgrade validation and the plan creation card.
+
+## Reset choices and cycle price update (22 October 2026)
+
+Standard plan creation/editing and the Business Settings product editor expose
+Phase 1 Reset: Not available / Custom price, and Funded Reset: Not available /
+Automatic 2× base plan fee / Custom price. Zero is Not available, not a free
+reset; NULL funded_reset_fee selects automatic pricing. Custom prices are not
+replaced when the base fee changes. The shared Phase reset price continues to
+cover challenge stages on two-phase products. Already approved reset orders and
+historical included Second Life entitlements keep their existing fulfillment.
+
+Cycle prices use the existing versioned business_settings key/value storage,
+under standard_plan_cycle_prices_v1. No guessed prices are installed. Configure
+3, 4, 5 and unlimited separately; blank means that upgrade is unavailable.
+These are additional upfront charges, not a charge each time a payout is made.
+They apply to the cycle count selected on the plan card. Premium fixed-plan and
+Build Your Package pricing remain separate. Recorded purchase fees and cycle
+snapshots are not rewritten. Existing promo/affiliate rules apply to the full
+quoted purchase price, including the cycle charge.
+
+Deploy the backend changes together with plan_commercial.py before replacing
+website-downloads/admin_clean.html and website-downloads/trader_clean.html in
+cPanel. production-settings.js is synchronized for standalone consumers.
+This change reuses existing reset price and business_settings columns. Existing
+cycle/snapshot migrations listed above must already be installed.

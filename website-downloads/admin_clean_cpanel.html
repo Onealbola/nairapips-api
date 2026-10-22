@@ -1,12 +1,28 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<!-- NAIRAPIPS ADMIN V128 WORK INTERRUPTION FIX · 02 OCT 2026
+     - Journey Control Centre no longer auto-fires PAID payout renewals.
+     - Successful payout renewal no longer auto-opens/re-opens Journey Control Centre.
+     - Manual payout renewal buttons and all backend protections remain unchanged.
+-->
 
+<!-- NAIRAPIPS ADMIN CURRENT PAYOUT RENEWAL ROUTING FIX · 02 OCT 2026
+     Paid payout button now uses exact payout-renewal authority.
+     It no longer routes PAID payouts through Operational MT5 Recovery.
+     All unrelated Admin controls remain unchanged.
+-->
 
-
-
- 
-
+<!-- NAIRAPIPS ADMIN V46 FAST FIFO ASSIGNMENT · 25 SEP 2026
+     - Assignment buttons respond immediately with busy state
+     - Assignable MT5 read is capped at 8 seconds then safe-cache fallback
+     - FIFO: oldest eligible MT5 in correct vault/size is chosen first
+     - POST assignment remains single-shot and backend-authoritative
+     - Existing journey, anti-replay, wrong-trader and single-use protections unchanged
+-->
+<!-- NAIRAPIPS ADMIN V40 EXACT ASSIGNED-ENTITLEMENT RECALL · 2026-09-22
+     Fix: Recall remains visible after an entitlement is assigned/consumed.
+     Exact active account ID is preselected; backend still blocks any traded account. -->
 
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1955,7 +1971,7 @@ body:has(.nav.active[onclick*="revenue"]) #content .text-red-400{color:#ff737b!i
 </style>
 
 
-
+<!-- NAIRAPIPS STUNNING 3D ELECTRIC BLUE PASS/WATING STYLE - DISPLAY ONLY -->
 <style id="nairapips-3d-blue-pass-style">
 :root{
   --np-electric-blue:#00c6ff;
@@ -2593,10 +2609,16 @@ input::placeholder, textarea::placeholder{
 </style>
 
 
+<!-- NAIRAPIPS ADMIN V103 MANAGEMENT RECALL LINEAGE DISPLAY PROTECTION · 27 SEP 2026
+     PATCHED DIRECTLY ON THE 933KB PRODUCTION MASTER.
+     Existing Universal Recall V87 and Management Recall V102 controls are preserved.
+     Historical recalled/archived accounts remain in the ledger but cannot be rendered
+     as CURRENT solely through a stale current_account_id pointer.
+     Backend V103 owns Management Hold, Return lineage, worker firewall and life-count reconciliation.
+-->
 
 
-
-
+<!-- V105 MANAGEMENT RECALL/RETURN VISUAL DISTINCTION · PRESENTATION ONLY · 27 SEP 2026 -->
 
 <style>
 /* V156 PRODUCT MARKETS */
@@ -10409,17 +10431,39 @@ const cat = p => String(p.product_category || "standard").toLowerCase() === "pre
 const sorted = rows => rows.slice().sort((a, b) => Number(a.category_sort || 10) - Number(b.category_sort || 10) || Number(a.account_size || 0) - Number(b.account_size || 0));
 const marketTable = (label, key) => {
 const rows = sorted(list.filter(p => cat(p) === key));
-return `<section class="np-market-section ${key}">\n      <div class="np-market-head">\n        <div>\n          <div class="np-market-title">${label} Plans</div>\n          <div class="text-xs text-gray-400">${rows.length} plan(s) · separate customer market</div>\n        </div>\n        <span class="np-market-chip">${key.toUpperCase()}</span>\n      </div>\n      <div style="overflow-x:auto"><table class="compact">\n        <thead><tr><th>Name</th><th>Size</th><th>Fee</th><th>Target</th><th>DD Type</th><th>Total DD</th><th>Payout</th><th>Funded cycles</th><th>Profit Split</th><th>Phase Reset</th><th>Funded Reset</th><th>Status</th><th>Actions</th></tr></thead>\n        <tbody>${rows.map(p => `<tr>\n          <td><b>${esc(p.name || p.plan_name || "—")}</b></td>\n          <td>${esc(money(p.account_size || p.size || 0))}</td>\n          <td>${esc(money(p.fee || p.price || 0))}</td>\n          <td>${pct(p.profit_target || p.phase1_target || 0)} → ${Number(p.phase2_target || 0) > 0 ? "Phase 2 " + pct(p.phase2_target) : "Funded"}</td>\n          <td>${esc(p.drawdown_type || "STATIC")}</td>\n          <td>${pct(p.max_drawdown || p.total_dd || 0)}</td>\n          <td>${esc(p.payout_frequency || "Daily")}</td>\n          <td>${p.payout_cycles === 0 ? "Unlimited" : p.payout_cycles ?? 2}</td>\n          <td>${pct(Number(p.payout_split ?? 60))}</td>\n          <td>${money(Number(p.reset_fee || 0))}</td>\n          <td>${money(Number(p.fee || p.price || 0) * 2)} <span class="text-xs text-gray-400">(2× fee)</span></td>\n          <td>${esc(p.status || "active")}</td>\n          <td><div class="row-actions">\n            <button class="btn btn-sm" onclick='editPlan(${JSON.stringify(p.id)})'>Edit</button>\n            <button class="btn btn-sm btn-red" onclick='deletePlan(${JSON.stringify(p.id)},${JSON.stringify(p.name || p.plan_name)})'>Del</button>\n          </div></td>\n        </tr>`).join("") || '<tr><td colspan="13"><div class="empty">No plans in this market yet.</div></td></tr>'}</tbody>\n      </table></div>\n    </section>`;
+return `<section class="np-market-section ${key}">\n      <div class="np-market-head">\n        <div>\n          <div class="np-market-title">${label} Plans</div>\n          <div class="text-xs text-gray-400">${rows.length} plan(s) · separate customer market</div>\n        </div>\n        <span class="np-market-chip">${key.toUpperCase()}</span>\n      </div>\n      <div style="overflow-x:auto"><table class="compact">\n        <thead><tr><th>Name</th><th>Size</th><th>Fee</th><th>Target</th><th>DD Type</th><th>Total DD</th><th>Payout</th><th>Funded cycles</th><th>Profit Split</th><th>Phase Reset</th><th>Funded Reset</th><th>Status</th><th>Actions</th></tr></thead>\n        <tbody>${rows.map(p => `<tr>\n          <td><b>${esc(p.name || p.plan_name || "—")}</b></td>\n          <td>${esc(money(p.account_size || p.size || 0))}</td>\n          <td>${esc(money(p.fee || p.price || 0))}</td>\n          <td>${pct(p.profit_target || p.phase1_target || 0)} → ${Number(p.phase2_target || 0) > 0 ? "Phase 2 " + pct(p.phase2_target) : "Funded"}</td>\n          <td>${esc(p.drawdown_type || "STATIC")}</td>\n          <td>${pct(p.max_drawdown || p.total_dd || 0)}</td>\n          <td>${esc(p.payout_frequency || "Daily")}</td>\n          <td>${p.payout_cycles === 0 ? "Unlimited" : p.payout_cycles ?? 2}</td>\n          <td>${pct(Number(p.payout_split ?? 60))}</td>\n          <td>${Number(p.reset_fee || 0) > 0 ? money(Number(p.reset_fee)) : "Not available"}</td>\n          <td>${p.funded_reset_fee === 0 ? "Not available" : money(Number(p.funded_reset_fee ?? Number(p.fee || p.price || 0) * 2))}</td>\n          <td>${esc(p.status || "active")}</td>\n          <td><div class="row-actions">\n            <button class="btn btn-sm" onclick='editPlan(${JSON.stringify(p.id)})'>Edit</button>\n            <button class="btn btn-sm btn-red" onclick='deletePlan(${JSON.stringify(p.id)},${JSON.stringify(p.name || p.plan_name)})'>Del</button>\n          </div></td>\n        </tr>`).join("") || '<tr><td colspan="13"><div class="empty">No plans in this market yet.</div></td></tr>'}</tbody>\n      </table></div>\n    </section>`;
 };
 document.getElementById("content").innerHTML = `\n    <div class="vault mb-6 tab-content">\n      <div class="flex items-center justify-between flex-wrap gap-3">\n        <div>\n          <div class="badge">TWO SEPARATE PRODUCT MARKETS</div>\n          <div style="font-size:24px;font-weight:900;margin-top:6px">${list.length} plan(s)</div>\n          <div class="text-xs text-gray-400 mt-1">Standard Plans and Premium Plans are deliberately separated below. Each market has its own plans, pricing and trading rules.</div>\n        </div>\n        <button class="btn btn-gold" onclick="showCreatePlan()">＋ New Plan</button>\n      </div>\n    </div>\n    ${marketTable("Standard", "standard")}\n    ${marketTable("Premium", "premium")}\n  `;
 }
 
+window.npResetControl = function(prefix, kind, value, fee) {
+const funded = kind === "funded";
+const id = prefix + (funded ? "-funded-reset-fee" : "-reset-fee");
+const mode = funded && value == null ? "auto" : Number(value || 0) > 0 ? "custom" : "none";
+return `<div><div class="kpi-sub">${funded ? "Funded" : "Phase 1"} Reset</div>\n    <select class="select" id="${id}-mode" onchange="npResetModeChanged('${prefix}','${kind}')">\n      <option value="none" ${mode === "none" ? "selected" : ""}>Not available</option>\n      ${funded ? `<option value="auto" ${mode === "auto" ? "selected" : ""}>Automatic · 2× plan fee</option>` : ""}\n      <option value="custom" ${mode === "custom" ? "selected" : ""}>Custom price</option>\n    </select><input class="input" aria-label="${funded ? "Funded" : "Phase 1"} reset price" id="${id}" type="number" min="0.01" step="0.01" ${mode === "custom" ? "" : "disabled"} style="${mode === "none" ? "display:none" : ""}" value="${mode === "auto" ? Number(fee || 0) * 2 : Number(value || 0)}"></div>`;
+};
+
+window.npResetModeChanged = function(prefix, kind) {
+const id = prefix + (kind === "funded" ? "-funded-reset-fee" : "-reset-fee");
+const mode = document.getElementById(id + "-mode").value;
+const field = document.getElementById(id);
+field.disabled = mode !== "custom";
+field.style.display = mode === "none" ? "none" : "";
+if (mode === "auto") field.value = Number(document.getElementById(prefix + "-fee")?.value || 0) * 2;
+};
+
+window.npResetValue = function(prefix, kind) {
+const id = prefix + (kind === "funded" ? "-funded-reset-fee" : "-reset-fee");
+const mode = document.getElementById(id + "-mode").value;
+if (mode === "none") return 0;
+if (mode === "auto") return null;
+const value = Number(document.getElementById(id).value);
+if (!Number.isFinite(value) || value <= 0) throw Error("Enter a positive reset price or select Not available");
+return value;
+};
+
 window.npSyncFundedResetDoubleV152 = function(prefix) {
-const feeEl = document.getElementById(prefix + "-fee");
-const fundedEl = document.getElementById(prefix + "-funded-reset-fee");
-if (!feeEl || !fundedEl) return;
-const fee = Number(feeEl.value || 0);
-fundedEl.value = fee > 0 ? String(fee * 2) : "";
+if (document.getElementById(prefix + "-funded-reset-fee-mode")?.value === "auto") npResetModeChanged(prefix, "funded");
 };
 
 window.npPlanRouteChanged = function(prefix) {
@@ -10434,7 +10478,7 @@ if (route === "phase2" && !Number(target.value)) target.value = 8;
 };
 
 window.showCreatePlan = function() {
-npShowResetModalSafe(`\n    <button onclick="this.closest('.modal-bg').remove()" style="position:absolute;top:8px;right:14px;background:0;border:0;color:#fff;font-size:24px">&times;</button>\n    <h2 style="font-size:22px;font-weight:900;margin:6px 0 12px">New Challenge Plan</h2>\n    <div class="grid sm:grid-cols-2 gap-2">\n      <div><div class="kpi-sub">Plan Name *</div><input class="input" id="pl-name" placeholder="₦500,000 Account"></div>\n      <div><div class="kpi-sub">Product Market</div><select class="select" id="pl-category"><option value="standard">Standard Plans</option><option value="premium">Premium Plans</option></select></div>\n      <div><div class="kpi-sub">Display Order</div><input class="input" id="pl-category-sort" type="number" min="1" value="10"></div>\n      <div><div class="kpi-sub">Drawdown Type</div><select class="select" id="pl-drawdown-type"><option value="STATIC">STATIC</option><option value="TRAILING" disabled>TRAILING — not released</option></select></div>\n      <div><div class="kpi-sub">Payout Frequency</div><select class="select" id="pl-payout-frequency"><option value="Daily">Daily</option><option value="Weekly">Weekly</option><option value="Biweekly">Biweekly</option><option value="Monthly">Monthly</option><option value="On Demand">On Demand</option></select></div>\n      <div><div class="kpi-sub">Account Size</div><input class="input" id="pl-size" type="number" placeholder="500000"></div>\n      <div><div class="kpi-sub">Fee</div><input class="input" id="pl-fee" type="number" placeholder="25000" oninput="npSyncFundedResetDoubleV152('pl')"></div>\n      <div><div class="kpi-sub">MT5 Server</div><input class="input" id="pl-server" value="Exness-MT5Trial9"></div>\n      <div><div class="kpi-sub">Phase 1 Target %</div><input class="input" id="pl-t1" type="number" placeholder="10"></div>\n      <div><div class="kpi-sub">After Phase 1</div><select class="select" id="pl-route" onchange="npPlanRouteChanged('pl')"><option value="phase2">Continue to Phase 2</option><option value="funded">Move Directly to Funded (1-Phase)</option></select></div>\n      <div id="pl-t2-wrap"><div class="kpi-sub">Phase 2 Target %</div><input class="input" id="pl-t2" type="number" placeholder="8"></div>\n      <div><div class="kpi-sub">Daily DD</div><input class="input" id="pl-ddd" type="text" value="None" placeholder="None" readonly></div>\n      <div><div class="kpi-sub">Max DD %</div><input class="input" id="pl-tdd" type="number" placeholder="10"></div>\n      <div><div class="kpi-sub">Payout Split %</div><input class="input" id="pl-split" type="number" min="0" max="100" step="0.01" placeholder="60 or 70"></div>\n      <div><div class="kpi-sub">Phase Reset Price</div><input class="input" id="pl-reset-fee" type="number" min="0" step="1" placeholder="Enter exact Phase reset price"></div>\n      <div><div class="kpi-sub">Funded Reset Price · AUTO 2× FEE</div><input class="input" id="pl-funded-reset-fee" type="number" min="0" step="1" readonly placeholder="Automatically double challenge fee"></div>\n      <div><div class="kpi-sub">Funded payout cycles</div><select class="select" id="pl-cycles">${[ 1, 2, 3, 4, 5, 0 ].map(n => `<option value="${n}" ${Number(2) === n ? "selected" : ""}>${n === 0 ? "Unlimited (paid option)" : n + " cycle" + (n === 1 ? "" : "s") + (n === 2 ? " — included default" : "")}</option>`).join("")}</select><div class="text-xs text-gray-400">Two cycles included by default. For 3–5 or unlimited, set the plan fee to include the paid upgrade. Paid at purchase.</div></div>\n      <div><div class="kpi-sub">Public Card Badge</div><input class="input" id="pl-public-badge" maxlength="24" placeholder="NEW, POPULAR, BEST VALUE, LIMITED"></div>\n      <div style="grid-column:1 / -1"><div class="kpi-sub">Description</div><textarea class="input" id="pl-desc" rows="2"></textarea></div>\n    </div>\n    <label style="display:block;margin-top:12px"><input type="checkbox" id="pl-release"> Open this product for new purchases</label>\n    <div class="flex gap-2 mt-3"><button class="btn btn-gold" onclick="createPlan()">＋ Create</button></div>\n  `);
+npShowResetModalSafe(`\n    <button onclick="this.closest('.modal-bg').remove()" style="position:absolute;top:8px;right:14px;background:0;border:0;color:#fff;font-size:24px">&times;</button>\n    <h2 style="font-size:22px;font-weight:900;margin:6px 0 12px">New Challenge Plan</h2>\n    <div class="grid sm:grid-cols-2 gap-2">\n      <div><div class="kpi-sub">Plan Name *</div><input class="input" id="pl-name" placeholder="₦500,000 Account"></div>\n      <div><div class="kpi-sub">Product Market</div><select class="select" id="pl-category"><option value="standard">Standard Plans</option><option value="premium">Premium Plans</option></select></div>\n      <div><div class="kpi-sub">Display Order</div><input class="input" id="pl-category-sort" type="number" min="1" value="10"></div>\n      <div><div class="kpi-sub">Drawdown Type</div><select class="select" id="pl-drawdown-type"><option value="STATIC">STATIC</option><option value="TRAILING" disabled>TRAILING — not released</option></select></div>\n      <div><div class="kpi-sub">Payout Frequency</div><select class="select" id="pl-payout-frequency"><option value="Daily">Daily</option><option value="Weekly">Weekly</option><option value="Biweekly">Biweekly</option><option value="Monthly">Monthly</option><option value="On Demand">On Demand</option></select></div>\n      <div><div class="kpi-sub">Account Size</div><input class="input" id="pl-size" type="number" placeholder="500000"></div>\n      <div><div class="kpi-sub">Base Plan Fee</div><input class="input" id="pl-fee" type="number" placeholder="25000" oninput="npSyncFundedResetDoubleV152('pl')"></div>\n      <div><div class="kpi-sub">MT5 Server</div><input class="input" id="pl-server" value="Exness-MT5Trial9"></div>\n      <div><div class="kpi-sub">Phase 1 Target %</div><input class="input" id="pl-t1" type="number" placeholder="10"></div>\n      <div><div class="kpi-sub">After Phase 1</div><select class="select" id="pl-route" onchange="npPlanRouteChanged('pl')"><option value="phase2">Continue to Phase 2</option><option value="funded">Move Directly to Funded (1-Phase)</option></select></div>\n      <div id="pl-t2-wrap"><div class="kpi-sub">Phase 2 Target %</div><input class="input" id="pl-t2" type="number" placeholder="8"></div>\n      <div><div class="kpi-sub">Daily DD</div><input class="input" id="pl-ddd" type="text" value="None" placeholder="None" readonly></div>\n      <div><div class="kpi-sub">Max DD %</div><input class="input" id="pl-tdd" type="number" placeholder="10"></div>\n      <div><div class="kpi-sub">Payout Split %</div><input class="input" id="pl-split" type="number" min="0" max="100" step="0.01" placeholder="60 or 70"></div>\n      ${npResetControl("pl", "phase", 0, 0)}\n      ${npResetControl("pl", "funded", null, 0)}\n      <div><div class="kpi-sub">Funded payout cycles</div><select class="select" id="pl-cycles">${[ 1, 2, 3, 4, 5, 0 ].map(n => `<option value="${n}" ${Number(2) === n ? "selected" : ""}>${n === 0 ? "Unlimited (paid option)" : n + " cycle" + (n === 1 ? "" : "s") + (n === 2 ? " — included default" : n > 2 ? " — paid extra" : "")}</option>`).join("")}</select><div class="text-xs text-gray-400">Two cycles included by default. 1 cycle has no extra charge. For standard plans, the extra charge for 3, 4, 5 or unlimited cycles is added automatically from Business Settings. 1 cycle has no extra charge.</div></div>\n      <div><div class="kpi-sub">Public Card Badge</div><input class="input" id="pl-public-badge" maxlength="24" placeholder="NEW, POPULAR, BEST VALUE, LIMITED"></div>\n      <div style="grid-column:1 / -1"><div class="kpi-sub">Description</div><textarea class="input" id="pl-desc" rows="2"></textarea></div>\n    </div>\n    <label style="display:block;margin-top:12px"><input type="checkbox" id="pl-release"> Open this product for new purchases</label>\n    <div class="flex gap-2 mt-3"><button class="btn btn-gold" onclick="createPlan()">＋ Create</button></div>\n  `);
 setTimeout(() => {
 npPlanRouteChanged("pl");
 npSyncFundedResetDoubleV152("pl");
@@ -10442,7 +10486,9 @@ npSyncFundedResetDoubleV152("pl");
 };
 
 window.createPlan = async function() {
-const payload = {
+let payload;
+try {
+payload = {
 name: document.getElementById("pl-name").value.trim(),
 product_category: document.getElementById("pl-category").value,
 category_sort: Number(document.getElementById("pl-category-sort").value || 10),
@@ -10457,8 +10503,8 @@ phase2_target: document.getElementById("pl-route").value === "funded" ? 0 : Numb
 daily_drawdown: "None",
 max_drawdown: Number(document.getElementById("pl-tdd").value),
 payout_split: Number(document.getElementById("pl-split").value || 60),
-reset_fee: Number(document.getElementById("pl-reset-fee").value || 0),
-funded_reset_fee: Number(document.getElementById("pl-fee").value || 0) * 2,
+reset_fee: npResetValue("pl", "phase"),
+funded_reset_fee: npResetValue("pl", "funded"),
 second_life_enabled: false,
 public_badge: (document.getElementById("pl-public-badge")?.value || "").trim().slice(0, 24),
 mt5_server: document.getElementById("pl-server").value,
@@ -10466,6 +10512,10 @@ default_server: document.getElementById("pl-server").value,
 description: document.getElementById("pl-desc").value,
 status: document.getElementById("pl-release").checked ? "active" : "inactive"
 };
+} catch (e) {
+toast(e.message, "err");
+return;
+}
 if (!payload.name) {
 toast("Plan name required", "err");
 return;
@@ -10487,7 +10537,7 @@ if (!p) {
 toast("Not found", "err");
 return;
 }
-npShowResetModalSafe(`\n    <button onclick="this.closest('.modal-bg').remove()" style="position:absolute;top:8px;right:14px;background:0;border:0;color:#fff;font-size:24px">&times;</button>\n    <h2 style="font-size:22px;font-weight:900;margin:6px 0 12px">Edit Plan — ${esc(p.name || p.plan_name)}</h2>\n    <div class="grid sm:grid-cols-2 gap-2">\n      <div><div class="kpi-sub">Plan Name</div><input class="input" id="epl-name" value="${esc(p.name || p.plan_name || "")}"></div>\n      <div><div class="kpi-sub">Product Market</div><select class="select" id="epl-category"><option value="standard" ${String(p.product_category || "standard").toLowerCase() !== "premium" ? "selected" : ""}>Standard Plans</option><option value="premium" ${String(p.product_category || "standard").toLowerCase() === "premium" ? "selected" : ""}>Premium Plans</option></select></div>\n      <div><div class="kpi-sub">Display Order</div><input class="input" id="epl-category-sort" type="number" min="1" value="${Number(p.category_sort || 10)}"></div>\n      <div><div class="kpi-sub">Drawdown Type</div><select class="select" id="epl-drawdown-type"><option value="STATIC" ${String(p.drawdown_type || "STATIC").toUpperCase() === "STATIC" ? "selected" : ""}>STATIC</option><option value="TRAILING" ${String(p.drawdown_type || "STATIC").toUpperCase() === "TRAILING" ? "selected" : ""}>TRAILING</option></select></div>\n      <div><div class="kpi-sub">Payout Frequency</div><select class="select" id="epl-payout-frequency"><option value="Daily" ${String(p.payout_frequency || "Daily") === "Daily" ? "selected" : ""}>Daily</option><option value="Weekly" ${String(p.payout_frequency || "Daily") === "Weekly" ? "selected" : ""}>Weekly</option><option value="Biweekly" ${String(p.payout_frequency || "Daily") === "Biweekly" ? "selected" : ""}>Biweekly</option><option value="Monthly" ${String(p.payout_frequency || "Daily") === "Monthly" ? "selected" : ""}>Monthly</option><option value="On Demand" ${String(p.payout_frequency || "Daily") === "On Demand" ? "selected" : ""}>On Demand</option></select></div>\n      <div><div class="kpi-sub">Account Size</div><input class="input" id="epl-size" type="number" value="${p.account_size || p.size || 0}"></div>\n      <div><div class="kpi-sub">Fee</div><input class="input" id="epl-fee" type="number" value="${p.fee || p.price || 0}" oninput="npSyncFundedResetDoubleV152('epl')"></div>\n      <div><div class="kpi-sub">MT5 Server</div><input class="input" id="epl-server" value="${esc(p.mt5_server || p.default_server || "")}"></div>\n      <div><div class="kpi-sub">Phase 1 Target %</div><input class="input" id="epl-t1" type="number" value="${p.profit_target || p.phase1_target || 0}"></div>\n      <div><div class="kpi-sub">After Phase 1</div><select class="select" id="epl-route" onchange="npPlanRouteChanged('epl')"><option value="phase2" ${Number(p.phase2_target || 0) > 0 ? "selected" : ""}>Continue to Phase 2</option><option value="funded" ${Number(p.phase2_target || 0) <= 0 ? "selected" : ""}>Move Directly to Funded (1-Phase)</option></select></div>\n      <div id="epl-t2-wrap" style="${Number(p.phase2_target || 0) <= 0 ? "display:none" : ""}"><div class="kpi-sub">Phase 2 Target %</div><input class="input" id="epl-t2" type="number" value="${p.phase2_target || 8}"></div>\n      <div><div class="kpi-sub">Daily DD</div><input class="input" id="epl-ddd" type="text" value="None" readonly></div>\n      <div><div class="kpi-sub">Max DD %</div><input class="input" id="epl-tdd" type="number" value="${p.max_drawdown || p.total_dd || 0}"></div>\n      <div><div class="kpi-sub">Payout Split %</div><input class="input" id="epl-split" type="number" min="0" max="100" step="0.01" value="${p.payout_split ?? 60}"></div>\n      <div><div class="kpi-sub">Phase Reset Price</div><input class="input" id="epl-reset-fee" type="number" min="0" step="1" value="${p.reset_fee || 0}"></div>\n      <div><div class="kpi-sub">Funded Reset Price · AUTO 2× FEE</div><input class="input" id="epl-funded-reset-fee" type="number" min="0" step="1" readonly value="${Number(p.fee || p.price || 0) * 2}"></div>\n      <div><div class="kpi-sub">Funded payout cycles</div><select class="select" id="epl-cycles"><option value="" ${p.payout_cycles == null ? "selected" : ""}>Existing terms — new purchases default to 2</option>${[ 1, 2, 3, 4, 5, 0 ].map(n => `<option value="${n}" ${Number(p.payout_cycles) === n ? "selected" : ""}>${n === 0 ? "Unlimited (paid option)" : n + " cycle" + (n === 1 ? "" : "s") + (n === 2 ? " — included default" : "")}</option>`).join("")}</select><div class="text-xs text-gray-400">Two cycles included by default. For 3–5 or unlimited, set the plan fee to include the paid upgrade. Paid at purchase.</div></div>\n      <div><div class="kpi-sub">Public Card Badge</div><input class="input" id="epl-public-badge" maxlength="24" value="${esc(p.public_badge || p.card_badge || "")}" placeholder="NEW, POPULAR, BEST VALUE, LIMITED"></div>\n      <div style="grid-column:1 / -1"><div class="kpi-sub">Description</div><textarea class="input" id="epl-desc" rows="2">${esc(p.description || "")}</textarea></div>\n    </div>\n    <label style="display:block;margin-top:12px"><input type="checkbox" id="epl-release" ${p.status === "active" ? "checked" : ""}> Open this product for new purchases</label>\n    <div class="flex gap-2 mt-3"><button class="btn btn-gold" onclick="savePlan('${esc(String(p.id))}')">💾 Save</button></div>\n  `);
+npShowResetModalSafe(`\n    <button onclick="this.closest('.modal-bg').remove()" style="position:absolute;top:8px;right:14px;background:0;border:0;color:#fff;font-size:24px">&times;</button>\n    <h2 style="font-size:22px;font-weight:900;margin:6px 0 12px">Edit Plan — ${esc(p.name || p.plan_name)}</h2>\n    <div class="grid sm:grid-cols-2 gap-2">\n      <div><div class="kpi-sub">Plan Name</div><input class="input" id="epl-name" value="${esc(p.name || p.plan_name || "")}"></div>\n      <div><div class="kpi-sub">Product Market</div><select class="select" id="epl-category"><option value="standard" ${String(p.product_category || "standard").toLowerCase() !== "premium" ? "selected" : ""}>Standard Plans</option><option value="premium" ${String(p.product_category || "standard").toLowerCase() === "premium" ? "selected" : ""}>Premium Plans</option></select></div>\n      <div><div class="kpi-sub">Display Order</div><input class="input" id="epl-category-sort" type="number" min="1" value="${Number(p.category_sort || 10)}"></div>\n      <div><div class="kpi-sub">Drawdown Type</div><select class="select" id="epl-drawdown-type"><option value="STATIC" ${String(p.drawdown_type || "STATIC").toUpperCase() === "STATIC" ? "selected" : ""}>STATIC</option><option value="TRAILING" ${String(p.drawdown_type || "STATIC").toUpperCase() === "TRAILING" ? "selected" : ""}>TRAILING</option></select></div>\n      <div><div class="kpi-sub">Payout Frequency</div><select class="select" id="epl-payout-frequency"><option value="Daily" ${String(p.payout_frequency || "Daily") === "Daily" ? "selected" : ""}>Daily</option><option value="Weekly" ${String(p.payout_frequency || "Daily") === "Weekly" ? "selected" : ""}>Weekly</option><option value="Biweekly" ${String(p.payout_frequency || "Daily") === "Biweekly" ? "selected" : ""}>Biweekly</option><option value="Monthly" ${String(p.payout_frequency || "Daily") === "Monthly" ? "selected" : ""}>Monthly</option><option value="On Demand" ${String(p.payout_frequency || "Daily") === "On Demand" ? "selected" : ""}>On Demand</option></select></div>\n      <div><div class="kpi-sub">Account Size</div><input class="input" id="epl-size" type="number" value="${p.account_size || p.size || 0}"></div>\n      <div><div class="kpi-sub">Base Plan Fee</div><input class="input" id="epl-fee" type="number" value="${p.fee || p.price || 0}" oninput="npSyncFundedResetDoubleV152('epl')"></div>\n      <div><div class="kpi-sub">MT5 Server</div><input class="input" id="epl-server" value="${esc(p.mt5_server || p.default_server || "")}"></div>\n      <div><div class="kpi-sub">Phase 1 Target %</div><input class="input" id="epl-t1" type="number" value="${p.profit_target || p.phase1_target || 0}"></div>\n      <div><div class="kpi-sub">After Phase 1</div><select class="select" id="epl-route" onchange="npPlanRouteChanged('epl')"><option value="phase2" ${Number(p.phase2_target || 0) > 0 ? "selected" : ""}>Continue to Phase 2</option><option value="funded" ${Number(p.phase2_target || 0) <= 0 ? "selected" : ""}>Move Directly to Funded (1-Phase)</option></select></div>\n      <div id="epl-t2-wrap" style="${Number(p.phase2_target || 0) <= 0 ? "display:none" : ""}"><div class="kpi-sub">Phase 2 Target %</div><input class="input" id="epl-t2" type="number" value="${p.phase2_target || 8}"></div>\n      <div><div class="kpi-sub">Daily DD</div><input class="input" id="epl-ddd" type="text" value="None" readonly></div>\n      <div><div class="kpi-sub">Max DD %</div><input class="input" id="epl-tdd" type="number" value="${p.max_drawdown || p.total_dd || 0}"></div>\n      <div><div class="kpi-sub">Payout Split %</div><input class="input" id="epl-split" type="number" min="0" max="100" step="0.01" value="${p.payout_split ?? 60}"></div>\n      ${npResetControl("epl", "phase", p.reset_fee, p.fee)}\n      ${npResetControl("epl", "funded", p.funded_reset_fee, p.fee)}\n      <div><div class="kpi-sub">Funded payout cycles</div><select class="select" id="epl-cycles"><option value="" ${p.payout_cycles == null ? "selected" : ""}>Existing terms — new purchases default to 2</option>${[ 1, 2, 3, 4, 5, 0 ].map(n => `<option value="${n}" ${Number(p.payout_cycles) === n ? "selected" : ""}>${n === 0 ? "Unlimited (paid option)" : n + " cycle" + (n === 1 ? "" : "s") + (n === 2 ? " — included default" : n > 2 ? " — paid extra" : "")}</option>`).join("")}</select><div class="text-xs text-gray-400">Two cycles included by default. 1 cycle has no extra charge. For standard plans, the extra charge for 3, 4, 5 or unlimited cycles is added automatically from Business Settings. 1 cycle has no extra charge.</div></div>\n      <div><div class="kpi-sub">Public Card Badge</div><input class="input" id="epl-public-badge" maxlength="24" value="${esc(p.public_badge || p.card_badge || "")}" placeholder="NEW, POPULAR, BEST VALUE, LIMITED"></div>\n      <div style="grid-column:1 / -1"><div class="kpi-sub">Description</div><textarea class="input" id="epl-desc" rows="2">${esc(p.description || "")}</textarea></div>\n    </div>\n    <label style="display:block;margin-top:12px"><input type="checkbox" id="epl-release" ${p.status === "active" ? "checked" : ""}> Open this product for new purchases</label>\n    <div class="flex gap-2 mt-3"><button class="btn btn-gold" onclick="savePlan('${esc(String(p.id))}')">💾 Save</button></div>\n  `);
 };
 
 window.savePlan = async function(id) {
@@ -10508,8 +10558,8 @@ phase2_target: document.getElementById("epl-route").value === "funded" ? 0 : Num
 daily_drawdown: "None",
 max_drawdown: Number(document.getElementById("epl-tdd").value),
 payout_split: Number(document.getElementById("epl-split").value || 60),
-reset_fee: Number(document.getElementById("epl-reset-fee").value || 0),
-funded_reset_fee: Number(document.getElementById("epl-fee").value || 0) * 2,
+reset_fee: npResetValue("epl", "phase"),
+funded_reset_fee: npResetValue("epl", "funded"),
 second_life_enabled: false,
 public_badge: (document.getElementById("epl-public-badge")?.value || "").trim().slice(0, 24),
 mt5_server: document.getElementById("epl-server").value,
@@ -15267,7 +15317,7 @@ npShowResetModalSafe(`\n    <button onclick="this.closest('.modal-bg').remove()"
 <script>
 window.NAIRAPIPS_ADMIN_RELEASE_V38 = "V38_RECALL_NO_PROMPT_MT5_FIFO_2026_09_21";
 </script>
-
+<!-- V38: Recall fixed to production monitoring URL; MT5 picker FIFO oldest eligible first. -->
 
 <script>
 window.NAIRAPIPS_ADMIN_RELEASE = "V39_RECALL_NO_PROMPT_FIFO_SAFETY_2026_09_22";
@@ -15407,7 +15457,7 @@ toast("Historic Truth failed: " + (e?.message || e), "err");
 
 window.NAIRAPIPS_HISTORIC_TRUTH_RELEASE = "V110_HISTORIC_TRUTH_2026_09_30";
 </script>
-
+<!-- V110 HISTORIC TRUTH · 30 SEP 2026 -->
 
 <script>
 (function() {
@@ -15428,17 +15478,39 @@ if (!node) return;
 const sequence = ++loadSequence;
 node.innerHTML = "<h3>Production controls</h3><p>Loading saved settings…</p>";
 try {
-const results = await Promise.all([ api("/admin/production_controls"), api("/admin/production_catalog"), api("/admin/package_configuration") ]);
+const results = await Promise.all([ api("/admin/production_controls"), api("/admin/production_catalog"), api("/admin/package_configuration"), api("/admin/standard_cycle_prices") ]);
 if (sequence !== loadSequence || document.getElementById("np-production-settings") !== node) return;
-const [c, p, f] = results;
+const [c, p, f, cyclePrices] = results;
 controls = c;
 catalog = p.plans;
 packages = f;
-node.innerHTML = `<h3>Business settings</h3><p>Set prices and benefits below. Save changes whenever you need; completed purchases retain their agreed terms.</p><details><summary>Service availability</summary><h3>Service release controls</h3><p>Tick to accept new requests. Unticking keeps history, issued account protection and existing settlement obligations.</p>\n      <div>${c.facilities.map(r => `<label style="display:block;margin:12px 0"><input type="checkbox" id="np-control-${e(r.key)}" ${c.data.features[r.key] ? "checked" : ""}> ${e(r.label)}</label>`).join("")}</div>\n      <button class="btn btn-gold" onclick="npSaveProductionControls(this)">Save service switches</button>\n      <p id="np-control-message" role="status"></p>\n      <p>Saved revision ${e(c.data.revision)} · Changes reach the server within ${e(c.propagation_seconds)} seconds.</p>\n      <p>Always protected: ${c.protected.map(e).join(" · ")}.</p>\n      </details><details><summary>Existing products: edit, pause or reopen</summary><h3>Products: available now or held for later</h3>\n      <p>Inactive products stay in production and can be opened for new sales later. Existing customers retain their purchased terms. Edit current plans whenever needed. Saved changes apply to future purchases; existing purchases retain their terms.</p>\n      <div>${catalog.map((r, i) => `<div class="card" style="margin:12px 0"><h4>${e(r.name)} · ${e(r.account_size)}</h4>\n        <label><input type="checkbox" id="np-plan-active-${i}" ${r.status === "active" ? "checked" : ""}> Open for new purchases</label>\n        <div class="grid md:grid-cols-3 gap-2" style="margin-top:12px">\n          ${[ [ "name", "Product name" ], [ "fee", "Purchase fee ₦" ], [ "account_size", "Account size ₦" ], [ "phase1_target", "Phase 1 target %" ], [ "phase2_target", "Phase 2 target % (0 for one phase)" ], [ "max_drawdown", "Maximum drawdown %" ], [ "payout_split", "Trader share % (60 or 70)" ], [ "reset_fee", "Phase reset fee ₦" ] ].map(([key, label]) => `<label>${label}${input(`np-plan-${i}-${key}`, r[key] ?? "", key === "name" ? 'maxlength="100"' : 'type="number" min="0" step="0.01"')}</label>`).join("")}\n          <label>Funded payout cycles<select class="input" id="np-plan-${i}-payout_cycles"><option value="" ${r.payout_cycles == null ? "selected" : ""}>Existing terms; new purchases: 2</option>${[ 1, 2, 3, 4, 5, 0 ].map(n => `<option value="${n}" ${r.payout_cycles != null && Number(r.payout_cycles) === n ? "selected" : ""}>${n === 0 ? "Unlimited (paid option)" : n + " cycle" + (n === 1 ? "" : "s")}</option>`).join("")}</select></label>\n          <label>Evaluation route<select class="input" id="np-plan-${i}-challenge_journey"><option value="one_phase" ${journey(r) === "one_phase" ? "selected" : ""}>One phase</option><option value="two_phase" ${journey(r) === "two_phase" ? "selected" : ""}>Two phases</option></select></label>\n        </div><p>Drawdown: ${e(r.drawdown_type || "STATIC")}. Current funded reset pricing remains twice the challenge fee.</p>\n        <button class="btn btn-gold" onclick="npSaveProductionPlan(${i},this)">Save product</button>\n        <button class="btn" onclick="npCloneProductionPlan(${i},this)">Copy as inactive product</button>\n        <p id="np-plan-message-${i}" role="status"></p></div>`).join("")}</div>\n      </details><hr style="margin:24px 0"><h3 id="np-package-pricing-section">Package prices & benefits</h3>\n      <p>Every choice has its own editable price and active status. Enter 0 for an included benefit. Leave future choices inactive. Saving changes future quotes and preserves existing purchase terms.</p>\n      <p>${e(f.price_rule)}</p>\n      <label>Minimum purchase price ₦ ${input("np-package-minimum", f.data.minimum_price ?? "", 'type="number" min="0.01" step="0.01"')}</label>\n      ${Object.entries(f.data.options).sort(([a], [b]) => facilityOrder.indexOf(a) - facilityOrder.indexOf(b)).map(([key, rows]) => `<div class="card" style="margin:12px 0"><h4>${e(f.labels[key])}</h4><div id="np-package-rows-${key}">${rows.map((r, i) => choiceRow(key, r, i)).join("")}</div>${[ "phases", "drawdown_type" ].includes(key) ? "" : `<button class="btn" onclick="npAddPackageOption('${key}')">Add choice</button>`}</div>`).join("")}\n      <label><input id="np-package-release" type="checkbox" ${f.release_ready || f.data.enabled ? "" : "disabled"} ${f.data.enabled ? "checked" : ""}> Release new package checkout</label>\n      <p>Release is locked until: ${f.release_blockers.map(e).join("; ")}. Saved prices and choices are real configuration; customers cannot purchase an unenforced contract.</p>\n      <button class="btn btn-gold" onclick="npSavePackageConfiguration(this)">Save prices and benefits</button>\n      <p id="np-package-message" role="status"></p>\n      <h4>Check a package price using saved settings</h4>\n      <div class="grid md:grid-cols-3 gap-2">${Object.entries(f.data.options).sort(([a], [b]) => facilityOrder.indexOf(a) - facilityOrder.indexOf(b)).map(([key, rows]) => `<label>${e(f.labels[key])}<select class="input" id="np-package-preview-${key}">${rows.filter(r => r.enabled).map(r => `<option value="${e(r.value)}">${e(r.value)}</option>`).join("")}</select></label>`).join("")}</div>\n      <button class="btn" onclick="npPreviewPackageQuote(this)">Calculate saved price</button>\n      <p id="np-package-quote" role="status"></p>\n      <hr style="margin:24px 0"><h3>Package accounts awaiting delivery</h3><p>Approved package orders keep their purchased rules while waiting for matching verified stock.</p><div id="np-package-deliveries"></div>`;
+window.npStandardCyclePrices = cyclePrices.data;
+node.innerHTML = `<h3>Business settings</h3><p>Set prices and benefits below. Save changes whenever you need; completed purchases retain their agreed terms.</p><div class="card"><h3>Standard plan payout cycle extra cost</h3><p>1 or 2 cycles: no extra cost. 2 cycles is the default. These prices are added to the base plan fee at purchase. Leave a paid option blank to make it unavailable.</p>\n      <div class="grid md:grid-cols-4 gap-2">${[ "3", "4", "5", "0" ].map(key => `<label>${key === "0" ? "Unlimited" : key + " cycles"} · extra ₦${input("np-standard-cycle-" + key, cyclePrices.data.prices[key] ?? "", 'type="number" min="0.01" step="0.01"')}</label>`).join("")}</div>\n      <button class="btn btn-gold" onclick="npSaveStandardCyclePrices(this)">Save cycle extra costs</button><p id="np-cycle-price-message" role="status"></p></div><details><summary>Service availability</summary><h3>Service release controls</h3><p>Tick to accept new requests. Unticking keeps history, issued account protection and existing settlement obligations.</p>\n      <div>${c.facilities.map(r => `<label style="display:block;margin:12px 0"><input type="checkbox" id="np-control-${e(r.key)}" ${c.data.features[r.key] ? "checked" : ""}> ${e(r.label)}</label>`).join("")}</div>\n      <button class="btn btn-gold" onclick="npSaveProductionControls(this)">Save service switches</button>\n      <p id="np-control-message" role="status"></p>\n      <p>Saved revision ${e(c.data.revision)} · Changes reach the server within ${e(c.propagation_seconds)} seconds.</p>\n      <p>Always protected: ${c.protected.map(e).join(" · ")}.</p>\n      </details><details><summary>Existing products: edit, pause or reopen</summary><h3>Products: available now or held for later</h3>\n      <p>Inactive products stay in production and can be opened for new sales later. Existing customers retain their purchased terms. Edit current plans whenever needed. Saved changes apply to future purchases; existing purchases retain their terms.</p>\n      <div>${catalog.map((r, i) => `<div class="card" style="margin:12px 0"><h4>${e(r.name)} · ${e(r.account_size)}</h4>\n        <label><input type="checkbox" id="np-plan-active-${i}" ${r.status === "active" ? "checked" : ""}> Open for new purchases</label>\n        <div class="grid md:grid-cols-3 gap-2" style="margin-top:12px">\n          ${[ [ "name", "Product name" ], [ "fee", "Base plan fee ₦" ], [ "account_size", "Account size ₦" ], [ "phase1_target", "Phase 1 target %" ], [ "phase2_target", "Phase 2 target % (0 for one phase)" ], [ "max_drawdown", "Maximum drawdown %" ], [ "payout_split", "Trader share % (60 or 70)" ] ].map(([key, label]) => `<label>${label}${input(`np-plan-${i}-${key}`, r[key] ?? "", key === "name" ? 'maxlength="100"' : 'type="number" min="0" step="0.01"')}</label>`).join("")}\n          ${npResetControl("np-plan-" + i, "phase", r.reset_fee, r.fee)}${npResetControl("np-plan-" + i, "funded", r.funded_reset_fee, r.fee)}\n          <label>Funded payout cycles<select class="input" id="np-plan-${i}-payout_cycles"><option value="" ${r.payout_cycles == null ? "selected" : ""}>Existing terms; new purchases: 2</option>${[ 1, 2, 3, 4, 5, 0 ].map(n => `<option value="${n}" ${r.payout_cycles != null && Number(r.payout_cycles) === n ? "selected" : ""}>${n === 0 ? "Unlimited (paid option)" : n + " cycle" + (n === 1 ? "" : "s") + (n > 2 ? " — paid extra" : n === 2 ? " — included default" : "")}</option>`).join("")}</select></label>\n          <label>Evaluation route<select class="input" id="np-plan-${i}-challenge_journey"><option value="one_phase" ${journey(r) === "one_phase" ? "selected" : ""}>One phase</option><option value="two_phase" ${journey(r) === "two_phase" ? "selected" : ""}>Two phases</option></select></label>\n        </div><p>Drawdown: ${e(r.drawdown_type || "STATIC")}. Current funded reset pricing remains twice the challenge fee.</p>\n        <button class="btn btn-gold" onclick="npSaveProductionPlan(${i},this)">Save product</button>\n        <button class="btn" onclick="npCloneProductionPlan(${i},this)">Copy as inactive product</button>\n        <p id="np-plan-message-${i}" role="status"></p></div>`).join("")}</div>\n      </details><hr style="margin:24px 0"><h3 id="np-package-pricing-section">Package prices & benefits</h3>\n      <p>Every choice has its own editable price and active status. Enter 0 for an included benefit. Leave future choices inactive. Saving changes future quotes and preserves existing purchase terms.</p>\n      <p>${e(f.price_rule)}</p>\n      <label>Minimum purchase price ₦ ${input("np-package-minimum", f.data.minimum_price ?? "", 'type="number" min="0.01" step="0.01"')}</label>\n      ${Object.entries(f.data.options).sort(([a], [b]) => facilityOrder.indexOf(a) - facilityOrder.indexOf(b)).map(([key, rows]) => `<div class="card" style="margin:12px 0"><h4>${e(f.labels[key])}</h4><div id="np-package-rows-${key}">${rows.map((r, i) => choiceRow(key, r, i)).join("")}</div>${[ "phases", "drawdown_type" ].includes(key) ? "" : `<button class="btn" onclick="npAddPackageOption('${key}')">Add choice</button>`}</div>`).join("")}\n      <label><input id="np-package-release" type="checkbox" ${f.release_ready || f.data.enabled ? "" : "disabled"} ${f.data.enabled ? "checked" : ""}> Release new package checkout</label>\n      <p>Release is locked until: ${f.release_blockers.map(e).join("; ")}. Saved prices and choices are real configuration; customers cannot purchase an unenforced contract.</p>\n      <button class="btn btn-gold" onclick="npSavePackageConfiguration(this)">Save prices and benefits</button>\n      <p id="np-package-message" role="status"></p>\n      <h4>Check a package price using saved settings</h4>\n      <div class="grid md:grid-cols-3 gap-2">${Object.entries(f.data.options).sort(([a], [b]) => facilityOrder.indexOf(a) - facilityOrder.indexOf(b)).map(([key, rows]) => `<label>${e(f.labels[key])}<select class="input" id="np-package-preview-${key}">${rows.filter(r => r.enabled).map(r => `<option value="${e(r.value)}">${e(r.value)}</option>`).join("")}</select></label>`).join("")}</div>\n      <button class="btn" onclick="npPreviewPackageQuote(this)">Calculate saved price</button>\n      <p id="np-package-quote" role="status"></p>\n      <hr style="margin:24px 0"><h3>Package accounts awaiting delivery</h3><p>Approved package orders keep their purchased rules while waiting for matching verified stock.</p><div id="np-package-deliveries"></div>`;
 refreshPackagePreview();
 npLoadPackageDeliveries(1);
 } catch (err) {
 node.innerHTML = `<h3>Production settings unavailable</h3><p>${e(err.message)}</p><button class="btn" onclick="npLoadProductionSettings()">Retry</button>`;
+}
+};
+window.npSaveStandardCyclePrices = async function(button) {
+button.disabled = true;
+message("np-cycle-price-message", "Saving…");
+try {
+const prices = {};
+for (const key of [ "3", "4", "5", "0" ]) {
+const raw = document.getElementById("np-standard-cycle-" + key).value;
+prices[key] = raw.trim() === "" ? null : Number(raw);
+}
+const result = await api("/admin/standard_cycle_prices", "POST", {
+revision: window.npStandardCyclePrices.revision,
+prices: prices
+});
+window.npStandardCyclePrices = result.data;
+message("np-cycle-price-message", "Saved. Cycle extra costs apply to new purchases.");
+} catch (err) {
+message("np-cycle-price-message", err.message);
+} finally {
+button.disabled = false;
 }
 };
 window.npSaveProductionControls = async function(button) {
@@ -15463,7 +15535,7 @@ window.npSaveProductionPlan = async function(i, button) {
 button.disabled = true;
 message("np-plan-message-" + i, "Saving…");
 try {
-const row = catalog[i], changes = {}, numeric = [ "fee", "account_size", "phase1_target", "phase2_target", "max_drawdown", "payout_split", "reset_fee" ];
+const row = catalog[i], changes = {}, numeric = [ "fee", "account_size", "phase1_target", "phase2_target", "max_drawdown", "payout_split" ];
 for (const key of [ "name", ...numeric, "challenge_journey" ]) {
 const n = document.getElementById(`np-plan-${i}-${key}`);
 const baseline = key === "challenge_journey" ? journey(row) : String(row[key] ?? "");
@@ -15478,6 +15550,9 @@ changes[key] = value;
 changes[key] = n.value;
 }
 }
+const resetFee = npResetValue("np-plan-" + i, "phase"), fundedFee = npResetValue("np-plan-" + i, "funded");
+if (resetFee !== Number(row.reset_fee || 0)) changes.reset_fee = resetFee;
+if (fundedFee !== (row.funded_reset_fee ?? null)) changes.funded_reset_fee = fundedFee;
 const cycleValue = document.getElementById(`np-plan-${i}-payout_cycles`).value;
 if (cycleValue !== String(row.payout_cycles ?? "")) changes.payout_cycles = cycleValue === "" ? null : Number(cycleValue);
 const status = document.getElementById("np-plan-active-" + i).checked ? "active" : "inactive";
@@ -15667,23 +15742,23 @@ npShowResetModalSafe(`<h2>Approve package payment</h2><p>${e(purchase.plan_name 
 </body>
 </html>
 
+<!-- NP_HOTFIX: RESTORE_EXACT_FUNDED_RESET_CONFIRM_ONLY_2026_09_08 -->
 
+<!-- NP_FIX: ADMIN_TERMINAL_FUNDED_RESET_EXHAUSTION_PRESENTATION_2026_09_08 -->
 
+<!-- NP_FIX: TERMINAL_JOURNEY_ACTION_BAR_LOCK_2026_09_08 -->
 
+<!-- NP_FIX: MULTI_PURCHASE_SECOND_LIFE_ACTION_VISIBILITY_2026_09_08 -->
 
+<!-- NP_FIX: CROSS_PURCHASE_PASS_ENTITLEMENT_VISIBLE_WHILE_SECOND_LIFE_ACTIVE_2026_09_09 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V39_FULL_MT5_POOL_PURCHASE_AND_COCKPIT_2026_09_15 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V40_FAST_COMPLETE_ASSIGNABLE_MT5_2026_09_15 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V41_COCKPIT_CACHE_FIRST_RESILIENT_2026_09_15 -->
 
-
-
-
-
-
-
-
-
-
+<!-- NAIRAPIPS_ADMIN_RELEASE: V42_RUNTIME_TESTED_MT5_STAGE_SCOPE_FIX_2026_09_15 -->
 
 <script>
 window.openFundedCycleReturn = function() {
@@ -15692,65 +15767,65 @@ toast("Same-MT5 payout cycles are retired. A PAID payout requires a fresh Funded
 
 window.confirmFundedCycleReturn = window.openFundedCycleReturn;
 </script>
+<!-- NAIRAPIPS_ADMIN_RELEASE: V44_LEGACY_PAYOUT_MANUAL_ASSIGNMENT_2026_09_16 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V45_BACKEND_AUTHORITY_PROGRESSION_2026_09_16 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V46_RESET_RECALL_EXACT_ACCOUNT_FIX_2026_09_16 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V47_STAFF_RECOVERY_ASSIGNMENT_FIX_2026_09_16 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V48_EXPLICIT_STAFF_RECOVERY_APPROVAL_2026_09_16 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: EXACT_CURRENT_V50_OPERATIONS_RADAR_FIX_2026_09_17 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V51_AUTOMATION_GUIDE_JOURNEY_CONTROL_2026_09_17 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V52_PAYOUT_REJECTION_RESTORED_2026_09_17 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V53_PAYOUT_REJECTION_CLICK_SAFETY_2026_09_17 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V54_PAYOUT_REJECTION_DELIVERY_STATUS_2026_09_17 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V55_REMOVE_PAYOUT_ADMIN_NOTE_COLUMN_2026_09_17 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V56_MASTER_AUTOMATION_ALIGNMENT_2026_09_17 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V57_FUNDED_RESET_AUTHORITY_FALLBACK_2026_09_18 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V58_DIRECT_FUNDED_RESET_AUTHORITY_2026_09_18 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V59_DURABLE_RESET_RIGHT_AND_ANTI_ABUSE_2026_09_18 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V60_COCKPIT_EXACT_RESET_WORKFLOW_2026_09_18 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V61_FOCUS_EXACT_RESET_ACCOUNT_2026_09_18 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V62_FORENSIC_RESET_FALLBACK_2026_09_18 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V63_RESET_FULFILLED_RECONCILIATION_2026_09_19 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V34_LIVE_PAYOUT_LIABILITY_INTELLIGENCE_2026_09_20 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V34_1_LIVE_PAYOUT_LIABILITY_INTELLIGENCE_FAILSAFE_2026_09_20 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V35_SECOND_LIFE_COCKPIT_RECONCILIATION_2026_09_21 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V36_PAYOUT_REJECTION_TRADE_SYNC_FALLBACK_2026_09_21 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V37_PAYOUT_REJECTION_SINGLE_NOTE_AND_TRADE_RECOVERY_2026_09_21 -->
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+<!-- V39: Recall fixed URL; assignment fallback excludes stale/undated MT5; FIFO oldest eligible first. -->
 
 <script>
 window.NAIRAPIPS_ADMIN_RECALL_HANDOFF_RELEASE = "V42_RECALLED_ENTITLEMENT_REPLACEMENT_VISIBLE_2026_09_22";
 </script>
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V50_WAITING_BUTTON_GENERIC_BRANCH_2026_09_22 -->
 
+<!-- NAIRAPIPS_ADMIN_RELEASE: V51_EXACT_RESET_WORKAROUND_RECOVERY_2026_09_22 -->
 
-
-
-
+<!-- NAIRAPIPS_ADMIN_RELEASE: V58_BLACK_BOOK_TWO_TIMESTAMPS_SAFE_2026_09_23 -->
 
 
 <script>

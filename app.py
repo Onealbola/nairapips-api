@@ -10004,6 +10004,7 @@ def _np_plan_category_v156(value):
 
 def _np_plan_rule_snapshot_v156(plan):
     from plan_cycles import cycle_limit
+    from plan_commercial import reset_price
     plan = plan or {}
     return {
         "product_category": _np_plan_category_v156(plan.get("product_category")),
@@ -10015,7 +10016,7 @@ def _np_plan_rule_snapshot_v156(plan):
         "max_drawdown": float(plan.get("max_drawdown") or plan.get("total_dd") or 20),
         "payout_split": _effective_payout_split(plan.get("payout_split")),
         "reset_fee": clean(plan.get("reset_fee")),
-        "funded_reset_fee": clean(plan.get("funded_reset_fee")),
+        "funded_reset_fee": reset_price(plan, "funded"),
         "plan_snapshot_at": now_iso(),
     }
 
@@ -10049,7 +10050,22 @@ def _np_public_plan_snapshot_rows():
             float(r.get("account_size") or 0),
         ))
         return out
-    return np_cached_read("public_plans_snapshot", 300, _fetch)
+    # Cache product rows, but reprice against the current tariff on every read.
+    # A saved surcharge must not stay stale for the product cache's five minutes.
+    rows = np_cached_read("public_plans_snapshot", 300, _fetch)
+    prices = _np_cycle_price_store.read()[0]["prices"] if any(
+        r.get("product_category") == "standard" for r in rows) else {}
+    out = []
+    for raw in rows:
+        row = dict(raw)
+        if row.get("product_category") == "standard":
+            try:
+                row = _np_priced_plan(row, prices)
+            except ValueError:
+                row["status"] = "inactive"
+                row["cycle_price_available"] = False
+        out.append(row)
+    return out
 
 
 @app.route("/public_plan_snapshot", methods=["GET"])
@@ -10172,6 +10188,7 @@ def plans_alias():
 def create_plan():
     try:
         from plan_cycles import cycle_limit
+        from plan_commercial import money as _np_commercial_money
         d=request.json or {}; name=str(d.get("name","")).strip()
         if not name: return bad("Plan name is required")
         mt5_server = d.get("mt5_server") or d.get("default_server") or ""
@@ -10193,9 +10210,9 @@ def create_plan():
              # V123 commercial controls: new/current plans do not create a free
              # Second Life. Phase and Funded reset prices are explicit plan prices.
              "second_life_enabled":False,"lives_total":1,
-             "reset_fee":clean(d.get("reset_fee")),
-             # V152: Funded reset price follows the commercial rule automatically.
-             "funded_reset_fee":(clean(d.get("fee")) * 2 if clean(d.get("fee")) else 0),
+             "reset_fee":_np_commercial_money(d.get("reset_fee") or 0),
+             # NULL: automatic 2x; zero: Not available; positive: custom price.
+             "funded_reset_fee":(None if d.get("funded_reset_fee") is None else _np_commercial_money(d["funded_reset_fee"])),
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
              "status":d.get("status","inactive"),"created_at":now_iso(),"updated_at":now_iso()}
         result = _NPRenewalRestQueryV211("challenge_plans").insert(row).execute().data
@@ -10207,6 +10224,7 @@ def create_plan():
 def update_plan():
     try:
         from plan_cycles import cycle_limit
+        from plan_commercial import money as _np_commercial_money
         d=request.json or {}; pid=d.get("id")
         if not pid: return bad("Missing plan id")
         upd={"updated_at":now_iso()}
@@ -10230,22 +10248,10 @@ def update_plan():
         upd["second_life_enabled"] = False
         upd["lives_total"] = 1
         if "reset_fee" in d:
-            upd["reset_fee"] = clean(d.get("reset_fee"))
+            upd["reset_fee"] = _np_commercial_money(d.get("reset_fee") or 0)
 
-        # V152: Funded reset is always double the CURRENT challenge fee.
-        # Use the submitted fee when present; otherwise resolve the current row.
-        _v152_fee = clean(d.get("fee")) if "fee" in d else 0
-        if not _v152_fee:
-            try:
-                _v152_rows = (
-                    _NPRenewalRestQueryV211("challenge_plans").select("fee")
-                    .eq("id", pid).limit(1).execute().data or []
-                )
-                _v152_fee = clean((_v152_rows[0] if _v152_rows else {}).get("fee"))
-            except Exception:
-                _v152_fee = 0
-        if _v152_fee and _v152_fee > 0:
-            upd["funded_reset_fee"] = float(_v152_fee) * 2
+        if "funded_reset_fee" in d:
+            upd["funded_reset_fee"] = None if d["funded_reset_fee"] is None else _np_commercial_money(d["funded_reset_fee"])
 
         upd["daily_drawdown"] = "None"
         if "mt5_server" in d and "default_server" not in d:
@@ -27374,7 +27380,13 @@ def _np_reset_current_plan_for(account, purchase=None):
             or ""
         )
 
-    # Strongest commercial match: current active row of same product + size.
+    # Exact product identity takes precedence over another plan at the same size.
+    exact_plan_id = str(purchase.get("plan_id") or account.get("plan_id") or "").strip()
+    exact = [r for r in active if exact_plan_id and str(r.get("id") or "") == exact_plan_id]
+    if exact:
+        return exact[0]
+
+    # Legacy accounts without an active exact plan retain name/size resolution.
     same_name = [r for r in active if purchase_name and _row_name(r) == purchase_name]
     rows = same_name or active
     rows.sort(key=_recency, reverse=True)
@@ -27383,32 +27395,10 @@ def _np_reset_current_plan_for(account, purchase=None):
 
 
 def _np_reset_price(plan, stage=None):
-    """Current reset-price authority.
+    """Zero explicitly means Not available; NULL funded pricing keeps automatic 2x."""
+    from plan_commercial import reset_price
+    return reset_price(plan, _normalize_lifecycle_stage(stage or "phase1"))
 
-    V152 business rule:
-      * Phase 1 / Phase 2 reset price remains Admin-configurable via reset_fee.
-      * Funded reset price is ALWAYS 2 x the CURRENT challenge plan fee.
-
-    This function changes PRICE ONLY. It does not alter reset entitlement,
-    reset usage count, lineage, payment approval, or replacement assignment.
-    """
-    if not plan:
-        return 0.0
-
-    stage = _normalize_lifecycle_stage(stage or "phase1")
-
-    if stage == "funded":
-        fee = clean(
-            plan.get("fee")
-            or plan.get("price")
-            or plan.get("challenge_fee")
-            or plan.get("plan_fee")
-            or 0
-        )
-        return float(fee) * 2 if fee and fee > 0 else 0.0
-
-    value = clean(plan.get("reset_fee"))
-    return float(value) if value and value > 0 else 0.0
 
 
 def _np_reset_account_is_breached(account):
@@ -27586,6 +27576,10 @@ def _np_reset_policy(account, trader=None):
             "source_mt5_login": account.get("mt5_login"), "purchase_id": purchase.get("id"),
             "reset_order_id": open_order.get("id"), "price": clean(open_order.get("fee") or open_order.get("amount_due") or price),
         }
+
+    if not second_enabled and price <= 0:
+        return {"eligible": False, "kind": "none", "reason": "reset_not_available",
+                "title": "Reset Not available", "stage": stage, "price": 0}
 
     # Challenge-stage policy.
     if stage in {"phase1", "phase2"}:
@@ -42618,12 +42612,11 @@ def _np_reset_policy(account, trader=None):
     if price <= 0:
         return {
             "eligible": False,
-            "kind": "review",
-            "reason": "funded_reset_price_unresolved",
-            "title": "Funded Reset Price Requires Review",
+            "kind": "none",
+            "reason": "reset_not_available",
+            "title": "Funded Reset Not available",
             "subtitle": (
-                "The one Funded Reset right is intact, but the paid reset price "
-                "could not be resolved safely. No free reset was created."
+                "Funded reset is Not available for this plan."
             ),
             "stage": "funded",
             "account_size": size,
@@ -43188,12 +43181,11 @@ def _np_v62_direct_funded_reset_policy(account, trader=None):
     if price <= 0:
         return {
             "eligible": False,
-            "kind": "review",
-            "reason": "funded_reset_price_unresolved",
-            "title": "Funded Reset Price Requires Review",
+            "kind": "none",
+            "reason": "reset_not_available",
+            "title": "Funded Reset Not available",
             "subtitle": (
-                "The Funded Reset right is intact, but the paid reset amount "
-                "could not be resolved safely."
+                "Funded reset is Not available for this plan."
             ),
             "stage": "funded",
             "account_size": size,
@@ -44211,8 +44203,8 @@ def _np_v64_positive_money(row, keys):
 def _np_v61_reset_price(account, purchase):
     """Final Funded-reset price authority for V61/V62/V63.
 
-    Funded reset price is whatever Admin saved in challenge_plans.funded_reset_fee.
-    It is intentionally NOT calculated from challenge fee and is NOT hard-coded.
+    Zero disables the reset, a positive amount is custom pricing, and NULL
+    selects automatic pricing at twice the base plan fee.
     """
     account = account or {}
     purchase = purchase or {}
@@ -44223,16 +44215,8 @@ def _np_v61_reset_price(account, purchase):
     except Exception:
         plan = {}
 
-    current_fee, key = _np_v64_positive_money(
-        plan,
-        ("fee", "price", "challenge_fee", "plan_fee"),
-    )
-    if current_fee > 0:
-        return current_fee * 2, plan, f"v152_double_current_plan_{key}"
+    return _np_reset_price(plan, "funded"), plan, "admin_configured_funded_reset_price"
 
-    # No historical-price fallback. If today's challenge fee cannot be proven,
-    # fail closed rather than resurrect an old ₦9,999/₦14,999 reset price.
-    return 0.0, plan or {}, "v152_current_challenge_fee_unresolved"
 
 
 
@@ -44275,7 +44259,7 @@ def trader_reset_price_v153():
 
         if not price or price <= 0:
             return bad(
-                "Current reset price is not configured for this account size.",
+                "Reset is not available for this plan.",
                 409
             )
 
@@ -44297,7 +44281,7 @@ def trader_reset_price_v153():
                 or 0
             ),
             "pricing_rule": (
-                "funded_reset_equals_2x_current_challenge_fee"
+                "funded_reset_uses_current_plan_setting"
                 if stage == "funded"
                 else "phase_reset_uses_current_reset_fee"
             ),
@@ -59985,3 +59969,17 @@ _NPRegisterPackageCustomerV226(app)
 from admin_account_live import register_admin_account_state as _np_register_admin_account_state
 _np_register_admin_account_state(app, requests, SUPABASE_URL,
     SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, _require_admin, _np_v198_is_live_row)
+
+# Standard fixed-plan prices: base fee plus the saved cycle-option charge.
+from plan_commercial import (CyclePriceStore as _NPCyclePriceStore,
+    register_cycle_prices as _NPRegisterCyclePrices, priced_plan as _np_priced_plan)
+_np_cycle_price_store = _NPCyclePriceStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
+
+def _np_price_standard_plan(plan):
+    if str(plan.get("product_category") or "standard").lower() != "standard":
+        return dict(plan)
+    return _np_priced_plan(plan, _np_cycle_price_store.read()[0]["prices"])
+
+_NPRegisterCyclePrices(app, _np_cycle_price_store, _require_admin,
+    _np_owner_catalog_invalidate_v225, _audit_safe)
+app.config["NP_STANDARD_PLAN_PRICER"] = _np_price_standard_plan

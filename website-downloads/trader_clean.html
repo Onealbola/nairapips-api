@@ -6433,10 +6433,9 @@ function npResetPriceFromPurchase(p,stage='funded'){
   const isFunded=String(stage||'').toLowerCase().includes('funded');
 
   if(isFunded){
-    const fee=Number(String(
-      plan.fee ?? plan.price ?? plan.challenge_fee ?? plan.plan_fee ?? ''
-    ).replace(/[₦,\s]/g,''));
-    return Number.isFinite(fee)&&fee>0 ? fee*2 : 0;
+    const fee=Number(String(plan.base_fee ?? plan.fee ?? plan.price ?? 0).replace(/[₦,\s]/g,''));
+    const price=plan.funded_reset_fee==null?fee*2:Number(plan.funded_reset_fee);
+    return Number.isFinite(price)&&price>0?price:0;
   }
 
   const n=Number(String(plan.reset_fee??'').replace(/[₦,\s]/g,''));
@@ -8422,8 +8421,8 @@ function npProductMarketBlockV156(plans,key,mode='plans'){
         <div style="font-size:11px;margin-top:6px;color:var(--text-mute);line-height:1.65">
           ${esc(p.drawdown_type||'STATIC')} DD · Max ${Number(p.max_drawdown||p.total_dd||20)}%<br>
           Payout: ${esc(p.payout_frequency||'Daily')} · Split ${Number(p.payout_split||60)}%<br>
-          Funded cycles: <b>${p.payout_cycles===0?'Unlimited':(p.payout_cycles??2)}</b> · Included in this plan’s purchase fee<br>
-          Account Reset: <b>Available</b>
+          Funded cycles: <b>${p.payout_cycles===0?'Unlimited':(p.payout_cycles??2)}</b> · Included in the total shown<br>
+          Phase 1 Reset: <b>${Number(p.reset_fee||0)>0?'Available':'Not available'}</b><br>Funded Reset: <b>${p.funded_reset_fee===0?'Not available':'Available'}</b>
         </div>
       </div>`;
     }
@@ -8442,7 +8441,7 @@ function npProductMarketBlockV156(plans,key,mode='plans'){
         <div><div class="rule-label">Drawdown</div><div class="rule-value">${esc(p.drawdown_type||'STATIC')} · ${(p.max_drawdown||p.total_dd||20)}%</div></div>
         <div><div class="rule-label">Payout</div><div class="rule-value">${esc(p.payout_frequency||'Daily')} · ${Number(p.payout_split||60)}%</div></div>
         <div><div class="rule-label">Funded payout cycles</div><div class="rule-value">${p.payout_cycles===0?'Unlimited':(p.payout_cycles??2)}</div></div>
-        <div><div class="rule-label">Account Reset</div><div class="rule-value">Available</div></div>
+        <div><div class="rule-label">Phase 1 Reset</div><div class="rule-value">${Number(p.reset_fee||0)>0?fmt.money(p.reset_fee):'Not available'}</div></div><div><div class="rule-label">Funded Reset</div><div class="rule-value">${p.funded_reset_fee===0?'Not available':fmt.money(p.funded_reset_fee??Number(p.base_fee??p.fee??0)*2)}</div></div>
       </div>
       <button class="btn btn-gold btn-block">Select Plan →</button>
     </div>`;
@@ -8710,6 +8709,7 @@ function purchasePlan(planId, privateOfferCode=''){
       <div class="mono" style="font-size:16px;color:var(--gold);font-weight:900;letter-spacing:.1em;margin-top:4px">${esc(pa.account_number||'—')}</div>
     </div>`:''}
 
+    ${p.payout_cycle_extra>0?`<div style="margin-bottom:12px;font-size:12px">Base plan fee: <b>${fmt.money(p.base_fee)}</b><br>${p.payout_cycles===0?'Unlimited':p.payout_cycles} payout cycles · extra: <b>${fmt.money(p.payout_cycle_extra)}</b><br>Total before discounts: <b>${fmt.money(p.fee)}</b></div>`:''}
     <div class="field-label">Promo / Affiliate Code (optional)</div>
     <input class="input" id="pur-promo" value="${esc(capturedRef)}" placeholder="COMEBACK50, PHASEHELP, FLASH20..." oninput="schedulePromoQuote('${esc(String(p.id))}')" onpaste="setTimeout(()=>schedulePromoQuote('${esc(String(p.id))}',true),0)" onblur="applyPromoQuote('${esc(String(p.id))}')">
     <div id="promo-result" style="font-size:12px;margin-bottom:10px"></div>

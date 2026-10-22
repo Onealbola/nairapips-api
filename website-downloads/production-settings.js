@@ -1,3 +1,34 @@
+window.npResetControl = function(prefix, kind, value, fee){
+  const funded=kind==='funded';
+  const id=prefix+(funded?'-funded-reset-fee':'-reset-fee');
+  const mode=funded&&value==null?'auto':Number(value||0)>0?'custom':'none';
+  return `<div><div class="kpi-sub">${funded?'Funded':'Phase 1'} Reset</div>
+    <select class="select" id="${id}-mode" onchange="npResetModeChanged('${prefix}','${kind}')">
+      <option value="none" ${mode==='none'?'selected':''}>Not available</option>
+      ${funded?`<option value="auto" ${mode==='auto'?'selected':''}>Automatic · 2× plan fee</option>`:''}
+      <option value="custom" ${mode==='custom'?'selected':''}>Custom price</option>
+    </select><input class="input" aria-label="${funded?'Funded':'Phase 1'} reset price" id="${id}" type="number" min="0.01" step="0.01" ${mode==='custom'?'':'disabled'} style="${mode==='none'?'display:none':''}" value="${mode==='auto'?Number(fee||0)*2:Number(value||0)}"></div>`;
+};
+window.npResetModeChanged = function(prefix,kind){
+  const id=prefix+(kind==='funded'?'-funded-reset-fee':'-reset-fee');
+  const mode=document.getElementById(id+'-mode').value;
+  const field=document.getElementById(id);
+  field.disabled=mode!=='custom';field.style.display=mode==='none'?'none':'';
+  if(mode==='auto')field.value=Number(document.getElementById(prefix+'-fee')?.value||0)*2;
+};
+window.npResetValue = function(prefix,kind){
+  const id=prefix+(kind==='funded'?'-funded-reset-fee':'-reset-fee');
+  const mode=document.getElementById(id+'-mode').value;
+  if(mode==='none')return 0;
+  if(mode==='auto')return null;
+  const value=Number(document.getElementById(id).value);
+  if(!Number.isFinite(value)||value<=0)throw Error('Enter a positive reset price or select Not available');
+  return value;
+};
+window.npSyncFundedResetDoubleV152 = function(prefix){
+  if(document.getElementById(prefix+'-funded-reset-fee-mode')?.value==='auto')npResetModeChanged(prefix,'funded');
+};
+
 /* Owner controls: real API persistence; no writes to issued account rules. */
 (function(){
 'use strict';
@@ -13,10 +44,12 @@ window.npLoadProductionSettings=async function(){
   const sequence=++loadSequence;
   node.innerHTML='<h3>Production controls</h3><p>Loading saved settings…</p>';
   try{
-    const results=await Promise.all([api('/admin/production_controls'),api('/admin/production_catalog'),api('/admin/package_configuration')]);
+    const results=await Promise.all([api('/admin/production_controls'),api('/admin/production_catalog'),api('/admin/package_configuration'),api('/admin/standard_cycle_prices')]);
     if(sequence!==loadSequence||document.getElementById('np-production-settings')!==node)return;
-    const [c,p,f]=results;controls=c;catalog=p.plans;packages=f;
-    node.innerHTML=`<h3>Business settings</h3><p>Set prices and benefits below. Save changes whenever you need; completed purchases retain their agreed terms.</p><details><summary>Service availability</summary><h3>Service release controls</h3><p>Tick to accept new requests. Unticking keeps history, issued account protection and existing settlement obligations.</p>
+    const [c,p,f,cyclePrices]=results;controls=c;catalog=p.plans;packages=f;window.npStandardCyclePrices=cyclePrices.data;
+    node.innerHTML=`<h3>Business settings</h3><p>Set prices and benefits below. Save changes whenever you need; completed purchases retain their agreed terms.</p><div class="card"><h3>Standard plan payout cycle extra cost</h3><p>1 or 2 cycles: no extra cost. 2 cycles is the default. These prices are added to the base plan fee at purchase. Leave a paid option blank to make it unavailable.</p>
+      <div class="grid md:grid-cols-4 gap-2">${['3','4','5','0'].map(key=>`<label>${key==='0'?'Unlimited':key+' cycles'} · extra ₦${input('np-standard-cycle-'+key,cyclePrices.data.prices[key]??'','type="number" min="0.01" step="0.01"')}</label>`).join('')}</div>
+      <button class="btn btn-gold" onclick="npSaveStandardCyclePrices(this)">Save cycle extra costs</button><p id="np-cycle-price-message" role="status"></p></div><details><summary>Service availability</summary><h3>Service release controls</h3><p>Tick to accept new requests. Unticking keeps history, issued account protection and existing settlement obligations.</p>
       <div>${c.facilities.map(r=>`<label style="display:block;margin:12px 0"><input type="checkbox" id="np-control-${e(r.key)}" ${c.data.features[r.key]?'checked':''}> ${e(r.label)}</label>`).join('')}</div>
       <button class="btn btn-gold" onclick="npSaveProductionControls(this)">Save service switches</button>
       <p id="np-control-message" role="status"></p>
@@ -27,8 +60,9 @@ window.npLoadProductionSettings=async function(){
       <div>${catalog.map((r,i)=>`<div class="card" style="margin:12px 0"><h4>${e(r.name)} · ${e(r.account_size)}</h4>
         <label><input type="checkbox" id="np-plan-active-${i}" ${r.status==='active'?'checked':''}> Open for new purchases</label>
         <div class="grid md:grid-cols-3 gap-2" style="margin-top:12px">
-          ${[['name','Product name'],['fee','Purchase fee ₦'],['account_size','Account size ₦'],['phase1_target','Phase 1 target %'],['phase2_target','Phase 2 target % (0 for one phase)'],['max_drawdown','Maximum drawdown %'],['payout_split','Trader share % (60 or 70)'],['reset_fee','Phase reset fee ₦']].map(([key,label])=>`<label>${label}${input(`np-plan-${i}-${key}`,r[key]??'',key==='name'?'maxlength="100"':'type="number" min="0" step="0.01"')}</label>`).join('')}
-          <label>Funded payout cycles<select class="input" id="np-plan-${i}-payout_cycles"><option value="" ${r.payout_cycles==null?'selected':''}>Existing terms; new purchases: 2</option>${[1,2,3,4,5,0].map(n=>`<option value="${n}" ${r.payout_cycles!=null&&Number(r.payout_cycles)===n?'selected':''}>${n===0?'Unlimited (paid option)':n+' cycle'+(n===1?'':'s')}</option>`).join('')}</select></label>
+          ${[['name','Product name'],['fee','Base plan fee ₦'],['account_size','Account size ₦'],['phase1_target','Phase 1 target %'],['phase2_target','Phase 2 target % (0 for one phase)'],['max_drawdown','Maximum drawdown %'],['payout_split','Trader share % (60 or 70)']].map(([key,label])=>`<label>${label}${input(`np-plan-${i}-${key}`,r[key]??'',key==='name'?'maxlength="100"':'type="number" min="0" step="0.01"')}</label>`).join('')}
+          ${npResetControl('np-plan-'+i,'phase',r.reset_fee,r.fee)}${npResetControl('np-plan-'+i,'funded',r.funded_reset_fee,r.fee)}
+          <label>Funded payout cycles<select class="input" id="np-plan-${i}-payout_cycles"><option value="" ${r.payout_cycles==null?'selected':''}>Existing terms; new purchases: 2</option>${[1,2,3,4,5,0].map(n=>`<option value="${n}" ${r.payout_cycles!=null&&Number(r.payout_cycles)===n?'selected':''}>${n===0?'Unlimited (paid option)':n+' cycle'+(n===1?'':'s')+(n>2?' — paid extra':n===2?' — included default':'')}</option>`).join('')}</select></label>
           <label>Evaluation route<select class="input" id="np-plan-${i}-challenge_journey"><option value="one_phase" ${journey(r)==='one_phase'?'selected':''}>One phase</option><option value="two_phase" ${journey(r)==='two_phase'?'selected':''}>Two phases</option></select></label>
         </div><p>Drawdown: ${e(r.drawdown_type||'STATIC')}. Current funded reset pricing remains twice the challenge fee.</p>
         <button class="btn btn-gold" onclick="npSaveProductionPlan(${i},this)">Save product</button>
@@ -52,6 +86,13 @@ window.npLoadProductionSettings=async function(){
     npLoadPackageDeliveries(1);
   }catch(err){node.innerHTML=`<h3>Production settings unavailable</h3><p>${e(err.message)}</p><button class="btn" onclick="npLoadProductionSettings()">Retry</button>`;}
 };
+window.npSaveStandardCyclePrices=async function(button){
+  button.disabled=true;message('np-cycle-price-message','Saving…');
+  try{const prices={};for(const key of ['3','4','5','0']){const raw=document.getElementById('np-standard-cycle-'+key).value;prices[key]=raw.trim()===''?null:Number(raw);}
+    const result=await api('/admin/standard_cycle_prices','POST',{revision:window.npStandardCyclePrices.revision,prices});
+    window.npStandardCyclePrices=result.data;message('np-cycle-price-message','Saved. Cycle extra costs apply to new purchases.');
+  }catch(err){message('np-cycle-price-message',err.message);}finally{button.disabled=false;}
+};
 window.npSaveProductionControls=async function(button){
   button.disabled=true;message('np-control-message','Saving…');
   try{const flags={};for(const r of controls.facilities)flags[r.key]=document.getElementById('np-control-'+r.key).checked;
@@ -60,8 +101,11 @@ window.npSaveProductionControls=async function(button){
 };
 window.npSaveProductionPlan=async function(i,button){
   button.disabled=true;message('np-plan-message-'+i,'Saving…');
-  try{const row=catalog[i],changes={},numeric=['fee','account_size','phase1_target','phase2_target','max_drawdown','payout_split','reset_fee'];
+  try{const row=catalog[i],changes={},numeric=['fee','account_size','phase1_target','phase2_target','max_drawdown','payout_split'];
     for(const key of ['name',...numeric,'challenge_journey']){const n=document.getElementById(`np-plan-${i}-${key}`);const baseline=key==='challenge_journey'?journey(row):String(row[key]??'');if(n.value===baseline)continue;if(numeric.includes(key)){if(!n.value.trim())throw Error('Set '+key);const value=Number(n.value);if(!Number.isFinite(value))throw Error('Enter a valid '+key);if(baseline!==''&&Number(baseline)===value)continue;changes[key]=value;}else{changes[key]=n.value;}}
+    const resetFee=npResetValue('np-plan-'+i,'phase'),fundedFee=npResetValue('np-plan-'+i,'funded');
+    if(resetFee!==Number(row.reset_fee||0))changes.reset_fee=resetFee;
+    if(fundedFee!==(row.funded_reset_fee??null))changes.funded_reset_fee=fundedFee;
     const cycleValue=document.getElementById(`np-plan-${i}-payout_cycles`).value;
     if(cycleValue!==String(row.payout_cycles??''))changes.payout_cycles=cycleValue===''?null:Number(cycleValue);
     const status=document.getElementById('np-plan-active-'+i).checked?'active':'inactive';if(status!==row.status)changes.status=status;

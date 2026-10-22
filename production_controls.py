@@ -239,6 +239,12 @@ def register_controls(app, store, require_admin, invalidate, audit):
                     if not plans or str(plans[0].get('status') or '').lower() != 'active':
                         return jsonify(success=False, code='PRODUCT_NOT_RELEASED',
                                        error='This product is not open for new purchases.', operation_started=False), 403
+                    pricer = app.config.get('NP_STANDARD_PLAN_PRICER')
+                    if pricer:
+                        try:
+                            plans[0] = pricer(plans[0])
+                        except ValueError as exc:
+                            return jsonify(success=False, error=str(exc), operation_started=False), 409
                     from decimal import Decimal, InvalidOperation
                     try:
                         if Decimal(str(body.get('fee'))) != Decimal(str(plans[0].get('fee'))):

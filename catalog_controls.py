@@ -8,7 +8,7 @@ from flask import jsonify, request
 
 FIELDS = {
     'name', 'description', 'status', 'fee', 'account_size', 'phase1_target',
-    'phase2_target', 'max_drawdown', 'payout_split', 'reset_fee',
+    'phase2_target', 'max_drawdown', 'payout_split', 'reset_fee', 'funded_reset_fee',
     'challenge_journey', 'drawdown_type', 'payout_cycles',
 }
 RULE_FIELDS = {'fee', 'reset_fee', 'phase1_target', 'phase2_target', 'max_drawdown', 'payout_split',
@@ -44,6 +44,9 @@ def validated_plan(current, changes):
             release_fields['phase2_target'] = 0
         validated_plan({}, release_fields)
     result = dict(changes)
+    if 'funded_reset_fee' in changes:
+        from plan_commercial import money
+        result['funded_reset_fee'] = None if changes['funded_reset_fee'] is None else money(changes['funded_reset_fee'])
     if "payout_cycles" in changes:
         from plan_cycles import cycle_limit
         result["payout_cycles"] = cycle_limit(changes["payout_cycles"])
@@ -142,9 +145,6 @@ def register_catalog_controls(app, transport, url, key, require_admin, invalidat
                 return jsonify(success=False, error='Plan changed in another session. Reload before editing.'), 409
             changes = validated_plan(current, body['changes'])
             # np_preserve_sold_plan_terms freezes historical snapshots atomically.
-            if 'fee' in changes:
-                # Current funded-reset rule is explicitly twice current fee.
-                changes['funded_reset_fee'] = round(changes['fee'] * 2, 2)
             from datetime import datetime, timezone
             changes['updated_at'] = datetime.now(timezone.utc).isoformat()
             compare = 'is.null' if body['updated_at'] is None else 'eq.' + str(body['updated_at'])
