@@ -8399,10 +8399,6 @@ function npProductMarketRowsV156(plans,key){
     Number(a.account_size||a.size||0)-Number(b.account_size||b.size||0)
   );
 }
-function npBuyerCycleSummary(plan){
-  const paid=(plan.cycle_options||[]).filter(o=>o.available && o.extra>0);
-  return '2 cycles included · 1 cycle also available at no extra cost.<br>'+(paid.length?paid.map(o=>(o.cycles===0?'Unlimited':o.cycles+' cycles')+': +'+fmt.money(o.extra)).join(' · '):'Choose available upgrades at checkout.');
-}
 function npProductMarketBlockV156(plans,key,mode='plans'){
   const rows=npProductMarketRowsV156(plans,key);
   const label=key==='premium'?'Premium':'Standard';
@@ -8421,13 +8417,12 @@ function npProductMarketBlockV156(plans,key,mode='plans'){
         </div>
         <div style="font-weight:900;font-size:16px;margin:4px 0">${esc(p.name||p.plan_name||'—')}</div>
         <div style="font-size:22px;font-weight:900;color:${key==='premium'?'#c7d2fe':'var(--gold)'};font-family:'JetBrains Mono',monospace;margin:6px 0">${fmt.money(p.account_size||p.size||0)}</div>
-        <div style="font-size:12px;color:var(--text-dim)">Fee with 2 cycles: <b>${fmt.money(p.fee||p.price||0)}</b></div>${p.base_fee!=null?`<div style="font-size:11px;color:var(--text-mute);margin-top:4px">Base ${fmt.money(p.base_fee)} + cycle extra ${fmt.money(p.payout_cycle_extra??0)}</div>`:''}
+        <div style="font-size:12px;color:var(--text-dim)">Fee: <b>${fmt.money(p.fee||p.price||0)}</b></div>
         <div style="font-size:11px;margin-top:8px;color:${route.onePhase?'var(--gold)':'var(--info-text)'};font-weight:800">${route.phase1Target}% Phase 1 → ${route.nextLabel}${route.onePhase?'':' '+route.phase2Target+'%'}</div>
         <div style="font-size:11px;margin-top:6px;color:var(--text-mute);line-height:1.65">
           ${esc(p.drawdown_type||'STATIC')} DD · Max ${Number(p.max_drawdown||p.total_dd||20)}%<br>
           Payout: ${esc(p.payout_frequency||'Daily')} · Split ${Number(p.payout_split||60)}%<br>
-          Funded cycles: <b>${p.payout_cycles===0?'Unlimited':(p.payout_cycles??2)}</b> · Choose cycles when buying<br>
-          ${npBuyerCycleSummary(p)}<br>Phase 1 Reset: <b>${Number(p.reset_fee||0)>0?'Available':'Not available'}</b><br>Funded Reset: <b>${p.funded_reset_fee===0?'Not available':'Available'}</b>
+          Phase 1 Reset: <b>${Number(p.reset_fee||0)>0?'Available':'Not available'}</b><br>Funded Reset: <b>${p.funded_reset_fee===0?'Not available':'Available'}</b>
         </div>
       </div>`;
     }
@@ -8439,18 +8434,15 @@ function npProductMarketBlockV156(plans,key,mode='plans'){
       </div>
       <div class="name">${esc(p.name||p.plan_name||'—')}</div>
       <div class="size">${fmt.money(p.account_size||p.size||0)}</div>
-      <div class="fee">Fee with 2 cycles: <b style="color:${key==='premium'?'#c7d2fe':'var(--gold)'}">${fmt.money(p.fee||p.price||0)}</b></div>
-      ${p.base_fee!=null?`<p style="font-size:11px;color:var(--text-mute)">Base ${fmt.money(p.base_fee)} + cycle extra ${fmt.money(p.payout_cycle_extra??0)} = total ${fmt.money(p.fee)}</p>`:''}
+      <div class="fee">Fee: <b style="color:${key==='premium'?'#c7d2fe':'var(--gold)'}">${fmt.money(p.fee||p.price||0)}</b></div>
       <div class="rules">
         <div><div class="rule-label">Phase 1 Target</div><div class="rule-value gold">${route.phase1Target}%</div></div>
         <div><div class="rule-label">After Phase 1</div><div class="rule-value ${route.onePhase?'gold':''}">${route.nextLabel}</div></div>
         <div><div class="rule-label">Drawdown</div><div class="rule-value">${esc(p.drawdown_type||'STATIC')} · ${(p.max_drawdown||p.total_dd||20)}%</div></div>
         <div><div class="rule-label">Payout</div><div class="rule-value">${esc(p.payout_frequency||'Daily')} · ${Number(p.payout_split||60)}%</div></div>
-        <div><div class="rule-label">Funded payout cycles</div><div class="rule-value">${p.payout_cycles===0?'Unlimited':(p.payout_cycles??2)}</div></div>
         <div><div class="rule-label">Phase 1 Reset</div><div class="rule-value">${Number(p.reset_fee||0)>0?fmt.money(p.reset_fee):'Not available'}</div></div><div><div class="rule-label">Funded Reset</div><div class="rule-value">${p.funded_reset_fee===0?'Not available':fmt.money(p.funded_reset_fee??Number(p.base_fee??p.fee??0)*2)}</div></div>
       </div>
-      <p style="font-size:12px">${npBuyerCycleSummary(p)}</p>
-      <button class="btn btn-gold btn-block">Select Plan &amp; Cycles →</button>
+      <button class="btn btn-gold btn-block">Select Plan →</button>
     </div>`;
   }).join('');
   return `<section class="np-product-market ${key}">

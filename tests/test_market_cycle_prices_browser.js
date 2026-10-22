@@ -31,7 +31,11 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
   await page.addScriptTag({content:html.slice(a,b)});
   const c=html.indexOf('let NP_BUYER_CHECKOUT='),d=html.indexOf('/* ====== PAYOUTS',c);await page.addScriptTag({content:html.slice(c,d)});
   await page.evaluate(()=>document.getElementById('cards').innerHTML=npProductMarketBlockV156(SESSION.plansList,'standard')+npProductMarketBlockV156(SESSION.plansList,'premium'));
-  assert((await page.locator('.np-product-market.premium').innerText()).includes('18,000'));
+  const cards=await page.locator('#cards').innerText();
+  assert(!cards.includes('18,000'));assert(!cards.includes('cycle'));assert(!cards.includes('Base '));
+  await page.evaluate(()=>document.getElementById('cards').innerHTML=npProductMarketBlockV156(SESSION.plansList,'standard','purchase')+npProductMarketBlockV156(SESSION.plansList,'premium','purchase'));
+  const purchaseCards=await page.locator('#cards').innerText();
+  assert(!purchaseCards.includes('cycle'));assert(!purchaseCards.includes('Base '));
   const open=async id=>{await page.evaluate(id=>purchasePlan(id),id);await page.waitForFunction(()=>!document.getElementById('pur-cycles').disabled);};
   await open('s');assert.equal(await page.locator('#pur-cycles').inputValue(),'2');
   assert((await page.locator('#pur-amount-display').innerText()).includes('20,000'));
