@@ -60032,3 +60032,6 @@ _np_register_cycle_progress(app, _np_limited_cycle_guard, _require_admin)
 # Recovery access to existing login UIs when the separately hosted HTML is missing.
 from panel_delivery import register_panel_delivery as _np_register_panel_delivery
 _np_register_panel_delivery(app)
+
+from cycle_progress import register_trader_cycle_progress as _np_register_trader_cycle_progress
+_np_register_trader_cycle_progress(app, _np_limited_cycle_guard, _authenticated_trader_id_for_request)

@@ -42,8 +42,12 @@ def progress_report(guard, purchases, accounts, payouts):
             'purchases':result,'payouts':payout_map,'counts':{'tracked':len(result),'completed':sum(r['completed'] for r in result),
             'review_required':sum(not r['verified'] for r in result)}}
 
-def read_progress(guard):
-    purchases=guard.rows('challenge_purchases',{'payout_cycles':'gt.0','select':'id,trader_id,trader_name,plan_name,payout_cycles,lifecycle_state'})
+def read_progress(guard, trader_id=None):
+    params={'payout_cycles':'gt.0','select':'id,trader_id,trader_name,plan_name,payout_cycles,lifecycle_state'}
+    if trader_id:params['trader_id']='eq.'+str(trader_id)
+    purchases=guard.rows('challenge_purchases',params)
+    if trader_id:
+        purchases=[p for p in purchases if str(p.get('trader_id'))==str(trader_id)]
     accounts=[]
     for start in range(0,len(purchases),100):
         ids=','.join(str(p['id']) for p in purchases[start:start+100])
@@ -68,3 +72,21 @@ def register_cycle_progress(app, guard, require_admin):
             return response
         except Exception:
             return jsonify(success=False,error='Complete cycle progress could not be verified. Refresh before authorizing payment.'),503
+
+
+def register_trader_cycle_progress(app, guard, authenticate):
+    @app.get('/trader/funded_cycle_progress')
+    def trader_cycle_progress():
+        trader_id, error = authenticate()
+        if error or not trader_id:
+            return jsonify(success=False,error='Trader authentication is required'),401
+        try:
+            report=read_progress(guard,trader_id)
+            fields=('purchase_id','plan','limit','paid','reserved','remaining','completed','verified','status')
+            response=jsonify(success=True,data={'generated_at':report['generated_at'],
+                'purchases':[{k:row[k] for k in fields} for row in report['purchases']]})
+        except Exception:
+            response=jsonify(success=False,error='Payout cycle status is temporarily unavailable. Please refresh or contact support.')
+            response.status_code=503
+        response.headers['Cache-Control']='no-store, private'
+        return response
