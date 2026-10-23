@@ -60035,3 +60035,6 @@ _np_register_panel_delivery(app)
 
 from cycle_progress import register_trader_cycle_progress as _np_register_trader_cycle_progress
 _np_register_trader_cycle_progress(app, _np_limited_cycle_guard, _authenticated_trader_id_for_request)
+
+from purchase_alert import register_purchase_alert as _np_register_purchase_alert
+_np_register_purchase_alert(app, _np_limited_cycle_guard, _require_admin)

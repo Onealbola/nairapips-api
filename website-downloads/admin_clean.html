@@ -3075,6 +3075,11 @@ input::placeholder, textarea::placeholder{
 }
 </style>
 
+<style>
+@keyframes npPurchaseBlink{0%,100%{opacity:1;box-shadow:0 0 12px #ef444480}50%{opacity:.55;box-shadow:none}}
+.np-purchase-blink{animation:npPurchaseBlink 1.4s ease-in-out infinite}
+@media(prefers-reduced-motion:reduce){.np-purchase-blink{animation:none}}
+</style>
 </head>
 <body>
 <div id="root"></div>
@@ -4301,7 +4306,7 @@ function renderApp(){
 
         <div class="nav-section">Money</div>
         <button class="nav" data-mod="plans" onclick="setMod('plans')">◇ Plans</button>
-        <button class="nav" data-mod="purchases" onclick="setMod('purchases')">🛒 Purchases</button>
+        <button class="nav" data-mod="purchases" onclick="setMod('purchases')" style="display:flex;align-items:center;gap:9px">🛒 Purchases <span data-purchase-alert-slot>${npPurchaseAlertBadge()}</span></button>
         <button class="nav" data-mod="payouts" onclick="setMod('payouts')" style="display:flex;align-items:center;gap:9px">⇩ Payouts ${(()=>{const n=(SESSION.payouts||[]).filter(p=>['pending','requested','submitted','pending_review','awaiting_review','under_review'].includes(String(p.status||'pending').toLowerCase())).length;return n?`<span id="np-payout-alert-badge" title="${n} withdrawal request${n===1?'':'s'} waiting for review" style="margin-left:auto;min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:#ef4444;color:#fff;font-size:10px;font-weight:950;display:inline-grid;place-items:center;box-shadow:0 0 16px rgba(239,68,68,.45)">${n}</span>`:'';})()}</button>
         <button class="nav" data-mod="salesOutcomes" onclick="setMod('salesOutcomes')">📈 Sales Outcomes</button>
         <button class="nav" data-mod="revenue" onclick="setMod('revenue')">📊 Revenue</button>
@@ -4349,7 +4354,7 @@ function renderApp(){
       <nav class="mobile-nav" aria-label="Quick modules">
         <button class="mnav active" data-mod="overview" onclick="setMod('overview')"><span class="ico">⌂</span><span>Home</span></button>
         <button class="mnav" data-mod="actions" onclick="setMod('actions')"><span class="ico">⚡</span><span>Actions</span></button>
-        <button class="mnav" data-mod="purchases" onclick="setMod('purchases')"><span class="ico">◇</span><span>Purchases</span></button>
+        <button class="mnav" data-mod="purchases" onclick="setMod('purchases')"><span class="ico">◇</span><span>Purchases</span><span data-purchase-alert-slot>${npPurchaseAlertBadge()}</span></button>
         <button class="mnav" data-mod="payouts" onclick="setMod('payouts')"><span class="ico">⇩</span><span>Payouts</span></button>
         <button class="mnav" aria-label="All modules" aria-controls="np-admin-sidebar" aria-expanded="false" onclick="npAdminOpenMenu()"><span class="ico">☰</span><span>All modules</span></button>
       </nav>
@@ -12346,6 +12351,52 @@ window.PURCHASE_FILTER_Q = window.PURCHASE_FILTER_Q || '';
 window.PURCHASE_CUSTOM_FROM = window.PURCHASE_CUSTOM_FROM || '';
 window.PURCHASE_CUSTOM_TO = window.PURCHASE_CUSTOM_TO || '';
 
+/* PURCHASE_ALERT_START: exact unreviewed payments; no financial writes. */
+function npPurchaseNeedsReview(row){
+ const status=String(row.status||'').trim().toLowerCase(),payment=String(row.payment_status||'').trim().toLowerCase();
+ const terminal=['rejected','declined','cancelled','canceled','refunded','failed','expired'];
+ if(row.mark_as_test===true||terminal.includes(status)||terminal.includes(payment))return false;
+ if(['approved','paid'].includes(payment)||['approved','paid','completed','approved_active','assigned','approved_waiting_mt5'].includes(status))return false;
+ return ['pending','pending_review','awaiting_review','review','payment_pending','submitted','awaiting_verification','under_review','awaiting_approval','requested'].includes(payment||status);
+}
+function npPurchaseAlertState(){
+ const key=String(SESSION.token||'')+'|'+String(SESSION.admin?.id||'');
+ if(!window.NP_PURCHASE_ALERT||NP_PURCHASE_ALERT.key!==key)window.NP_PURCHASE_ALERT={key,count:null,error:false,pending:false,loadedAt:0};
+ return window.NP_PURCHASE_ALERT;
+}
+function npPurchaseAlertBadge(){
+ const s=npPurchaseAlertState();
+ if(!s.loadedAt&&!s.pending&&!s.error&&SESSION.token)setTimeout(npPurchaseAlertRefresh,0);
+ const stale=s.error||!s.loadedAt||Date.now()-s.loadedAt>65000;
+ const count=stale?null:s.count;
+ return `<span data-purchase-alert-badge class="${count>0?'np-purchase-blink':''}" style="margin-left:auto;min-width:20px;padding:2px 6px;border-radius:999px;background:${count>0?'#ef4444':'#555'};color:white;font-size:11px;font-weight:950;${count===0?'display:none':''}" title="${count===null?'Purchase review count unavailable':count+' purchase payments waiting for review'}">${count===null?'…':count}</span>`;
+}
+function npPurchaseAlertApply(){
+ document.querySelectorAll('[data-purchase-alert-slot]').forEach(el=>el.innerHTML=npPurchaseAlertBadge());
+ const banner=document.getElementById('np-purchase-review-alert');if(!banner)return;
+ const s=npPurchaseAlertState(),stale=s.error||!s.loadedAt||Date.now()-s.loadedAt>65000;
+ banner.hidden=!stale&&s.count===0;
+ banner.innerHTML=stale?'Purchase alert unavailable. Refresh purchases to check payment reviews.':`<strong class="np-purchase-blink">● ${s.count} purchase payment${s.count===1?'':'s'} waiting for review</strong> <button class="btn btn-sm btn-gold" type="button" onclick="npOpenPurchaseReviews()">Review purchases</button>`;
+}
+async function npPurchaseAlertRefresh(){
+ const s=npPurchaseAlertState();if(!SESSION.token||s.pending||document.hidden)return;
+ s.pending=true;
+ try{
+  const r=await api('/admin/purchase_alert?_t='+Date.now(),'GET');
+  if(npPurchaseAlertState()!==s)return;
+  if(!r.success||!Number.isSafeInteger(r.pending)||r.pending<0)throw Error('Invalid count');
+  s.count=r.pending;s.loadedAt=Date.now();s.error=false;
+ }catch(e){if(npPurchaseAlertState()===s)s.error=true;}
+ finally{if(npPurchaseAlertState()===s){s.pending=false;npPurchaseAlertApply();}}
+}
+function npOpenPurchaseReviews(){
+ window.PURCHASE_FILTER_STATUS='needs_review';window.PURCHASE_FILTER_RANGE='all';window.PURCHASE_FILTER_Q='';
+ setMod('purchases');
+}
+setInterval(npPurchaseAlertRefresh,30000);
+window.addEventListener('focus',npPurchaseAlertRefresh);
+/* PURCHASE_ALERT_END */
+
 function purchaseStatus(p){
   const lifecycle=String(p?.status||'').trim().toLowerCase();
   const payment=String(p?.payment_status||'').trim().toLowerCase();
@@ -12557,6 +12608,7 @@ async function npRefreshPurchaseOperationsData(force=false){
     if(Array.isArray(pays)) SESSION.payouts=pays;
     NP_PURCHASE_LIVE_REFRESH_AT=Date.now();
     if(SESSION.currentMod==='purchases') renderPurchases(true);
+    npPurchaseAlertRefresh();
   }catch(e){
     console.warn('Purchase operations live refresh failed:',e?.message||e);
   }finally{
@@ -12569,7 +12621,7 @@ function purchaseVisibleRows(){
   const range=String(window.PURCHASE_FILTER_RANGE||'all').toLowerCase();
   return (SESSION.purchases||[]).filter(p=>{
     const ps=purchaseStatus(p);
-    if(status!=='all' && ps!==status) return false;
+    if(status==='needs_review'?!npPurchaseNeedsReview(p):status!=='all'&&ps!==status) return false;
     if(range!=='all' && !purchaseInRange(purchaseSalesDate(p), range)) return false;
     if(!q) return true;
     const t=purchaseTrader(p);
@@ -12837,19 +12889,21 @@ async function npCyclePreflight(id){
 /* FUNDED_CYCLE_PROGRESS_END */
 
 function renderPurchases(skipLiveRefresh=false){
+  setTimeout(()=>{npPurchaseAlertApply();npPurchaseAlertRefresh();},0);
   if(!skipLiveRefresh){
     setTimeout(()=>npRefreshPurchaseOperationsData(false),0);
   }
   const list = SESSION.purchases || [];
   const visible = purchaseVisibleRows();
   const approved = list.filter(approvedPurchase).length;
-  const pending = list.filter(p=>['pending','awaiting_review','review','payment_pending'].includes(purchaseStatus(p))).length;
+  const pending = list.filter(npPurchaseNeedsReview).length;
   const rejected = list.filter(p=>purchaseStatus(p)==='rejected').length;
   const activeRange = window.PURCHASE_FILTER_RANGE || 'all';
   const activeStatus = window.PURCHASE_FILTER_STATUS || 'all';
   const filterBtn = (kind,val,label)=>`<button class="btn btn-sm ${((kind==='range'?activeRange:activeStatus)===val)?'btn-gold':'btn-ghost'}" onclick="purchaseSetFilter('${kind}','${val}')">${label}</button>`;
 
   document.getElementById('content').innerHTML = `
+    <div id="np-purchase-review-alert" class="card mb-4" role="status" aria-live="polite" style="border:1px solid #ef4444;padding:14px" hidden></div>
     ${npCyclePanel()}
     <div class="vault mb-6 tab-content">
       <div class="flex items-center justify-between flex-wrap gap-3">
@@ -12900,6 +12954,7 @@ function renderPurchases(skipLiveRefresh=false){
           ${filterBtn('status','all','All Status')}
           ${filterBtn('status','approved','Approved')}
           ${filterBtn('status','pending','Pending')}
+          ${filterBtn('status','needs_review','Needs review')}
           ${filterBtn('status','rejected','Rejected')}
         </div>
       </div>
