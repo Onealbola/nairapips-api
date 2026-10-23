@@ -130,3 +130,34 @@ class SalesOutcomesRouteTests(unittest.TestCase):
         self.assertEqual(client.get('/report?from=bad').status_code,400)
 
 if __name__=='__main__':unittest.main()
+
+
+class CurrentPositionTests(SalesOutcomesTests):
+    def report(self,accounts,payouts=None,purchase=None):
+        return build_report([purchase or self.p()],accounts,'','',payouts)
+    def test_current_phase1_is_not_every_purchase_that_started_phase1(self):
+        r=self.report([self.a(account_status='assigned_active')]);self.assertEqual(r['summary']['still_phase1'],1);self.assertEqual(r['summary']['still_funded'],0)
+        r=self.report([self.a(account_status='archived_phase1'),self.a('b',stage='funded',account_status='assigned_active')]);self.assertEqual(r['summary']['still_phase1'],0);self.assertEqual(r['summary']['still_funded'],1)
+    def test_terminal_or_unverified_accounts_are_not_current(self):
+        for changes in [dict(account_status='archived'),dict(account_status='breached_archived'),dict(account_status='assigned_active',archived_at='now'),dict(account_status='assigned_active',breached_at='now'),dict(account_status='assigned_active',mt5_login=''),dict(account_status='unknown')]:
+            r=self.report([self.a(stage='funded',**changes)]);self.assertEqual(r['summary']['still_funded'],0)
+    def test_protected_and_pending_funded_count_as_still_funded(self):
+        for state in ['profit_protected','payout_pending','payment_processing']:
+            r=self.report([self.a(stage='funded',account_status=state)]);self.assertEqual(r['summary']['still_funded'],1)
+    def test_paid_account_excluded_until_fresh_funded_account_exists(self):
+        paid=dict(id='paid',trader_id='t',trader_account_id='a',status='paid',amount=100,paid_at='now')
+        a=self.a(stage='funded',account_status='assigned_active')
+        r=self.report([a],[paid]);self.assertEqual(r['summary']['still_funded'],0)
+        r=self.report([a,self.a('b',stage='funded',account_status='assigned_active')],[paid]);self.assertEqual(r['summary']['still_funded'],1)
+        paid['status']='cancelled';self.assertEqual(self.report([a],[paid])['summary']['still_funded'],0)
+    def test_conflicting_stages_and_wrong_owner_do_not_inflate_counts(self):
+        accounts=[self.a(account_status='assigned_active'),self.a('b',stage='funded',account_status='assigned_active')]
+        r=self.report(accounts);self.assertEqual(r['rows'][0]['current_position'],'review_required');self.assertEqual(r['summary']['still_phase1']+r['summary']['still_funded'],0)
+        accounts=[self.a(account_status='assigned_active',trader_id='someone_else')];self.assertEqual(self.report(accounts)['summary']['still_phase1'],0)
+    def test_duplicate_current_accounts_count_purchase_once_and_completed_purchase_excluded(self):
+        accounts=[self.a(stage='funded',account_status='assigned_active'),self.a('b',stage='funded',account_status='assigned_active')]
+        self.assertEqual(self.report(accounts)['summary']['still_funded'],1)
+        self.assertEqual(self.report(accounts,purchase=self.p(lifecycle_state='funded_cycles_completed'))['summary']['still_funded'],0)
+    def test_current_position_is_scoped_to_sale_period_and_plan_totals(self):
+        r=build_report([self.p(),self.p('old',created_at='2025-01-01')],[self.a(account_status='assigned_active'),self.a('b',purchase_id='old',stage='funded',account_status='assigned_active')],'2026-10-01','2026-10-31')
+        self.assertEqual((r['summary']['still_phase1'],r['summary']['still_funded']),(1,0));self.assertEqual(r['plans'][0]['still_phase1'],1)

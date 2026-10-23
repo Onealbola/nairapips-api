@@ -77,6 +77,36 @@ def _paid_then_breached_closed(journey, paid_times):
     return False
 
 
+CURRENT_OPEN = {'assigned_active','active','current_active','phase1_active','phase2_active','funded_active',
+                'live','funded','approved_active','profit_protected','payout_pending',
+                'approved_payout_pending','payment_processing','funded_profit_cap_reached'}
+
+
+def current_position(purchase, journey, paid_accounts):
+    """One current stage per exact purchase; archived history is never a survivor."""
+    if purchase.get('lifecycle_state') == 'funded_cycles_completed':
+        return 'closed'
+    stages=set()
+    for account in journey:
+        if str(account.get('trader_id') or '') != str(purchase.get('trader_id') or ''):
+            continue
+        state=str(account.get('account_status') or account.get('status') or '').strip().lower()
+        stage=str(account.get('stage') or account.get('phase') or '').lower().replace('_','').replace(' ','')
+        if state not in CURRENT_OPEN or not account.get('mt5_login'):
+            continue
+        if any(account.get(key) for key in ('archived_at','closed_at','breached_at','breach_at')):
+            continue
+        if stage in {'phase1','phase2'} and account.get('passed_at'):
+            continue
+        if str(account.get('id')) in paid_accounts:
+            continue
+        if stage in {'phase1','phase2','funded'}:
+            stages.add(stage)
+    if len(stages)>1:
+        return 'review_required'
+    return next(iter(stages)) if stages else 'no_open_account'
+
+
 def build_report(purchases, accounts, start, end, payouts=None):
     for value in (start, end):
         if value:
@@ -119,6 +149,9 @@ def build_report(purchases, accounts, start, end, payouts=None):
         paid_when = _recorded_time(payout.get("paid_at"))
         if paid_when:
             paid_times[(account_id, str(payout.get("trader_id") or ""))].append(paid_when)
+    paid_accounts={str(p.get('trader_account_id') or p.get('account_id')) for p in payouts or []
+                   if (str(p.get('status') or '').lower()=='paid' or p.get('paid_at'))
+                   and str(p.get('trader_id') or '')==str(by_id.get(str(p.get('trader_account_id') or p.get('account_id')),{}).get('trader_id') or '')}
     rows, seen, undated = [], set(), 0
     for p in purchases:
         pid = str(p.get("id") or "")
@@ -168,14 +201,15 @@ def build_report(purchases, accounts, start, end, payouts=None):
             passed |= bool(a.get("passed_at") or "passed" in state or (issued and ("phase2" in stage or "funded" in stage)))
         paid_records = {paid_id: amount for aid in ids for paid_id, amount in paid_by_account.get(aid, [])}
         payout_amount = float(sum(paid_records.values(), Decimal("0")).quantize(Decimal("0.01")))
-        rows.append({"purchase_id": pid, "sale_date": day, "plan": str(p.get("plan_name") or p.get("plan") or "Unspecified"), "account_size": p.get("account_size") or 0, "mt5_login": str(p.get("mt5_login") or (journey[0].get("mt5_login") if journey else "") or ""), "breached": breached, "passed": passed, "funded": funded, "funded_breached": funded_breached, "collected_payout": bool(paid_records), "paid_then_breached_closed": _paid_then_breached_closed(journey, paid_times) if paid_records else False, "paid_payout_count": len(paid_records), "payout_amount": payout_amount, "assigned": any(a.get("mt5_login") for a in journey)})
+        position = current_position(p, journey, paid_accounts)
+        rows.append({"current_position":position,"still_phase1":position=="phase1","still_funded":position=="funded","purchase_id": pid, "sale_date": day, "plan": str(p.get("plan_name") or p.get("plan") or "Unspecified"), "account_size": p.get("account_size") or 0, "mt5_login": str(p.get("mt5_login") or (journey[0].get("mt5_login") if journey else "") or ""), "breached": breached, "passed": passed, "funded": funded, "funded_breached": funded_breached, "collected_payout": bool(paid_records), "paid_then_breached_closed": _paid_then_breached_closed(journey, paid_times) if paid_records else False, "paid_payout_count": len(paid_records), "payout_amount": payout_amount, "assigned": any(a.get("mt5_login") for a in journey)})
     for row in rows:
         row["outcome"] = outcome_for(row)
         row["outcome_label"] = OUTCOMES[row["outcome"]]
     def totals(group):
         sold = len(group)
         result = {"sold": sold}
-        for key in ("breached", "passed", "funded", "funded_breached", "collected_payout", "paid_then_breached_closed", "assigned"):
+        for key in ("breached", "passed", "funded", "funded_breached", "collected_payout", "paid_then_breached_closed", "assigned", "still_phase1", "still_funded"):
             result[key] = sum(bool(r[key]) for r in group)
             result[key + "_rate"] = round(result[key] * 100 / sold, 1) if sold else 0
         result["paid_payout_count"] = sum(r["paid_payout_count"] for r in group)
@@ -193,4 +227,4 @@ def build_report(purchases, accounts, start, end, payouts=None):
     plans = defaultdict(list)
     for row in rows:
         plans[row["plan"]].append(row)
-    return {"success": True, "from": start, "to": end, "timezone": "Africa/Lagos", "summary": totals(rows), "outcome_labels": OUTCOMES, "plans": [{"plan": name, **totals(group)} for name, group in sorted(plans.items())], "rows": sorted(rows, key=lambda r: (r["sale_date"], r["purchase_id"]), reverse=True), "undated_sales_excluded": undated, "unlinked_paid_records": unlinked_paid, "definition": "Approved original purchases by transaction date. Milestones cover their linked account history up to now; passed means at least one evaluation phase passed. Counts overlap: a funded trader can receive payouts and later breach. Collected payouts are records marked paid, linked by exact account and owner; pending/approved requests are excluded. Amounts cover payments up to now for the selected sales cohort, not payments made only within the sale dates. Resets are excluded as new sales."}
+    return {"success": True, "generated_at": datetime.now(TZ).isoformat(), "from": start, "to": end, "timezone": "Africa/Lagos", "summary": totals(rows), "outcome_labels": OUTCOMES, "plans": [{"plan": name, **totals(group)} for name, group in sorted(plans.items())], "rows": sorted(rows, key=lambda r: (r["sale_date"], r["purchase_id"]), reverse=True), "undated_sales_excluded": undated, "unlinked_paid_records": unlinked_paid, "definition": "Still in Phase 1 / Still Funded count purchases with a recorded open account in that stage now, including payout holds. Archived, closed, breached, passed evaluation and already-paid accounts are excluded; conflicting open stages require review. Approved original purchases by transaction date. Milestones cover their linked account history up to now; passed means at least one evaluation phase passed. Counts overlap: a funded trader can receive payouts and later breach. Collected payouts are records marked paid, linked by exact account and owner; pending/approved requests are excluded. Amounts cover payments up to now for the selected sales cohort, not payments made only within the sale dates. Resets are excluded as new sales."}
