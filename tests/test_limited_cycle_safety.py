@@ -103,4 +103,16 @@ class SafetyTests(unittest.TestCase):
         a=dict(self.a,id='other-a',purchase_id='other');self.db.tables['trader_accounts'].append(a)
         other=self.g.acquire(a);self.g.release(other);self.g.release(c)
 
+    def test_four_cycle_purchase_stops_after_four_and_old_two_cycle_test_stays_valid(self):
+        self.p['payout_cycles']=4
+        accounts=self.db.tables['trader_accounts']
+        accounts.extend([dict(self.a,id='d',mt5_login='444'),dict(self.a,id='e',mt5_login='555')])
+        for i,account in enumerate(accounts[:4]):
+            c=self.g.acquire(account,action='paid')
+            self.assertEqual(c['cycles']['remaining'],4-i)
+            self.paid(account,'paid-'+str(i));self.g.release(c)
+        for action in ('create','approve','paid'):
+            with self.assertRaisesRegex(CycleBlocked,'PURCHASE COMPLETED'):self.g.acquire(accounts[4],action=action)
+        self.assertEqual(self.g.inspect(self.p,accounts[0])['remaining'],0)
+
 if __name__=='__main__':unittest.main()

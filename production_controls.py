@@ -243,7 +243,7 @@ def register_controls(app, store, require_admin, invalidate, audit):
                     pricer = app.config.get('NP_STANDARD_PLAN_PRICER')
                     if buyer_pricer or pricer:
                         try:
-                            plans[0] = buyer_pricer(plans[0], body.get('payout_cycles', 2)) if buyer_pricer else pricer(plans[0])
+                            plans[0] = buyer_pricer(plans[0], body.get('payout_cycles', 4)) if buyer_pricer else pricer(plans[0])
                         except ValueError as exc:
                             return jsonify(success=False, error=str(exc), operation_started=False), 409
                     from decimal import Decimal, InvalidOperation

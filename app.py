@@ -10010,7 +10010,7 @@ def _np_plan_rule_snapshot_v156(plan):
         "product_category": _np_plan_category_v156(plan.get("product_category")),
         "drawdown_type": str(plan.get("drawdown_type") or "STATIC").strip().upper(),
         "payout_frequency": str(plan.get("payout_frequency") or "Daily").strip(),
-        "payout_cycles": cycle_limit(plan.get("payout_cycles") if plan.get("payout_cycles") is not None else 2),
+        "payout_cycles": cycle_limit(plan.get("payout_cycles") if plan.get("payout_cycles") is not None else 4),
         "phase1_target": float(plan.get("phase1_target") or plan.get("profit_target") or 10),
         "phase2_target": float(plan.get("phase2_target") or 0),
         "max_drawdown": float(plan.get("max_drawdown") or plan.get("total_dd") or 20),
@@ -10202,7 +10202,7 @@ def create_plan():
              "category_sort":int(d.get("category_sort") or 10),
              "drawdown_type":str(d.get("drawdown_type") or "STATIC").strip().upper(),
              "payout_frequency":str(d.get("payout_frequency") or "Daily").strip(),
-             "payout_cycles":cycle_limit(d.get("payout_cycles", 2)),
+             "payout_cycles":cycle_limit(d.get("payout_cycles", 4)),
              "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":phase2_target,
              "max_drawdown":float(d.get("max_drawdown") or 20),"daily_drawdown":"None",
              "challenge_journey": challenge_journey, "journey_source": "plan_create",
@@ -18083,7 +18083,7 @@ def quote_challenge_price():
         base_fee = clean(d.get("fee") or d.get("challenge_fee") or d.get("amount"))
         if d.get("plan_id"):
             try:
-                selected, _ = _np_resolve_purchase_plan(_np_market_cycle_stores, d["plan_id"], d.get("payout_cycles", 2))
+                selected, _ = _np_resolve_purchase_plan(_np_market_cycle_stores, d["plan_id"], d.get("payout_cycles", 4))
                 base_fee = selected["fee"]
             except ValueError as exc:
                 return bad(str(exc), 400)
@@ -60010,7 +60010,7 @@ _NPRegisterCyclePrices(app, _np_cycle_price_store, _require_admin,
     _np_owner_catalog_invalidate_v225, _audit_safe, premium_store=_np_premium_cycle_price_store)
 app.config["NP_STANDARD_PLAN_PRICER"] = _np_price_standard_plan
 
-def _np_price_buyer_plan(plan, cycles=2):
+def _np_price_buyer_plan(plan, cycles=4):
     category = _np_plan_category_v156(plan.get("product_category"))
     return _np_purchase_plan(plan, _np_market_cycle_stores[category].read(fresh=True)[0]["prices"], cycles)
 

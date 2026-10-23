@@ -31,10 +31,10 @@ class CommercialTests(unittest.TestCase):
             self.actions.append(copy.deepcopy(request.environ['np_verified_checkout_plan_v221']))
             return jsonify(success=True)
         self.client = self.app.test_client()
-        self.prices = {'3': 5000, '4': 9000, '5': 12000, '0': 20000}
+        self.prices = {'3': 12000, '4': 9000, '5': 5000, '0': 20000}
 
     def test_distinct_upgrade_prices_and_free_one_two_and_default(self):
-        for n, extra in [(None, 0), (1, 0), (2, 0), (3, 5000), (4, 9000), (5, 12000), (0, 20000)]:
+        for n, extra in [(None, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 5000), (0, 20000)]:
             source = dict(fee=40000, payout_cycles=n)
             result = priced_plan(source, self.prices)
             self.assertEqual(result['fee'], 40000 + extra)
@@ -47,17 +47,17 @@ class CommercialTests(unittest.TestCase):
     def test_checkout_rejects_base_only_stale_and_client_forged_prices(self):
         self.store.save(dict(revision=0, prices=self.prices), 'owner')
         plan = self.db.rows['challenge_plans'][0]
-        plan['payout_cycles'] = 3
+        plan['payout_cycles'] = 5
         self.assertEqual(self.client.post('/create_challenge_purchase', json=dict(plan_id='p', fee=20000, payout_cycle_extra=0)).status_code, 409)
         self.assertEqual(self.client.post('/create_challenge_purchase', json=dict(plan_id='p', fee=25000)).status_code, 200)
         self.assertEqual(self.actions[0]['fee'], 25000)
-        self.assertEqual(self.actions[0]['payout_cycles'], 3)
-        self.store.save(dict(revision=1, prices={**self.prices, '3': 6000}), 'owner')
+        self.assertEqual(self.actions[0]['payout_cycles'], 5)
+        self.store.save(dict(revision=1, prices={**self.prices, '5': 6000}), 'owner')
         self.assertEqual(self.client.post('/create_challenge_purchase', json=dict(plan_id='p', fee=25000)).status_code, 409)
         self.assertEqual(len(self.actions), 1)
 
     def test_unpriced_upgrades_unavailable_and_saving_does_not_edit_purchases(self):
-        self.db.rows['challenge_plans'][0]['payout_cycles'] = 4
+        self.db.rows['challenge_plans'][0]['payout_cycles'] = 5
         self.db.rows['challenge_purchases'] = [dict(id='sold', fee=20000, payout_cycles=2)]
         self.assertEqual(self.client.post('/create_challenge_purchase', json=dict(plan_id='p', fee=20000)).status_code, 409)
         saved = self.client.post('/admin/standard_cycle_prices', json=dict(revision=0, prices=self.prices))
@@ -127,27 +127,27 @@ class CommercialTests(unittest.TestCase):
         from types import SimpleNamespace
         tree = ast.parse(Path('app.py').read_text())
         node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_np_public_plan_snapshot_rows')
-        rows = [dict(id='p', product_category='standard', status='active', fee=40000, payout_cycles=3)]
+        rows = [dict(id='p', product_category='standard', status='active', fee=40000, payout_cycles=5)]
         prices = dict(self.prices)
         env = dict(np_cached_read=lambda *a: rows, _np_priced_plan=priced_plan, _np_purchase_catalog=purchase_catalog,
                    _np_market_cycle_stores={'standard': SimpleNamespace(read=lambda: ({'prices': prices}, None))})
         exec(compile(ast.Module(body=[node], type_ignores=[]), 'public-prices', 'exec'), env)
         self.assertEqual(env[node.name]()[0]['fee'], 40000)
-        self.assertEqual(env[node.name]()[0]['cycle_options'][2]['fee'], 45000)
-        prices['3'] = 8000
-        self.assertEqual(env[node.name]()[0]['cycle_options'][2]['fee'], 48000)
+        self.assertEqual(env[node.name]()[0]['cycle_options'][4]['fee'], 45000)
+        prices['5'] = 8000
+        self.assertEqual(env[node.name]()[0]['cycle_options'][4]['fee'], 48000)
         self.assertEqual(rows[0]['fee'], 40000)
 
     def test_premium_prices_are_independent_and_cannot_bypass_checkout(self):
         self.store.save(dict(revision=0, prices=self.prices), 'owner')
-        premium_prices = {**self.prices, '3': 18000}
+        premium_prices = {**self.prices, '5': 18000}
         saved = self.client.post('/admin/premium_cycle_prices', json=dict(revision=0, prices=premium_prices))
         self.assertEqual(saved.status_code, 200, saved.json)
         self.assertEqual(saved.json['category'], 'premium')
-        self.assertEqual(self.store.read(fresh=True)[0]['prices']['3'], 5000)
-        self.assertEqual(self.premium.read(fresh=True)[0]['prices']['3'], 18000)
+        self.assertEqual(self.store.read(fresh=True)[0]['prices']['5'], 5000)
+        self.assertEqual(self.premium.read(fresh=True)[0]['prices']['5'], 18000)
         plan = self.db.rows['challenge_plans'][0]
-        plan.update(product_category='premium', payout_cycles=3)
+        plan.update(product_category='premium', payout_cycles=5)
         self.assertEqual(self.client.post('/create_challenge_purchase', json=dict(plan_id='p', fee=20000)).status_code,409)
         self.assertEqual(self.client.post('/create_challenge_purchase', json=dict(plan_id='p', fee=25000)).status_code,409)
         self.assertEqual(self.client.post('/create_challenge_purchase', json=dict(plan_id='p', fee=38000)).status_code,200)
@@ -160,7 +160,7 @@ class CommercialTests(unittest.TestCase):
     def test_premium_default_is_two_and_paid_upgrades_require_prices(self):
         plan=dict(product_category='premium',fee=40000,payout_cycles=None)
         self.assertEqual(priced_plan(plan,defaults()['prices'],category='premium')['fee'],40000)
-        plan['payout_cycles']=3
+        plan['payout_cycles']=5
         with self.assertRaises(ValueError):priced_plan(plan,defaults()['prices'],category='premium')
         self.assertEqual(priced_plan(plan,self.prices,category='premium')['fee'],45000)
 

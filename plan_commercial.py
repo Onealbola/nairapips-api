@@ -6,8 +6,11 @@ from production_controls import ControlsStore, ControlsUnavailable, Conflict
 from plan_cycles import cycle_limit
 
 KEY = 'standard_plan_cycle_prices_v1'
-PAID = ('3', '4', '5', '0')
-RELEASE = 'buyer-cycle-selection-2026-10-22'
+# Keep the stored key format compatible; 3/4 prices are retained but no longer charged.
+PRICE_KEYS = ('3', '4', '5', '0')
+DEFAULT_CYCLES = 4
+FREE_CYCLES = (1, 2, 3, 4)
+RELEASE = 'four-included-cycles-2026-10-23'
 
 
 def money(value):
@@ -23,14 +26,14 @@ def money(value):
 
 
 def defaults():
-    return dict(revision=0, prices={k: None for k in PAID}, updated_at=None, updated_by=None)
+    return dict(revision=0, prices={k: None for k in PRICE_KEYS}, updated_at=None, updated_by=None)
 
 
 def validate(doc):
     if not isinstance(doc, dict) or set(doc) != set(defaults()) or type(doc['revision']) is not int or doc['revision'] < 0:
         raise ValueError('Invalid cycle pricing settings')
-    if not isinstance(doc['prices'], dict) or set(doc['prices']) != set(PAID):
-        raise ValueError('Set separate prices for 3, 4, 5 and unlimited cycles')
+    if not isinstance(doc['prices'], dict) or set(doc['prices']) != set(PRICE_KEYS):
+        raise ValueError('Set prices for 5 and unlimited cycles')
     prices = {k: None if v is None else money(v) for k, v in doc['prices'].items()}
     if any(v is not None and v <= 0 for v in prices.values()):
         raise ValueError('Extra cycles require a positive price; leave blank to make that upgrade unavailable')
@@ -64,8 +67,8 @@ def priced_plan(plan, prices, category='standard'):
     row = dict(plan)
     if str(row.get('product_category') or 'standard').lower() != category:
         return row
-    cycles = cycle_limit(row.get('payout_cycles') if row.get('payout_cycles') is not None else 2)
-    extra = 0 if cycles in (1, 2) else prices[str(cycles)]
+    cycles = cycle_limit(row.get('payout_cycles') if row.get('payout_cycles') is not None else DEFAULT_CYCLES)
+    extra = 0 if cycles in FREE_CYCLES else prices[str(cycles)]
     if extra is None:
         raise ValueError('Set the extra cost for this payout cycle option in Business Settings before selling this plan')
     base = money(row.get('base_fee', row.get('fee', 0)))
@@ -73,9 +76,9 @@ def priced_plan(plan, prices, category='standard'):
     return row
 
 
-def purchase_plan(plan, prices, cycles=2):
+def purchase_plan(plan, prices, cycles=DEFAULT_CYCLES):
     """Price a buyer's selection without changing the saved product or past sales."""
-    cycles = cycle_limit(2 if cycles is None else cycles)
+    cycles = cycle_limit(DEFAULT_CYCLES if cycles is None else cycles)
     category = str(plan.get('product_category') or 'standard').lower()
     if category not in {'standard', 'premium'}:
         raise ValueError('Unknown plan market')
@@ -83,7 +86,7 @@ def purchase_plan(plan, prices, cycles=2):
 
 
 def purchase_catalog(plan, prices):
-    row = purchase_plan(plan, prices, 2)
+    row = purchase_plan(plan, prices, DEFAULT_CYCLES)
     options = []
     for cycles in (1, 2, 3, 4, 5, 0):
         try:
@@ -91,10 +94,10 @@ def purchase_catalog(plan, prices):
             options.append(dict(cycles=cycles, available=True, extra=selected['payout_cycle_extra'], fee=selected['fee']))
         except ValueError:
             options.append(dict(cycles=cycles, available=False, extra=None, fee=None))
-    return {**row, 'cycle_options': options, 'default_cycles': 2}
+    return {**row, 'cycle_options': options, 'default_cycles': DEFAULT_CYCLES}
 
 
-def resolve_purchase_plan(stores, plan_id, cycles=2):
+def resolve_purchase_plan(stores, plan_id, cycles=DEFAULT_CYCLES):
     if not plan_id or len(str(plan_id)) > 100:
         raise ValueError('Choose a plan')
     store = stores['standard']
@@ -127,12 +130,12 @@ def register_cycle_prices(app, store, require_admin, invalidate, audit, premium_
         stores['premium'] = premium_store
     @app.get('/plan_commercial_version')
     def plan_commercial_version():
-        return jsonify(success=True, release=RELEASE, buyer_selectable=True, markets=sorted(stores), default_cycles=2, free_cycle_options=[1, 2], paid_cycle_options=[3, 4, 5, 0])
+        return jsonify(success=True, release=RELEASE, buyer_selectable=True, markets=sorted(stores), default_cycles=DEFAULT_CYCLES, free_cycle_options=list(FREE_CYCLES), paid_cycle_options=[5, 0])
 
     @app.get('/plan_purchase_options')
     def plan_purchase_options():
         try:
-            selected, catalog = resolve_purchase_plan(stores, request.args.get('plan_id'), request.args.get('payout_cycles', 2))
+            selected, catalog = resolve_purchase_plan(stores, request.args.get('plan_id'), request.args.get('payout_cycles', DEFAULT_CYCLES))
             response = jsonify(success=True, data={**catalog, **selected})
             response.headers['Cache-Control'] = 'no-store'
             return response
