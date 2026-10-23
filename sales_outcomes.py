@@ -82,11 +82,11 @@ CURRENT_OPEN = {'assigned_active','active','current_active','phase1_active','pha
                 'approved_payout_pending','payment_processing','funded_profit_cap_reached'}
 
 
-def current_position(purchase, journey, paid_accounts):
-    """One current stage per exact purchase; archived history is never a survivor."""
+def current_accounts(purchase, journey, paid_accounts):
+    """Public display fields for the exact accounts used in current-stage counts."""
     if purchase.get('lifecycle_state') == 'funded_cycles_completed':
-        return 'closed'
-    stages=set()
+        return []
+    result=[]
     for account in journey:
         if str(account.get('trader_id') or '') != str(purchase.get('trader_id') or ''):
             continue
@@ -101,7 +101,14 @@ def current_position(purchase, journey, paid_accounts):
         if str(account.get('id')) in paid_accounts:
             continue
         if stage in {'phase1','phase2','funded'}:
-            stages.add(stage)
+            result.append({'id':str(account.get('id') or ''),'mt5_login':str(account['mt5_login']),'stage':stage,'status':state})
+    return result
+
+
+def current_position(purchase, journey, paid_accounts):
+    if purchase.get('lifecycle_state') == 'funded_cycles_completed':
+        return 'closed'
+    stages={a['stage'] for a in current_accounts(purchase,journey,paid_accounts)}
     if len(stages)>1:
         return 'review_required'
     return next(iter(stages)) if stages else 'no_open_account'
@@ -202,7 +209,7 @@ def build_report(purchases, accounts, start, end, payouts=None):
         paid_records = {paid_id: amount for aid in ids for paid_id, amount in paid_by_account.get(aid, [])}
         payout_amount = float(sum(paid_records.values(), Decimal("0")).quantize(Decimal("0.01")))
         position = current_position(p, journey, paid_accounts)
-        rows.append({"current_position":position,"still_phase1":position=="phase1","still_funded":position=="funded","purchase_id": pid, "sale_date": day, "plan": str(p.get("plan_name") or p.get("plan") or "Unspecified"), "account_size": p.get("account_size") or 0, "mt5_login": str(p.get("mt5_login") or (journey[0].get("mt5_login") if journey else "") or ""), "breached": breached, "passed": passed, "funded": funded, "funded_breached": funded_breached, "collected_payout": bool(paid_records), "paid_then_breached_closed": _paid_then_breached_closed(journey, paid_times) if paid_records else False, "paid_payout_count": len(paid_records), "payout_amount": payout_amount, "assigned": any(a.get("mt5_login") for a in journey)})
+        rows.append({"trader_id":str(p.get("trader_id") or ""),"trader_name":str(p.get("trader_name") or ""),"email":str(p.get("email") or ""),"current_accounts":current_accounts(p,journey,paid_accounts),"current_position":position,"still_phase1":position=="phase1","still_funded":position=="funded","purchase_id": pid, "sale_date": day, "plan": str(p.get("plan_name") or p.get("plan") or "Unspecified"), "account_size": p.get("account_size") or 0, "mt5_login": str(p.get("mt5_login") or (journey[0].get("mt5_login") if journey else "") or ""), "breached": breached, "passed": passed, "funded": funded, "funded_breached": funded_breached, "collected_payout": bool(paid_records), "paid_then_breached_closed": _paid_then_breached_closed(journey, paid_times) if paid_records else False, "paid_payout_count": len(paid_records), "payout_amount": payout_amount, "assigned": any(a.get("mt5_login") for a in journey)})
     for row in rows:
         row["outcome"] = outcome_for(row)
         row["outcome_label"] = OUTCOMES[row["outcome"]]

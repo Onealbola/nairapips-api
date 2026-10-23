@@ -161,3 +161,13 @@ class CurrentPositionTests(SalesOutcomesTests):
     def test_current_position_is_scoped_to_sale_period_and_plan_totals(self):
         r=build_report([self.p(),self.p('old',created_at='2025-01-01')],[self.a(account_status='assigned_active'),self.a('b',purchase_id='old',stage='funded',account_status='assigned_active')],'2026-10-01','2026-10-31')
         self.assertEqual((r['summary']['still_phase1'],r['summary']['still_funded']),(1,0));self.assertEqual(r['plans'][0]['still_phase1'],1)
+
+
+class DrilldownIdentityTests(SalesOutcomesTests):
+    def test_drilldown_identity_and_accounts_match_count_without_credentials(self):
+        purchase=self.p(trader_name='Fixture Trader',email='fixture@example.invalid')
+        accounts=[self.a(account_status='archived_phase1'),self.a('fresh',stage='funded',account_status='profit_protected',mt5_login='456',mt5_master_password='secret')]
+        report=build_report([purchase],accounts,'','');row=report['rows'][0]
+        self.assertEqual(row['trader_name'],'Fixture Trader');self.assertEqual(row['trader_id'],'t');self.assertTrue(row['still_funded'])
+        self.assertEqual(row['current_accounts'],[dict(id='fresh',mt5_login='456',stage='funded',status='profit_protected')])
+        self.assertNotIn('secret',str(report))
