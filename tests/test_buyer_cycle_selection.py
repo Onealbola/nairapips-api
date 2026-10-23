@@ -19,24 +19,24 @@ class BuyerCycles(CommercialTests):
     def test_buyer_selection_overrides_admin_preset_and_free_default(self):
         self.db.rows['challenge_plans'][0]['payout_cycles']=5
         self.store.save(dict(revision=0, prices=self.prices), 'owner')
-        for cycles, extra in [(1,0),(2,0),(3,0),(4,0),(5,5000),(0,20000)]:
+        for cycles, extra in [(1,0),(2,0),(3,0),(4,9000),(5,5000),(0,20000)]:
             r=self.client.post('/create_challenge_purchase', json=dict(plan_id='p',payout_cycles=cycles,fee=20000+extra))
             self.assertEqual(r.status_code,200,r.json)
             self.assertEqual(self.actions[-1]['payout_cycles'],cycles)
             self.assertEqual(self.actions[-1]['fee'],20000+extra)
         self.assertEqual(self.client.post('/create_challenge_purchase',json=dict(plan_id='p',fee=20000)).status_code,200)
-        self.assertEqual(self.actions[-1]['payout_cycles'],4)
+        self.assertEqual(self.actions[-1]['payout_cycles'],3)
         self.assertEqual(self.db.rows['challenge_plans'][0]['payout_cycles'],5)
 
     def test_unconfigured_unlimited_and_invalid_selection_cannot_be_sold(self):
-        for cycle in [0,5,True,-1,6,'2.0','nan',{},[]]:
+        for cycle in [0,4,5,True,-1,6,'2.0','nan',{},[]]:
             r=self.client.post('/create_challenge_purchase',json=dict(plan_id='p',payout_cycles=cycle,fee=20000))
             self.assertEqual(r.status_code,409,r.json)
         self.assertFalse(self.actions)
         r=self.client.get('/plan_purchase_options?plan_id=p')
         self.assertEqual(r.status_code,200,r.json)
-        self.assertEqual(r.json['data']['payout_cycles'],4)
-        self.assertEqual([o['cycles'] for o in r.json['data']['cycle_options'] if o['available']],[1,2,3,4])
+        self.assertEqual(r.json['data']['payout_cycles'],3)
+        self.assertEqual([o['cycles'] for o in r.json['data']['cycle_options'] if o['available']],[1,2,3])
         self.assertEqual(r.headers['Cache-Control'],'no-store')
         self.assertFalse(self.db.writes)
 

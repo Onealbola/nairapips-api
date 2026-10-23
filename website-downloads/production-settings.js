@@ -34,12 +34,12 @@ window.npCycleCurrency=value=>new Intl.NumberFormat('en-NG',{style:'currency',cu
 window.npUpdatePlanCyclePreview=function(prefix){
  const node=document.getElementById(prefix+'-cycle-price-preview');if(!node)return;
  const category=document.getElementById(prefix+'-category')?.value||'standard';
- const raw=document.getElementById(prefix+'-cycles')?.value,cycles=raw===''?4:Number(raw);
+ const raw=document.getElementById(prefix+'-cycles')?.value,cycles=raw===''?3:Number(raw);
  const fee=document.getElementById(prefix+'-fee')?.value||'',base=Number(fee);
  if(!fee.trim()||!Number.isFinite(base)||base<=0){node.textContent='Enter the base plan fee to see the total.';return;}
  if(node._priceCategory!==category||!node._priceDocument){node.textContent='Loading '+category+' cycle prices…';return;}
- const extra=[1,2,3,4].includes(cycles)?0:node._priceDocument.prices[String(cycles)];
- node.textContent=extra==null?'Extra cost for '+(cycles===0?'unlimited':cycles)+' cycles: Not set in '+category+' Business Settings. Set it there before selling this option.':(cycles===4?'4 cycles included. ':'')+'Base fee '+npCycleCurrency(base)+' + cycle extra '+npCycleCurrency(extra)+' = total at purchase '+npCycleCurrency(base+Number(extra))+'. Save the base fee only.';
+ const extra=[1,2,3].includes(cycles)?0:node._priceDocument.prices[String(cycles)];
+ node.textContent=extra==null?'Extra cost for '+(cycles===0?'unlimited':cycles)+' cycles: Not set in '+category+' Business Settings. Set it there before selling this option.':(cycles===3?'3 cycles included. ':'')+'Base fee '+npCycleCurrency(base)+' + cycle extra '+npCycleCurrency(extra)+' = total at purchase '+npCycleCurrency(base+Number(extra))+'. Save the base fee only.';
 };
 window.npLoadPlanCyclePreview=async function(prefix){
  const node=document.getElementById(prefix+'-cycle-price-preview');if(!node)return;
@@ -55,7 +55,7 @@ window.npLoadPlanListCyclePrices=async function(plans){
  await Promise.all(categories.map(async category=>{
   try{const result=await api('/admin/'+category+'_cycle_prices');if(!result.data?.prices)throw Error('Prices unavailable');
    for(const cell of cells){if(!cell.isConnected)continue;const row=plans.find(p=>String(p.id)===cell.dataset.planPriceId);if(!row||(String(row.product_category||'standard').toLowerCase()==='premium'?'premium':'standard')!==category)continue;
-    const cycles=row.payout_cycles==null?4:Number(row.payout_cycles),extra=[1,2,3,4].includes(cycles)?0:result.data.prices[String(cycles)];
+    const cycles=row.payout_cycles==null?3:Number(row.payout_cycles),extra=[1,2,3].includes(cycles)?0:result.data.prices[String(cycles)];
     cell.textContent=extra==null?'Cycle extra: Not set in Business Settings':(cycles===0?'Unlimited':cycles+' cycles')+' · extra '+npCycleCurrency(extra)+' · total '+npCycleCurrency(Number(row.fee||row.price||0)+Number(extra));
    }
   }catch(err){for(const cell of cells){if(cell.isConnected&&cell.dataset.planMarket===category)cell.textContent='Cycle price unavailable';}}
@@ -89,8 +89,8 @@ window.npLoadPlanCyclePrices=async function(categories=['standard','premium']){
    window.npPlanCyclePrices[category]=doc;
    if(category==='standard')window.npStandardCyclePrices=doc;else window.npPremiumCyclePrices=doc;
    if(document.getElementById('np-cycle-'+category)!==node)return;
-   node.innerHTML=`<section class="card" style="margin-bottom:16px"><h3>${label} plan payout cycle extra cost</h3><p>Up to 4 cycles: no extra cost. 4 cycles is the default. Only 5 cycles and unlimited cost extra. These prices apply only to ${label} plans and are added to the base plan fee. Blank means Not set; that paid upgrade cannot be sold yet.</p>
-   <div class="grid md:grid-cols-4 gap-2">${['5','0'].map(key=>`<label>${key==='0'?'Unlimited':key+' cycles'} · extra ₦${input('np-'+category+'-cycle-'+key,doc.prices[key]??'','type="number" min="0.01" step="0.01" placeholder="Not set"')}</label>`).join('')}</div>
+   node.innerHTML=`<section class="card" style="margin-bottom:16px"><h3>${label} plan payout cycle extra cost</h3><p>Up to 3 cycles: no extra cost. 3 cycles is the default. Only 4, 5 cycles and unlimited cost extra. These prices apply only to ${label} plans and are added to the base plan fee. Blank means Not set; that paid upgrade cannot be sold yet.</p>
+   <div class="grid md:grid-cols-4 gap-2">${['4','5','0'].map(key=>`<label>${key==='0'?'Unlimited':key+' cycles'} · extra ₦${input('np-'+category+'-cycle-'+key,doc.prices[key]??'','type="number" min="0.01" step="0.01" placeholder="Not set"')}</label>`).join('')}</div>
    <button class="btn btn-gold" onclick="npSavePlanCyclePrices('${category}',this)">${category==='standard'?'Save cycle extra costs':'Save Premium cycle extra costs'}</button><p id="${priceMessage(category)}" role="status"></p></section>`;
    npPreviewAllProductionPrices();
   }catch(err){if(document.getElementById('np-cycle-'+category)===node)node.innerHTML=`<div class="card"><h3>${label} plan payout cycle extra cost</h3><p role="alert">${e(err.message)}</p><button class="btn" onclick="npLoadPlanCyclePrices(['${category}'])">Retry ${label} prices</button></div>`;}
@@ -99,7 +99,7 @@ window.npLoadPlanCyclePrices=async function(categories=['standard','premium']){
 window.npSavePlanCyclePrices=async function(category,button){
  button.disabled=true;const id=priceMessage(category);message(id,'Saving…');
  try{const doc=window.npPlanCyclePrices[category];if(!doc)throw Error('Load saved prices before saving');
-  const prices={...doc.prices};for(const key of ['5','0']){const raw=document.getElementById('np-'+category+'-cycle-'+key).value;prices[key]=raw.trim()===''?null:Number(raw);}
+  const prices={...doc.prices};for(const key of ['4','5','0']){const raw=document.getElementById('np-'+category+'-cycle-'+key).value;prices[key]=raw.trim()===''?null:Number(raw);}
   const result=await api('/admin/'+category+'_cycle_prices','POST',{revision:doc.revision,prices});
   window.npPlanCyclePrices[category]=result.data;
   if(category==='standard')window.npStandardCyclePrices=result.data;else window.npPremiumCyclePrices=result.data;
@@ -110,10 +110,10 @@ window.npSaveStandardCyclePrices=button=>npSavePlanCyclePrices('standard',button
 window.npPreviewProductionPrice=function(i){
  const row=catalog[i],host=document.getElementById('np-plan-'+i+'-price-preview');if(!row||!host)return;
  const doc=window.npPlanCyclePrices[marketOf(row)],raw=document.getElementById('np-plan-'+i+'-payout_cycles')?.value;
- const fee=document.getElementById('np-plan-'+i+'-fee')?.value||'',cycles=raw===''?4:Number(raw),base=Number(fee);
+ const fee=document.getElementById('np-plan-'+i+'-fee')?.value||'',cycles=raw===''?3:Number(raw),base=Number(fee);
  if(!fee.trim()||!Number.isFinite(base)||base<=0){host.textContent='Set a valid base plan fee.';return;}
  if(!doc){host.textContent='Load '+marketOf(row)+' cycle prices to see the total.';return;}
- const extra=[1,2,3,4].includes(cycles)?0:doc.prices[String(cycles)];
+ const extra=[1,2,3].includes(cycles)?0:doc.prices[String(cycles)];
  host.textContent=extra==null?'Extra price for '+(cycles===0?'unlimited':cycles)+' cycles: Not set. Set it above before selling this option.':'Base fee: '+cash(base)+' + cycle extra: '+cash(extra)+' = total at purchase: '+cash(base+Number(extra));
 };
 window.npPreviewAllProductionPrices=function(){catalog.forEach((row,i)=>npPreviewProductionPrice(i));};
@@ -141,7 +141,7 @@ window.npLoadProductionSettings=async function(){
         <div class="grid md:grid-cols-3 gap-2" style="margin-top:12px">
           ${[['name','Product name'],['fee','Base plan fee ₦'],['account_size','Account size ₦'],['phase1_target','Phase 1 target %'],['phase2_target','Phase 2 target % (0 for one phase)'],['max_drawdown','Maximum drawdown %'],['payout_split','Trader share % (60 or 70)']].map(([key,label])=>`<label>${label}${input(`np-plan-${i}-${key}`,r[key]??'',key==='name'?'maxlength="100"':'type="number" min="0" step="0.01"'+(key==='fee'?` oninput="npSyncFundedResetDoubleV152('np-plan-${i}');npPreviewProductionPrice(${i})"`:''))}</label>`).join('')}
           ${npResetControl('np-plan-'+i,'phase',r.reset_fee,r.fee)}${npResetControl('np-plan-'+i,'funded',r.funded_reset_fee,r.fee)}
-          <label>Funded payout cycles<select class="input" id="np-plan-${i}-payout_cycles" onchange="npPreviewProductionPrice(${i})"><option value="" ${r.payout_cycles==null?'selected':''}>Existing terms; new purchases: 4</option>${[1,2,3,4,5,0].map(n=>`<option value="${n}" ${r.payout_cycles!=null&&Number(r.payout_cycles)===n?'selected':''}>${n===0?'Unlimited (paid option)':n+' cycle'+(n===1?'':'s')+(n>4?' — paid extra':n===4?' — included default':'')}</option>`).join('')}</select></label>
+          <label>Funded payout cycles<select class="input" id="np-plan-${i}-payout_cycles" onchange="npPreviewProductionPrice(${i})"><option value="" ${r.payout_cycles==null?'selected':''}>Existing terms; new purchases: 3</option>${[1,2,3,4,5,0].map(n=>`<option value="${n}" ${r.payout_cycles!=null&&Number(r.payout_cycles)===n?'selected':''}>${n===0?'Unlimited (paid option)':n+' cycle'+(n===1?'':'s')+(n>3?' — paid extra':n===3?' — included default':'')}</option>`).join('')}</select></label>
           <label>Evaluation route<select class="input" id="np-plan-${i}-challenge_journey"><option value="one_phase" ${journey(r)==='one_phase'?'selected':''}>One phase</option><option value="two_phase" ${journey(r)==='two_phase'?'selected':''}>Two phases</option></select></label>
         </div><p>Drawdown: ${e(r.drawdown_type||'STATIC')}. Funded reset follows the selected Not available, Automatic or Custom setting.</p>
         <p id="np-plan-${i}-price-preview" style="margin:10px 0;color:var(--gold)"></p><button class="btn btn-gold" onclick="npSaveProductionPlan(${i},this)">Save product</button>

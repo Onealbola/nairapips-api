@@ -8726,15 +8726,15 @@ function npBuyerSelected(planId){
   const state=NP_BUYER_CHECKOUT;
   return state && state.ready && String(state.plan.id)===String(planId) && state.element===document.getElementById('pur-cycles') ? state.plan : null;
 }
-function npBuyerRender(catalog, cycles=catalog.default_cycles??4){
+function npBuyerRender(catalog, cycles=catalog.default_cycles??3){
   const select=document.getElementById('pur-cycles');
   if(!select || !NP_BUYER_CHECKOUT || select!==NP_BUYER_CHECKOUT.element) return;
   NP_BUYER_CHECKOUT.catalog=catalog;
-  select.innerHTML=(catalog.cycle_options||[]).map(o=>`<option value="${o.cycles}" ${o.available?'':'disabled'}>${o.cycles===0?'Unlimited':o.cycles+' cycle'+(o.cycles===1?'':'s')}${!o.available?' — Not available':o.extra>0?' — +'+fmt.money(o.extra):o.cycles===Number(catalog.default_cycles??4)?' — included default':' — no extra cost'}</option>`).join('');
+  select.innerHTML=(catalog.cycle_options||[]).map(o=>`<option value="${o.cycles}" ${o.available?'':'disabled'}>${o.cycles===0?'Unlimited':o.cycles+' cycle'+(o.cycles===1?'':'s')}${!o.available?' — Not available':o.extra>0?' — +'+fmt.money(o.extra):o.cycles===Number(catalog.default_cycles??3)?' — included default':' — no extra cost'}</option>`).join('');
   select.value=String(cycles);
   NP_BUYER_CHECKOUT.ready=true;
   const toggle=document.getElementById('pur-cycle-toggle');
-  toggle.checked=Number(cycles)!==Number(catalog.default_cycles??4); toggle.disabled=false;
+  toggle.checked=Number(cycles)!==Number(catalog.default_cycles??3); toggle.disabled=false;
   document.getElementById('pur-cycle-options').hidden=!toggle.checked;
   select.disabled=!toggle.checked;
   document.getElementById('pur-file').disabled=false;
@@ -8747,13 +8747,13 @@ function npBuyerToggleCycles(){
   const select=state.element;
   document.getElementById('pur-cycle-options').hidden=!toggle.checked;
   select.disabled=!toggle.checked;
-  if(!toggle.checked) select.value=String(state.catalog.default_cycles??4);
+  if(!toggle.checked) select.value=String(state.catalog.default_cycles??3);
   npBuyerCycleChanged();
 }
 function npBuyerCycleChanged(){
   const state=NP_BUYER_CHECKOUT, select=document.getElementById('pur-cycles');
   if(!state || !state.ready || select!==state.element) return;
-  if(!document.getElementById('pur-cycle-toggle').checked) select.value=String(state.catalog.default_cycles??4);
+  if(!document.getElementById('pur-cycle-toggle').checked) select.value=String(state.catalog.default_cycles??3);
   const option=state.catalog.cycle_options.find(o=>String(o.cycles)===select.value && o.available);
   if(!option) return;
   state.plan={...state.catalog,payout_cycles:option.cycles,payout_cycle_extra:option.extra,fee:option.fee};
@@ -8790,7 +8790,7 @@ function purchasePlan(planId, privateOfferCode=''){
   showModal(`
     <button onclick="this.closest('.modal-bg').remove()" style="position:absolute;top:10px;right:14px;background:0;border:0;color:#fff;font-size:24px;cursor:pointer">&times;</button>
     <div class="np-product-market-chip" style="display:inline-block;margin-bottom:8px">${npProductCategoryV156(p).toUpperCase()}</div><h2>${esc(p.name||p.plan_name||'Plan')}</h2>
-    <label style="display:flex;align-items:center;gap:8px;font-size:12px;margin:8px 0;cursor:pointer"><input type="checkbox" id="pur-cycle-toggle" disabled onchange="npBuyerToggleCycles()" style="width:14px;height:14px;margin:0;accent-color:var(--gold)"> Change payout cycles (4 included)</label>
+    <label style="display:flex;align-items:center;gap:8px;font-size:12px;margin:8px 0;cursor:pointer"><input type="checkbox" id="pur-cycle-toggle" disabled onchange="npBuyerToggleCycles()" style="width:14px;height:14px;margin:0;accent-color:var(--gold)"> Change payout cycles (3 included)</label>
     <div id="pur-cycle-options" hidden><select class="input" id="pur-cycles" disabled aria-label="Funded payout cycles" onchange="npBuyerCycleChanged()"><option>Loading current prices…</option></select></div>
     <div id="pur-price-status" style="font-size:12px;margin-bottom:12px">Verifying current prices before payment…</div>
     <div style="background:rgba(212,175,55,.05);padding:14px;border-radius:10px;margin-bottom:14px">

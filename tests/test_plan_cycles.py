@@ -22,15 +22,15 @@ class PlanCycleTests(unittest.TestCase):
         http.post.return_value.json.return_value={'state':'maybe'}
         with self.assertRaises(RuntimeError):paid_cycle_decision(http,'https://db.invalid','fixture','id')
 
-    def test_actual_purchase_snapshot_uses_four_by_default_and_freezes_chosen_count(self):
+    def test_actual_purchase_snapshot_uses_three_by_default_and_freezes_chosen_count(self):
         tree=ast.parse(Path('app.py').read_text())
         node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_np_plan_rule_snapshot_v156')
         env={'_np_plan_category_v156':lambda x:x,'_effective_payout_split':lambda x:x,
              'clean':lambda x:float(x or 0),'now_iso':lambda:'fixture-time'}
         exec(compile(ast.Module(body=[node],type_ignores=[]),'snapshot','exec'),env)
         snap=env[node.name]
-        self.assertEqual(snap({})['payout_cycles'],4)
-        self.assertEqual(snap({'payout_cycles':None})['payout_cycles'],4)
+        self.assertEqual(snap({})['payout_cycles'],3)
+        self.assertEqual(snap({'payout_cycles':None})['payout_cycles'],3)
         for n in range(6):self.assertEqual(snap({'payout_cycles':n})['payout_cycles'],n)
         plan={'payout_cycles':3};purchase=snap(plan);plan['payout_cycles']=5
         self.assertEqual(purchase['payout_cycles'],3)

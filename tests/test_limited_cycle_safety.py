@@ -114,5 +114,16 @@ class SafetyTests(unittest.TestCase):
         for action in ('create','approve','paid'):
             with self.assertRaisesRegex(CycleBlocked,'PURCHASE COMPLETED'):self.g.acquire(accounts[4],action=action)
         self.assertEqual(self.g.inspect(self.p,accounts[0])['remaining'],0)
+    def test_three_cycle_purchase_stops_after_three(self):
+        self.p['payout_cycles']=3
+        accounts=self.db.tables['trader_accounts']
+        accounts.extend([dict(self.a,id='d',mt5_login='444'),dict(self.a,id='e',mt5_login='555')])
+        for i,account in enumerate(accounts[:3]):
+            c=self.g.acquire(account,action='paid')
+            self.assertEqual(c['cycles']['remaining'],3-i)
+            self.paid(account,'paid-'+str(i));self.g.release(c)
+        for action in ('create','approve','paid'):
+            with self.assertRaisesRegex(CycleBlocked,'PURCHASE COMPLETED'):self.g.acquire(accounts[3],action=action)
+        self.assertEqual(self.g.inspect(self.p,accounts[0])['remaining'],0)
 
 if __name__=='__main__':unittest.main()

@@ -15,7 +15,7 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
   await page.addScriptTag({content:html.slice(start,end)});
   for(const value of ['1','2','3','4','5','0']){
    await page.evaluate(()=>showCreatePlan());
-   assert.equal(await page.locator('#pl-cycles').inputValue(),'4');
+   assert.equal(await page.locator('#pl-cycles').inputValue(),'3');
    assert.equal(await page.locator('#pl-cycles option').count(),6);
    await page.locator('#pl-cycles').selectOption(value);await page.locator('#pl-name').fill('Cycle fixture');
    await page.evaluate(()=>createPlan());
@@ -38,6 +38,6 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
   await page.evaluate(()=>createPlan());
   assert.equal((await page.evaluate(()=>calls.at(-1))).body.funded_reset_fee,0);
   assert.equal((await page.evaluate(()=>calls.at(-1))).body.reset_fee,0);
-  console.log('Passed: actual new-plan card defaults to four, offers 1–5/unlimited, and submits each exact limit without releasing sales.');
+  console.log('Passed: actual new-plan card defaults to three, offers 1–5/unlimited, and submits each exact limit without releasing sales.');
  }finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exit(1)});

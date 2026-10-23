@@ -34,7 +34,7 @@ class CommercialTests(unittest.TestCase):
         self.prices = {'3': 12000, '4': 9000, '5': 5000, '0': 20000}
 
     def test_distinct_upgrade_prices_and_free_one_two_and_default(self):
-        for n, extra in [(None, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 5000), (0, 20000)]:
+        for n, extra in [(None, 0), (1, 0), (2, 0), (3, 0), (4, 9000), (5, 5000), (0, 20000)]:
             source = dict(fee=40000, payout_cycles=n)
             result = priced_plan(source, self.prices)
             self.assertEqual(result['fee'], 40000 + extra)

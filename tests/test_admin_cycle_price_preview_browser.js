@@ -16,7 +16,7 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
   await page.evaluate(()=>renderPlans());
   await page.waitForFunction(()=>document.querySelector('[data-plan-price-id="p"]').textContent.includes('58,000'));
   assert((await page.locator('[data-plan-price-id="s"]').innerText()).includes('20,000'));
-  await page.evaluate(()=>editPlan('s'));await page.waitForFunction(()=>document.getElementById('epl-cycle-price-preview').textContent.includes('4 cycles included'));
+  await page.evaluate(()=>editPlan('s'));await page.waitForFunction(()=>document.getElementById('epl-cycle-price-preview').textContent.includes('3 cycles included'));
   assert.equal(await page.locator('#epl-cycles').inputValue(),'');
   await page.evaluate(()=>editPlan('p'));await page.waitForFunction(()=>document.getElementById('epl-cycle-price-preview').textContent.includes('58,000'));
   assert((await page.locator('#epl-cycle-price-preview').innerText()).includes('18,000'));
@@ -24,6 +24,6 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
   assert.equal(await page.locator('#epl-funded-reset-fee').inputValue(),'100000');
   await page.locator('#epl-category').selectOption('standard');await page.waitForFunction(()=>document.getElementById('epl-cycle-price-preview').textContent.includes('55,000'));
   await page.close();
- }console.log('PASS: full and compact Plans lists/editors show saved market extras, recalculate totals, preserve base reset pricing and keep legacy defaults at four.');}
+ }console.log('PASS: full and compact Plans lists/editors show saved market extras, recalculate totals, preserve base reset pricing and keep legacy defaults at three.');}
  finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exit(1)});
