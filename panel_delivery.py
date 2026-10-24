@@ -20,6 +20,12 @@ def register_panel_delivery(app, root=None):
     def hosted_admin_login():
         return deliver('admin_clean_cpanel.html')
     @app.get('/dashboard/')
+    @app.get('/dashboard/index.html')
+    def hosted_trader_entry():
+        return deliver('trader_entry_redirect.html')
+    @app.get('/dashboard/register.html')
+    def hosted_trader_registration():
+        return deliver('trader_login.html')
     @app.get('/dashboard/trader_clean.html')
     def hosted_trader_login():
         return deliver('trader_clean.html')

@@ -1,1 +1,13 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="robots" content="noindex, nofollow"><title>NairaPips Trader</title><script>location.replace('/dashboard/trader_clean.html'+location.search+location.hash);</script></head><body><a href="/dashboard/trader_clean.html">Open NairaPips Trader</a></body></html>
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex, nofollow"><title>NairaPips Trader</title>
+<script>
+(function(){
+  const query=new URLSearchParams(location.search);
+  const mode=String(query.get('mode')||location.hash||'').toLowerCase();
+  const signup=mode.includes('register')||mode.includes('signup');
+  if(signup)query.set('mode','register');
+  const path=signup?'/dashboard/register.html':'/dashboard/trader_clean.html';
+  const search=query.toString();
+  location.replace(path+(search?'?'+search:'')+location.hash);
+})();
+</script></head><body><p>Opening NairaPips…</p><a href="/dashboard/trader_clean.html">Open dashboard</a> · <a href="/dashboard/register.html?mode=register">Create account</a></body></html>
