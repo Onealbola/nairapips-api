@@ -4253,6 +4253,7 @@ window.refreshPhaseAssignmentQueue = async function(button){
 };
 
 function reload(){
+  if(typeof npFinanceSourceState==='function')npFinanceSourceState().at=0;
   const mod = SESSION.currentMod || 'overview';
   try{ setMod(mod); }catch(e){}
   return loadAll().then(()=>setMod(mod)).catch(e=>toast('Reload failed: '+(e?.message||e),'err'));
@@ -12455,7 +12456,7 @@ function npFinanceInRange(v,range,from='',to=''){const d=npFinanceDate(v);if(!d)
 function npFinanceRangeLabel(range,from='',to=''){
  if(range==='custom'&&!from&&!to)range='all';
  const names={all:'ALL TIME',today:'TODAY',yesterday:'YESTERDAY',week:'THIS WEEK',month:'THIS MONTH',year:'THIS YEAR','7d':'LAST 7 DAYS','30d':'LAST 30 DAYS','24h':'LAST 24 HOURS',custom:'CUSTOM'};
- const b=npFinanceBounds(range,from,to),fmt=n=>new Date(n).toLocaleDateString('en-GB',{timeZone:'Africa/Lagos',day:'numeric',month:'short',year:'numeric'});
+ const b=npFinanceBounds(range,from,to),fmt=n=>new Date(n).toLocaleDateString('en-GB',{timeZone:'Africa/Lagos',day:'numeric',month:'short',year:'numeric',...((range==='24h'||range==='custom'&&(from.includes('T')||to.includes('T')))?{hour:'2-digit',minute:'2-digit'}:{})});
  return (names[range]||range)+(Number.isFinite(b.fromMs)?' · '+fmt(b.fromMs)+' → '+fmt(b.toMs):'')+' · WAT';
 }
 function npFinanceSourceState(){const key=String(SESSION.token||'');if(!window.NP_FINANCE_SOURCE||NP_FINANCE_SOURCE.key!==key)window.NP_FINANCE_SOURCE={key,data:null,at:0,pending:null};return NP_FINANCE_SOURCE;}
@@ -12466,6 +12467,7 @@ async function npFinanceLoad(){
  s.pending=(async()=>{const r=await api('/admin/finance_source?nonce='+Date.now()+'-'+Math.random().toString(36).slice(2));if(npFinanceSourceState()!==s)throw Error('Session changed');if(!r.success||!Array.isArray(r.purchases)||!Array.isArray(r.payouts))throw Error(r.error||'Financial records unavailable');s.data=r;s.at=Date.now();})().finally(()=>s.pending=null);return s.pending;
 }
 /* FINANCE_RULES_END */
+
 
 
 
@@ -14476,6 +14478,7 @@ async function setRecordTestFlag(type,row,marked=true){
   await revPostJSON(`/mark_record_test`,{table:tableMap[type]||type,id:row.id,mark_as_test:marked,excluded_from_revenue:marked,admin_name:SESSION.admin?.name||SESSION.admin?.username||"admin"});
   row.mark_as_test = marked;
   row.excluded_from_revenue = marked;
+  npFinanceSourceState().at=0;
 }
 async function setRevenueLaunchDate(){
   if(!revenueIsSuperAdmin()){setRevenueMessage("Only super admin can change revenue cleanup settings.","error"); revenueModule(); return;}
@@ -18947,12 +18950,12 @@ if(document.readyState==='loading'){
   const period=window.NP_FINANCE_PERIOD;
   if(mod!==previousModule&&period){
    if(mod==='purchases'){window.PURCHASE_FILTER_RANGE=period.range;window.PURCHASE_CUSTOM_FROM=period.from||'';window.PURCHASE_CUSTOM_TO=period.to||'';}
-   if(mod==='payouts'){window.NP_PAYOUT_INTEL.range=period.range;window.NP_PAYOUT_INTEL.from=period.from||'';window.NP_PAYOUT_INTEL.to=period.to||'';}
+   if(mod==='payouts'){window.NP_PAYOUT_INTEL.range=period.range;window.NP_PAYOUT_INTEL.from=period.from?(period.from.includes('T')?period.from:period.from+'T00:00'):'';window.NP_PAYOUT_INTEL.to=period.to?(period.to.includes('T')?period.to:period.to+'T23:59'):'';}
    if(mod==='revenue'){const b=npFinanceBounds(period.range,period.from||'',period.to||'');saveRevenueDateFilters({from_date:Number.isFinite(b.fromMs)?npFinanceDay(new Date(b.fromMs)):'',to_date:npFinanceDay(new Date(b.toMs))});}
   }
   previousModule=mod;
   if(mod==='purchases')window.NP_FINANCE_PERIOD={range:window.PURCHASE_FILTER_RANGE||'all',from:window.PURCHASE_CUSTOM_FROM||'',to:window.PURCHASE_CUSTOM_TO||''};
-  if(mod==='payouts'&&NP_PAYOUT_INTEL.range!=='24h')window.NP_FINANCE_PERIOD={range:NP_PAYOUT_INTEL.range||'all',from:NP_PAYOUT_INTEL.from||'',to:NP_PAYOUT_INTEL.to||''};
+  if(mod==='payouts'&&NP_PAYOUT_INTEL.range!=='24h'){const f=NP_PAYOUT_INTEL.from||'',t=NP_PAYOUT_INTEL.to||'';if(NP_PAYOUT_INTEL.range!=='custom'||(!f||!f.includes('T')||f.endsWith('T00:00'))&&(!t||!t.includes('T')||t.endsWith('T23:59')))window.NP_FINANCE_PERIOD={range:NP_PAYOUT_INTEL.range||'all',from:f.slice(0,10),to:t.slice(0,10)};}
   if(mod==='revenue'){
    const f=revenueDateFilters(),p=window.NP_FINANCE_PERIOD,b=p?npFinanceBounds(p.range,p.from||'',p.to||''):null;
    if(!b||(Number.isFinite(b.fromMs)?npFinanceDay(new Date(b.fromMs)):'')!==f.from_date||npFinanceDay(new Date(b.toMs))!==f.to_date)window.NP_FINANCE_PERIOD={range:'custom',from:f.from_date,to:f.to_date};

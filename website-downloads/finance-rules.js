@@ -35,7 +35,7 @@ function npFinanceInRange(v,range,from='',to=''){const d=npFinanceDate(v);if(!d)
 function npFinanceRangeLabel(range,from='',to=''){
  if(range==='custom'&&!from&&!to)range='all';
  const names={all:'ALL TIME',today:'TODAY',yesterday:'YESTERDAY',week:'THIS WEEK',month:'THIS MONTH',year:'THIS YEAR','7d':'LAST 7 DAYS','30d':'LAST 30 DAYS','24h':'LAST 24 HOURS',custom:'CUSTOM'};
- const b=npFinanceBounds(range,from,to),fmt=n=>new Date(n).toLocaleDateString('en-GB',{timeZone:'Africa/Lagos',day:'numeric',month:'short',year:'numeric'});
+ const b=npFinanceBounds(range,from,to),fmt=n=>new Date(n).toLocaleDateString('en-GB',{timeZone:'Africa/Lagos',day:'numeric',month:'short',year:'numeric',...((range==='24h'||range==='custom'&&(from.includes('T')||to.includes('T')))?{hour:'2-digit',minute:'2-digit'}:{})});
  return (names[range]||range)+(Number.isFinite(b.fromMs)?' · '+fmt(b.fromMs)+' → '+fmt(b.toMs):'')+' · WAT';
 }
 function npFinanceSourceState(){const key=String(SESSION.token||'');if(!window.NP_FINANCE_SOURCE||NP_FINANCE_SOURCE.key!==key)window.NP_FINANCE_SOURCE={key,data:null,at:0,pending:null};return NP_FINANCE_SOURCE;}

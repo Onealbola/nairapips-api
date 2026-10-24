@@ -11,6 +11,10 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
  await page.evaluate(()=>renderPurchases());assert.equal(await page.evaluate(()=>count),1);
  await page.evaluate(()=>{SESSION.currentMod='payouts';return renderPayouts()});assert.equal(await page.evaluate(()=>NP_PAYOUT_INTEL.range),'month');assert.equal(await page.evaluate(()=>count),1);
  await page.evaluate(()=>{SESSION.currentMod='revenue';return revenueModule()});assert.deepEqual(await page.evaluate(()=>saved),{from_date:'2026-10-01',to_date:'2026-10-24'});
+ await page.evaluate(()=>{saveRevenueDateFilters({from_date:'2026-10-03',to_date:'2026-10-20'});return revenueModule()});
+ await page.evaluate(()=>{SESSION.currentMod='payouts';return renderPayouts()});assert.equal(await page.evaluate(()=>NP_PAYOUT_INTEL.from),'2026-10-03T00:00');assert.equal(await page.evaluate(()=>NP_PAYOUT_INTEL.to),'2026-10-20T23:59');
+ await page.evaluate(()=>{SESSION.currentMod='purchases';return renderPurchases()});assert.equal(await page.evaluate(()=>PURCHASE_CUSTOM_FROM),'2026-10-03');
+ await page.evaluate(()=>{SESSION.currentMod='revenue';return revenueModule()});
  await page.evaluate(()=>api('/mark_payout_paid','POST',{}));assert.equal(await page.evaluate(()=>npFinanceSourceState().at),0);
  await page.evaluate(()=>{failure=true;return revenueModule()});assert((await page.locator('#content').innerText()).includes('Unavailable'));assert(!(await page.locator('#content').innerText()).includes('₦0'));
  console.log('PASS: shared period carries between modules, complete source reused, payment changes invalidate totals and unavailable source never shows zero.');
