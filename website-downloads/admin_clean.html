@@ -9930,7 +9930,7 @@ function admAccountDateRange(filter){
   return [-Infinity,Infinity];
 }
 function admAccountDateControls(){
-  const filters=[['all','All Time'],['today','Today'],['yesterday','Yesterday'],['week','This Week'],['last7','Last 7 Days'],['last14','Last 2 Weeks'],['month','This Month'],['custom','Choose Dates']];
+  const filters=[['all','All Time'],['today','Today'],['yesterday','Yesterday'],['week','This Week'],['last7','Last 7 Days'],['last14','Last 2 Weeks'],['week','This Week'],['month','This Month'],['custom','Choose Dates']];
   return `<div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0;align-items:center"><span class="muted">MT5 assigned date · Nigeria time</span>${filters.map(([key,label])=>`<button class="btn btn-sm ${(window.ACCT_DATE_FILTER||'all')===key?'btn-gold':'btn-ghost'}" onclick="ACCT_DATE_FILTER='${key}';admRenderAccountView()">${label}</button>`).join('')}<label>From <input type="date" value="${esc(window.ACCT_DATE_FROM||'')}" onchange="ACCT_DATE_FROM=this.value;ACCT_DATE_FILTER='custom';admRenderAccountView()"></label><label>To <input type="date" value="${esc(window.ACCT_DATE_TO||'')}" onchange="ACCT_DATE_TO=this.value;ACCT_DATE_FILTER='custom';admRenderAccountView()"></label></div>`;
 }
 function admRenderAccountView(){if(SESSION.currentMod==='funded')renderFunded();else renderAccounts();}
@@ -12418,6 +12418,57 @@ window.addEventListener('focus',npPurchaseAlertRefresh);
 /* PURCHASE_ALERT_END */
 
 
+/* FINANCE_RULES_START: common dates, amounts and exclusions for financial reports. */
+function npFinanceFlag(v){return v===true||String(v).toLowerCase()==='true';}
+function npFinanceExcluded(r){return npFinanceFlag(r.mark_as_test)||npFinanceFlag(r.excluded_from_revenue);}
+function npFinanceStatus(r){return String(r.status||'').trim().toLowerCase();}
+function npFinanceApproved(r){
+ const s=npFinanceStatus(r),p=String(r.payment_status||'').trim().toLowerCase();
+ return !npFinanceExcluded(r)&&!['rejected','declined','cancelled','canceled','refunded'].includes(s)&&!['rejected','refunded'].includes(p)&&(['approved','paid'].includes(p)||['approved','paid','completed','approved_active','assigned','approved_waiting_mt5'].includes(s));
+}
+function npFinancePaid(r){return !npFinanceExcluded(r)&&(npFinanceStatus(r)==='paid'||!!r.paid_at);}
+function npFinanceNumber(r,keys){for(const k of keys){if(r[k]!==null&&r[k]!==undefined&&r[k]!==''){const n=Number(r[k]);if(!Number.isFinite(n)||n<0)throw Error('Invalid financial amount');return n;}}return 0;}
+function npFinanceSum(rows,fn){return rows.reduce((sum,r)=>sum+Math.round(fn(r)*100),0)/100;}
+function npFinanceSaleAmount(r){return npFinanceNumber(r,['final_fee','amount_paid','payment_amount','amount','challenge_fee','plan_fee','fee','amount_due','price']);}
+function npFinancePayoutAmount(r){return npFinanceNumber(r,['amount','payout_amount','profit_share_amount','available_payout']);}
+function npFinanceDate(v){if(!v)return null;const d=new Date(/^\d{4}-\d{2}-\d{2}$/.test(String(v))?v+'T00:00:00+01:00':v);return Number.isNaN(d.getTime())?null:d;}
+function npFinanceSaleDate(r){for(const k of ['created_at','payment_submitted_at','payment_date','date','paid_at','payment_confirmed_at','approved_at']){const d=npFinanceDate(r[k]);if(d)return d;}return null;}
+function npFinancePayoutDate(r){if(npFinancePaid(r))return npFinanceDate(r.paid_at);return npFinanceDate(npFinanceStatus(r)==='approved'?(r.approved_at||r.requested_at||r.created_at):(r.requested_at||r.created_at));}
+function npFinanceDay(v){const d=npFinanceDate(v);return d?new Date(d.getTime()+3600000).toISOString().slice(0,10):'';}
+function npFinanceBounds(range,from='',to='',now=new Date()){
+ const n=now.getTime(),wat=new Date(n+3600000),day=Date.UTC(wat.getUTCFullYear(),wat.getUTCMonth(),wat.getUTCDate())-3600000;
+ let lo=-Infinity,hi=n;
+ if(range==='today')lo=day;
+ else if(range==='yesterday'){lo=day-86400000;hi=day-1;}
+ else if(range==='week')lo=day-((wat.getUTCDay()+6)%7)*86400000;
+ else if(range==='month')lo=Date.UTC(wat.getUTCFullYear(),wat.getUTCMonth(),1)-3600000;
+ else if(range==='year')lo=Date.UTC(wat.getUTCFullYear(),0,1)-3600000;
+ else if(range==='7d'||range==='30d')lo=day-((range==='7d'?7:30)-1)*86400000;
+ else if(range==='24h')lo=n-86400000;
+ else if(range==='custom'){
+  if(from)lo=new Date(from.includes('T')?from+'+01:00':from+'T00:00:00+01:00').getTime();
+  if(to)hi=new Date(to.includes('T')?to+'+01:00':to+'T23:59:59.999+01:00').getTime()+(to.includes('T')?59999:0);
+ }
+ return {fromMs:lo,toMs:Math.min(hi,n)};
+}
+function npFinanceInRange(v,range,from='',to=''){const d=npFinanceDate(v);if(!d)return false;const b=npFinanceBounds(range,from,to);return d.getTime()>=b.fromMs&&d.getTime()<=b.toMs;}
+function npFinanceRangeLabel(range,from='',to=''){
+ if(range==='custom'&&!from&&!to)range='all';
+ const names={all:'ALL TIME',today:'TODAY',yesterday:'YESTERDAY',week:'THIS WEEK',month:'THIS MONTH',year:'THIS YEAR','7d':'LAST 7 DAYS','30d':'LAST 30 DAYS','24h':'LAST 24 HOURS',custom:'CUSTOM'};
+ const b=npFinanceBounds(range,from,to),fmt=n=>new Date(n).toLocaleDateString('en-GB',{timeZone:'Africa/Lagos',day:'numeric',month:'short',year:'numeric'});
+ return (names[range]||range)+(Number.isFinite(b.fromMs)?' · '+fmt(b.fromMs)+' → '+fmt(b.toMs):'')+' · WAT';
+}
+function npFinanceSourceState(){const key=String(SESSION.token||'');if(!window.NP_FINANCE_SOURCE||NP_FINANCE_SOURCE.key!==key)window.NP_FINANCE_SOURCE={key,data:null,at:0,pending:null};return NP_FINANCE_SOURCE;}
+function npFinancePurchases(){return npFinanceSourceState().data?.purchases||SESSION.purchases||[];}
+function npFinancePayouts(){return npFinanceSourceState().data?.payouts||SESSION.payouts||[];}
+async function npFinanceLoad(){
+ const s=npFinanceSourceState();if(s.pending)return s.pending;
+ s.pending=(async()=>{const r=await api('/admin/finance_source?nonce='+Date.now()+'-'+Math.random().toString(36).slice(2));if(npFinanceSourceState()!==s)throw Error('Session changed');if(!r.success||!Array.isArray(r.purchases)||!Array.isArray(r.payouts))throw Error(r.error||'Financial records unavailable');s.data=r;s.at=Date.now();})().finally(()=>s.pending=null);return s.pending;
+}
+/* FINANCE_RULES_END */
+
+
+
 function purchaseStatus(p){
   const lifecycle=String(p?.status||'').trim().toLowerCase();
   const payment=String(p?.payment_status||'').trim().toLowerCase();
@@ -12428,13 +12479,8 @@ function purchaseStatus(p){
   }
   return payment || lifecycle || 'pending';
 }
-function approvedPurchase(p){
-  const payment=String(p?.payment_status||'').trim().toLowerCase();
-  const lifecycle=String(p?.status||'').trim().toLowerCase();
-  // Finance remains approved even while MT5 fulfilment is waiting.
-  return ['approved','paid'].includes(payment) ||
-    ['approved','approved_active','assigned','completed'].includes(lifecycle);
-}
+function approvedPurchase(p){return npFinanceApproved(p);}
+
 function purchaseHasRealAssignmentV146(p){
   // V149: a linked trader_account_id / assigned_mt5_id is NOT proof that
   // an MT5 was actually allocated. Waiting placeholders often have account
@@ -12469,16 +12515,8 @@ function purchaseTrader(p){return SESSION.traders.find(x=>String(x.id)===String(
 function purchaseTraderName(p){const t=purchaseTrader(p);return p.trader_name || p.name || t.name || t.full_name || p.email || t.email || '—';}
 function purchasePlanName(p){return p.plan_name || p.selected_plan || p.challenge_name || p.plan || '—';}
 function purchaseSize(p){return Number(p.account_size || p.challenge_account_size || p.size || 0);}
-function purchaseFee(p){
-  const direct = [p.amount, p.amount_paid, p.payment_amount, p.challenge_fee, p.plan_fee, p.fee, p.final_fee, p.amount_due, p.price]
-    .map(v=>Number(v)).find(v=>isFinite(v) && v>0);
-  if(direct) return direct;
-  const pname = String(purchasePlanName(p)).toLowerCase().trim();
-  const pid = String(p.plan_id || p.challenge_plan_id || '').trim();
-  const plan = (SESSION.plans||[]).find(x => (pid && String(x.id)===pid) || (pname && String(x.name||x.plan_name||'').toLowerCase().trim()===pname));
-  const fromPlan = Number(plan?.fee || plan?.price || plan?.challenge_fee || 0);
-  return isFinite(fromPlan) ? fromPlan : 0;
-}
+function purchaseFee(p){return npFinanceSaleAmount(p);}
+
 function purchaseLinkedAccountDate(p){
   const pid=String(p?.id||'').trim();
   if(!pid) return null;
@@ -12489,14 +12527,8 @@ function purchaseLinkedAccountDate(p){
     .sort((a,b)=>new Date(a)-new Date(b));
   return linked[0]||null;
 }
-function purchaseSalesDate(p){
-  // BUSINESS DATE = when the customer transaction/purchase was created/submitted.
-  // Approval may happen hours or days later and must NOT move an old sale into
-  // Today / Yesterday / This Week. This keeps daily/weekly sales historically correct.
-  return p.created_at || p.payment_submitted_at || p.payment_date || p.date ||
-         p.paid_at || p.payment_confirmed_at || p.approved_at ||
-         purchaseLinkedAccountDate(p) || p.updated_at || null;
-}
+function purchaseSalesDate(p){return npFinanceSaleDate(p);}
+
 function purchaseCreatedDate(p){return p.created_at || p.date || p.approved_at || p.updated_at || null;}
 function pStartDay(d){const x=new Date(d);x.setHours(0,0,0,0);return x;}
 function pEndDay(d){const x=new Date(d);x.setHours(23,59,59,999);return x;}
@@ -12510,43 +12542,15 @@ function purchaseCustomLabel(){
   if(to) return 'Until ' + to;
   return 'Custom period';
 }
-function purchaseInRange(ts, range){
-  if(range==='all') return true;
-  if(!ts) return false;
-  const d=new Date(ts); if(isNaN(d.getTime())) return false;
-  const now=new Date();
-  if(range==='today') return d>=pStartDay(now) && d<=pEndDay(now);
-  if(range==='yesterday'){const y=pStartDay(now);y.setDate(y.getDate()-1);return d>=y && d<=pEndDay(y);}
-  if(range==='week') return d>=pStartWeek(now) && d<=pEndDay(now);
-  if(range==='month') return d>=pStartMonth(now) && d<=pEndDay(now);
-  if(range==='custom'){
-    const from = window.PURCHASE_CUSTOM_FROM ? pStartDay(window.PURCHASE_CUSTOM_FROM) : null;
-    const to = window.PURCHASE_CUSTOM_TO ? pEndDay(window.PURCHASE_CUSTOM_TO) : null;
-    if(from && d < from) return false;
-    if(to && d > to) return false;
-    return !!(from || to);
-  }
-  return true;
-}
-function purchaseSalesRows(range){return (SESSION.purchases||[]).filter(p=>approvedPurchase(p) && purchaseFee(p)>0 && purchaseInRange(purchaseSalesDate(p), range||'all'));}
-function purchaseSalesTotal(range){return purchaseSalesRows(range||'all').reduce((a,p)=>a+purchaseFee(p),0);}
+function purchaseInRange(ts,range){return npFinanceInRange(ts,range||'all',window.PURCHASE_CUSTOM_FROM||'',window.PURCHASE_CUSTOM_TO||'');}
 
-function npPaidPayoutRowsInRange(range){
-  const seen=new Set();
-  return (SESSION.payouts||[]).filter(p=>{
-    const st=String(p?.status||'').trim().toLowerCase();
-    const paid=!!p?.paid_at || st==='paid';
-    if(!paid) return false;
-    const when=p?.paid_at||p?.updated_at||p?.approved_at||p?.created_at;
-    if(!purchaseInRange(when,range||'all')) return false;
-    const key=String(p?.id||'').trim() || [p?.trader_account_id,p?.mt5_login,p?.amount,when].join('|');
-    if(seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
+function purchaseSalesRows(range){return npFinancePurchases().filter(p=>approvedPurchase(p) && purchaseInRange(purchaseSalesDate(p), range||'all'));}
+function purchaseSalesTotal(range){return npFinanceSum(purchaseSalesRows(range||'all'),purchaseFee);}
+
+function npPaidPayoutRowsInRange(range){const seen=new Set();return npFinancePayouts().filter(p=>{if(seen.has(p.id))return false;seen.add(p.id);return npFinancePaid(p)&&purchaseInRange(p.paid_at,range||'all');});}
+
 function npPaidPayoutTotalInRange(range){
-  return npPaidPayoutRowsInRange(range).reduce((s,p)=>s+(Number(p?.amount||0)||0),0);
+  return npFinanceSum(npPaidPayoutRowsInRange(range),npFinancePayoutAmount);
 }
 function npNetTradingResult(range){
   return purchaseSalesTotal(range)-npPaidPayoutTotalInRange(range);
@@ -12599,14 +12603,8 @@ function npFundedAccountsInRange(range){
     seen.add(k); return true;
   });
 }
-function npPurchaseRangeLabel(range){
-  if(range==='today') return 'TODAY';
-  if(range==='yesterday') return 'YESTERDAY';
-  if(range==='week') return 'THIS WEEK';
-  if(range==='month') return 'THIS MONTH';
-  if(range==='custom') return 'SELECTED PERIOD';
-  return 'ALL-TIME';
-}
+function npPurchaseRangeLabel(range){return npFinanceRangeLabel(range,window.PURCHASE_CUSTOM_FROM||'',window.PURCHASE_CUSTOM_TO||'');}
+
 function npAccountCapital(rows){
   return (rows||[]).reduce((s,a)=>s+npAccountSize(a),0);
 }
@@ -12811,7 +12809,7 @@ async function loadSalesOutcomes(){
    <div class="card mb-4"><h2 style="font-size:20px;font-weight:900">Payout Journey</h2><div class="grid md:grid-cols-2 gap-3 mt-3">
     ${card('GOT PAID',t.collected_payout,fraction(t.collected_payout,t.sold),'#4ade80')}
     ${card('GOT PAID → BREACHED → CLOSED',t.paid_then_breached_closed,t.paid_then_breached_closed+' out of '+t.collected_payout+' paid purchases · '+rate(t.paid_then_breached_closed,t.collected_payout),'#ef4444')}
-   </div><p class="text-gray-400 text-sm mt-3">Closed cases are included in Got paid, not added again. The second figure requires recorded payment before breach and a closed or archived account state. Total recorded paid: <strong>${e(money(t.payout_amount))}</strong> · ${t.paid_payout_count} payment(s).</p></div>
+   </div><p class="text-gray-400 text-sm mt-3">Closed cases are included in Got paid, not added again. The second figure requires recorded payment before breach and a closed or archived account state. Lifetime payouts for these selected purchases: <strong>${e(money(t.payout_amount))}</strong> · ${t.paid_payout_count} payment(s).</p></div>
    ${(r.undated_sales_excluded||r.unlinked_paid_records)?`<div class="card mb-4"><strong>Data notes</strong>${r.undated_sales_excluded?`<p>${r.undated_sales_excluded} approved sales have no valid date and are excluded.</p>`:''}${r.unlinked_paid_records?`<p>${r.unlinked_paid_records} paid records across the system could not be linked to an exact account and owner. They are excluded rather than guessed.</p>`:''}</div>`:''}
    <div class="card mb-4" style="overflow:auto"><h2 style="font-size:20px;font-weight:900">Results by plan</h2><p class="text-gray-400 text-sm">Percentages use bought accounts for each plan. Paid-then-closed percentages use accounts that got paid. Breached and paid can overlap.</p><table class="w-full"><thead><tr><th>Plan</th><th>Total bought</th><th>Total breached</th><th>Total reached funded</th><th>Still in Phase 1</th><th>Still Funded</th><th>Total got payout</th><th>Got paid → breached → closed</th><th>Total amount paid</th></tr></thead><tbody>${r.plans.map(p=>`<tr><td>${e(p.plan)}</td><td>${p.sold}</td><td>${countRate(p.breached,p.sold)}</td><td>${countRate(p.funded,p.sold)}</td><td>${countRate(p.still_phase1,p.sold)}</td><td>${countRate(p.still_funded,p.sold)}</td><td>${countRate(p.collected_payout,p.sold)}</td><td>${countRate(p.paid_then_breached_closed,p.collected_payout)}</td><td>${e(money(p.payout_amount))}</td></tr>`).join('')||'<tr><td colspan="9">No approved sales in this period.</td></tr>'}</tbody><tfoot><tr style="border-top:2px solid #b69b36;background:#ffda5c0d;font-weight:950;color:#ffda5c"><th scope="row">TOTAL</th><td>${t.sold}</td><td>${countRate(t.breached,t.sold)}</td><td>${countRate(t.funded,t.sold)}</td><td>${countRate(t.still_phase1,t.sold)}</td><td>${countRate(t.still_funded,t.sold)}</td><td>${countRate(t.collected_payout,t.sold)}</td><td>${countRate(t.paid_then_breached_closed,t.collected_payout)}</td><td>${e(money(t.payout_amount))}</td></tr></tfoot></table></div>
    <div class="card" style="overflow:auto"><h2 style="font-size:20px;font-weight:900">One outcome per purchase</h2><table class="w-full"><thead><tr><th>Sale date</th><th>Plan / size</th><th>Original MT5</th><th>Current position</th><th>Outcome</th><th>Paid payments</th><th>Amount paid</th></tr></thead><tbody>${r.rows.map(p=>`<tr title="Purchase ${e(p.purchase_id)}"><td>${e(p.sale_date)}</td><td>${e(p.plan)} · ${e(money(p.account_size))}</td><td>${e(p.mt5_login)||'Awaiting assignment'}</td><td>${e(({phase1:'Still in Phase 1',phase2:'Still in Phase 2',funded:'Still Funded',closed:'Cycles completed',no_open_account:'No open account',review_required:'Records need review'})[p.current_position]||'Not verified')}</td><td>${e(p.outcome_label)}</td><td>${p.paid_payout_count}</td><td>${e(money(p.payout_amount))}</td></tr>`).join('')||'<tr><td colspan="7">No approved sales in this period.</td></tr>'}</tbody></table></div>`;
@@ -12942,7 +12940,7 @@ function renderPurchases(skipLiveRefresh=false){
       ${(()=>{
         const label=npPurchaseRangeLabel(activeRange);
         const rows=purchaseSalesRows(activeRange);
-        return kpi(label+' SALES', money(rows.reduce((s,p)=>s+purchaseFee(p),0)), rows.length+' approved sale(s)', {color:'gold'});
+        return kpi(label+' SALES', money(purchaseSalesTotal(activeRange)), rows.length+' approved sale(s)', {color:'gold'});
       })()}
       ${(()=>{
         const label=npPurchaseRangeLabel(activeRange);
@@ -12969,6 +12967,8 @@ function renderPurchases(skipLiveRefresh=false){
           ${filterBtn('range','today','Today')}
           ${filterBtn('range','yesterday','Yesterday')}
           ${filterBtn('range','week','This Week')}
+          ${filterBtn('range','7d','Last 7 Days')}
+          ${filterBtn('range','30d','Last 30 Days')}
           ${filterBtn('range','month','This Month')}
           ${filterBtn('range','custom','Custom')}
         </div>
@@ -13392,71 +13392,11 @@ function npPayoutIntelStatus(p){
   return raw || 'pending';
 }
 
-function npPayoutIntelAmount(p){
-  for(const k of ['amount','payout_amount','profit_share_amount','available_payout']){
-    const n=Number(p?.[k]);
-    if(Number.isFinite(n) && n>0) return n;
-  }
-  return 0;
-}
-
-function npPayoutIntelWhen(p){
-  const st=npPayoutIntelStatus(p);
-  const raw = st==='paid'
-    ? (p?.paid_at||p?.updated_at||p?.approved_at||p?.requested_at||p?.created_at)
-    : st==='approved'
-      ? (p?.approved_at||p?.requested_at||p?.created_at||p?.updated_at)
-      : (p?.requested_at||p?.created_at||p?.updated_at||p?.approved_at);
-  if(!raw) return null;
-  const d=new Date(raw);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
-function npPayoutIntelRangeLabel(range){
-  const st=window.NP_PAYOUT_INTEL||{};
-  if(range==='24h') return 'LAST 24 HOURS';
-  if(range==='today') return 'TODAY';
-  if(range==='yesterday') return 'YESTERDAY';
-  if(range==='7d') return 'LAST 7 DAYS';
-  if(range==='30d') return 'LAST 30 DAYS';
-  if(range==='month') return 'THIS MONTH';
-  if(range==='custom'){
-    const a=npPayoutNigeriaInput(st.from);
-    const b=npPayoutNigeriaInput(st.to);
-    const fmt=d=>d && !Number.isNaN(d.getTime())
-      ? d.toLocaleString('en-GB',{timeZone:'Africa/Lagos',day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'})
-      : '—';
-    return `CUSTOM · ${fmt(a)} → ${fmt(b)}`;
-  }
-  return 'ALL TIME';
-}
-
-function npPayoutIntelBounds(){
-  const st=window.NP_PAYOUT_INTEL||{},now=new Date();
-  const nigeria=new Date(now.getTime()+3600000);
-  const day=Date.UTC(nigeria.getUTCFullYear(),nigeria.getUTCMonth(),nigeria.getUTCDate())-3600000;
-  let fromMs=0,toMs=Infinity;
-  if(st.range==='24h'){fromMs=now.getTime()-86400000;toMs=now.getTime();}
-  else if(st.range==='today'){fromMs=day;toMs=now.getTime();}
-  else if(st.range==='yesterday'){fromMs=day-86400000;toMs=day-1;}
-  else if(st.range==='7d'||st.range==='30d'){
-    fromMs=now.getTime()-(st.range==='7d'?7:30)*86400000;toMs=now.getTime();
-  }else if(st.range==='month'){
-    fromMs=Date.UTC(nigeria.getUTCFullYear(),nigeria.getUTCMonth(),1)-3600000;toMs=now.getTime();
-  }else if(st.range==='custom'){
-    fromMs=st.from?npPayoutNigeriaInput(st.from).getTime():0;
-    toMs=st.to?npPayoutNigeriaInput(st.to).getTime()+59999:Infinity;
-  }
-  return {fromMs,toMs};
-}
-
-function npPayoutIntelInRange(p){
-  const d=npPayoutIntelWhen(p);
-  if(!d) return (window.NP_PAYOUT_INTEL.range||'all')==='all';
-  const {fromMs,toMs}=npPayoutIntelBounds();
-  const ts=d.getTime();
-  return ts>=fromMs && ts<=toMs;
-}
+function npPayoutIntelAmount(p){return npFinancePayoutAmount(p);}
+function npPayoutIntelWhen(p){return npFinancePayoutDate(p);}
+function npPayoutIntelRangeLabel(range){return npFinanceRangeLabel(range,window.NP_PAYOUT_INTEL?.from||'',window.NP_PAYOUT_INTEL?.to||'');}
+function npPayoutIntelBounds(){return npFinanceBounds(window.NP_PAYOUT_INTEL?.range||'all',window.NP_PAYOUT_INTEL?.from||'',window.NP_PAYOUT_INTEL?.to||'');}
+function npPayoutIntelInRange(p){return !npFinanceExcluded(p)&&npFinanceInRange(npPayoutIntelWhen(p),window.NP_PAYOUT_INTEL?.range||'all',window.NP_PAYOUT_INTEL?.from||'',window.NP_PAYOUT_INTEL?.to||'');}
 
 function npPayoutIntelIdentity(p,t){
   return String(
@@ -13466,6 +13406,8 @@ function npPayoutIntelIdentity(p,t){
 }
 
 function npPayoutIntelBuild(list){
+  const details=new Map((list||[]).map(p=>[String(p.id),p]));
+  list=npFinancePayouts().map(p=>({...details.get(String(p.id)),...p}));
   const st=window.NP_PAYOUT_INTEL||{};
   const all=npPayoutFiltered(list)
     .map(p=>({p,status:npPayoutIntelStatus(p),amount:npPayoutIntelAmount(p),when:npPayoutIntelWhen(p)}))
@@ -13542,9 +13484,9 @@ function npPayoutIntelBuild(list){
   const approvedRows=all.filter(x=>x.status==='approved');
   const pendingRows=all.filter(x=>x.status==='pending');
 
-  const paidTotal=paidRows.reduce((s,x)=>s+x.amount,0);
-  const approvedTotal=approvedRows.reduce((s,x)=>s+x.amount,0);
-  const pendingTotal=pendingRows.reduce((s,x)=>s+x.amount,0);
+  const paidTotal=npFinanceSum(paidRows,x=>x.amount);
+  const approvedTotal=npFinanceSum(approvedRows,x=>x.amount);
+  const pendingTotal=npFinanceSum(pendingRows,x=>x.amount);
   const openTotal=approvedTotal+pendingTotal;
   const exposureTotal=paidTotal+openTotal;
 
@@ -13630,6 +13572,7 @@ window.npPayoutIntelRefreshNow=async function(silent=false){
   try{
     const r=await api('/payouts?limit=1000&_t='+Date.now(),'GET');
     SESSION.payouts=Array.isArray(r)?r:(r?.payouts||r?.data||[]);
+    npFinanceSourceState().at=0;await npFinanceLoad();
     st.lastRefresh=new Date().toISOString();
     if(SESSION.currentMod==='payouts') renderPayouts();
     if(!silent) toast('Payout intelligence refreshed.','ok');
@@ -13740,7 +13683,7 @@ function renderPayouts(){
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           ${[
             ['all','All Time'],['24h','24 Hours'],['today','Today'],['yesterday','Yesterday'],
-            ['7d','7 Days'],['30d','30 Days'],['month','This Month']
+            ['7d','7 Days'],['30d','30 Days'],['week','This Week'],['month','This Month']
           ].map(([v,l])=>`<button class="btn btn-sm ${activeIntelRange===v?'btn-gold':'btn-ghost'}" onclick="npPayoutIntelSetRange('${v}')">${l}</button>`).join('')}
           <button class="btn btn-sm ${activeIntelRange==='custom'?'btn-gold':'btn-ghost'}" onclick="document.getElementById('np-payout-intel-from')?.focus()">Custom</button>
           <span style="width:1px;height:26px;background:rgba(255,255,255,.12);margin:0 2px"></span>
@@ -13760,7 +13703,7 @@ function renderPayouts(){
         </div>
       </div>
 
-      <p class="text-xs text-gray-400" style="margin-bottom:12px">All cards and tables use this period and search. Times are Nigerian time (WAT). Paid payouts use the paid date; approved payouts use the approval date; other requests use the request date. The ending minute is included.</p>
+      <p class="text-xs text-gray-400" style="margin-bottom:12px">All cards and tables use this period and search. Times are Nigerian time (WAT). Financial totals use common production records and Nigeria dates. Last 7/30 Days include today; This Week starts Monday; This Month starts on the 1st. Paid payouts use the paid date; approved payouts use the approval date; other requests use the request date. The ending minute is included.</p>
       <div class="grid md:grid-cols-3 gap-3 mb-4">
         ${kpi('PAID OUT · '+intelRangeLabel, money(paidTotal), payoutIntel.paidRows.length+' paid payout(s)', {color:'red'})}
         ${kpi('APPROVED · UNPAID', money(approvedTotal), payoutIntel.approvedRows.length+' approved payout(s) still open', {color:approvedTotal>0?'red':'green'})}
@@ -14497,7 +14440,7 @@ async function setProductionMode(mode){
     return;
   }
   revenueUiState.saving = "";
-  setRevenueMessage(`${safeMode.toUpperCase()} MODE saved. Revenue calculations refreshed.`,"success");
+  setRevenueMessage(`${safeMode.toUpperCase()} MODE saved. Use the visible date filters to choose the report period.`,"success");
   logAdminAudit("revenue", "production_mode", `Production mode set to ${safeMode.toUpperCase()}`, "production_mode");
   revenueModule();
 }
@@ -14550,7 +14493,7 @@ async function setRevenueLaunchDate(){
     return;
   }
   revenueUiState.saving = "";
-  setRevenueMessage(value ? `Launch date saved: ${formatRevenueDisplayDate(value)}. Revenue calculations refreshed.` : "Launch date cleared. Revenue calculations refreshed.","success");
+  setRevenueMessage(value ? `Launch date saved: ${formatRevenueDisplayDate(value)}. Use the visible date filters to choose the report period.` : "Launch date cleared. Use the visible date filters to choose the report period.","success");
   logAdminAudit("revenue","launch_date_set",value?`Business launch date set to ${value}`:"Business launch date cleared","business_launch_date");
   revenueModule();
 }
@@ -14569,7 +14512,7 @@ async function clearRevenueLaunchDate(){
     return;
   }
   revenueUiState.saving = "";
-  setRevenueMessage("Launch date cleared in Supabase. Revenue calculations refreshed.","success");
+  setRevenueMessage("Launch date cleared in Supabase. Use the visible date filters to choose the report period.","success");
   logAdminAudit("revenue","launch_date_cleared","Business launch date cleared","business_launch_date");
   revenueModule();
 }
@@ -14686,13 +14629,8 @@ async function restoreHiddenRevenue(){
 
 
 const REVENUE_FILTER_KEY = "nairapips_revenue_date_filter_v2";
-function todayIsoLocal(){
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth()+1).padStart(2,"0");
-  const day = String(d.getDate()).padStart(2,"0");
-  return `${y}-${m}-${day}`;
-}
+function todayIsoLocal(){return npFinanceDay(new Date());}
+
 function revenueDateFilters(){
   try{
     const saved = JSON.parse(localStorage.getItem(REVENUE_FILTER_KEY)||"{}") || {};
@@ -14715,35 +14653,13 @@ function applyRevenueDateFilter(){
   revenueModule();
 }
 function setRevenueDateFilterPreset(preset){
-  const now = new Date();
-  let from_date = "";
-  let to_date = todayIsoLocal();
-  const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
-  if(preset === "today"){
-    from_date = to_date;
-  }else if(preset === "yesterday"){
-    const d = new Date(now); d.setDate(d.getDate()-1);
-    from_date = iso(d); to_date = from_date;
-  }else if(preset === "7days"){
-    const d = new Date(now); d.setDate(d.getDate()-6);
-    from_date = iso(d);
-  }else if(preset === "30days"){
-    const d = new Date(now); d.setDate(d.getDate()-29);
-    from_date = iso(d);
-  }else if(preset === "week"){
-    const d = new Date(now);
-    const day = d.getDay() || 7;
-    d.setDate(d.getDate() - day + 1);
-    from_date = iso(d);
-  }else if(preset === "month"){
-    from_date = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-01`;
-  }else if(preset === "year"){
-    from_date = `${now.getFullYear()}-01-01`;
-  }else if(preset === "all"){ from_date = NAIRAPIPS_ECONOMIC_START; to_date = todayIsoLocal(); }
-  if(!from_date || from_date < NAIRAPIPS_ECONOMIC_START) from_date=NAIRAPIPS_ECONOMIC_START; saveRevenueDateFilters({from_date,to_date});
-  setRevenueMessage(`Revenue preset applied: ${preset.toUpperCase()}.`,"success");
-  revenueModule();
+ const range=({'7days':'7d','30days':'30d'})[preset]||preset;
+ const b=npFinanceBounds(range);
+ window.NP_FINANCE_PERIOD={range,from:'',to:''};
+ saveRevenueDateFilters({from_date:Number.isFinite(b.fromMs)?npFinanceDay(new Date(b.fromMs)):'',to_date:npFinanceDay(new Date(b.toMs))});
+ setRevenueMessage('Financial period: '+npFinanceRangeLabel(range),'success');revenueModule();
 }
+
 window.nairaPipsApplyRevenueDateFilter = applyRevenueDateFilter;
 window.nairaPipsRevenuePreset = setRevenueDateFilterPreset;
 
@@ -14768,25 +14684,14 @@ function npRevenueDate(row, keys){
   }
   return null;
 }
-function npRevenueInRange(date, fromIso, toIso){
-  if(!date) return !fromIso && !toIso;
-  const day = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
-  if(fromIso){
-    const from = new Date(fromIso+"T00:00:00").getTime();
-    if(day < from) return false;
-  }
-  if(toIso){
-    const to = new Date(toIso+"T23:59:59").getTime();
-    if(day > to) return false;
-  }
-  return true;
-}
+function npRevenueInRange(date,fromIso,toIso){return npFinanceInRange(date,fromIso||toIso?'custom':'all',fromIso,toIso);}
+
 function npRevenueStatus(row){
   return String(row?.payment_status || row?.status || "").trim().toLowerCase();
 }
 function npRevenueLocalSummaries(filters){
-  const purchases = Array.isArray(SESSION.purchases) ? SESSION.purchases : [];
-  const payouts = Array.isArray(SESSION.payouts) ? SESSION.payouts : [];
+  const purchases = npFinancePurchases();
+  const payouts = npFinancePayouts();
   const traders = Array.isArray(SESSION.traders) ? SESSION.traders : [];
   const fromIso = filters?.from_date || "";
   const toIso = filters?.to_date || "";
@@ -14794,40 +14699,40 @@ function npRevenueLocalSummaries(filters){
 
   const purchaseRows = purchases.map(row=>{
     const status = npRevenueStatus(row);
-    const date = npRevenueDate(row, ["approved_at","paid_at","created_at","updated_at"]);
-    const amount = npRevenueNumber(row, ["final_fee","amount_paid","amount","fee","price","challenge_fee"]);
-    const excluded = liveMode && revenueIsExcluded("purchase", row);
+    const date = npFinanceSaleDate(row);
+    const amount = npFinanceSaleAmount(row);
+    const excluded = npFinanceExcluded(row);
     return {row,status,date,amount,excluded};
   });
   const payoutRows = payouts.map(row=>{
-    const status = npRevenueStatus(row);
-    const date = npRevenueDate(row, ["paid_at","approved_at","requested_at","created_at","updated_at"]);
-    const amount = npRevenueNumber(row, ["amount","profit_share_amount","payout_amount","available_payout"]);
-    const excluded = liveMode && revenueIsExcluded("payout", row);
+    const status = npPayoutIntelStatus(row);
+    const date = npFinancePayoutDate(row);
+    const amount = npFinancePayoutAmount(row);
+    const excluded = npFinanceExcluded(row);
     return {row,status,date,amount,excluded};
   });
 
-  const approvedPurchase = x => ["approved","paid","completed","approved_active"].includes(x.status);
+  const approvedPurchase = x => npFinanceApproved(x.row);
   const pendingPurchase = x => ["pending","payment_pending","submitted","awaiting_verification"].includes(x.status);
   const rejectedPurchase = x => ["rejected","declined","cancelled","canceled","payment_rejected"].includes(x.status);
-  const paidPayout = x => ["paid","completed"].includes(x.status);
+  const paidPayout = x => npFinancePaid(x.row);
   const approvedPayout = x => ["approved"].includes(x.status);
   const pendingPayout = x => ["pending","requested","submitted"].includes(x.status);
   const rejectedPayout = x => ["rejected","declined","cancelled","canceled"].includes(x.status);
 
-  const validPurchases = purchaseRows.filter(x=>!x.excluded && revenueAfterLaunch(x.date));
-  const validPayouts = payoutRows.filter(x=>!x.excluded && revenueAfterLaunch(x.date));
+  const validPurchases = purchaseRows.filter(x=>!x.excluded&&x.date&&x.date<=new Date());
+  const validPayouts = payoutRows.filter(x=>!x.excluded&&x.date&&x.date<=new Date());
   const rangePurchases = validPurchases.filter(x=>npRevenueInRange(x.date,fromIso,toIso));
   const rangePayouts = validPayouts.filter(x=>npRevenueInRange(x.date,fromIso,toIso));
 
-  const sum = rows => rows.reduce((a,x)=>a+(Number(x.amount)||0),0);
+  const sum = rows => npFinanceSum(rows,x=>x.amount);
   const now = new Date();
-  const startWeek = new Date(now); startWeek.setHours(0,0,0,0); startWeek.setDate(startWeek.getDate()-((startWeek.getDay()||7)-1));
-  const startMonth = new Date(now.getFullYear(),now.getMonth(),1);
-  const startYear = new Date(now.getFullYear(),0,1);
+  const startWeek = new Date(npFinanceBounds('week').fromMs);
+  const startMonth = new Date(npFinanceBounds('month').fromMs);
+  const startYear = new Date(npFinanceBounds('year').fromMs);
   const approvedAll = validPurchases.filter(approvedPurchase);
   const paidAll = validPayouts.filter(paidPayout);
-  const periodSum = (rows, start) => sum(rows.filter(x=>x.date && x.date >= start));
+  const periodSum = (rows, start) => sum(rows.filter(x=>x.date && x.date >= start && x.date<=now));
 
   const rangeApproved = rangePurchases.filter(approvedPurchase);
   const rangePaid = rangePayouts.filter(paidPayout);
@@ -14850,7 +14755,7 @@ function npRevenueLocalSummaries(filters){
   const dayMap = new Map();
   rangeApproved.forEach(x=>{
     if(!x.date) return;
-    const key = x.date.toISOString().slice(0,10);
+    const key = npFinanceDay(x.date);
     const current = dayMap.get(key) || {date:key,sales_count:0,revenue:0,amount:0};
     current.sales_count += 1; current.revenue += x.amount; current.amount += x.amount;
     dayMap.set(key,current);
@@ -14860,7 +14765,7 @@ function npRevenueLocalSummaries(filters){
   const monthMap = new Map();
   approvedAll.forEach(x=>{
     if(!x.date) return;
-    const key = `${x.date.getFullYear()}-${String(x.date.getMonth()+1).padStart(2,"0")}`;
+    const key = npFinanceDay(x.date).slice(0,7);
     const current = monthMap.get(key) || {month:key,sales_count:0,revenue:0,amount:0};
     current.sales_count += 1; current.revenue += x.amount; current.amount += x.amount;
     monthMap.set(key,current);
@@ -14879,7 +14784,7 @@ function npRevenueLocalSummaries(filters){
   const payoutDayMap = new Map();
   rangePaid.forEach(x=>{
     if(!x.date) return;
-    const key = x.date.toISOString().slice(0,10);
+    const key = npFinanceDay(x.date);
     const current = payoutDayMap.get(key) || {date:key,payout_count:0,amount:0};
     current.payout_count += 1; current.amount += x.amount;
     payoutDayMap.set(key,current);
@@ -14900,7 +14805,7 @@ function npRevenueLocalSummaries(filters){
   const conversionRate = traders.length ? ((approvedAll.length/traders.length)*100).toFixed(1)+"%" : "0%";
 
   const summary = {
-    production_mode_used: productionMode(),
+    production_mode_used: 'live',
     launch_date_used: revenueLaunchDateValue(),
     from_date_used: fromIso,
     to_date_used: toIso,
@@ -14989,20 +14894,11 @@ async function revenueModule(){
     summary = localRevenue.summary;
     salesSummary = localRevenue.salesSummary;
     payoutSummary = localRevenue.payoutSummary;
-    setRevenueMessage("Revenue opened from the Admin data already loaded from production. No backend summary wait is required.","success");
+    setRevenueMessage("Complete shared production records loaded. Financial totals use Nigeria dates and common exclusions.","success");
   }catch(e){
-    console.error("Local Revenue build failed", e);
-    summary = {
-      production_mode_used: productionMode(),
-      launch_date_used: revenueLaunchDateValue(),
-      from_date_used: filters.from_date || "",
-      to_date_used: filters.to_date || "",
-      total_purchases_loaded: 0,
-      total_payouts_loaded: 0
-    };
-    salesSummary = {plan_rows:[],day_rows:[],total_sales_loaded:0};
-    payoutSummary = {bank_rows:[],day_rows:[],total_payouts_loaded:0};
-    setRevenueMessage("Revenue opened safely, but some local records could not be calculated: "+(e.message||e),"error");
+    console.error("Revenue build failed",e);
+    if(content)content.textContent='Financial totals unavailable: '+(e.message||'Records could not be verified');
+    return;
   }
 
   businessSettingsCache = {
@@ -15015,10 +14911,8 @@ async function revenueModule(){
   const toDateValue = normalizeRevenueDateToIso(summary.to_date_used || filters.to_date || "");
   const dateRangeLabel = `${fromDateValue ? formatRevenueDisplayDate(fromDateValue) : "All start"} → ${toDateValue ? formatRevenueDisplayDate(toDateValue) : "All end"}`;
   const latestResetCount = revenueLastReset().length;
-  const modeLabel = summary.production_mode_used === "live" ? "LIVE MODE" : "TEST MODE";
-  const modeSubtext = summary.production_mode_used === "live"
-    ? "Production-only: test/excluded records are hidden."
-    : "Test-inclusive: backend keeps test records visible while still applying the launch date.";
+  const modeLabel = "PRODUCTION FINANCIAL TOTALS";
+  const modeSubtext = "Same production exclusions as Purchases and Payouts. Test and excluded records are omitted. No hidden launch-date cutoff is applied.";
   const saving = revenueUiState.saving;
   const msgClass = revenueUiState.messageType === "error" ? "text-red-400 border-red-900/40" : revenueUiState.messageType === "info" ? "text-yellow-300 border-yellow-900/40" : "text-green-400 border-green-900/40";
 
@@ -15188,9 +15082,9 @@ async function revenueModule(){
     <div class="flex flex-wrap justify-between gap-5 items-start mb-5">
       <div>
         <span class="badge text-red-400">PRODUCTION REVENUE CONTROL</span>
-        <h3 class="text-3xl font-black gold mt-3">Revenue Launch Mode</h3>
+        <h3 class="text-3xl font-black gold mt-3">Revenue Reporting Controls</h3>
         <p class="text-gray-300 mt-2">This does not delete customer data. It only removes test data from revenue reporting.</p>
-        <p class="text-gray-500 text-sm mt-2">LIVE MODE hides test data and counts only production records after the launch date.</p>
+        <p class="text-gray-500 text-sm mt-2">Financial totals omit test/excluded records and use only the visible date filter. Launch-date settings do not silently remove history.</p>
       </div>
       <div class="card2 p-4 rounded-2xl min-w-[230px]">
         <p class="text-gray-500 text-sm">Hidden / Filtered Records</p>
@@ -15256,7 +15150,7 @@ async function revenueModule(){
       <p class="text-gray-500 mt-2">Paid payouts in ${dateRangeLabel}</p>
     </div>
     <div class="vault p-6 rounded-3xl border border-yellow-900/40">
-      <p class="text-gray-400 text-sm">Selected Range Net Revenue</p>
+      <p class="text-gray-400 text-sm">Selected Range Sales − Paid Payouts</p>
       <h3 class="text-4xl font-black ${rangeRevenue >= 0 ? "text-green-400" : "text-red-400"}">${money(rangeRevenue)}</h3>
       <p class="text-gray-500 mt-2">Sales minus paid payouts in selected range</p>
     </div>
@@ -15414,7 +15308,7 @@ async function revenueModule(){
   </div>
 
   <div class="grid md:grid-cols-4 gap-4 mb-8">
-    ${stat("Gross Revenue",money(salesAll),"Approved challenge fees")}
+    ${stat("All-time approved sales",money(salesAll),"All recorded transaction dates")}
     ${stat("Approved Payouts",money(approvedLiability),"Approved but not paid")}
     ${stat("Pending Payouts",money(pendingLiability),"Requested but not approved")}
     ${stat("Net Cash Contribution",money(netRevenue),"Cash in minus paid payouts")}
@@ -15424,7 +15318,7 @@ async function revenueModule(){
     ${stat("Mode",productionMode().toUpperCase(),isLiveMode()?"Test data hidden":"Testing records visible")}
     ${stat("Pending Sales",money(pendingSales),"Awaiting verification")}
     ${stat("Rejected Sales",money(rejectedSales),"Declined purchases")}
-    ${stat("Paid Payouts",money(paidAll),"Total cash outflow")}
+    ${stat("All-time paid payouts",money(paidAll),"All recorded payment dates")}
     ${stat("Approved Purchases",countedPurchases,"Counted approved challenge buyers")}
   </div>
 
@@ -18601,7 +18495,7 @@ if(typeof oldApprovePurchase==='function')window.approvePurchase=function(id,...
 (function(){
 'use strict';
 const B={data:null,error:'',loading:false,period:'today',sequence:0,metric:null,query:'',page:1,identity:null};
-const labels={customers:'Registered profiles',paying_customers:'Customers with approved payments',open_accounts:'Open MT5 assignments',phase1_accounts:'Phase 1 trading',phase2_accounts:'Phase 2 trading',funded_accounts:'Funded trading',protected_accounts:'Protected / awaiting payout',other_open_accounts:'Other open stages',available_stock:'Available MT5 stock',telemetry_fresh:'Fresh broker observations',telemetry_attention:'Broker updates to check',purchase_reviews:'Plan payments to review',reset_reviews:'Reset payments to review',first_account_waiting:'Approved purchases awaiting first MT5',payout_reviews:'Payout requests to review',approved_payouts:'Approved payouts not marked paid',open_tickets:'Open support tickets',work_waiting:'Work waiting now',approved_receipts:'Approved payments recorded',paid_payouts:'Payouts recorded paid',record_checks:'Records to reconcile',account_history:'Historical account rows',excluded_transactions:'Excluded / test transactions'};
+const labels={customers:'Registered profiles',paying_customers:'Customers with approved payments',open_accounts:'Open MT5 assignments',phase1_accounts:'Phase 1 trading',phase2_accounts:'Phase 2 trading',funded_accounts:'Funded trading',protected_accounts:'Protected / awaiting payout',other_open_accounts:'Other open stages',available_stock:'Available MT5 stock',telemetry_fresh:'Fresh broker observations',telemetry_attention:'Broker updates to check',purchase_reviews:'Plan payments to review',reset_reviews:'Reset payments to review',first_account_waiting:'Approved purchases awaiting first MT5',payout_reviews:'Payout requests to review',approved_payouts:'Approved payouts not marked paid',open_tickets:'Open support tickets',work_waiting:'Work waiting now',approved_receipts:'Payments approved (approval date)',paid_payouts:'Payouts recorded paid',record_checks:'Records to reconcile',account_history:'Historical account rows',excluded_transactions:'Excluded / test transactions'};
 const explanations={
  customers:'Profile records, not a count of paying or currently trading customers.',
  paying_customers:'Distinct customer profiles with at least one approved payment that is not flagged as test.',
@@ -19038,4 +18932,41 @@ if(document.readyState==='loading'){
 }else{
   setTimeout(npLoadExactRegisteredTraderCountV50,800);
 }
+</script>
+
+<script>
+(function(){
+ const apiCore=window.api;
+ window.api=function(path,method,body){
+  const result=apiCore(path,method,body),verb=String(typeof method==='object'?method.method||'GET':method||'GET').toUpperCase();
+  if(verb!=='GET'&&/((create|approve|reject|mark|cancel|update).*(purchase|payout|payment)|(purchase|payout|payment).*(approve|reject|paid|cancel))/i.test(path))return result.finally(()=>{npFinanceSourceState().at=0;});
+  return result;
+ };
+ let previousModule='';
+ function prepare(mod){
+  const period=window.NP_FINANCE_PERIOD;
+  if(mod!==previousModule&&period){
+   if(mod==='purchases'){window.PURCHASE_FILTER_RANGE=period.range;window.PURCHASE_CUSTOM_FROM=period.from||'';window.PURCHASE_CUSTOM_TO=period.to||'';}
+   if(mod==='payouts'){window.NP_PAYOUT_INTEL.range=period.range;window.NP_PAYOUT_INTEL.from=period.from||'';window.NP_PAYOUT_INTEL.to=period.to||'';}
+   if(mod==='revenue'){const b=npFinanceBounds(period.range,period.from||'',period.to||'');saveRevenueDateFilters({from_date:Number.isFinite(b.fromMs)?npFinanceDay(new Date(b.fromMs)):'',to_date:npFinanceDay(new Date(b.toMs))});}
+  }
+  previousModule=mod;
+  if(mod==='purchases')window.NP_FINANCE_PERIOD={range:window.PURCHASE_FILTER_RANGE||'all',from:window.PURCHASE_CUSTOM_FROM||'',to:window.PURCHASE_CUSTOM_TO||''};
+  if(mod==='payouts'&&NP_PAYOUT_INTEL.range!=='24h')window.NP_FINANCE_PERIOD={range:NP_PAYOUT_INTEL.range||'all',from:NP_PAYOUT_INTEL.from||'',to:NP_PAYOUT_INTEL.to||''};
+  if(mod==='revenue'){
+   const f=revenueDateFilters(),p=window.NP_FINANCE_PERIOD,b=p?npFinanceBounds(p.range,p.from||'',p.to||''):null;
+   if(!b||(Number.isFinite(b.fromMs)?npFinanceDay(new Date(b.fromMs)):'')!==f.from_date||npFinanceDay(new Date(b.toMs))!==f.to_date)window.NP_FINANCE_PERIOD={range:'custom',from:f.from_date,to:f.to_date};
+  }
+ }
+ const wrap=(key,mod)=>{const core=window[key];if(typeof core!=='function')return;window[key]=function(...args){
+  prepare(mod);const state=npFinanceSourceState();
+  if(!state.data||Date.now()-state.at>60000){
+   const content=document.getElementById('content');if(content)content.innerHTML='<div class="card" role="status">Loading complete financial records…</div>';
+   return npFinanceLoad().then(()=>{if(SESSION.currentMod===mod)return window[key](...args);}).catch(e=>{if(SESSION.currentMod===mod&&content)content.textContent=e.message||'Financial totals unavailable. Please reload.';});
+  }
+  const decorate=()=>{const content=document.getElementById('content');if(!content)return;content.querySelector('[data-finance-source-note]')?.remove();const note=document.createElement('div');note.dataset.financeSourceNote='1';note.className='card mb-4';note.style.cssText='padding:12px;border:1px solid #b69b36;font-size:12px';note.textContent='Shared financial records · '+new Date(state.data.generated_at).toLocaleString('en-GB',{timeZone:'Africa/Lagos'})+' WAT. Sales use transaction dates; payouts use paid dates. Test/excluded records are omitted. Sales Outcomes shows lifetime payouts for its selected purchases, not cash paid during this period.';content.prepend(note);};
+  const result=core.apply(this,args);if(result?.then)return result.then(decorate);decorate();return result;
+ };};
+ wrap('renderPurchases','purchases');wrap('renderPayouts','payouts');wrap('revenueModule','revenue');
+})();
 </script>
