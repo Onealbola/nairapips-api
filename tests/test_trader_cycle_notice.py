@@ -7,7 +7,7 @@ class TraderNoticeTests(ProgressTests):
     def setUp(self):
         super().setUp()
         original=self.db.matches
-        self.db.matches=lambda row,params: (row.get('payout_cycles',0) or 0)>0 and original(row,{k:v for k,v in params.items() if v!='gt.0'}) if 'payout_cycles' in params else original(row,params)
+        self.db.matches=lambda row,params: (row.get('payout_cycles',0) or 0)>0 and original(row,{k:v for k,v in params.items() if v!='gt.0' and k!='or'}) if 'payout_cycles' in params or 'or' in params else original(row,params)
         self.auth=['owner',None]
         self.app=Flask(__name__)
         register_trader_cycle_progress(self.app,self.guard,lambda:tuple(self.auth))

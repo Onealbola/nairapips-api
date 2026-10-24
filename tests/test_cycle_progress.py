@@ -44,4 +44,12 @@ class ProgressTests(unittest.TestCase):
             authorized[0]=True;r=c.get('/admin/funded_cycle_progress');self.assertEqual(r.status_code,503);self.assertNotIn('data',r.json)
     def test_no_funded_account_is_zero_paid_not_completed(self):
         self.db.tables['trader_accounts']=[];p=self.report()['purchases'][0];self.assertEqual(p['status'],'awaiting_funded');self.assertEqual(p['paid'],0);self.assertFalse(p['completed'])
+    def test_requested_legacy_display_keeps_terms_and_actions_unchanged(self):
+        self.p['id']='4e4c7880-5593-4ffd-8c1a-2c531635d71f';self.p['payout_cycles']=None
+        for a in self.db.tables['trader_accounts']:a['purchase_id']=self.p['id']
+        self.payout('a','one');self.payout('b','two')
+        r=self.report();p=r['purchases'][0]
+        self.assertEqual(p['paid'],2);self.assertIsNone(p['limit']);self.assertIsNone(p['remaining']);self.assertTrue(p['display_only'])
+        self.assertFalse(r['payouts']['two']['blocked']);self.assertEqual(self.db.writes,[])
+        self.p['id']='unrelated';self.assertEqual(self.report()['purchases'],[])
 if __name__=='__main__':unittest.main()

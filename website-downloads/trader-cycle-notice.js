@@ -6,8 +6,9 @@ const text=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt
 function markup(row){
  const label=text(row.plan)+' · Purchase '+text(row.purchase_id.slice(0,8));
  if(!row.verified)return `<article><strong>${label}</strong><p>Your payout cycle records need checking. Please contact support before requesting another payout.</p></article>`;
+ const legacy=row.limit==null||row.limit===0;
  const title=row.completed?'Payout cycles completed':row.remaining===1?'Your final payout cycle remains':'Your payout cycles';
- const message=row.completed?'All payouts included in this purchase have been received. No further payout is available under this purchase.':`${row.paid} of ${row.limit} payouts received · ${row.remaining} remaining`;
+ const message=legacy?`${row.paid} payout${row.paid===1?'':'s'} received · ${row.limit===0?'Unlimited cycles':'Your existing purchase terms apply; no cycle limit is recorded.'}`:row.completed?'All payouts included in this purchase have been received. No further payout is available under this purchase.':`${row.paid} of ${row.limit} payouts received · ${row.remaining} remaining`;
  const pending=row.reserved?`<p>${row.reserved} payout request${row.reserved===1?' is':'s are'} pending or processing. These count as received only after payment.</p>`:'';
  return `<article style="padding:10px 0"><strong style="color:${row.completed?'#ffb3a7':'var(--gold,#ffd85a)'}">${title}</strong><div style="font-size:12px;opacity:.8;margin:5px 0">${label}</div><p>${message}</p>${pending}${row.status==='awaiting_funded'?'<p>These cycles start when your account becomes funded.</p>':''}</article>`;
 }

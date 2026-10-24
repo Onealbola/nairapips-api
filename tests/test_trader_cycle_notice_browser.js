@@ -23,6 +23,9 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
   await page.evaluate(()=>{rows[0].paid=3;rows[0].remaining=0;rows[0].reserved=0;rows[0].completed=true;document.querySelector('main').innerHTML=renderPayouts()});
   await page.getByText('Payout cycles completed',{exact:true}).waitFor();
   assert(await page.getByText('No further payout is available under this purchase.',{exact:false}).count());
+  await page.evaluate(()=>{rows[0].limit=null;rows[0].paid=2;rows[0].remaining=null;rows[0].completed=false;tick()});
+  await page.getByText('2 payouts received',{exact:false}).waitFor();
+  assert(!(await page.locator('main').innerText()).includes('of null'));
   await page.evaluate(()=>{fail=true;tick()});
   await page.getByText('Payout cycle status is temporarily unavailable.',{exact:false}).waitFor();
   assert.equal(await page.getByText('Payout cycles completed',{exact:true}).count(),0);
