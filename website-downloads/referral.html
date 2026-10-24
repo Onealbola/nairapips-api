@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>NairaPips Referrals</title>
+<style>
+:root{--gold:#f7c843;--muted:#aaa;--green:#4ade80;--red:#f87171;--line:#2c230b}
+*{box-sizing:border-box}body{margin:0;background:#000;color:#fff;font-family:Arial,Helvetica,sans-serif}.wrap{max-width:1080px;margin:auto;padding:22px}.top{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:16px}.brand{font-size:20px;font-weight:1000}.brand span{color:var(--gold)}button{cursor:pointer}.back,.btn{border:1px solid #333;background:#111;color:#fff;border-radius:10px;padding:11px 14px;font-weight:900}.btn.gold{background:linear-gradient(180deg,#ffd968,#f7c843);color:#000;border:none}.hero,.panel{background:linear-gradient(145deg,#111,#050505);border:1px solid var(--line);border-radius:20px;padding:22px;margin-bottom:16px}.eyebrow{font-size:11px;letter-spacing:.14em;color:var(--gold);font-weight:900}.hero h1{font-size:clamp(34px,6vw,62px);line-height:.95;margin:9px 0}.muted{color:var(--muted)}.head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:13px}.head h2{margin:0;font-size:18px}.status{font-size:10px;font-weight:900;letter-spacing:.08em;padding:5px 9px;border-radius:999px;border:1px solid #604d12;color:var(--gold)}.status.ok{color:var(--green);border-color:#245b35}.status.bad{color:var(--red);border-color:#6b2525}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.stat{background:#080808;border:1px solid #222;border-radius:14px;padding:16px}.stat small{display:block;color:#999;font-size:10px;font-weight:900;letter-spacing:.1em}.stat strong{display:block;color:var(--gold);font-size:25px;margin-top:7px;word-break:break-word}.linkbox{margin-top:12px;border:1px solid #282828;background:#050505;padding:13px;border-radius:10px;color:var(--gold);font-weight:800;word-break:break-all}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.msg{margin-top:12px;padding:14px;border:1px dashed #333;border-radius:12px;text-align:center;color:#bbb}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border-bottom:1px solid #222;padding:11px 8px;text-align:left;font-size:13px}th{font-size:10px;color:var(--gold);letter-spacing:.08em}.note{font-size:12px;color:#999;margin-top:10px}.flash{padding:12px;border-radius:12px;background:rgba(247,200,67,.08);border:1px solid rgba(247,200,67,.25);margin-bottom:14px}.hidden{display:none!important}
+@media(max-width:760px){.grid{grid-template-columns:1fr}.wrap{padding:14px}.top{align-items:flex-start}.hero h1{font-size:42px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top"><div class="brand">NAIRA<span>PIPS</span> REFERRALS</div><button class="back" onclick="location.href='/dashboard/trader_clean.html'">← Trader Dashboard</button></div>
+
+  <section class="hero">
+    <div class="eyebrow">FRESH NP2 REFERRAL SYSTEM</div>
+    <h1>Share. Track. Earn.</h1>
+    <p class="muted">A separate referral ledger. A successful referred registration appears here without waiting for a purchase.</p>
+  </section>
+
+  <div id="flash" class="flash hidden"></div>
+
+  <section class="panel">
+    <div class="head"><h2>Your Referral Link</h2><span id="profileStatus" class="status">LOADING</span></div>
+    <div class="grid">
+      <div class="stat"><small>YOUR CODE</small><strong id="code">—</strong></div>
+      <div class="stat"><small>ONE-TIME FIRST PURCHASE COMMISSION</small><strong id="commission">—</strong></div>
+      <div class="stat"><small>BUYER DISCOUNT</small><strong id="discount">—</strong></div>
+    </div>
+    <div id="link" class="linkbox">Preparing your permanent referral link…</div>
+    <div class="actions">
+      <button id="copyLinkBtn" class="btn gold" onclick="copyLink()" disabled>Copy Link</button>
+      <button id="copyCodeBtn" class="btn" onclick="copyCode()" disabled>Copy Code</button>
+      <button id="openLinkBtn" class="btn" onclick="openLink()" disabled>Open Registration Link</button>
+    </div>
+    <div class="note">Your code is now short and easy to say over the phone — usually your first name plus 2 digits. Any older NP2 link already shared still works as an alias.</div>
+  </section>
+
+  <section class="panel">
+    <div class="head"><h2>Referral Activity</h2><span id="activityStatus" class="status">WAITING</span></div>
+    <div class="grid">
+      <div class="stat"><small>REFERRED TRADERS</small><strong id="registered">0</strong></div>
+      <div class="stat"><small>QUALIFIED REFERRALS</small><strong id="buyers">0</strong></div>
+      <div class="stat"><small>APPROVED COMMISSION</small><strong id="activityApproved">₦0</strong></div>
+    </div>
+    <div id="activityBody" class="msg">Loading fresh referral activity…</div>
+    <div class="actions"><button class="btn" onclick="loadActivity(true)">Refresh Activity</button></div>
+    <div class="note">Referral rewards are earned once per referred trader. Later purchase activity is private and is not displayed to the referrer.</div>
+  </section>
+
+  <section class="panel">
+    <div class="head"><h2>Referral Earnings</h2><span class="status ok">FRESH LEDGER</span></div>
+    <div class="grid">
+      <div class="stat"><small>APPROVED COMMISSION</small><strong id="approved">₦0</strong></div>
+      <div class="stat"><small>PAID COMMISSION</small><strong id="paid">₦0</strong></div>
+      <div class="stat"><small>SYSTEM</small><strong style="font-size:18px">Independent</strong></div>
+    </div>
+  </section>
+
+  <section class="panel" id="payoutPanel">
+    <div class="head"><h2>Referral Withdrawal</h2><span id="payoutStatus" class="status">LOADING</span></div>
+    <div class="grid">
+      <div class="stat"><small>AVAILABLE TO WITHDRAW</small><strong id="withdrawAvailable">₦0</strong></div>
+      <div class="stat"><small>MINIMUM WITHDRAWAL</small><strong>₦5,000</strong></div>
+      <div class="stat"><small>AMOUNT NEEDED</small><strong id="withdrawNeeded">₦5,000</strong></div>
+    </div>
+    <div id="payoutMessage" class="msg">Checking withdrawal eligibility…</div>
+    <div id="payoutForm" class="hidden">
+      <div class="grid" style="margin-top:12px">
+        <div class="stat"><small>WITHDRAWAL AMOUNT</small><input id="withdrawAmount" type="number" min="5000" step="0.01" placeholder="5000" style="width:100%;margin-top:8px;padding:11px;border-radius:9px;border:1px solid #333;background:#050505;color:#fff"></div>
+        <div class="stat"><small>PAYMENT METHOD</small><select id="withdrawMethod" style="width:100%;margin-top:8px;padding:11px;border-radius:9px;border:1px solid #333;background:#050505;color:#fff"><option>Bank Transfer</option></select></div>
+        <div class="stat"><small>BANK / WALLET NAME</small><input id="withdrawBank" placeholder="Bank name" style="width:100%;margin-top:8px;padding:11px;border-radius:9px;border:1px solid #333;background:#050505;color:#fff"></div>
+      </div>
+      <div class="grid" style="margin-top:12px">
+        <div class="stat"><small>ACCOUNT NUMBER</small><input id="withdrawAccountNumber" placeholder="Account number" style="width:100%;margin-top:8px;padding:11px;border-radius:9px;border:1px solid #333;background:#050505;color:#fff"></div>
+        <div class="stat"><small>ACCOUNT NAME</small><input id="withdrawAccountName" placeholder="Account name" style="width:100%;margin-top:8px;padding:11px;border-radius:9px;border:1px solid #333;background:#050505;color:#fff"></div>
+        <div class="stat"><small>RULE</small><strong style="font-size:17px">₦5,000 minimum</strong></div>
+      </div>
+      <div class="actions"><button id="withdrawBtn" class="btn gold" onclick="submitWithdrawal()">Request Withdrawal</button></div>
+    </div>
+    <div class="note">Referral withdrawal is separate from trader trading payouts. Requests below ₦5,000 are blocked by the page, backend and database.</div>
+  </section>
+
+</div>
+<script>
+const API='https://nairapips-api.onrender.com';
+let trader=null, token='', profile=null, referralLink='';
+function session(){try{return JSON.parse(sessionStorage.getItem('np_trader')||'null')}catch(e){return null}}
+function authHeaders(){return token?{Authorization:'Bearer '+token}:{}}
+function esc(s){return String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
+function money(v){return '₦'+Number(v||0).toLocaleString('en-NG',{maximumFractionDigits:2})}
+function flash(msg,bad=false){const e=document.getElementById('flash');e.textContent=msg||'';e.className='flash'+(msg?'':' hidden')+(bad?' bad':'')}
+async function request(path,opts={},ms=8000){const c=new AbortController();const timer=setTimeout(()=>c.abort(),ms);try{const r=await fetch(API+path,{...opts,headers:{...(opts.headers||{}),...authHeaders()},signal:c.signal,cache:'no-store'});const d=await r.json().catch(()=>({success:false,error:'Invalid server response'}));if(!r.ok||d.success===false)throw new Error(d.error||d.message||'Request failed');return d.data||d}catch(e){if(e?.name==='AbortError')throw new Error('Referral service timed out. Try again.');throw e}finally{clearTimeout(timer)}}
+function setProfileStatus(ok,text){const s=document.getElementById('profileStatus');s.textContent=text;s.className='status '+(ok?'ok':'bad')}
+function enableLinkButtons(on){['copyLinkBtn','copyCodeBtn','openLinkBtn'].forEach(id=>document.getElementById(id).disabled=!on)}
+async function loadProfile(){setProfileStatus(false,'LOADING');try{const d=await request('/np2_referral/profile?trader_id='+encodeURIComponent(trader.id));profile=d.profile||d;referralLink=d.referral_link||'';document.getElementById('code').textContent=d.code||profile.code||'—';document.getElementById('commission').textContent=Number(d.commission_percent??profile.commission_percent??10)+'%';document.getElementById('discount').textContent=Number(d.buyer_discount_percent??profile.buyer_discount_percent??0)+'%';document.getElementById('link').textContent=referralLink||'Referral link unavailable';enableLinkButtons(Boolean(referralLink));setProfileStatus(true,'READY');loadActivity(false);loadPayoutSummary()}catch(e){setProfileStatus(false,'NOT READY');document.getElementById('link').textContent=e.message;document.getElementById('activityBody').innerHTML='<span class="bad">'+esc(e.message)+'</span>';flash(e.message,true)}}
+function renderActivity(d){
+  document.getElementById('registered').textContent=d.registered_count||0;
+  document.getElementById('buyers').textContent=d.buyer_count||0;
+  document.getElementById('activityApproved').textContent=money(d.approved_commission||0);
+  document.getElementById('approved').textContent=money(d.approved_commission||0);
+  document.getElementById('paid').textContent=money(d.paid_commission||0);
+  const rows=Array.isArray(d.referrals)?d.referrals:[];
+  const body=document.getElementById('activityBody');
+  if(!rows.length){body.textContent='No fresh referred registration yet.';return}
+  body.innerHTML='<div style="overflow:auto"><table><thead><tr><th>REFERRED TRADER</th><th>REGISTERED</th><th>REFERRAL STATUS</th><th>COMMISSION</th></tr></thead><tbody>'+
+    rows.map(x=>{
+      const amount=Number(x.commission_amount||0);
+      const cstatus=String(x.commission_status||'').toLowerCase();
+      const referralStatus=amount>0?(cstatus==='paid'?'Commission Paid':'Reward Earned'):'Registered';
+      const commission=amount>0?money(amount):'—';
+      return '<tr><td><b>'+esc(x.name||'Referred trader')+'</b><br><span class="muted">'+esc(x.email||'')+'</span></td><td>'+esc(x.registered_at||'—')+'</td><td>'+esc(referralStatus)+'</td><td>'+commission+'</td></tr>';
+    }).join('')+'</tbody></table></div>'
+}
+async function loadActivity(manual=false){if(!profile){if(manual)flash('Referral profile is still loading.',true);return}const s=document.getElementById('activityStatus');s.textContent='CHECKING';s.className='status';try{const d=await request('/np2_referral/activity?trader_id='+encodeURIComponent(trader.id),8000);renderActivity(d);s.textContent='LIVE';s.className='status ok';if(manual){flash('Referral activity refreshed.');loadPayoutSummary()}}catch(e){s.textContent='RETRY';s.className='status bad';document.getElementById('activityBody').innerHTML='<span class="bad">'+esc(e.message)+'</span>';if(manual)flash(e.message,true)}}
+function copyText(v){navigator.clipboard?.writeText(String(v||''));flash('Copied.');setTimeout(()=>flash(''),1200)}
+function copyLink(){copyText(referralLink)}function copyCode(){copyText(profile?.code||'')}function openLink(){if(referralLink)window.open(referralLink,'_blank','noopener')}
+
+async function loadPayoutSummary(){
+  const status=document.getElementById('payoutStatus');
+  if(!profile)return;
+  status.textContent='CHECKING';status.className='status';
+  try{
+    const d=await request('/np2_referral/payout_summary?trader_id='+encodeURIComponent(trader.id));
+    const available=Number(d.available||0), minimum=Number(d.minimum_withdrawal||5000);
+    const needed=Math.max(Number(d.amount_needed??(minimum-available)),0);
+    document.getElementById('withdrawAvailable').textContent=money(available);
+    document.getElementById('withdrawNeeded').textContent=money(needed);
+    const form=document.getElementById('payoutForm'), msg=document.getElementById('payoutMessage');
+    const open=d.open_request||null;
+    if(open){
+      form.classList.add('hidden');
+      msg.innerHTML='Withdrawal request <b>'+esc(open.status||'pending')+'</b>: '+money(open.amount||0)+'. NairaPips is reviewing it.';
+      status.textContent='UNDER REVIEW';status.className='status';return;
+    }
+    if(available<minimum){
+      form.classList.add('hidden');
+      msg.textContent='Minimum referral withdrawal is ₦5,000. You need '+money(needed)+' more before you can withdraw.';
+      status.textContent='LOCKED';status.className='status';return;
+    }
+    form.classList.remove('hidden');
+    msg.textContent='You are eligible to request a referral withdrawal.';
+    const amount=document.getElementById('withdrawAmount');
+    amount.min=String(minimum);amount.max=String(available);
+    if(!amount.value||Number(amount.value)<minimum||Number(amount.value)>available)amount.value=available.toFixed(2);
+    status.textContent='ELIGIBLE';status.className='status ok';
+  }catch(e){
+    status.textContent='RETRY';status.className='status bad';
+    document.getElementById('payoutMessage').innerHTML='<span class="bad">'+esc(e.message)+'</span>';
+  }
+}
+async function submitWithdrawal(){
+  const btn=document.getElementById('withdrawBtn');
+  const amount=Number(document.getElementById('withdrawAmount').value||0);
+  if(amount<5000){flash('Minimum referral withdrawal is ₦5,000.',true);return}
+  const bank=document.getElementById('withdrawBank').value.trim();
+  const number=document.getElementById('withdrawAccountNumber').value.trim();
+  const name=document.getElementById('withdrawAccountName').value.trim();
+  if(!bank||!number||!name){flash('Enter bank name, account number and account name.',true);return}
+  btn.disabled=true;btn.textContent='Submitting...';
+  try{
+    await request('/np2_referral/payout_request',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        trader_id:trader.id,amount,
+        payment_method:document.getElementById('withdrawMethod').value,
+        bank_name:bank,account_number:number,account_name:name
+      })
+    });
+    flash('Referral withdrawal request submitted for review.');
+    await loadPayoutSummary();
+  }catch(e){flash(e.message,true)}
+  finally{btn.disabled=false;btn.textContent='Request Withdrawal'}
+}
+
+(function boot(){const s=session();trader=s?.trader||null;token=s?.token||localStorage.getItem('nairapips_trader_auth_token')||'';if(!trader?.id||!token){location.replace('/dashboard/trader_clean.html');return}loadProfile()})();
+</script>
+</body>
+</html>

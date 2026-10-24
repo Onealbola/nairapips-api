@@ -23,3 +23,7 @@ def register_panel_delivery(app, root=None):
     @app.get('/dashboard/trader_clean.html')
     def hosted_trader_login():
         return deliver('trader_clean.html')
+
+    @app.get('/dashboard/referral.html')
+    def hosted_referral_portal():
+        return deliver('referral.html')

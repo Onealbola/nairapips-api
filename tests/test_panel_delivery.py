@@ -19,6 +19,15 @@ class PanelDeliveryTests(unittest.TestCase):
     def test_related_trader_preview_and_dashboard_links_resolve(self):
         for path in ['/dashboard/','/dashboard/trader_clean.html']:
             r=self.client.get(path);self.assertEqual(r.status_code,200);self.assertEqual(r.data,Path('website-downloads/trader_clean.html').read_bytes());r.close()
+    def test_referral_portal_is_available_on_the_dashboard_host(self):
+        r=self.client.get('/dashboard/referral.html')
+        self.assertEqual(r.status_code,200)
+        self.assertEqual(r.data,Path('website-downloads/referral.html').read_bytes())
+        self.assertIn('no-store',r.headers['Cache-Control'])
+        self.assertIn(b'/np2_referral/profile',r.data)
+        self.assertIn(b"Authorization:'Bearer '+token",r.data)
+        self.assertNotIn('Set-Cookie',r.headers)
+        r.close()
     def test_restore_archive_has_exact_filename_content_and_no_other_paths(self):
         with zipfile.ZipFile('website-downloads/admin-restore.zip') as z:
             self.assertEqual(z.namelist(),['admin/admin_clean.html'])
