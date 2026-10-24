@@ -1,0 +1,17 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const trader=fs.readFileSync('website-downloads/trader_clean.html','utf8');
+const begin=trader.indexOf('function npAdminOpenerOrigin(){'),end=trader.indexOf('function npAdminShellTimeoutGuard()',begin);
+let handler,received=0;const opener={};
+const ctx={URLSearchParams,console,SESSION:{},npAdminShellMode:()=>true,window:{location:{origin:'https://nairapips.com',search:'?admin_shell=1&handoff=nonce&admin_origin=https%3A%2F%2Fnairapips-api.onrender.com'},opener,addEventListener:(name,f)=>handler=f,__npHydrateAdminShellPayload:()=>{received++;return true;}}};
+vm.createContext(ctx);vm.runInContext(trader.slice(begin,end),ctx);
+const payload={type:'NAIRAPIPS_ADMIN_VIEW_BOOTSTRAP',handoff_id:'nonce'};
+handler({origin:'https://evil.example',source:opener,data:payload});
+handler({origin:'https://nairapips-api.onrender.com',source:{},data:payload});
+handler({origin:'https://nairapips-api.onrender.com',source:opener,data:{...payload,handoff_id:'wrong'}});
+assert.equal(received,0);
+handler({origin:'https://nairapips-api.onrender.com',source:opener,data:payload});assert.equal(received,1);
+delete ctx.window.__npTrustedAdminOrigin;ctx.window.location.search='?admin_origin=https://evil.example';assert.equal(ctx.npAdminOpenerOrigin(),'https://nairapips.com');
+const admin=fs.readFileSync('website-downloads/admin_clean.html','utf8');const a=admin.indexOf('window.viewTraderDashboard = async function'),b=admin.indexOf('\n};',a);const view=admin.slice(a,b);
+assert(view.includes("const traderOrigin = 'https://nairapips.com'"));assert(!view.includes("q.set('handoff'"));assert(!view.includes('child.location.replace'));
+for(const h of [admin,trader,fs.readFileSync('website-downloads/admin_clean_cpanel.html','utf8')])for(const m of h.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g))new vm.Script(m[1]);
+console.log('Branded admin preview accepts only exact trusted opener, origin and handoff; tokens stay out of preview URLs');

@@ -1523,8 +1523,10 @@ window.viewTraderDashboard = async function(traderId, focusAccountId=''){
   if(!t){ toast('Trader not found','err'); return; }
 
   const handoffId = 'av_' + Date.now() + '_' + Math.random().toString(36).slice(2,10);
-  const shellUrl = window.location.origin
+  const traderOrigin = 'https://nairapips.com';
+  const shellUrl = traderOrigin
     + '/dashboard/trader_clean.html?admin_shell=1&handoff=' + encodeURIComponent(handoffId)
+    + '&admin_origin=' + encodeURIComponent(window.location.origin)
     + '&v=' + Date.now();
 
   // Open the real trader page immediately so Chrome never blocks it.
@@ -1538,8 +1540,8 @@ window.viewTraderDashboard = async function(traderId, focusAccountId=''){
   let sendTimer = null;
 
   const onMessage = (event)=>{
-    if(event.origin !== window.location.origin) return;
-    if(event.source !== child) return;
+    if(event.origin !== traderOrigin) return;
+    if(event.source !== child || event.data?.handoff_id !== handoffId) return;
     if(event.data?.type === 'NAIRAPIPS_ADMIN_VIEW_READY'){
       // The child is ready; payload will be sent below when available.
       return;
@@ -1651,6 +1653,7 @@ window.viewTraderDashboard = async function(traderId, focusAccountId=''){
 
     let activeMessage = {
       type:'NAIRAPIPS_ADMIN_VIEW_BOOTSTRAP',
+      handoff_id:handoffId,
       traderId:exactId,
       trader_id:exactId,
       lookup:exactLookup,
@@ -1677,7 +1680,7 @@ window.viewTraderDashboard = async function(traderId, focusAccountId=''){
         if(sendTimer) clearInterval(sendTimer);
         return;
       }
-      try{ child.postMessage(activeMessage, window.location.origin); }catch(_e){}
+      try{ child.postMessage(activeMessage, traderOrigin); }catch(_e){}
     };
 
     // Open from Admin memory now, normally within one second.
@@ -1727,7 +1730,7 @@ window.viewTraderDashboard = async function(traderId, focusAccountId=''){
             expiresAt: Date.now() + 120000
           }));
         }catch(_e){}
-        try{ child.postMessage(activeMessage,window.location.origin); }catch(_e){}
+        try{ child.postMessage(activeMessage,traderOrigin); }catch(_e){}
       }
     })();
 
@@ -1737,18 +1740,7 @@ window.viewTraderDashboard = async function(traderId, focusAccountId=''){
         sendTimer = null;
       }
       if(!acked && !child.closed){
-        const q = new URLSearchParams({
-          admin_view:'1',
-          trader_id:exactId,
-          lookup:exactLookup,
-          token,
-          auth_token:token,
-          fallback:'1',
-          focus_account_id:String(focusAccountId||'').trim(),
-          v:String(Date.now())
-        });
-        q.set('handoff', handoffId);
-        child.location.replace(window.location.origin + '/dashboard/trader_clean.html?' + q.toString());
+        toast('Dashboard connection is delayed. Refresh admin and try View Dashboard again.','err');
       }
     }, 15000);
 
@@ -1759,8 +1751,9 @@ window.viewTraderDashboard = async function(traderId, focusAccountId=''){
     try{
       child.postMessage({
         type:'NAIRAPIPS_ADMIN_VIEW_ERROR',
+        handoff_id:handoffId,
         message:error.message || String(error)
-      },window.location.origin);
+      },traderOrigin);
     }catch(_e){}
     toast(error.message || 'Could not open trader dashboard','err');
   }

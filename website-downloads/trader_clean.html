@@ -2613,12 +2613,20 @@ function npAdminShellMode(){
   }
 }
 
+function npAdminOpenerOrigin(){
+  if(window.__npTrustedAdminOrigin)return window.__npTrustedAdminOrigin;
+  const candidate=new URLSearchParams(window.location.search||'').get('admin_origin');
+  const origin=['https://nairapips-api.onrender.com','https://nairapips.com','https://www.nairapips.com'].includes(candidate)?candidate:window.location.origin;
+  if(candidate===origin)window.__npTrustedAdminOrigin=origin;
+  return origin;
+}
 function npRenderAdminShell(){
   SESSION.__adminViewStarting = true;
   npRenderAdminOpeningScreen({lookup:'Secure trader session'});
 
   const params = new URLSearchParams(window.location.search || '');
   const handoffId = String(params.get('handoff') || '').trim();
+  window.__npAdminHandoffId=handoffId;
   let opened = false;
   let readyTimer = null;
   let handoffTimer = null;
@@ -2631,8 +2639,8 @@ function npRenderAdminShell(){
     try{
       if(window.opener && window.opener !== window){
         window.opener.postMessage(
-          {type:'NAIRAPIPS_ADMIN_VIEW_OPENED',trader_id:traderId},
-          window.location.origin
+          {type:'NAIRAPIPS_ADMIN_VIEW_OPENED',trader_id:traderId,handoff_id:handoffId},
+          npAdminOpenerOrigin()
         );
       }
     }catch(_e){}
@@ -2705,7 +2713,7 @@ function npRenderAdminShell(){
       if(window.opener && window.opener !== window){
         window.opener.postMessage(
           {type:'NAIRAPIPS_ADMIN_VIEW_READY',handoff_id:handoffId},
-          window.location.origin
+          npAdminOpenerOrigin()
         );
       }
     }catch(_e){}
@@ -2721,7 +2729,9 @@ function npRenderAdminShell(){
 }
 
 window.addEventListener('message',(event)=>{
-  if(event.origin !== window.location.origin) return;
+  if(event.origin !== npAdminOpenerOrigin() || event.source !== window.opener) return;
+  const expectedHandoff=window.__npAdminHandoffId||new URLSearchParams(window.location.search||'').get('handoff');
+  if(expectedHandoff && event.data?.handoff_id !== expectedHandoff)return;
   const payload = event.data || {};
 
   if(payload.type === 'NAIRAPIPS_ADMIN_VIEW_ERROR'){
@@ -2782,7 +2792,7 @@ window.addEventListener('message',(event)=>{
 
     try{
       event.source?.postMessage(
-        {type:'NAIRAPIPS_ADMIN_VIEW_OPENED',trader_id:traderId},
+        {type:'NAIRAPIPS_ADMIN_VIEW_OPENED',trader_id:traderId,handoff_id:expectedHandoff},
         event.origin
       );
     }catch(_e){}

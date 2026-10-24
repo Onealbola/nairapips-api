@@ -1,6 +1,6 @@
 const fs=require('fs'),vm=require('vm'),assert=require('assert');
 const html=fs.readFileSync(process.argv[2],'utf8');
-const begin=html.indexOf('function npRenderAdminShell(){');
+const begin=html.indexOf('function npAdminOpenerOrigin(){');
 const end=html.indexOf("window.addEventListener('message'",begin);
 assert(begin>=0&&end>begin);
 function check(stored){
