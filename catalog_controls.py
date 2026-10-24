@@ -58,9 +58,9 @@ def validated_plan(current, changes):
         if name in changes:
             result[name] = number(changes[name], name, Decimal(str(lo)), Decimal(str(hi)))
     if 'payout_split' in changes:
-        result['payout_split'] = number(changes['payout_split'], 'payout_split', 0, 100)
-        if result['payout_split'] not in (60, 70):
-            raise ValueError('Supported trader profit shares are 60% and 70%')
+        result['payout_split'] = number(changes['payout_split'], 'payout_split', Decimal('0.01'), 100)
+        if result['payout_split'] not in (50,60,70):
+            raise ValueError('Choose a trader profit share of 50%, 60% or 70%')
     if 'drawdown_type' in changes and str(changes['drawdown_type']).upper() != 'STATIC':
         raise ValueError('Only static drawdown is production verified; trailing cannot be released yet')
     if 'drawdown_type' in result:

@@ -256,27 +256,20 @@ def _staff_db():
 DEFAULT_PAYOUT_PROFIT_SHARE_PERCENT = 60.0
 FUNDED_MAX_GROSS_PROFIT_PERCENT = 15.0  # absolute payout-liability ceiling; independent of the plan's profit split
 
-# V187 PRODUCT RULE FIREWALL — NairaPips only recognises the commercial
-# payout shares that exist in the business. 80% (and browser-supplied values)
-# must never create a payout liability.
-_NP_ALLOWED_PAYOUT_SPLITS_V187 = {60.0, 70.0}
-
+# Admin-configured trader share. Only trusted saved plan/purchase values are
+# passed here; request payloads cannot choose their own payout percentage.
 def _effective_payout_split(*values):
-    """Return the first recognised NairaPips payout split; legacy-safe default 60.
-
-    Product rules are deliberately closed rather than accepting arbitrary 0..100
-    values. This prevents stale/foreign 80% values from becoming financial rules.
-    """
+    """Use the first valid saved percentage; preserve the legacy missing-value default."""
+    import math
     for raw in values:
-        if raw in (None, ""):
+        if raw is None or raw == "" or isinstance(raw, bool):
             continue
         try:
             value = float(str(raw).replace("%", "").strip())
-        except Exception:
+        except (ValueError, TypeError):
             continue
-        if value in _NP_ALLOWED_PAYOUT_SPLITS_V187:
+        if math.isfinite(value) and value in (50, 60, 70):
             return value
-        print("V187 PAYOUT SPLIT REJECTED:", raw, "allowed=60,70", flush=True)
     return DEFAULT_PAYOUT_PROFIT_SHARE_PERCENT
 
 from package_account_rules import has_package_binding as _np_has_package_binding_v227, load_package_rules as _np_load_package_rules_v227, PackageContractReader as _NPPackageContractReaderV227
