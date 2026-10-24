@@ -41,9 +41,9 @@
   <section class="panel">
     <div class="head"><h2>Referral Activity</h2><span id="activityStatus" class="status">WAITING</span></div>
     <div class="grid">
-      <div class="stat"><small>REFERRED TRADERS</small><strong id="registered">0</strong></div>
-      <div class="stat"><small>QUALIFIED REFERRALS</small><strong id="buyers">0</strong></div>
-      <div class="stat"><small>APPROVED COMMISSION</small><strong id="activityApproved">₦0</strong></div>
+      <div class="stat"><small>REFERRED TRADERS</small><strong id="registered">—</strong></div>
+      <div class="stat"><small>QUALIFIED REFERRALS</small><strong id="buyers">—</strong></div>
+      <div class="stat"><small>APPROVED COMMISSION</small><strong id="activityApproved">—</strong></div>
     </div>
     <div id="activityBody" class="msg">Loading fresh referral activity…</div>
     <div class="actions"><button class="btn" onclick="loadActivity(true)">Refresh Activity</button></div>
@@ -53,8 +53,8 @@
   <section class="panel">
     <div class="head"><h2>Referral Earnings</h2><span class="status ok">FRESH LEDGER</span></div>
     <div class="grid">
-      <div class="stat"><small>APPROVED COMMISSION</small><strong id="approved">₦0</strong></div>
-      <div class="stat"><small>PAID COMMISSION</small><strong id="paid">₦0</strong></div>
+      <div class="stat"><small>APPROVED COMMISSION</small><strong id="approved">—</strong></div>
+      <div class="stat"><small>PAID COMMISSION</small><strong id="paid">—</strong></div>
       <div class="stat"><small>SYSTEM</small><strong style="font-size:18px">Independent</strong></div>
     </div>
   </section>
@@ -86,7 +86,7 @@
 </div>
 <script>
 const API='https://nairapips-api.onrender.com';
-let trader=null, token='', profile=null, referralLink='';
+let trader=null, token='', profile=null, referralLink='', activityLoading=false;
 function session(){try{return JSON.parse(sessionStorage.getItem('np_trader')||'null')}catch(e){return null}}
 function authHeaders(){return token?{Authorization:'Bearer '+token}:{}}
 function esc(s){return String(s??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));}
@@ -114,7 +114,7 @@ function renderActivity(d){
       return '<tr><td><b>'+esc(x.name||'Referred trader')+'</b><br><span class="muted">'+esc(x.email||'')+'</span></td><td>'+esc(x.registered_at||'—')+'</td><td>'+esc(referralStatus)+'</td><td>'+commission+'</td></tr>';
     }).join('')+'</tbody></table></div>'
 }
-async function loadActivity(manual=false){if(!profile){if(manual)flash('Referral profile is still loading.',true);return}const s=document.getElementById('activityStatus');s.textContent='CHECKING';s.className='status';try{const d=await request('/np2_referral/activity?trader_id='+encodeURIComponent(trader.id),8000);renderActivity(d);s.textContent='LIVE';s.className='status ok';if(manual){flash('Referral activity refreshed.');loadPayoutSummary()}}catch(e){s.textContent='RETRY';s.className='status bad';document.getElementById('activityBody').innerHTML='<span class="bad">'+esc(e.message)+'</span>';if(manual)flash(e.message,true)}}
+async function loadActivity(manual=false){if(activityLoading)return;if(!profile){if(manual)flash('Referral profile is still loading.',true);return}activityLoading=true;const s=document.getElementById('activityStatus');s.textContent='CHECKING';s.className='status';try{const d=await request('/np2_referral/activity?trader_id='+encodeURIComponent(trader.id),{},20000);renderActivity(d);s.textContent='LIVE';s.className='status ok';if(manual){flash('Referral activity refreshed.');loadPayoutSummary()}}catch(e){s.textContent='RETRY';s.className='status bad';['registered','buyers','activityApproved','approved','paid'].forEach(id=>document.getElementById(id).textContent='Unavailable');document.getElementById('activityBody').innerHTML='<span class="bad">'+esc(e.message)+'</span>';if(manual)flash(e.message,true)}finally{activityLoading=false}}
 function copyText(v){navigator.clipboard?.writeText(String(v||''));flash('Copied.');setTimeout(()=>flash(''),1200)}
 function copyLink(){copyText(referralLink)}function copyCode(){copyText(profile?.code||'')}function openLink(){if(referralLink)window.open(referralLink,'_blank','noopener')}
 

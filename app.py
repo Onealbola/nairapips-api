@@ -46379,23 +46379,18 @@ def np2_referral_activity():
     try:
         profile = _np2_ref_ensure_profile(trader)
         pid = str(profile.get("id") or "")
-        db = _np2_ref_db()
 
-        registrations = (
-            db.table("np2_referral_registrations").select("*")
-            .eq("profile_id", pid).order("registered_at", desc=True)
-            .limit(500).execute().data or []
-        )
-        purchases = (
-            db.table("np2_referral_purchases").select("*")
-            .eq("profile_id", pid).order("created_at", desc=True)
-            .limit(1000).execute().data or []
-        )
-        commissions = (
-            db.table("np2_referral_commissions").select("*")
-            .eq("profile_id", pid).order("created_at", desc=True)
-            .limit(1000).execute().data or []
-        )
+        # Independent bounded REST reads avoid the shared SDK transport during
+        # concurrent dashboard refreshes. Complete pages or an error, never partial totals.
+        registrations = _np_limited_cycle_guard.rows(
+            "np2_referral_registrations", {"select": "*", "profile_id": "eq." + pid})
+        purchases = _np_limited_cycle_guard.rows(
+            "np2_referral_purchases", {"select": "*", "profile_id": "eq." + pid})
+        commissions = _np_limited_cycle_guard.rows(
+            "np2_referral_commissions", {"select": "*", "profile_id": "eq." + pid})
+        registrations.sort(key=lambda r: str(r.get("registered_at") or ""), reverse=True)
+        purchases.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+        commissions.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
 
         purchases_by_registration = {}
         for p in purchases:
@@ -46454,7 +46449,7 @@ def np2_referral_activity():
         })
     except Exception as exc:
         print("NP2 REFERRAL ACTIVITY ERROR:", repr(exc), flush=True)
-        return _np_fail("Referral activity could not load: " + str(exc), 503)
+        return _np_fail("Referral activity is temporarily unavailable. Please refresh shortly; your rewards have not been changed.", 503)
 
 
 # -------- Registration interception: stage FIRST, then run the existing proven registration route. --------
