@@ -13818,7 +13818,7 @@ function renderPayouts(){
           <div class="badge">FUNDED PAYOUT CYCLE</div>
           <div style="font-size:18px;font-weight:900;margin-top:8px">PAID → Fresh Funded MT5</div>
           <div class="text-sm text-gray-400" style="margin-top:6px;max-width:760px;line-height:1.55">
-            NairaPips does not recycle the paid Funded MT5. After PAID, the old cycle closes and the next cycle starts only on a fresh Funded MT5. For capped purchases, another cycle starts only while purchased cycles remain. Completed purchases receive no further funded cycle.
+            Business-wide funded profit cap: 15% per cycle. Trader payout uses the plan’s profit split. NairaPips does not recycle the paid Funded MT5. After PAID, the old cycle closes and the next cycle starts only on a fresh Funded MT5. For capped purchases, another cycle starts only while purchased cycles remain. Completed purchases receive no further funded cycle.
           </div>
         </div>
         <button class="btn btn-sm btn-gold" onclick="loadModuleData('payouts').then(()=>renderPayouts()).catch(e=>toast('Refresh failed: '+e.message,'err'))">Refresh Payouts</button>
@@ -13849,7 +13849,7 @@ function renderPayouts(){
         return `<tr style="${isPending?'background:rgba(239,68,68,.045);':''}">
         <td><div style="font-weight:900">${esc(traderName)}</div>${email?`<div class="text-xs text-gray-400">${esc(email)}</div>`:''}${phone?`<div class="text-xs text-gray-500">${esc(phone)}</div>`:''}</td>
         <td><div class="mono" style="font-weight:900;color:var(--gold)">${esc(p.mt5_login||'—')}</div>${p.account_size?`<div class="text-xs text-gray-400">${esc(money(p.account_size))}</div>`:''}</td>
-        <td><b style="color:var(--gold);font-size:16px">${esc(money(p.amount))}</b>${p.verified_profit?`<div class="text-xs text-gray-400">Verified profit: ${esc(money(p.verified_profit))}</div>`:''}</td>
+        <td><b style="color:var(--gold);font-size:16px">${esc(money(p.amount))}</b>${Number(p.amount)>Number(p.start_balance||p.account_size||0)*0.15*Number(p.payout_split||60)/100&&!p.paid_at&&String(p.status).toLowerCase()!=='paid'?'<div class="text-xs" style="color:#fca5a5;font-weight:800">ABOVE 15% PROFIT CAP — payment blocked</div>':''}${p.verified_profit?`<div class="text-xs text-gray-400">Verified profit: ${esc(money(p.verified_profit))}</div>`:''}</td>
         <td><div style="font-weight:900;color:#fff">${esc(method)}</div><div style="color:#f5d061;font-weight:800;margin-top:3px">${esc(bank)}</div><div class="mono" style="color:#fff;margin-top:2px">${esc(accountNumber)}</div><div class="text-xs text-gray-400">${esc(accountName)}</div></td>
         <td>${npCyclePayoutCell(p)}</td>
         <td>${awaitingVerification?'<span class="tag tag-gold">AWAITING BALANCE VERIFICATION</span>':isPending?'<span class="tag tag-red">ACTION REQUIRED</span>':tag(st)||`<span class="tag">${esc(st.toUpperCase())}</span>`}</td>

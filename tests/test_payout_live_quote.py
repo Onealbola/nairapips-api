@@ -78,6 +78,11 @@ class PayoutTests(unittest.TestCase):
     def test_live_profit_replaces_frozen_assignment_balance(self):
         self.assertEqual(self.quote()['available_payout'],120)
         self.assertEqual(self.a['current_equity'],1000)
+    def test_business_fifteen_percent_caps_ajayi_quote(self):
+        self.env['FUNDED_MAX_GROSS_PROFIT_PERCENT']=15
+        self.a['start_balance']=500000
+        quote=self.quote(dict(self.snap,equity=617395.89,balance=617395.89))
+        self.assertTrue(quote['verified']);self.assertEqual(quote['available_payout'],45000)
     def test_exact_identity_and_login_must_match(self):
         for k in ('trader_account_id','trader_id','mt5_login'):
             snap=dict(self.snap);snap[k]='other'

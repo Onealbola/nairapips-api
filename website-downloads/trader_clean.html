@@ -9913,7 +9913,7 @@ function renderPayouts(){
 
     <div class="grid g-32 mb-4">
       <div class="card">
-        <div class="card-h"><div class="card-title">Request Payout</div></div>
+        <div class="card-h"><div class="card-title">Request Payout</div></div><p style="font-size:12px;color:var(--gold);margin-bottom:12px">Funded profit is capped at 15% of starting capital per cycle. Your plan’s profit split applies to that capped profit.</p>
         ${openRequest?`
           <div style="padding:22px;text-align:center;background:rgba(234,179,8,.07);border:1px solid rgba(234,179,8,.35);border-radius:12px">
             <div style="font-size:34px;margin-bottom:8px">${['approved','processing','payment_processing'].includes(ps.openStatus)?'✅':'⏳'}</div>

@@ -115,7 +115,7 @@ class LimitedCycleSafety:
             self.release(claim)
             raise
 
-    def check_amount(self, claim, value, quote=None, gross_cap_percent=50):
+    def check_amount(self, claim, value, quote=None, gross_cap_percent=15):
         if not claim:return
         p=claim['purchase'];n=amount(value)
         if n<=0 or n!=n.quantize(Decimal('.01')):raise CycleBlocked('Payout amount must be positive with at most two decimals.')

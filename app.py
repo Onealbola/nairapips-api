@@ -254,7 +254,7 @@ def _staff_db():
 # Profit split is NOT globally hard-coded. Each Challenge Plan may choose its own
 # trader payout percentage. 60 is only a legacy fallback when no saved value exists.
 DEFAULT_PAYOUT_PROFIT_SHARE_PERCENT = 60.0
-FUNDED_MAX_GROSS_PROFIT_PERCENT = 50.0  # absolute payout-liability ceiling; independent of the plan's profit split
+FUNDED_MAX_GROSS_PROFIT_PERCENT = 15.0  # absolute payout-liability ceiling; independent of the plan's profit split
 
 # V187 PRODUCT RULE FIREWALL — NairaPips only recognises the commercial
 # payout shares that exist in the business. 80% (and browser-supplied values)
@@ -13920,7 +13920,7 @@ Rewarding Nigerian Traders. Changing Trading Stories.""",
 
 FUNDED_CYCLE_TRADER_SHARE_PERCENT = 60
 FUNDED_CYCLE_NAIRAPIPS_SHARE_PERCENT = 40
-FUNDED_CYCLE_PROFIT_CAP_PERCENT = 50
+FUNDED_CYCLE_PROFIT_CAP_PERCENT = 15
 FUNDED_CYCLE_MARKER_PREFIX = "FUNDED_CYCLE_RETURNED"
 
 
@@ -27025,27 +27025,27 @@ def _np_ops_build():
                     evidence={"last_sync_at": a.get("last_sync_at"), "updated_at": a.get("updated_at")}
                 ))
 
-        # Funded 50% gross profit liability ceiling.
+        # Funded 15% gross profit liability ceiling.
         if _np_ops_stage(a) == "funded" and active:
             start = clean(a.get("start_balance") or a.get("account_size") or 0)
             eq = clean(a.get("current_equity") or a.get("current_balance") or start)
             pct = ((eq - start) / start * 100.0) if start > 0 else 0.0
-            if pct >= 50:
+            if pct >= 15:
                 actions.append(_np_ops_make_action(
-                    "critical", "money", "FUNDED_50_PERCENT_CAP_REACHED",
-                    "Funded 50% gross-profit ceiling reached",
+                    "critical", "money", "FUNDED_15_PERCENT_CAP_REACHED",
+                    "Funded 15% gross-profit ceiling reached",
                     trader, account=a,
                     happened=f"Funded MT5 {a.get('mt5_login') or '—'} is at {round(pct,2)}% gross profit.",
-                    required="Trading must stop at the funded-cycle cap; payout liability is capped at 50% gross profit and split remains 60/40.",
+                    required="Trading must stop at the funded-cycle cap; payout liability is capped at 15% gross profit and split remains 60/40.",
                     evidence={"start_balance": start, "current_equity": eq, "gross_profit_percent": round(pct,2)}
                 ))
-            elif pct >= 45:
+            elif pct >= 13.5:
                 actions.append(_np_ops_make_action(
                     "money", "money", "FUNDED_CAP_NEAR",
-                    "Funded account approaching 50% ceiling",
+                    "Funded account approaching 15% ceiling",
                     trader, account=a,
                     happened=f"Funded MT5 {a.get('mt5_login') or '—'} is at {round(pct,2)}% gross profit.",
-                    required="Watch closely; engine should stop the cycle at 50%.",
+                    required="Watch closely; engine should stop the cycle at 15%.",
                     evidence={"gross_profit_percent": round(pct,2)}
                 ))
 
@@ -60038,3 +60038,6 @@ _np_register_trader_cycle_progress(app, _np_limited_cycle_guard, _authenticated_
 
 from purchase_alert import register_purchase_alert as _np_register_purchase_alert
 _np_register_purchase_alert(app, _np_limited_cycle_guard, _require_admin)
+
+from funded_profit_policy import register_profit_policy as _np_register_profit_policy
+_np_register_profit_policy(app, globals())

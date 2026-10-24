@@ -14,6 +14,7 @@ def register_package_production(app,transport,url,key,config,controls,require_ad
             'Reset allowances':runtime.get('_np_v55_decision'),
         }
         blockers=[name for name,fn in consumers.items() if getattr(fn,'np_package_rules_version',None)!=RULES_VERSION]
+        blockers.append('Paid custom profit-cap packages have not been released; current business cap is 15%')
         if not orders.schema_available():blockers.append('Production package database migration')
         probe=runtime.get('_np_verified_package_dd_runtime_v222')
         try:verified=callable(probe) and probe() is True

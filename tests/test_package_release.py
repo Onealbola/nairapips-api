@@ -12,7 +12,7 @@ class ReleaseTests(unittest.TestCase):
         app.add_url_rule('/approve_challenge_purchase','approve_purchase',lambda:jsonify(success=True),methods=['POST'])
         transport=Mock()
         source=(Path(__file__).resolve().parents[1]/'app.py').read_text()
-        tail=source[source.index('# V224: private owner test page'):]
+        tail=source[source.index('# V224: private owner test page'):source.index('# Complete Admin fleet and exact-account broker telemetry; read-only.')]
         scope={'app':app,'requests':transport,'SUPABASE_URL':'https://fixture.invalid',
                'SUPABASE_SERVICE_ROLE_KEY':'private-server-fixture','SUPABASE_KEY':'fixture','_require_admin':lambda:({'id':'owner','role':'owner'},None),
                '_authenticated_trader_id_for_request':lambda _:('', 'Authentication required'),
@@ -37,6 +37,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(response.json['ready'])
         self.assertIn('Verified running monitoring and DD fleet',response.json['blockers'])
         self.assertIn('Payout verification',response.json['blockers'])
+        self.assertTrue(any('current business cap is 15%' in b for b in response.json['blockers']))
         transport.reset_mock()
         for path in ['/trader/package_quote','/trader/package_price','/trader/package_checkout']:
             self.assertEqual(client.post(path,json={}).status_code,401)
