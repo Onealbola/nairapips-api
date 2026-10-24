@@ -183,7 +183,7 @@ class ControlsTests(unittest.TestCase):
             self.assertEqual(self.db.rows['challenge_plans'][0]['max_drawdown'],20)
 
     def test_plan_validation_rejects_unsupported_trailing_nan_and_conflicting_routes(self):
-        for changes in [{'drawdown_type':'TRAILING'},{'payout_split':80},{'fee':'NaN'},{'max_drawdown':0},{'phase2_target':8},{'fee':True}]:
+        for changes in [{'drawdown_type':'TRAILING'},{'payout_split':101},{'fee':'NaN'},{'max_drawdown':0},{'phase2_target':8},{'fee':True}]:
             r=self.client.post('/admin/production_catalog',json={'id':'p','updated_at':'v1','changes':changes})
             self.assertEqual(r.status_code,400,r.json)
         self.assertFalse(self.db.writes)

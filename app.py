@@ -268,7 +268,7 @@ def _effective_payout_split(*values):
             value = float(str(raw).replace("%", "").strip())
         except (ValueError, TypeError):
             continue
-        if math.isfinite(value) and value in (50, 60, 70):
+        if math.isfinite(value) and 0.01 <= value <= 100:
             return value
     return DEFAULT_PAYOUT_PROFIT_SHARE_PERCENT
 
