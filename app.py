@@ -56084,7 +56084,12 @@ def _np_v122_start(pid, actor=None):
             return {"state":"processing","reason":"already_processing","payout_id":pid}
         _NP_V122_RUNNING.add(pid)
     _np_v122_result(pid,state="queued")
-    threading.Thread(target=_np_v122_worker,args=(pid,actor),name=f"np-v122-renew-{pid[:8]}",daemon=True).start()
+    try:
+        threading.Thread(target=_np_v122_worker,args=(pid,actor),name=f"np-v122-renew-{pid[:8]}",daemon=True).start()
+    except Exception:
+        with _NP_V122_LOCK:
+            _NP_V122_RUNNING.discard(pid)
+        return _np_v122_result(pid,state="retry_required",reason="renewal_worker_unavailable",accepted=False,processing=False)
     return {"state":"queued","payout_id":pid,"accepted":True,"processing":True}
 
 
@@ -56249,6 +56254,10 @@ def _np_v122_repair_outstanding_current_paid(limit=80):
             st=_np_v122_l(source.get("account_status") or source.get("status"))
             stuck=st in {"payout_renewal_waiting_mt5","payout_renewal_assigning","funded_profit_cap_reached","profit_protected","payment_processing","payout_pending","approved_payout_pending"}
             explicitly_owed = _np_paid_replacement_exception_v210(source, p)
+            if not explicitly_owed:
+                from finite_renewal_recovery import finite_renewal_owed
+                explicitly_owed = finite_renewal_owed(source, p, requests, SUPABASE_URL,
+                    SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
             if not current and not stuck and not explicitly_owed:
                 summary["skipped"]+=1; continue
             started=_np_v122_start(pid)
