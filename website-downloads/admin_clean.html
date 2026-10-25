@@ -12369,7 +12369,7 @@ function npPurchaseAlertBadge(){
  const s=npPurchaseAlertState();
  if(!s.loadedAt&&!s.pending&&!s.error&&SESSION.token)setTimeout(npPurchaseAlertRefresh,0);
  const stale=s.error||!s.loadedAt||Date.now()-s.loadedAt>65000,count=stale?null:s.count;
- return `<span data-purchase-alert-badge class="${count>0?'np-purchase-blink':''}" style="margin-left:auto;min-width:20px;padding:2px 6px;border-radius:999px;background:${count>0?'#ef4444':'#555'};color:white;font-size:11px;font-weight:950;${count===0?'display:none':''}" title="${count===null?'New purchase check unavailable':count+' new purchase'+(count===1?'':'s')}">${count===null?'…':count}</span>`;
+ return `<span data-purchase-alert-badge class="${count>0?'np-purchase-blink':''}" style="margin-left:auto;min-width:20px;padding:2px 6px;border-radius:999px;background:${count>0?'#ef4444':'#555'};color:white;font-size:11px;font-weight:950;" role="status" aria-live="polite" title="${count===null?'New purchase check unavailable':count===0?'Purchase alerts active · no unseen purchases':count+' new purchase'+(count===1?'':'s')}">${count===null?'…':count}</span>`;
 }
 function npPurchaseAlertApply(){
  document.querySelectorAll('[data-purchase-alert-slot]').forEach(el=>el.innerHTML=npPurchaseAlertBadge());
