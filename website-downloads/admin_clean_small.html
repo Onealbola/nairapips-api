@@ -1,0 +1,1470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!-- NAIRAPIPS ADMIN V128 WORK INTERRUPTION FIX · 02 OCT 2026
+     - Journey Control Centre no longer auto-fires PAID payout renewals.
+     - Successful payout renewal no longer auto-opens/re-opens Journey Control Centre.
+     - Manual payout renewal buttons and all backend protections remain unchanged.
+-->
+
+<!-- NAIRAPIPS ADMIN CURRENT PAYOUT RENEWAL ROUTING FIX · 02 OCT 2026
+     Paid payout button now uses exact payout-renewal authority.
+     It no longer routes PAID payouts through Operational MT5 Recovery.
+     All unrelated Admin controls remain unchanged.
+-->
+
+<!-- NAIRAPIPS ADMIN V46 FAST FIFO ASSIGNMENT · 25 SEP 2026
+     - Assignment buttons respond immediately with busy state
+     - Assignable MT5 read is capped at 8 seconds then safe-cache fallback
+     - FIFO: oldest eligible MT5 in correct vault/size is chosen first
+     - POST assignment remains single-shot and backend-authoritative
+     - Existing journey, anti-replay, wrong-trader and single-use protections unchanged
+-->
+<!-- NAIRAPIPS ADMIN V40 EXACT ASSIGNED-ENTITLEMENT RECALL · 2026-09-22
+     Fix: Recall remains visible after an entitlement is assigned/consumed.
+     Exact active account ID is preselected; backend still blocks any traded account. -->
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NairaPips Admin v4 — Lifecycle Coordinated R2</title>
+<script src="./admin-assets/b9175effbdff/panel-01.js"></script>
+<style>
+.phase-assignment-refresh-action{
+  position:relative!important;
+  z-index:120!important;
+  pointer-events:auto!important;
+  touch-action:manipulation!important;
+  user-select:none!important;
+}
+.phase-assignment-refresh-action:disabled{
+  cursor:wait!important;
+  opacity:.75!important;
+}
+
+.overview-refresh-action{
+  position:relative!important;
+  z-index:120!important;
+  pointer-events:auto!important;
+  touch-action:manipulation!important;
+  user-select:none!important;
+}
+.overview-refresh-action:disabled{
+  cursor:wait!important;
+  opacity:.75!important;
+}
+
+.league-refresh-action{
+  position:relative!important;
+  z-index:120!important;
+  pointer-events:auto!important;
+  touch-action:manipulation!important;
+  user-select:none!important;
+}
+.league-refresh-action:disabled{
+  cursor:wait!important;
+  opacity:.75!important;
+}
+
+.gs-result:hover{background:rgba(212,175,55,.12)!important}
+.gs-active{background:rgba(212,175,55,.18)!important;outline:1px solid var(--gold)}
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+/* =========================================================================
+   NAIRAPIPS ADMIN — matches your reference (old admin style)
+   Black + warm gold + pill action buttons + trader card grid + mono money
+   ========================================================================= */
+:root{
+  --bg:#000000;
+  --card:#0a0a0a;
+  --card-2:#111111;
+  --line:#1f1f1f;
+  --line-2:#2a2a2a;
+  --line-gold:rgba(212,175,55,.35);
+
+  --gold:#f7c843;          /* warm yellow-gold (your reference) */
+  --gold-2:#ffd968;
+  --gold-deep:#c89a25;
+
+  --green:#1f8a3a;          /* Pass Phase button */
+  --green-2:#22c55e;
+  --green-text:#4ade80;
+
+  --red:#c2292c;            /* Breached button */
+  --red-2:#ef4444;
+  --red-text:#f87171;
+
+  --yellow:#eab308;          /* Mark Funded */
+  --yellow-2:#fbbf24;
+
+  --blue:#38bdf8;
+  --info-text:#7dd3fc;
+
+  --t1:#ffffff;
+  --t2:#e5e5e5;
+  --t3:#a1a1aa;
+  --t4:#71717a;
+  --t5:#52525b;
+}
+
+*{box-sizing:border-box;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+html,body{margin:0;background:var(--bg);color:var(--t1);font-family:'Inter',-apple-system,system-ui,sans-serif;font-size:14px;line-height:1.5}
+
+/* App shell */
+.app{display:grid;grid-template-columns:232px 1fr;min-height:100vh;background:var(--bg)}
+.app>aside{position:sticky;top:0;height:100vh;overflow-y:auto;background:#000;border-right:1px solid var(--line)}
+.app>main{min-width:0}
+@media(max-width:900px){.app{grid-template-columns:1fr}.app>aside{display:none}}
+
+/* ---------- Sidebar (your reference = plain text + yellow active) ---------- */
+.brand{padding:18px 18px 16px;border-bottom:1px solid var(--line)}
+.brand-name{font-weight:900;font-size:17px;letter-spacing:.02em;color:#fff;text-transform:uppercase}
+.brand-name span{color:var(--gold)}
+.brand-sub{font-size:10px;color:var(--t4);letter-spacing:.18em;text-transform:uppercase;margin-top:3px;font-weight:600}
+
+.nav-section{padding:14px 18px 4px;color:var(--t4);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.18em}
+.nav{display:flex;align-items:center;gap:9px;width:auto;margin:0 8px;padding:7px 11px;color:var(--t2);font-weight:500;font-size:13px;background:transparent;border:0;text-align:left;cursor:pointer;font-family:inherit;line-height:1.2;border-radius:6px;transition:background .1s linear}
+.nav .ico{width:14px;font-size:12px;flex-shrink:0;color:var(--t4)}
+.nav:hover{background:#161616;color:var(--gold)}
+.nav:hover .ico{color:var(--gold)}
+.nav.active{background:rgba(247,200,67,.12);color:var(--gold);font-weight:600}
+.nav.active .ico{color:var(--gold)}
+
+/* ---------- Topbar (slim, gold-on-black) ---------- */
+.topbar{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:14px;padding:0 22px;height:50px;background:#000;border-bottom:1px solid var(--line)}
+.topbar h1{font-size:18px;font-weight:800;margin:0;color:#fff;letter-spacing:.005em;text-transform:uppercase}
+.topbar h1 small{color:var(--gold);font-weight:700;margin-left:8px;font-size:12px;letter-spacing:.1em}
+.tb-clock{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--t3);margin-left:auto;letter-spacing:.04em}
+.tb-clock .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green);margin-right:6px;box-shadow:0 0 8px var(--green)}
+
+/* ---------- Content area ---------- */
+.content{padding:22px}
+@media(max-width:700px){.content{padding:14px}}
+
+/* ---------- Cards (the reference look: dark inner box, thin gold border) ---------- */
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}
+.card.gold-border{border-color:var(--line-gold)}
+.card.tilt:hover{border-color:var(--line-2)}
+
+/* ---------- Section heading (your reference = big gold uppercase) ---------- */
+.sec-title{font-size:22px;font-weight:800;color:var(--gold);margin:0 0 4px;letter-spacing:.005em;text-transform:uppercase;line-height:1.2}
+.sec-sub{color:var(--t3);font-size:13px;margin-bottom:14px}
+
+/* ---------- Stat blocks (Account Size / Profit / Drawdown / MT5 Access) ---------- */
+.stat-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+@media(max-width:900px){.stat-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.stat-label{color:var(--t3);font-size:11px;font-weight:600;letter-spacing:.1em;text-transform:uppercase}
+.stat-value{font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:800;color:var(--gold);margin-top:6px;letter-spacing:-.02em;line-height:1.1;text-transform:uppercase}
+.stat-value.long{color:var(--green-text)}
+.stat-value.short{color:var(--red-text)}
+.stat-value.info{color:var(--info-text)}
+.stat-sub{font-size:11px;color:var(--t3);margin-top:4px}
+
+/* ---------- Trader card (your reference: outer gold border, badges on top, name, contact, stats, action row) ---------- */
+.trader-card{background:var(--card);border:2px solid var(--line-gold);border-radius:18px;padding:20px;margin-bottom:16px}
+.trader-card.breached{border-color:rgba(239,68,68,.5)}
+.trader-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}
+.trader-card-info{flex:1;min-width:0}
+.trader-card-badges{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+.trader-name{font-size:22px;font-weight:800;color:var(--gold);margin:4px 0 2px;line-height:1.2;text-transform:uppercase;letter-spacing:.005em}
+.trader-name.breached{color:var(--red-2)}
+.trader-contact{color:var(--t3);font-size:13px}
+.trader-contact a{color:var(--info-text);text-decoration:none}
+.trader-ref{color:var(--t4);font-size:12px;margin-top:4px}
+.trader-card-side{text-align:right;flex-shrink:0}
+.trader-mt5-label{color:var(--t3);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase}
+.trader-mt5{font-family:'JetBrains Mono',monospace;font-size:18px;color:var(--gold);font-weight:700;margin-top:3px;letter-spacing:-.01em}
+.trader-stage-label{color:var(--t3);font-size:11px;font-weight:600;margin-top:8px}
+.trader-stage-val{font-size:14px;font-weight:700;color:var(--gold);text-transform:uppercase}
+.trader-stage-val.breached{color:var(--red-2)}
+.trader-stage-val.passed{color:#8be0ff}
+
+/* ---------- Trader action row (your reference: 5 pill buttons in a row) ---------- */
+.trader-actions{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-top:14px}
+@media(max-width:900px){.trader-actions{grid-template-columns:repeat(2,minmax(0,1fr))}}
+
+.act{font-family:inherit;font-weight:700;font-size:13px;padding:14px 18px;border-radius:10px;border:0;cursor:pointer;text-align:center;letter-spacing:.01em;transition:all .12s ease;background:#1a1a1a;color:#fff}
+.act:hover{filter:brightness(1.15);transform:translateY(-1px)}
+.act:active{transform:translateY(0)}
+.act:disabled{opacity:.4;cursor:not-allowed}
+.act-pass{background:linear-gradient(180deg,#2ea14a,#1f8a3a);color:#fff}
+.act-funded{background:linear-gradient(180deg,#fbbf24,#d4a017);color:#000}
+.act-breach{background:linear-gradient(180deg,#e64545,#c2292c);color:#fff}
+.act-retry{background:linear-gradient(180deg,#3a3a3a,#1f1f1f);color:#fff;border:1px solid #444}
+.act-archive{background:linear-gradient(180deg,#525252,#303030);color:#fff;border:1px solid #666}
+
+/* ---------- Tags / pills (your reference = uppercase thin-border) ---------- */
+.tag{display:inline-block;padding:3px 9px;border-radius:6px;font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;border:1px solid transparent;font-family:'Inter',sans-serif}
+.tag-gold{background:rgba(247,200,67,.10);color:var(--gold);border-color:rgba(247,200,67,.35)}
+.tag-blue{background:rgba(56,189,248,.10);color:var(--info-text);border-color:rgba(56,189,248,.35)}
+.tag-green{background:rgba(34,197,94,.10);color:var(--green-text);border-color:rgba(34,197,94,.35)}
+.tag-red{background:rgba(239,68,68,.10);color:var(--red-text);border-color:rgba(239,68,68,.35)}
+.tag-yellow{background:rgba(234,179,8,.10);color:#fde68a;border-color:rgba(234,179,8,.35)}
+.tag-gray{background:rgba(113,113,122,.12);color:var(--t3);border-color:rgba(113,113,122,.35)}
+.tag-purple{background:rgba(168,85,247,.10);color:#d8b4fe;border-color:rgba(168,85,247,.35)}
+
+/* ---------- KPI / generic ---------- */
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.kpi-label{color:var(--t3);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}
+.kpi-value{font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:800;color:#fff;margin-top:6px;letter-spacing:-.02em}
+.kpi-value.gold{color:var(--gold)}
+.kpi-value.long{color:var(--green-text)}
+.kpi-value.short{color:var(--red-text)}
+.kpi-sub{font-size:11px;color:var(--t3);margin-top:5px}
+
+/* ---------- Forms (dark inputs) ---------- */
+.input,.select,textarea.input{width:100%;padding:11px 14px;background:#000;border:1px solid var(--line);border-radius:10px;color:#fff;font-family:inherit;font-size:13px;outline:none;transition:border-color .12s ease}
+.input:focus,.select:focus{border-color:var(--gold)}
+.input::placeholder{color:var(--t5)}
+textarea.input{resize:vertical;min-height:80px}
+label{display:block;font-size:11px;color:var(--t3);letter-spacing:.1em;text-transform:uppercase;font-weight:600;margin-bottom:5px;margin-top:10px}
+
+/* ---------- Buttons ---------- */
+.btn{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:8px;padding:10px 16px;font-weight:700;cursor:pointer;font-family:inherit;font-size:13px;background:#1a1a1a;color:#fff;transition:all .12s ease}
+.btn:hover{background:#2a2a2a;border-color:var(--line-2)}
+.btn-gold{background:linear-gradient(180deg,#ffd968,#f7c843)!important;color:#000!important;border:0!important;font-weight:800}
+.btn-gold:hover{filter:brightness(1.08)}
+.btn-red{background:var(--red-2)!important;color:#fff!important;border:0!important}
+.btn-green{background:var(--green)!important;color:#fff!important;border:0!important}
+.btn-blue{background:var(--blue)!important;color:#000!important;border:0!important}
+.btn-ghost{background:transparent!important;border:1px solid var(--line-2)!important}
+.btn-sm{padding:6px 10px!important;font-size:12px!important}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+
+/* ---------- Tables ---------- */
+.table-wrap{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:13px}
+thead th{background:#0f0f0f;color:var(--t3);text-align:left;padding:12px 14px;border-bottom:1px solid var(--line);font-size:11px;text-transform:uppercase;letter-spacing:.1em;font-weight:700;white-space:nowrap}
+tbody td{padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:middle;color:var(--t2)}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:#0f0f0f;color:#fff}
+.num{font-family:'JetBrains Mono',monospace;font-feature-settings:"tnum" 1;text-align:right}
+.num.gold{color:var(--gold)}
+.num.long{color:var(--green-text)}
+.num.short{color:var(--red-text)}
+
+/* ---------- Toasts / Modals ---------- */
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:12px 22px;border-radius:10px;font-weight:800;font-size:13.5px;z-index:99999;color:#000;background:linear-gradient(180deg,#ffd968,#f7c843);box-shadow:0 10px 30px rgba(0,0,0,.7);max-width:90vw;line-height:1.4;text-align:center;white-space:pre-wrap}
+.toast-err{background:linear-gradient(180deg,#f87171,#dc2626)!important;color:#fff!important}
+.toast-ok{background:linear-gradient(180deg,#86efac,#22c55e)!important;color:#052e16!important}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:99999;display:flex;align-items:flex-start;justify-content:center;padding:30px 16px;overflow-y:auto;backdrop-filter:blur(6px)}
+.modal-card{background:#0a0a0a;border:2px solid var(--line-gold);border-radius:18px;padding:28px;max-width:680px;width:100%;position:relative;max-height:90vh;overflow-y:auto}
+
+/* ---------- Misc utility (kept for renderers) ---------- */
+.flex{display:flex}.flex-wrap{flex-wrap:wrap}.flex-col{flex-direction:column}
+.gap-2{gap:8px}.gap-3{gap:12px}.gap-4{gap:16px}.gap-5{gap:20px}.gap-6{gap:24px}
+.mb-1{margin-bottom:4px}.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}.mb-4{margin-bottom:16px}.mb-5{margin-bottom:20px}.mb-6{margin-bottom:24px}.mb-8{margin-bottom:32px}
+.mt-1{margin-top:4px}.mt-2{margin-top:8px}.mt-3{margin-top:12px}.mt-4{margin-top:16px}.mt-6{margin-top:24px}
+.grid{display:grid}
+@media(min-width:640px){.sm\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.sm\:grid-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(min-width:768px){.md\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.md\:grid-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}.md\:grid-cols-4{grid-template-columns:repeat(4,minmax(0,1fr))}.md\:grid-cols-5{grid-template-columns:repeat(5,minmax(0,1fr))}.md\:grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.md\:grid-cols-7{grid-template-columns:repeat(7,minmax(0,1fr))}}
+.text-sm{font-size:13px}.text-xs{font-size:11px}.text-gray-400{color:var(--t3)}.text-gray-500{color:var(--t4)}
+.font-black{font-weight:900}.font-bold{font-weight:700}.text-center{text-align:center}.text-right{text-align:right}.hidden{display:none!important}
+.flex-1{flex:1}.items-center{align-items:center}.justify-between{justify-content:space-between}.justify-end{justify-content:flex-end}
+button{cursor:pointer;font-family:inherit}
+.empty{text-align:center;color:var(--t3);padding:48px 16px;font-size:14px}
+.row-actions{display:flex;gap:4px;flex-wrap:wrap}
+.bulk-bar{position:sticky;top:0;background:#0a0a0a;border:1px solid var(--line-gold);padding:10px 16px;border-radius:10px;margin-bottom:14px;display:flex;gap:8px;align-items:center;z-index:50;flex-wrap:wrap}
+.checkbox{width:16px;height:16px;cursor:pointer;accent-color:var(--gold)}
+.sp-right{margin-left:auto}
+.search-bar{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
+.pagination{display:flex;gap:6px;margin-top:14px;align-items:center;justify-content:center;flex-wrap:wrap}
+.page-btn{padding:7px 14px;border-radius:8px;background:#1a1a1a;color:#fff;border:1px solid var(--line);cursor:pointer;font-size:12px;font-family:inherit;font-weight:700}
+.page-btn.active{background:linear-gradient(180deg,#ffd968,#f7c843);color:#000;border-color:transparent}
+.page-btn:disabled{opacity:.4;cursor:not-allowed}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:6px;font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--gold);border:1px solid var(--line-gold);background:rgba(247,200,67,.05)}
+.tab-content{animation:fadein .2s ease}
+@keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.2);border-top-color:var(--gold);border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+.login-bg{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#000}
+.login-card{background:#0a0a0a;border:2px solid var(--line-gold);border-radius:18px;padding:36px;max-width:380px;width:90%}
+.login-card input{margin:6px 0}
+.login-card .btn{width:100%;margin-top:12px}
+.copy-field{display:flex;gap:6px;align-items:center}
+.copy-field .input{flex:1;font-family:monospace}
+table.compact td,table.compact th{padding:6px 10px;font-size:12px}
+
+/* ---------- Alert banner ---------- */
+.alert-critical{background:rgba(239,68,68,.10);border:1px solid rgba(239,68,68,.5);border-radius:14px;padding:14px 18px;margin-bottom:14px}
+.alert-critical .alert-head{font-weight:800;color:#fca5a5;font-size:13px;letter-spacing:.04em;display:flex;align-items:center;gap:8px;text-transform:uppercase}
+.alert-critical .alert-body{margin-top:8px;display:flex;flex-direction:column;gap:6px}
+
+/* ---------- Mobile bottom nav ---------- */
+.mobile-nav{display:none}
+@media(max-width:900px){
+  .mobile-nav{display:flex;position:fixed;bottom:0;left:0;right:0;z-index:60;background:#000;border-top:1px solid var(--line-gold);padding:8px;justify-content:space-around}
+  .mobile-nav .mnav{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px;border-radius:8px;background:transparent;border:0;color:var(--t3);font-size:10px;font-weight:700;cursor:pointer;font-family:inherit;text-transform:uppercase;letter-spacing:.05em}
+  .mobile-nav .mnav.active{color:var(--gold)}
+  .mobile-nav .mnav .ico{font-size:16px}
+  .content{padding-bottom:80px}
+}
+
+/* Visible count chip (like your reference "1 visible" / "13 visible") */
+.vis-chip{background:#000;border:1px solid var(--line-gold);color:var(--gold);padding:3px 12px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:lowercase;font-family:'JetBrains Mono',monospace}
+
+/* NAIRAPIPS PASSED / WAITING BLUE VISIBILITY PATCH */
+.pill-blue,.tag-blue{
+  background:linear-gradient(135deg, rgba(14,165,233,.95), rgba(56,189,248,.55))!important;
+  border-color:rgba(125,211,252,.95)!important;
+  color:#e0f7ff!important;
+  box-shadow:0 0 0 1px rgba(56,189,248,.28), 0 0 22px rgba(56,189,248,.28)!important;
+}
+.prog-fill.blue{background:linear-gradient(90deg,#0284c7,#38bdf8,#7dd3fc)!important;}
+.np-smart-hero-status.passed-status,
+.np-smart-panel.passed-account,
+.np-smart-panel.progress.passed-progress{
+  border-color:rgba(56,189,248,.70)!important;
+  background:linear-gradient(135deg,rgba(14,165,233,.16),rgba(0,0,0,.42) 55%,rgba(56,189,248,.08))!important;
+  box-shadow:0 0 0 1px rgba(56,189,248,.18),0 20px 70px rgba(14,165,233,.14)!important;
+}
+.np-smart-hero-status.passed-status strong{color:#dff8ff!important;text-shadow:0 0 18px rgba(56,189,248,.45)!important;}
+.np-smart-panel-head .pill-blue{font-size:10px!important;padding:7px 12px!important;}
+
+
+/* NIC admin modal */
+.nic-admin-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.nic-admin-stat{padding:14px;border-radius:14px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.08)}.nic-admin-stat b{display:block;font-size:19px;color:var(--gold);margin-top:5px}.nic-admin-stat small{color:var(--t3)}@media(max-width:800px){.nic-admin-grid{grid-template-columns:repeat(2,1fr)}}
+
+
+/* Revenue Department compatibility layer (legacy module inside Admin v4) */
+#content .p-10{padding:40px} #content .p-8{padding:32px} #content .p-7{padding:28px} #content .p-6{padding:24px} #content .p-5{padding:20px} #content .p-4{padding:16px}
+#content .rounded-3xl{border-radius:24px} #content .rounded-2xl{border-radius:16px} #content .rounded-xl{border-radius:12px}
+#content .text-4xl{font-size:36px;line-height:1.08} #content .text-3xl{font-size:30px;line-height:1.1} #content .text-2xl{font-size:24px;line-height:1.15}
+#content .text-xl{font-size:20px} #content .text-lg{font-size:18px} #content .text-sm{font-size:13px} #content .text-xs{font-size:11px}
+#content .font-black{font-weight:900} #content .font-bold{font-weight:700}
+#content .text-gray-300{color:#d1d5db} #content .text-gray-400{color:#9ca3af} #content .text-gray-500{color:#6b7280}
+#content .text-green-400{color:#4ade80} #content .text-red-400{color:#f87171} #content .text-yellow-300{color:#fde047}
+#content .mb-8{margin-bottom:32px} #content .mb-6{margin-bottom:24px} #content .mb-5{margin-bottom:20px} #content .mb-4{margin-bottom:16px} #content .mb-3{margin-bottom:12px} #content .mb-2{margin-bottom:8px}
+#content .mt-8{margin-top:32px} #content .mt-6{margin-top:24px} #content .mt-5{margin-top:20px} #content .mt-4{margin-top:16px} #content .mt-3{margin-top:12px} #content .mt-2{margin-top:8px}
+#content .flex{display:flex} #content .flex-wrap{flex-wrap:wrap} #content .items-center{align-items:center} #content .items-start{align-items:flex-start} #content .justify-between{justify-content:space-between}
+#content .gap-5{gap:20px} #content .gap-4{gap:16px} #content .gap-3{gap:12px} #content .gap-2{gap:8px}
+#content .grid{display:grid} #content .grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))} #content .grid-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))} #content .grid-cols-4{grid-template-columns:repeat(4,minmax(0,1fr))}
+#content .min-w-\[250px\]{min-width:250px} #content .w-full{width:100%}
+#content .border{border-width:1px;border-style:solid} #content .border-red-900\/40{border-color:rgba(127,29,29,.4)} #content .border-yellow-900\/40{border-color:rgba(113,63,18,.4)} #content .border-green-900\/40{border-color:rgba(20,83,45,.4)}
+#content .vault{background:linear-gradient(135deg,#141414,#050505);border:1px solid rgba(212,175,55,.35);box-shadow:0 0 35px rgba(212,175,55,.08)}
+#content .card2{background:#090909;border:1px solid rgba(255,255,255,.08)}
+#content .gold{color:var(--gold)}
+#content .loader{width:38px;height:38px;border:4px solid #333;border-top-color:var(--gold);border-radius:50%;animation:spin 1s linear infinite;flex:0 0 auto}
+#content .production-toggle{display:inline-grid;grid-template-columns:1fr 1fr;gap:4px;background:#050505;border:1px solid rgba(212,175,55,.25);border-radius:16px;padding:4px}
+#content .production-toggle button{border-radius:12px;padding:9px 12px;font-weight:900;color:#aaa;background:transparent;border:0}
+#content .production-toggle button.active{background:var(--gold);color:#000}
+#content .production-warning{border:1px solid rgba(239,68,68,.35);background:linear-gradient(135deg,rgba(127,29,29,.18),rgba(5,5,5,.96))}
+#content .test-badge{border-color:rgba(239,68,68,.35);color:#fb7185;background:rgba(127,29,29,.14)}
+@media(min-width:768px){#content .md\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}#content .md\:grid-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}#content .md\:grid-cols-4{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:760px){#content .grid,#content .grid-cols-2,#content .grid-cols-3,#content .grid-cols-4{grid-template-columns:1fr!important}#content .text-4xl{font-size:28px}}
+
+
+
+/* ========================================================================
+   NAIRAPIPS — REVENUE-ONLY COMPACT DESIGN
+   Scope depends on the active Revenue navigation button.
+   No styling below applies to Overview, Traders, Accounts, Payouts or any
+   other Admin department.
+   ======================================================================== */
+
+body:has(.nav.active[onclick*="revenue"]) #content > *{margin-bottom:10px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .vault,
+body:has(.nav.active[onclick*="revenue"]) #content .card,
+body:has(.nav.active[onclick*="revenue"]) #content .card2{border-radius:12px!important}
+
+/* Revenue launch controls */
+body:has(.nav.active[onclick*="revenue"]) #content .production-warning,
+body:has(.nav.active[onclick*="revenue"]) #content .vault.production-warning{
+  padding:13px 15px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content .production-warning h2,
+body:has(.nav.active[onclick*="revenue"]) #content .production-warning h3{margin:0 0 5px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .production-warning p{
+  margin:2px 0!important;
+  font-size:10px!important;
+  line-height:1.3!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content .production-toggle{padding:2px!important;border-radius:10px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .production-toggle button{
+  padding:6px 10px!important;
+  font-size:10px!important;
+  border-radius:8px!important;
+}
+
+/* Revenue date filter */
+body:has(.nav.active[onclick*="revenue"]) #content .vault:has(input[type="date"]){
+  padding:13px 15px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content .vault:has(input[type="date"]) .grid{gap:10px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .vault:has(input[type="date"]) label{
+  margin:0 0 3px!important;
+  font-size:9px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content .vault:has(input[type="date"]) p{
+  margin:2px 0!important;
+  font-size:9px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content input[type="date"]{
+  width:155px!important;
+  min-height:35px!important;
+  padding:6px 8px!important;
+  font-size:10px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content .vault:has(input[type="date"]) .flex.flex-wrap{
+  gap:5px!important;
+  margin-top:7px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content .vault:has(input[type="date"]) .btn{
+  min-height:34px!important;
+  padding:6px 9px!important;
+  font-size:9px!important;
+}
+
+/* Do not allow Revenue action buttons to stretch across the page */
+body:has(.nav.active[onclick*="revenue"]) #content .btn.btn-gold.w-full,
+body:has(.nav.active[onclick*="revenue"]) #content .btn-gold.w-full{
+  width:auto!important;
+  min-width:125px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content button[onclick*="Launch"],
+body:has(.nav.active[onclick*="revenue"]) #content button[onclick*="launch"],
+body:has(.nav.active[onclick*="revenue"]) #content button[onclick*="Clear"],
+body:has(.nav.active[onclick*="revenue"]) #content button[onclick*="clear"]{
+  width:auto!important;
+  min-width:105px!important;
+  display:inline-flex!important;
+  margin-right:6px!important;
+}
+
+/* Revenue section shells */
+body:has(.nav.active[onclick*="revenue"]) #content .vault.p-10,
+body:has(.nav.active[onclick*="revenue"]) #content .vault.p-8,
+body:has(.nav.active[onclick*="revenue"]) #content .vault.p-6,
+body:has(.nav.active[onclick*="revenue"]) #content .card.p-10,
+body:has(.nav.active[onclick*="revenue"]) #content .card.p-8,
+body:has(.nav.active[onclick*="revenue"]) #content .card.p-6{
+  padding:15px!important;
+}
+
+/* Revenue KPI rows */
+body:has(.nav.active[onclick*="revenue"]) #content > .grid.md\:grid-cols-3{
+  gap:10px!important;
+  margin-bottom:10px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content > .grid.md\:grid-cols-3 > .vault,
+body:has(.nav.active[onclick*="revenue"]) #content > .grid.md\:grid-cols-3 > .card{
+  min-height:100px!important;
+  padding:13px 15px!important;
+}
+
+body:has(.nav.active[onclick*="revenue"]) #content > .grid.md\:grid-cols-4{
+  gap:8px!important;
+  margin-bottom:10px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content > .grid.md\:grid-cols-4 > *{
+  min-height:80px!important;
+  padding:10px 11px!important;
+}
+
+body:has(.nav.active[onclick*="revenue"]) #content .kpi{
+  min-height:78px!important;
+  padding:10px 11px!important;
+  border-radius:10px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content .kpi-label{font-size:9px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .kpi-value{
+  font-size:20px!important;
+  margin-top:4px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content .kpi-sub{
+  font-size:9px!important;
+  margin-top:3px!important;
+  line-height:1.25!important;
+}
+
+/* Revenue reports */
+body:has(.nav.active[onclick*="revenue"]) #content .vault.border-yellow-900\/30,
+body:has(.nav.active[onclick*="revenue"]) #content .vault.border-red-900\/30{
+  padding:14px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content .vault.border-yellow-900\/30 > .flex,
+body:has(.nav.active[onclick*="revenue"]) #content .vault.border-red-900\/30 > .flex{
+  margin-bottom:9px!important;
+}
+
+/* Revenue by plan and monthly history */
+body:has(.nav.active[onclick*="revenue"]) #content > .grid.lg\:grid-cols-2{gap:10px!important}
+body:has(.nav.active[onclick*="revenue"]) #content > .grid.lg\:grid-cols-2 > .vault{padding:13px!important}
+body:has(.nav.active[onclick*="revenue"]) #content > .grid.lg\:grid-cols-2 .grid.gap-4{gap:6px!important}
+body:has(.nav.active[onclick*="revenue"]) #content > .grid.lg\:grid-cols-2 .card2{
+  min-height:54px!important;
+  padding:8px 10px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content > .grid.lg\:grid-cols-2 .card2 h3{
+  font-size:12px!important;
+  margin:0!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content > .grid.lg\:grid-cols-2 .card2 p{
+  font-size:9px!important;
+  margin-top:2px!important;
+}
+
+/* Revenue diagnostics */
+body:has(.nav.active[onclick*="revenue"]) #content .grid.md\:grid-cols-4.lg\:grid-cols-12 .card2{
+  min-height:56px!important;
+  padding:8px 9px!important;
+}
+
+/* Revenue typography only — readable, not tiny */
+body:has(.nav.active[onclick*="revenue"]) #content .text-4xl{font-size:27px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .text-3xl{font-size:22px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .text-2xl{font-size:18px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .text-xl{font-size:14px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .text-sm{font-size:11px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .text-xs{font-size:10px!important}
+
+/* Revenue spacing only */
+body:has(.nav.active[onclick*="revenue"]) #content .mb-8{margin-bottom:12px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .mb-6{margin-bottom:10px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .mb-5{margin-bottom:9px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .mb-4{margin-bottom:7px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .mt-6{margin-top:10px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .mt-5{margin-top:8px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .mt-4{margin-top:7px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .gap-6{gap:10px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .gap-5{gap:9px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .gap-4{gap:7px!important}
+body:has(.nav.active[onclick*="revenue"]) #content .gap-3{gap:6px!important}
+
+body:has(.nav.active[onclick*="revenue"]) #content .btn{
+  padding:7px 10px!important;
+  font-size:10px!important;
+  border-radius:8px!important;
+}
+body:has(.nav.active[onclick*="revenue"]) #content input,
+body:has(.nav.active[onclick*="revenue"]) #content select{
+  min-height:35px!important;
+  padding:6px 8px!important;
+  font-size:10px!important;
+}
+
+body:has(.nav.active[onclick*="revenue"]) #content .gold{color:#ffd64a!important}
+body:has(.nav.active[onclick*="revenue"]) #content .text-green-400{color:#43e681!important}
+body:has(.nav.active[onclick*="revenue"]) #content .text-red-400{color:#ff737b!important}
+
+@media(min-width:1100px){
+  body:has(.nav.active[onclick*="revenue"]) #content .vault:has(input[type="date"]) .grid{
+    grid-template-columns:180px 180px auto!important;
+    align-items:end!important;
+  }
+}
+@media(max-width:900px){
+  body:has(.nav.active[onclick*="revenue"]) #content .vault:has(input[type="date"]) .grid{
+    grid-template-columns:1fr!important;
+  }
+  body:has(.nav.active[onclick*="revenue"]) #content input[type="date"]{width:100%!important}
+}
+
+
+/* ============================================================================
+   NAIRAPIPS OPERATIONS RADAR V1
+   Management attention layer only. No lifecycle/business rule mutation.
+   ============================================================================ */
+@keyframes npRadarPulse{
+  0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,.10)}
+  50%{box-shadow:0 0 0 4px rgba(239,68,68,.10),0 0 26px rgba(239,68,68,.20)}
+}
+@keyframes npRadarDot{
+  0%,100%{opacity:1;transform:scale(1)}
+  50%{opacity:.35;transform:scale(.78)}
+}
+.np-radar-kpi{position:relative;cursor:pointer;transition:.18s ease;border:1px solid rgba(255,255,255,.10)}
+.np-radar-kpi:hover{transform:translateY(-1px);border-color:rgba(247,200,67,.38)}
+.np-radar-kpi.alerting{animation:npRadarPulse 1.8s ease-in-out infinite;border-color:rgba(239,68,68,.48)}
+.np-radar-kpi.pass-alert{border-color:rgba(59,130,246,.42)}
+.np-radar-kpi.payout-alert{border-color:rgba(245,158,11,.48)}
+.np-radar-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#ef4444;margin-right:6px;animation:npRadarDot 1.15s ease-in-out infinite}
+.np-radar-row{display:grid;grid-template-columns:minmax(190px,1.2fr) 120px 120px minmax(150px,1fr) 175px minmax(170px,1fr);gap:10px;align-items:center;padding:11px 12px;border-bottom:1px solid rgba(255,255,255,.065)}
+.np-radar-row:last-child{border-bottom:0}
+.np-radar-row:hover{background:rgba(255,255,255,.025)}
+.np-radar-head{font-size:10px;font-weight:900;letter-spacing:.10em;text-transform:uppercase;color:var(--t3)}
+.np-radar-time{font-variant-numeric:tabular-nums;white-space:nowrap}
+@media(max-width:900px){
+  .np-radar-row{grid-template-columns:1fr 1fr;gap:7px}
+  .np-radar-head{display:none}
+  .np-radar-row>div:nth-child(1){grid-column:1/-1}
+  .np-radar-row>div:nth-child(6){grid-column:1/-1}
+}
+
+
+
+
+/* ============================================================================
+   NAIRAPIPS RADAR TIME + PURCHASE COHORT LENS — DISPLAY/INTELLIGENCE ONLY
+   ============================================================================ */
+.np-radar-toolbar{display:flex;gap:7px;align-items:end;flex-wrap:wrap;padding:11px 13px;border-bottom:1px solid rgba(255,255,255,.065);background:rgba(255,255,255,.015)}
+.np-radar-toolbar .np-field{display:flex;flex-direction:column;gap:4px}
+.np-radar-toolbar label{font-size:9px;font-weight:900;letter-spacing:.08em;color:var(--t3);text-transform:uppercase}
+.np-radar-toolbar input[type="date"]{background:#090909;border:1px solid rgba(255,255,255,.12);color:#fff;border-radius:8px;padding:7px 9px;min-height:32px}
+.np-radar-chip{border:1px solid rgba(255,255,255,.12);background:#080808;color:#fff;border-radius:8px;padding:7px 10px;font-size:10px;font-weight:850;cursor:pointer}
+.np-radar-chip.active{background:var(--gold);color:#050505;border-color:var(--gold)}
+.np-cohort-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;padding:12px}
+.np-cohort-card{border:1px solid rgba(255,255,255,.09);border-radius:11px;padding:11px;background:rgba(255,255,255,.018)}
+.np-cohort-card .v{font-size:18px;font-weight:950;margin-top:4px}
+.np-cohort-card .s{font-size:10px;color:var(--t3);margin-top:3px}
+.np-cohort-table{overflow:auto;border-top:1px solid rgba(255,255,255,.07)}
+.np-cohort-row{display:grid;grid-template-columns:minmax(180px,1.2fr) 130px 120px 125px 125px 145px minmax(190px,1fr);gap:10px;align-items:center;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06)}
+.np-cohort-head{font-size:9px;font-weight:900;letter-spacing:.08em;text-transform:uppercase;color:var(--t3)}
+.np-cohort-status{font-size:9px;font-weight:900;padding:4px 7px;border-radius:999px;border:1px solid rgba(255,255,255,.12);display:inline-block}
+@media(max-width:1100px){.np-cohort-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.np-cohort-row{grid-template-columns:1fr 1fr}.np-cohort-head{display:none}.np-cohort-row>div:first-child{grid-column:1/-1}}
+
+</style>
+
+
+<!-- NAIRAPIPS STUNNING 3D ELECTRIC BLUE PASS/WATING STYLE - DISPLAY ONLY -->
+<style id="nairapips-3d-blue-pass-style">
+:root{
+  --np-electric-blue:#00c6ff;
+  --np-royal-blue:#0072ff;
+  --np-deep-blue:#1d4ed8;
+  --np-violet-blue:#6a5acd;
+  --np-blue-glow:rgba(0,198,255,.55);
+}
+.pill-blue,.tag-blue,
+.passed-status .pill,
+.passed-account .pill,
+.passed-progress .pill,
+.np-smart-panel-head .pill-blue{
+  background:linear-gradient(135deg,#00c6ff 0%,#0072ff 42%,#6a5acd 100%)!important;
+  color:#ffffff!important;
+  border:1px solid rgba(186,230,253,.85)!important;
+  box-shadow:0 0 14px rgba(0,198,255,.65),0 0 34px rgba(0,114,255,.35),inset 0 1px 0 rgba(255,255,255,.45)!important;
+  text-shadow:0 1px 2px rgba(0,0,0,.45)!important;
+  letter-spacing:.05em!important;
+}
+.np-smart-hero-status.passed-status,
+.np-smart-panel.passed-account,
+.np-smart-panel.progress.passed-progress,
+.np-smart-panel.passed-progress,
+.passed-account{
+  position:relative!important;
+  overflow:hidden!important;
+  border:1px solid rgba(56,189,248,.75)!important;
+  background:
+    radial-gradient(circle at 20% 0%,rgba(0,198,255,.22),transparent 30%),
+    linear-gradient(145deg,rgba(0,198,255,.12),rgba(0,114,255,.08) 48%,rgba(106,90,205,.10)),
+    rgba(8,13,24,.92)!important;
+  box-shadow:0 0 0 1px rgba(186,230,253,.08),0 0 35px rgba(0,198,255,.30),0 22px 70px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.08)!important;
+}
+.np-smart-hero-status.passed-status::before,
+.np-smart-panel.passed-account::before,
+.np-smart-panel.progress.passed-progress::before,
+.passed-account::before{
+  content:""!important;
+  position:absolute!important;
+  inset:-2px!important;
+  background:linear-gradient(115deg,transparent 0%,rgba(255,255,255,.14) 22%,transparent 42%,rgba(0,198,255,.12) 70%,transparent 100%)!important;
+  transform:translateX(-60%)!important;
+  pointer-events:none!important;
+  animation:npBlueShine 5s ease-in-out infinite!important;
+}
+@keyframes npBlueShine{
+  0%,55%{transform:translateX(-70%);opacity:.25}
+  75%{transform:translateX(70%);opacity:.75}
+  100%{transform:translateX(95%);opacity:.15}
+}
+.np-smart-hero-status.passed-status strong,
+.np-smart-panel.passed-account b,
+.np-smart-panel.progress.passed-progress b{
+  color:#ffffff!important;
+  text-shadow:0 0 10px rgba(0,198,255,.9),0 0 26px rgba(0,114,255,.55)!important;
+}
+.prog-fill.blue,
+.np-smart-progress-line .prog-fill.blue{
+  background:linear-gradient(90deg,#00c6ff 0%,#0072ff 45%,#6a5acd 100%)!important;
+  box-shadow:0 0 18px rgba(0,198,255,.9),0 0 32px rgba(0,114,255,.45)!important;
+}
+.np-smart-hero-status.passed-status small,
+.np-smart-panel.passed-account small,
+.np-smart-panel.progress.passed-progress small{
+  color:#baf3ff!important;
+}
+</style>
+
+
+
+<style id="np-fintech-clarity-design-2026-09-10">
+/* ============================================================
+   NAIRAPIPS FINTECH CLARITY
+   Quality/contrast/typography refinement — NOT a size inflation.
+   Additive visual layer only. No workflow or business logic changes.
+   ============================================================ */
+
+:root{
+  --np-crisp-white:#F8FAFC;
+  --np-crisp-text:#E5E7EB;
+  --np-crisp-muted:#AEB7C4;
+  --np-crisp-faint:#7D8796;
+  --np-panel:#080A0D;
+  --np-panel-2:#0B0E12;
+  --np-line:rgba(255,255,255,.10);
+  --np-gold-line:rgba(212,175,55,.34);
+}
+
+/* Native system fonts render sharper than remote/thin display fonts on ChromeOS */
+html{
+  -webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;
+  text-rendering:geometricPrecision;
+  font-synthesis:none;
+}
+body, button, input, select, textarea{
+  font-family:"Segoe UI", Arial, Helvetica, sans-serif !important;
+  font-feature-settings:"kern" 1, "liga" 1, "tnum" 1;
+}
+body{
+  color:var(--np-crisp-text);
+  letter-spacing:0;
+}
+
+/* Keep numerical data compact but sharper */
+.mono, code,
+[class*="amount"], [class*="money"], [class*="metric"], [class*="value"],
+[id*="amount"], [id*="money"], [id*="metric"], [id*="value"]{
+  font-family:"Segoe UI", Arial, Helvetica, sans-serif !important;
+  font-variant-numeric:tabular-nums lining-nums;
+  font-feature-settings:"tnum" 1, "lnum" 1;
+}
+
+/* Main content labels: eliminate thin, muddy text */
+main label, .card label, .panel label,
+.card .label, .panel .label,
+.metric-label, .kpi-label,
+[class*="eyebrow"], [class*="caption"]{
+  color:var(--np-crisp-muted) !important;
+  font-weight:700 !important;
+  letter-spacing:.035em !important;
+}
+
+/* Body/supporting copy */
+.card p, .panel p, .card small, .panel small,
+[class*="subtitle"], [class*="description"], [class*="note"]{
+  color:var(--np-crisp-muted) !important;
+  font-weight:500 !important;
+}
+
+/* Card treatment: less muddy, more premium */
+.card, .panel,
+[class*="revenue-card"], [class*="metric-card"], [class*="kpi-card"]{
+  background:linear-gradient(180deg,var(--np-panel-2),var(--np-panel)) !important;
+  border-color:var(--np-line) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.025),
+    0 8px 20px rgba(0,0,0,.18) !important;
+}
+
+/* Revenue / Owner section gold framing stays premium, not glowing */
+#np-owner-economic-centre,
+#owner-economic-command-centre,
+.owner-economic-command-centre{
+  background:
+    radial-gradient(circle at top left, rgba(212,175,55,.055), transparent 34%),
+    #070805 !important;
+  border-color:var(--np-gold-line) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.025),
+    0 14px 32px rgba(0,0,0,.24) !important;
+}
+
+/* Headings: same scale, improved weight and kerning */
+#np-owner-economic-centre h1,
+#np-owner-economic-centre h2,
+#np-owner-economic-centre h3,
+#owner-economic-command-centre h1,
+#owner-economic-command-centre h2,
+#owner-economic-command-centre h3,
+.owner-economic-command-centre h1,
+.owner-economic-command-centre h2,
+.owner-economic-command-centre h3{
+  font-family:"Segoe UI", Arial, Helvetica, sans-serif !important;
+  font-weight:800 !important;
+  letter-spacing:-.018em !important;
+  color:var(--np-crisp-white) !important;
+  text-shadow:none !important;
+}
+
+/* Owner labels and figures: sharp without making them giant */
+#np-owner-economic-centre .np-owner-label,
+#owner-economic-command-centre .np-owner-label,
+.owner-economic-command-centre .np-owner-label{
+  color:#B8C1CE !important;
+  font-weight:700 !important;
+  letter-spacing:.045em !important;
+}
+#np-owner-economic-centre .np-owner-value,
+#owner-economic-command-centre .np-owner-value,
+.owner-economic-command-centre .np-owner-value{
+  font-weight:800 !important;
+  letter-spacing:-.025em !important;
+  text-shadow:none !important;
+  filter:none !important;
+}
+
+/* Inline muted colors used heavily by current Admin: raise contrast without changing hierarchy */
+[style*="color:var(--t4)"]{ color:#8F99A8 !important; }
+[style*="color:var(--t3)"]{ color:#AEB7C4 !important; }
+[style*="color:var(--t2)"]{ color:#D0D5DD !important; }
+
+/* Avoid ultra-light font weights that look fuzzy */
+[style*="font-weight:400"]{ font-weight:500 !important; }
+[style*="font-weight:500"]{ font-weight:600 !important; }
+
+/* Tables: professional ledger clarity */
+table{
+  border-collapse:separate;
+  border-spacing:0;
+}
+th{
+  color:#B8C1CE !important;
+  font-weight:700 !important;
+  letter-spacing:.035em !important;
+  text-transform:uppercase;
+  background:#0B0E12 !important;
+}
+td{
+  color:#EDF1F6 !important;
+  font-weight:500 !important;
+}
+tr + tr td{
+  border-top-color:rgba(255,255,255,.065) !important;
+}
+
+/* Inputs/buttons: crisp labels, no fuzzy translucent text */
+button, .btn{
+  font-weight:700 !important;
+  letter-spacing:.005em !important;
+  text-shadow:none !important;
+}
+input, select, textarea{
+  color:#F8FAFC !important;
+  font-weight:500 !important;
+}
+input::placeholder, textarea::placeholder{
+  color:#7D8796 !important;
+  opacity:1 !important;
+}
+
+/* Sidebar: clarity without enlargement */
+.sidebar, aside{
+  -webkit-font-smoothing:antialiased;
+}
+.sidebar a, aside a, .mnav{
+  font-weight:650 !important;
+  text-shadow:none !important;
+}
+
+/* Revenue KPI cards: brighter hierarchy */
+#revenue .card strong, #revenue .panel strong,
+[id*="revenue"] .card strong, [id*="revenue"] .panel strong{
+  font-weight:800 !important;
+  letter-spacing:-.015em !important;
+}
+
+/* Status colors should remain vivid and readable */
+[style*="color:#22c55e"], [style*="color: #22c55e"]{ color:#34D399 !important; }
+[style*="color:#dc2626"], [style*="color: #dc2626"]{ color:#FB7185 !important; }
+[style*="color:#eab308"], [style*="color: #eab308"]{ color:#FACC15 !important; }
+[style*="color:var(--gold)"]{ text-shadow:none !important; }
+
+/* Remove excessive blur effects which soften text */
+[style*="backdrop-filter"]{
+  backdrop-filter:none !important;
+  -webkit-backdrop-filter:none !important;
+}
+</style>
+
+
+<style id="np-jcc-style">
+.np-jcc-shell{background:radial-gradient(circle at 15% 0%,rgba(212,175,55,.13),transparent 35%),linear-gradient(180deg,#090b10,#050608)!important;border:1px solid rgba(212,175,55,.28)!important;box-shadow:0 30px 90px #000,0 0 0 1px rgba(255,255,255,.03) inset;position:relative}.np-jcc-close{position:sticky;float:right;top:8px;z-index:8;border:1px solid #3b3f49;background:#10131a;color:#fff;width:38px;height:38px;border-radius:50%;font-size:20px;cursor:pointer}.np-jcc-loading{min-height:320px;display:flex;align-items:center;justify-content:center;gap:18px;color:#fff}.np-jcc-loading div div{color:#94a3b8;margin-top:5px}.np-jcc-orbit{width:44px;height:44px;border:3px solid rgba(212,175,55,.15);border-top-color:#d4af37;border-radius:50%;animation:npJccSpin .8s linear infinite}@keyframes npJccSpin{to{transform:rotate(360deg)}}
+.np-jcc-hero{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;padding:8px 4px 16px}.np-jcc-kicker{font-size:10px;letter-spacing:.16em;font-weight:900;color:#d4af37;text-transform:uppercase}.np-jcc-hero h2{font-size:30px;margin:5px 0 3px;color:#fff}.np-jcc-contact{font-size:12px;color:#94a3b8}.np-jcc-live-pill{display:flex;gap:8px;align-items:center;border:1px solid rgba(34,197,94,.4);background:rgba(34,197,94,.08);color:#86efac;border-radius:999px;padding:8px 12px;font-size:10px;font-weight:900;letter-spacing:.08em}.np-jcc-live-pill i{width:8px;height:8px;border-radius:50%;background:#22c55e;box-shadow:0 0 12px #22c55e;animation:npJccPulse 1.4s infinite}@keyframes npJccPulse{0%,100%{opacity:.45;transform:scale(.85)}50%{opacity:1;transform:scale(1.25)}}
+.np-jcc-topgrid{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:10px}.np-jcc-topgrid>div{background:#0d1016;border:1px solid #202633;border-radius:13px;padding:11px 12px;min-width:0}.np-jcc-topgrid span{display:block;font-size:9px;color:#7f8a9c;text-transform:uppercase;font-weight:800;letter-spacing:.05em}.np-jcc-topgrid b{display:block;color:#fff;font-size:18px;margin-top:3px}.np-jcc-topgrid .hot{border-color:rgba(239,68,68,.45);background:rgba(127,29,29,.13)}.np-jcc-topgrid .hot b{color:#f87171}.np-jcc-topgrid .alarm{animation:npJccAlarm 1.15s infinite;border-color:#ef4444}@keyframes npJccAlarm{0%,100%{box-shadow:0 0 0 rgba(239,68,68,0)}50%{box-shadow:0 0 22px rgba(239,68,68,.22)}}.np-jcc-rule{padding:9px 12px;border:1px dashed rgba(212,175,55,.35);border-radius:10px;color:#d6c07a;background:rgba(212,175,55,.045);font-size:10px;font-weight:800;text-align:center;letter-spacing:.04em;margin:8px 0 13px}
+.np-jcc-journey{border:1px solid #252b36;border-radius:16px;margin:10px 0;background:#0a0d12;overflow:hidden;transition:.2s}.np-jcc-journey.ok{border-color:rgba(34,197,94,.25)}.np-jcc-journey.warn{border-color:rgba(245,158,11,.35)}.np-jcc-journey.red,.np-jcc-journey.danger{border-color:rgba(239,68,68,.45)}.np-jcc-journey-head{width:100%;display:grid;grid-template-columns:8px minmax(0,1.4fr) minmax(220px,.8fr) 28px;gap:12px;align-items:center;background:linear-gradient(90deg,#0e1219,#0a0c11);border:0;color:#fff;padding:13px;text-align:left;cursor:pointer}.np-jcc-led{width:7px;height:46px;border-radius:999px;background:#64748b}.np-jcc-led.ok{background:#22c55e;box-shadow:0 0 16px rgba(34,197,94,.5)}.np-jcc-led.warn{background:#f59e0b;box-shadow:0 0 16px rgba(245,158,11,.45);animation:npJccPulse 1.8s infinite}.np-jcc-led.red,.np-jcc-led.danger{background:#ef4444;box-shadow:0 0 17px rgba(239,68,68,.55);animation:npJccPulse 1s infinite}.np-jcc-title h3{font-size:15px;margin:2px 0;color:#fff}.np-jcc-title>div:last-child{font-size:9px;color:#637083;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.np-jcc-verdict{border:1px solid #2a303b;border-radius:11px;padding:8px 10px;background:#10141b}.np-jcc-verdict b{font-size:11px;display:block}.np-jcc-verdict span{font-size:9px;color:#8e99aa;display:block;margin-top:2px}.np-jcc-verdict.ok b{color:#4ade80}.np-jcc-verdict.warn b{color:#fbbf24}.np-jcc-verdict.red b,.np-jcc-verdict.danger b{color:#f87171}.np-jcc-chevron{font-size:20px;color:#64748b;transition:.2s}.np-jcc-journey.open .np-jcc-chevron{transform:rotate(180deg)}.np-jcc-journey-body{display:none;padding:12px 13px 15px;border-top:1px solid #1c222c}.np-jcc-journey.open .np-jcc-journey-body{display:block}
+.np-jcc-livegrid{display:grid;grid-template-columns:repeat(8,1fr);gap:7px}.np-jcc-livegrid>div{background:#0e1218;border:1px solid #1f2631;border-radius:10px;padding:8px}.np-jcc-livegrid span{font-size:8px;text-transform:uppercase;color:#6f7b8c;display:block;font-weight:800}.np-jcc-livegrid b{font-size:11px;color:#fff;display:block;margin-top:3px}.pos{color:#4ade80!important}.neg{color:#f87171!important}.np-jcc-section-title{font-size:9px;color:#a9954e;font-weight:900;letter-spacing:.12em;margin:14px 0 7px}.np-jcc-account-strip{display:flex;gap:7px;overflow:auto;padding-bottom:3px}.np-jcc-account{min-width:205px;background:#0b0f14;border:1px solid #232b37;border-radius:11px;padding:9px;color:#fff;text-align:left;cursor:pointer}.np-jcc-account.live{border-color:rgba(34,197,94,.35)}.np-jcc-account.bad{border-color:rgba(239,68,68,.4);background:rgba(127,29,29,.08)}.np-jcc-account.pass{border-color:rgba(59,130,246,.35)}.np-jcc-account.picked{box-shadow:0 0 0 1px #d4af37 inset}.np-jcc-account-top{display:flex;justify-content:space-between;gap:10px;font-size:8px;color:#7f8a9b}.np-jcc-account-top b{font-size:12px;color:#fff}.np-jcc-account-stage{font-size:8px;color:#9aa4b2;margin:4px 0}.np-jcc-account-metrics{display:flex;gap:7px;font-size:9px;font-weight:800}.np-jcc-account-sync{font-size:8px;color:#586273;margin-top:5px}.np-jcc-controlbar{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-top:12px;padding:10px;border:1px solid rgba(212,175,55,.22);background:rgba(212,175,55,.035);border-radius:12px}.np-jcc-controlbar>div:first-child b{font-size:10px;color:#d4af37;display:block}.np-jcc-controlbar>div:first-child span{font-size:8px;color:#707b8b}.np-jcc-controls{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.np-jcc-btn{border:1px solid #2d3440;border-radius:8px;padding:7px 9px;font-size:9px;font-weight:900;color:#fff;background:#141922;cursor:pointer}.np-jcc-btn.gold{background:#d4af37;color:#0b0b0b;border-color:#d4af37}.np-jcc-btn.amber{background:#3b2a0b;border-color:#8a6412;color:#fcd34d}.np-jcc-btn.red{background:#4b1115;border-color:#8f1d27;color:#fecaca}.np-jcc-btn.orange{background:#3b200c;border-color:#8a4515;color:#fdba74}.np-jcc-btn.blue{background:#0b2e47;border-color:#125f91;color:#bae6fd}.np-jcc-btn.dark{background:#161a21;color:#aab2bf}.np-jcc-btn.pulse{animation:npJccAlarm 1s infinite}.np-jcc-two-col{display:grid;grid-template-columns:1.45fr .75fr;gap:12px}.np-jcc-timeline{border-left:1px solid #222a35;margin-left:12px}.np-jcc-event{display:grid;grid-template-columns:31px 1fr;gap:7px;position:relative;padding:5px 0}.np-jcc-event-dot{width:27px;height:27px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#10151c;border:1px solid var(--ev);margin-left:-14px;font-size:11px}.np-jcc-event-body{padding:1px 0 8px}.np-jcc-event-head{display:flex;justify-content:space-between;gap:10px}.np-jcc-event-head b{font-size:9px;color:var(--ev)}.np-jcc-event-head span{font-size:8px;color:#657082}.np-jcc-event-main{font-size:10px;color:#d8dee8}.np-jcc-event-note{font-size:8px;color:#6f7a89;margin-top:2px}.np-jcc-event-hot .np-jcc-event-dot{animation:npJccPulse 1.3s infinite}.np-jcc-moneybox,.np-jcc-evidence{display:grid;gap:6px}.np-jcc-payout,.np-jcc-evidence>div{padding:9px;border:1px solid #222a34;border-radius:10px;background:#0d1117}.np-jcc-payout.paid{border-color:rgba(239,68,68,.35);background:rgba(127,29,29,.08)}.np-jcc-payout>div{display:flex;justify-content:space-between}.np-jcc-payout b{font-size:12px;color:#fff}.np-jcc-payout span{font-size:8px;color:#f87171;font-weight:900}.np-jcc-payout small{display:block;color:#677384;font-size:8px;margin-top:3px}.np-jcc-payout button{margin-top:6px;border:0;border-radius:7px;padding:5px 8px;background:#7f1d1d;color:#fff;font-size:8px;font-weight:900}.np-jcc-evidence b{display:block;font-size:9px;color:#fbbf24}.np-jcc-evidence span{display:block;font-size:8px;color:#7f8998;margin-top:2px}.np-jcc-empty{padding:12px;color:#687385;font-size:10px;border:1px dashed #26303d;border-radius:9px}.np-jcc-footer{text-align:center;font-size:8px;color:#515b6a;padding:10px 0 2px}
+@media(max-width:900px){.np-jcc-topgrid{grid-template-columns:repeat(3,1fr)}.np-jcc-livegrid{grid-template-columns:repeat(4,1fr)}.np-jcc-two-col{grid-template-columns:1fr}.np-jcc-journey-head{grid-template-columns:6px 1fr}.np-jcc-verdict{grid-column:2}.np-jcc-chevron{display:none}.np-jcc-controlbar{align-items:flex-start;flex-direction:column}.np-jcc-controls{justify-content:flex-start}}@media(max-width:560px){.np-jcc-topgrid{grid-template-columns:repeat(2,1fr)}.np-jcc-livegrid{grid-template-columns:repeat(2,1fr)}}
+</style>
+
+<style id="np-jcc-2026-banking-legibility">
+/* Journey Cockpit — 2026 fintech banking legibility upgrade.
+   Visual-only. No automation, entitlement, payout or assignment logic changed. */
+#np-trader360 .np-jcc-shell{
+  width:min(97vw,1440px)!important;
+  max-width:1440px!important;
+  font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif!important;
+  letter-spacing:0!important;
+}
+#np-trader360 .np-jcc-hero h2{
+  font-size:36px!important;
+  line-height:1.06!important;
+  letter-spacing:-.035em!important;
+  font-weight:900!important;
+}
+#np-trader360 .np-jcc-kicker{
+  font-size:12px!important;
+  letter-spacing:.12em!important;
+  line-height:1.35!important;
+}
+#np-trader360 .np-jcc-contact{
+  font-size:14px!important;
+  line-height:1.45!important;
+}
+#np-trader360 .np-jcc-live-pill{
+  font-size:12px!important;
+  padding:10px 14px!important;
+}
+#np-trader360 .np-jcc-topgrid{
+  gap:10px!important;
+}
+#np-trader360 .np-jcc-topgrid>div{
+  padding:15px 16px!important;
+  min-height:78px!important;
+}
+#np-trader360 .np-jcc-topgrid span{
+  font-size:11px!important;
+  line-height:1.25!important;
+}
+#np-trader360 .np-jcc-topgrid b{
+  font-size:23px!important;
+  line-height:1.15!important;
+  font-weight:900!important;
+}
+#np-trader360 .np-jcc-rule{
+  font-size:12px!important;
+  line-height:1.45!important;
+  padding:12px 16px!important;
+}
+#np-trader360 .np-jcc-journey{
+  margin:14px 0!important;
+  border-radius:18px!important;
+}
+#np-trader360 .np-jcc-journey-head{
+  padding:18px 16px!important;
+  grid-template-columns:10px minmax(0,1.45fr) minmax(300px,.85fr) 34px!important;
+  gap:16px!important;
+}
+#np-trader360 .np-jcc-led{
+  width:8px!important;
+  height:58px!important;
+}
+#np-trader360 .np-jcc-title h3{
+  font-size:20px!important;
+  line-height:1.2!important;
+  letter-spacing:-.01em!important;
+}
+#np-trader360 .np-jcc-title>div:last-child{
+  font-size:12px!important;
+  line-height:1.35!important;
+}
+#np-trader360 .np-jcc-verdict{
+  padding:12px 14px!important;
+  border-radius:13px!important;
+}
+#np-trader360 .np-jcc-verdict b{
+  font-size:15px!important;
+  line-height:1.25!important;
+  letter-spacing:.01em!important;
+}
+#np-trader360 .np-jcc-verdict span{
+  font-size:12px!important;
+  line-height:1.4!important;
+  margin-top:4px!important;
+}
+#np-trader360 .np-jcc-chevron{
+  font-size:27px!important;
+}
+#np-trader360 .np-jcc-journey-body{
+  padding:16px 18px 20px!important;
+}
+#np-trader360 .np-jcc-livegrid{
+  gap:9px!important;
+}
+#np-trader360 .np-jcc-livegrid>div{
+  padding:12px 13px!important;
+  min-height:76px!important;
+  border-radius:12px!important;
+}
+#np-trader360 .np-jcc-livegrid span{
+  font-size:10px!important;
+  line-height:1.25!important;
+  letter-spacing:.075em!important;
+}
+#np-trader360 .np-jcc-livegrid b{
+  font-size:16px!important;
+  line-height:1.25!important;
+  margin-top:5px!important;
+  font-weight:900!important;
+}
+#np-trader360 .np-jcc-section-title{
+  font-size:12px!important;
+  line-height:1.3!important;
+  letter-spacing:.09em!important;
+  margin:18px 0 9px!important;
+}
+#np-trader360 .np-jcc-account-strip{
+  gap:10px!important;
+}
+#np-trader360 .np-jcc-account{
+  min-width:250px!important;
+  padding:13px!important;
+  border-radius:13px!important;
+}
+#np-trader360 .np-jcc-account-top{
+  font-size:10px!important;
+}
+#np-trader360 .np-jcc-account-top b{
+  font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace!important;
+  font-size:16px!important;
+  letter-spacing:.03em!important;
+}
+#np-trader360 .np-jcc-account-stage{
+  font-size:11px!important;
+  line-height:1.4!important;
+  margin:7px 0!important;
+}
+#np-trader360 .np-jcc-account-metrics{
+  font-size:12px!important;
+  gap:10px!important;
+  line-height:1.35!important;
+}
+#np-trader360 .np-jcc-account-sync{
+  font-size:10px!important;
+  line-height:1.4!important;
+  margin-top:8px!important;
+}
+#np-trader360 .np-jcc-controlbar{
+  padding:14px!important;
+  margin-top:16px!important;
+}
+#np-trader360 .np-jcc-controlbar>div:first-child b{
+  font-size:13px!important;
+}
+#np-trader360 .np-jcc-controlbar>div:first-child span{
+  font-size:11px!important;
+  line-height:1.4!important;
+}
+#np-trader360 .np-jcc-controls{
+  gap:8px!important;
+}
+#np-trader360 .np-jcc-btn{
+  font-size:12px!important;
+  padding:9px 12px!important;
+  border-radius:9px!important;
+}
+#np-trader360 .np-jcc-two-col{
+  gap:18px!important;
+}
+#np-trader360 .np-jcc-timeline{
+  margin-left:16px!important;
+}
+#np-trader360 .np-jcc-event{
+  grid-template-columns:42px 1fr!important;
+  gap:11px!important;
+  padding:9px 0!important;
+}
+#np-trader360 .np-jcc-event-dot{
+  width:36px!important;
+  height:36px!important;
+  margin-left:-18px!important;
+  font-size:15px!important;
+}
+#np-trader360 .np-jcc-event-body{
+  padding:2px 0 13px!important;
+}
+#np-trader360 .np-jcc-event-head{
+  gap:16px!important;
+  align-items:flex-start!important;
+}
+#np-trader360 .np-jcc-event-head b{
+  font-size:15px!important;
+  line-height:1.25!important;
+  letter-spacing:.01em!important;
+  font-weight:900!important;
+}
+#np-trader360 .np-jcc-event-head span{
+  font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace!important;
+  font-size:12px!important;
+  line-height:1.35!important;
+  color:#9ca8b8!important;
+  white-space:nowrap!important;
+}
+#np-trader360 .np-jcc-event-main{
+  font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace!important;
+  font-size:14px!important;
+  line-height:1.55!important;
+  letter-spacing:.015em!important;
+  margin-top:4px!important;
+  color:#f2f5f8!important;
+}
+#np-trader360 .np-jcc-event-note{
+  font-size:13px!important;
+  line-height:1.55!important;
+  margin-top:5px!important;
+  color:#aeb7c4!important;
+  max-width:980px!important;
+}
+#np-trader360 .np-jcc-event-hot .np-jcc-event-body{
+  background:linear-gradient(90deg,rgba(127,29,29,.16),rgba(127,29,29,0))!important;
+  border-radius:10px!important;
+  padding:8px 10px 12px!important;
+}
+#np-trader360 .np-jcc-moneybox,
+#np-trader360 .np-jcc-evidence{
+  gap:8px!important;
+}
+#np-trader360 .np-jcc-payout,
+#np-trader360 .np-jcc-evidence>div{
+  padding:13px!important;
+  border-radius:12px!important;
+}
+#np-trader360 .np-jcc-payout b{
+  font-size:18px!important;
+}
+#np-trader360 .np-jcc-payout span{
+  font-size:11px!important;
+}
+#np-trader360 .np-jcc-payout small{
+  font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace!important;
+  font-size:11px!important;
+  line-height:1.45!important;
+}
+#np-trader360 .np-jcc-payout button{
+  font-size:11px!important;
+  padding:7px 10px!important;
+}
+#np-trader360 .np-jcc-evidence b{
+  font-size:12px!important;
+  line-height:1.35!important;
+}
+#np-trader360 .np-jcc-evidence span{
+  font-size:11px!important;
+  line-height:1.5!important;
+  margin-top:4px!important;
+}
+#np-trader360 .np-jcc-empty{
+  font-size:12px!important;
+  line-height:1.5!important;
+  padding:15px!important;
+}
+#np-trader360 .np-jcc-footer{
+  font-size:10px!important;
+  padding:14px 0 4px!important;
+}
+#np-trader360 .np-jcc-close{
+  width:44px!important;
+  height:44px!important;
+  font-size:23px!important;
+}
+@media(max-width:1100px){
+  #np-trader360 .np-jcc-livegrid{grid-template-columns:repeat(4,1fr)!important}
+  #np-trader360 .np-jcc-topgrid{grid-template-columns:repeat(3,1fr)!important}
+}
+@media(max-width:720px){
+  #np-trader360 .np-jcc-hero h2{font-size:29px!important}
+  #np-trader360 .np-jcc-journey-head{grid-template-columns:8px 1fr!important}
+  #np-trader360 .np-jcc-verdict{grid-column:2!important}
+  #np-trader360 .np-jcc-livegrid{grid-template-columns:repeat(2,1fr)!important}
+  #np-trader360 .np-jcc-topgrid{grid-template-columns:repeat(2,1fr)!important}
+  #np-trader360 .np-jcc-two-col{grid-template-columns:1fr!important}
+  #np-trader360 .np-jcc-event-head{display:block!important}
+  #np-trader360 .np-jcc-event-head span{display:block!important;margin-top:3px!important}
+}
+</style>
+
+<style id="np-jcc-assignment-card-style">
+.np-jcc-assignment-card{border:1px solid #293241;background:linear-gradient(180deg,#0d131b,#090d12);border-radius:14px;padding:14px;display:grid;gap:8px;box-shadow:inset 0 1px 0 rgba(255,255,255,.025)}
+.np-jcc-assignment-card.due{border-color:rgba(234,179,8,.72);box-shadow:0 0 24px rgba(234,179,8,.08),inset 0 1px 0 rgba(255,255,255,.03)}
+.np-jcc-assignment-card.clear{border-color:rgba(34,197,94,.28)}
+.np-jcc-assignment-head{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:11px;letter-spacing:.11em;color:#d4af37}
+.np-jcc-assignment-head span{font-size:10px;padding:4px 8px;border-radius:999px;background:rgba(234,179,8,.12);border:1px solid rgba(234,179,8,.35);color:#fde68a}
+.np-jcc-assignment-card.clear .np-jcc-assignment-head span{background:rgba(34,197,94,.10);border-color:rgba(34,197,94,.28);color:#86efac}
+.np-jcc-assignment-card strong{font-size:17px;color:#fff;line-height:1.15}.np-jcc-assignment-card small{font-size:12px;color:#aeb8c7;line-height:1.45}.np-jcc-assignment-meta{font-size:11px;color:#8f9aaa;border-top:1px solid rgba(255,255,255,.06);padding-top:8px}.np-jcc-assignment-meta b{color:#fff}.np-jcc-assignment-card .np-jcc-btn{width:100%;justify-content:center;margin-top:2px;min-height:38px}
+</style>
+
+
+<style id="np-ja-admin-accountability-style">
+.np-jcc-assignment-card.blocked{border:1px solid rgba(239,68,68,.65);background:rgba(127,29,29,.13);box-shadow:0 0 18px rgba(239,68,68,.08)}
+.np-jcc-assignment-card.blocked .np-jcc-assignment-head span{color:#f87171}
+.np-jcc-assignment-card.blocked strong{color:#f87171}
+</style>
+
+<style id="np-magic-black-box-v2-style">
+/* NAIRAPIPS BLACK BOX V3 — luminous luxury fintech */
+.npbb-shell{position:relative;overflow:hidden;border-radius:30px;padding:2px;background:linear-gradient(120deg,#fff1a8 0%,#f7c843 18%,#ff9f1c 38%,#ff4d6d 60%,#7c3aed 78%,#22d3ee 100%);box-shadow:0 34px 110px rgba(0,0,0,.68),0 0 45px rgba(247,200,67,.22)}
+.npbb-inner{position:relative;overflow:hidden;border-radius:28px;padding:26px;background:radial-gradient(circle at 12% -10%,rgba(255,205,70,.30),transparent 31%),radial-gradient(circle at 92% 8%,rgba(124,58,237,.24),transparent 28%),radial-gradient(circle at 72% 92%,rgba(34,211,238,.12),transparent 28%),linear-gradient(145deg,#17120a 0%,#090a10 48%,#100b18 100%)}
+.npbb-inner:before{content:"";position:absolute;width:360px;height:360px;right:-160px;top:-180px;border-radius:50%;border:55px solid rgba(255,255,255,.035);box-shadow:0 0 0 55px rgba(247,200,67,.025)}
+.npbb-inner:after{content:"BLACK BOX";position:absolute;right:-18px;bottom:70px;font-size:76px;font-weight:950;letter-spacing:-.06em;color:rgba(255,255,255,.025);transform:rotate(-90deg);pointer-events:none}
+.npbb-head{position:relative;z-index:1;display:flex;justify-content:space-between;gap:20px;align-items:flex-start;padding-bottom:20px;border-bottom:1px solid rgba(255,255,255,.12)}
+.npbb-brand{display:inline-flex;padding:7px 10px;border-radius:999px;background:linear-gradient(90deg,#f7c843,#ffe899);color:#171006;font-size:9px;letter-spacing:.18em;text-transform:uppercase;font-weight:950;box-shadow:0 8px 28px rgba(247,200,67,.22)}
+.npbb-title{font-size:40px;line-height:.98;font-weight:950;letter-spacing:-.045em;margin:12px 0 7px;background:linear-gradient(90deg,#fff,#fff4bf 52%,#f7c843);-webkit-background-clip:text;background-clip:text;color:transparent}
+.npbb-sub{color:#c4c4cc;font-size:12px;max-width:640px;line-height:1.6}
+.npbb-seal{min-width:150px;text-align:center;border:1px solid rgba(255,94,111,.6);border-radius:15px;padding:12px 14px;background:linear-gradient(135deg,rgba(255,77,109,.23),rgba(239,68,68,.08));color:#ffd3da;font-size:10px;font-weight:950;letter-spacing:.13em;box-shadow:inset 0 1px 0 rgba(255,255,255,.12),0 10px 34px rgba(239,68,68,.12)}
+.npbb-moment{position:relative;z-index:1;margin-top:18px;padding:22px;border:1px solid rgba(255,193,74,.42);border-radius:22px;background:linear-gradient(110deg,rgba(255,180,49,.18),rgba(255,77,109,.10) 52%,rgba(124,58,237,.13));box-shadow:inset 0 1px 0 rgba(255,255,255,.10),0 14px 42px rgba(0,0,0,.22)}
+.npbb-kicker{font-size:9px;letter-spacing:.2em;text-transform:uppercase;color:#ffd86b;font-weight:950}.npbb-time{font-size:27px;font-weight:950;color:#fff;margin-top:7px;letter-spacing:-.025em;text-shadow:0 0 24px rgba(255,212,99,.16)}
+.npbb-metrics{position:relative;z-index:1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:13px}
+.npbb-card{position:relative;overflow:hidden;min-height:112px;padding:16px;border-radius:19px;border:1px solid rgba(255,255,255,.13);background:linear-gradient(145deg,rgba(255,255,255,.10),rgba(255,255,255,.025));box-shadow:inset 0 1px 0 rgba(255,255,255,.10),0 12px 32px rgba(0,0,0,.18)}
+.npbb-card:after{content:"";position:absolute;width:70px;height:70px;border-radius:50%;right:-34px;top:-34px;background:rgba(255,255,255,.06)}
+.npbb-card.critical{border-color:rgba(255,92,113,.48);background:linear-gradient(145deg,rgba(255,77,109,.20),rgba(111,20,38,.07))}.npbb-card.gold{border-color:rgba(255,216,107,.46);background:linear-gradient(145deg,rgba(247,200,67,.20),rgba(111,79,12,.05))}
+.npbb-label{font-size:9px;text-transform:uppercase;letter-spacing:.13em;color:#aeb0bb;font-weight:900}.npbb-value{margin-top:9px;font-size:21px;line-height:1.1;font-weight:950;color:#ffe279;word-break:break-word}.npbb-card.critical .npbb-value{color:#ffb1bf}.npbb-note{font-size:10px;color:#9294a0;margin-top:6px}
+.npbb-proof{position:relative;z-index:1;margin-top:13px;display:grid;grid-template-columns:1.18fr .82fr;gap:12px}.npbb-panel{padding:17px;border-radius:19px;border:1px solid rgba(255,255,255,.12);background:linear-gradient(145deg,rgba(255,255,255,.075),rgba(255,255,255,.022));box-shadow:inset 0 1px 0 rgba(255,255,255,.07)}
+.npbb-panel h4{margin:0 0 11px;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:#f2f2f4}.npbb-ruleline{height:10px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden;margin:13px 0 9px;box-shadow:inset 0 1px 3px rgba(0,0,0,.4)}.npbb-rulefill{height:100%;border-radius:999px;background:linear-gradient(90deg,#22d3ee 0%,#f7c843 48%,#ff9f1c 70%,#ff4d6d 100%);box-shadow:0 0 22px rgba(255,126,69,.55)}
+.npbb-recovery{margin-top:13px;padding:14px;border-radius:15px;border:1px solid rgba(52,211,153,.4);background:linear-gradient(120deg,rgba(16,185,129,.16),rgba(34,211,238,.07));color:#d1fae5}.npbb-recovery b{color:#6ee7b7}
+.npbb-foot{position:relative;z-index:1;display:flex;justify-content:space-between;gap:10px;align-items:center;margin-top:17px;padding-top:15px;border-top:1px solid rgba(255,255,255,.10);font-size:10px;color:#9a9ca7}.npbb-ref{font-family:'JetBrains Mono',monospace;color:#f3d574}
+.npbb-actions{display:flex;gap:8px;flex-wrap:wrap}.npbb-btn{border-radius:999px;padding:10px 15px;border:1px solid rgba(255,222,121,.52);background:linear-gradient(135deg,rgba(247,200,67,.20),rgba(255,159,28,.10));color:#ffe58b;font-size:10px;font-weight:950;cursor:pointer;box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}.npbb-btn:hover{transform:translateY(-1px);background:linear-gradient(135deg,rgba(247,200,67,.30),rgba(255,159,28,.16))}
+.npbb-timeline{margin-top:12px;max-height:245px;overflow:auto;border-radius:15px;border:1px solid rgba(255,255,255,.09);background:rgba(0,0,0,.16)}.npbb-timeline table{width:100%;min-width:760px;border-collapse:collapse;font-size:10px}.npbb-timeline th{position:sticky;top:0;background:#17141a;color:#f2d777;text-transform:uppercase;letter-spacing:.08em}.npbb-timeline th,.npbb-timeline td{padding:10px;border-bottom:1px solid rgba(255,255,255,.07);text-align:left}.npbb-timeline tr:hover td{background:rgba(247,200,67,.035)}
+@media(max-width:850px){.npbb-metrics{grid-template-columns:repeat(2,1fr)}.npbb-proof{grid-template-columns:1fr}.npbb-head{flex-direction:column}.npbb-title{font-size:32px}}
+@media(max-width:520px){.npbb-inner{padding:15px}.npbb-metrics{grid-template-columns:1fr 1fr}.npbb-value{font-size:17px}.npbb-time{font-size:21px}}
+</style>
+
+
+<style id="np-blackbox-number-fit-fix">
+/* V45 — presentation-only fit correction. No Black Box data or calculations changed. */
+.npbb-metrics{grid-template-columns:repeat(4,minmax(0,1fr))!important}
+.npbb-card{min-width:0!important;padding:14px 12px!important}
+.npbb-value{
+  display:block!important;
+  width:100%!important;
+  max-width:100%!important;
+  white-space:nowrap!important;
+  overflow:hidden!important;
+  text-overflow:clip!important;
+  word-break:normal!important;
+  overflow-wrap:normal!important;
+  font-size:clamp(13px,1.05vw,18px)!important;
+  line-height:1.12!important;
+  letter-spacing:-.035em!important;
+  font-variant-numeric:tabular-nums!important;
+}
+.npbb-note{
+  overflow-wrap:anywhere!important;
+  word-break:normal!important;
+  line-height:1.35!important;
+}
+.npbb-label{min-height:24px!important;line-height:1.3!important}
+@media(max-width:1100px){
+  .npbb-value{font-size:15px!important}
+}
+@media(max-width:760px){
+  .npbb-metrics{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+  .npbb-value{font-size:17px!important}
+}
+</style>
+
+
+<!-- NAIRAPIPS ADMIN V103 MANAGEMENT RECALL LINEAGE DISPLAY PROTECTION · 27 SEP 2026
+     PATCHED DIRECTLY ON THE 933KB PRODUCTION MASTER.
+     Existing Universal Recall V87 and Management Recall V102 controls are preserved.
+     Historical recalled/archived accounts remain in the ledger but cannot be rendered
+     as CURRENT solely through a stale current_account_id pointer.
+     Backend V103 owns Management Hold, Return lineage, worker firewall and life-count reconciliation.
+-->
+
+
+<!-- V105 MANAGEMENT RECALL/RETURN VISUAL DISTINCTION · PRESENTATION ONLY · 27 SEP 2026 -->
+
+<style>
+/* V156 PRODUCT MARKETS */
+.np-market-section{border:1px solid var(--line);border-radius:16px;padding:16px;margin:0 0 18px;background:linear-gradient(180deg,rgba(255,255,255,.02),rgba(255,255,255,.005))}
+.np-market-section.standard{border-color:rgba(245,208,97,.35);box-shadow:inset 0 1px 0 rgba(245,208,97,.08)}
+.np-market-section.premium{border-color:rgba(99,102,241,.42);box-shadow:inset 0 1px 0 rgba(129,140,248,.1)}
+.np-market-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+.np-market-title{font-size:18px;font-weight:950;letter-spacing:.04em}
+.np-market-section.standard .np-market-title{color:#f5d061}
+.np-market-section.premium .np-market-title{color:#a5b4fc}
+.np-market-chip{font-size:10px;font-weight:900;letter-spacing:.09em;padding:5px 9px;border-radius:999px}
+.np-market-section.standard .np-market-chip{background:rgba(245,208,97,.12);color:#f5d061;border:1px solid rgba(245,208,97,.28)}
+.np-market-section.premium .np-market-chip{background:rgba(99,102,241,.14);color:#c7d2fe;border:1px solid rgba(129,140,248,.3)}
+</style>
+
+
+<style>
+/* V158 — RESTORE STRONG VISUAL SEPARATION BETWEEN PRODUCT MARKETS */
+.np-market-section{
+  margin-bottom:28px!important;
+  padding:22px!important;
+  border-radius:22px!important;
+}
+.np-market-section.standard{
+  background:
+    radial-gradient(circle at 95% 0%,rgba(245,208,97,.15),transparent 28%),
+    linear-gradient(145deg,#151109,#070706 72%)!important;
+  border:1px solid rgba(245,208,97,.45)!important;
+  box-shadow:0 20px 60px rgba(0,0,0,.35),inset 0 1px 0 rgba(245,208,97,.10)!important;
+}
+.np-market-section.premium{
+  background:
+    radial-gradient(circle at 95% 0%,rgba(79,116,255,.22),transparent 30%),
+    linear-gradient(145deg,#0b1226,#05070d 72%)!important;
+  border:1px solid rgba(105,139,255,.55)!important;
+  box-shadow:0 20px 65px rgba(28,55,145,.16),inset 0 1px 0 rgba(130,158,255,.14)!important;
+}
+.np-market-section .np-market-head{
+  padding-bottom:14px;
+  margin-bottom:14px!important;
+  border-bottom:1px solid rgba(255,255,255,.07);
+}
+.np-market-section.standard .np-market-title{color:#FFD978!important}
+.np-market-section.premium .np-market-title{color:#AFC2FF!important}
+.np-market-section.standard table{border-color:rgba(245,208,97,.15)}
+.np-market-section.premium table{border-color:rgba(105,139,255,.18)}
+.np-market-section.premium thead th{color:#AFC2FF}
+.np-market-section.standard thead th{color:#FFD978}
+</style>
+
+
+<style id="np-admin-complete-mobile-menu">
+.np-admin-menu-trigger,.np-admin-drawer-head{display:none}
+#np-admin-menu-backdrop[hidden]{display:none!important}
+#np-admin-sidebar [data-menu-filtered="1"]{display:none!important}
+@media(max-width:900px){
+ .np-admin-menu-trigger{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-width:44px;min-height:44px;padding:8px 10px;border:1px solid var(--line-gold);border-radius:9px;background:#151106;color:var(--gold);font-size:12px;font-weight:800;flex-shrink:0}
+ .app>.np-admin-sidebar.np-admin-menu-open{display:block!important;position:fixed!important;inset:0 auto 0 0!important;width:min(86vw,340px)!important;height:100vh!important;height:100dvh!important;max-width:100%;overflow-y:auto!important;overscroll-behavior:contain;z-index:1001!important;padding:0 12px calc(24px + env(safe-area-inset-bottom));box-shadow:18px 0 45px #0009;background:#080808!important}
+ .np-admin-drawer-head{display:block;position:sticky;top:0;z-index:2;background:#080808;padding:14px 0 10px;border-bottom:1px solid var(--line-gold);margin-bottom:14px}
+ .np-admin-drawer-title{display:flex;justify-content:space-between;align-items:center;gap:10px;color:var(--gold);font-size:16px;font-weight:900;margin-bottom:10px}
+ #np-admin-menu-close{min-width:44px;min-height:44px;border:1px solid var(--line-gold);border-radius:8px;background:#151106;color:#fff;font-size:25px}
+ #np-admin-menu-search{width:100%;min-height:44px}
+ #np-admin-sidebar .nav{min-height:44px;width:calc(100% - 16px);font-size:14px}
+ #np-admin-menu-backdrop{position:fixed;inset:0;z-index:1000;background:#0009;border:0;width:100%;height:100%;touch-action:none}
+ .topbar{padding-left:10px;padding-right:10px;gap:9px}
+ .topbar h1{font-size:13px}.topbar h1 small{display:none}.topbar .tb-clock{display:none}
+ .mobile-nav{padding-bottom:calc(8px + env(safe-area-inset-bottom))}
+ .content{padding-bottom:calc(90px + env(safe-area-inset-bottom))!important}
+}
+</style>
+
+<style>
+@keyframes npPurchaseBlink{0%,100%{opacity:1;box-shadow:0 0 12px #ef444480}50%{opacity:.55;box-shadow:none}}
+.np-purchase-blink{animation:npPurchaseBlink 1.4s ease-in-out infinite}
+@media(prefers-reduced-motion:reduce){.np-purchase-blink{animation:none}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="./admin-assets/b9175effbdff/panel-02.js"></script>
+<script src="./admin-assets/b9175effbdff/panel-03.js"></script>
+
+<script src="./admin-assets/b9175effbdff/panel-04.js"></script>
+
+
+<script src="./admin-assets/b9175effbdff/panel-05.js"></script>
+
+
+<script src="./admin-assets/b9175effbdff/panel-06.js"></script>
+
+<script src="./admin-assets/b9175effbdff/panel-07.js"></script>
+
+
+<script src="./admin-assets/b9175effbdff/panel-08.js"></script>
+
+
+<script src="./admin-assets/b9175effbdff/panel-09.js"></script>
+<!-- V38: Recall fixed to production monitoring URL; MT5 picker FIFO oldest eligible first. -->
+
+<script src="./admin-assets/b9175effbdff/panel-10.js"></script>
+
+
+<script src="./admin-assets/b9175effbdff/panel-11.js"></script>
+
+<script src="./admin-assets/b9175effbdff/panel-12.js"></script>
+
+<script src="./admin-assets/b9175effbdff/panel-13.js"></script>
+<!-- V110 HISTORIC TRUTH · 30 SEP 2026 -->
+
+<script src="./admin-assets/b9175effbdff/panel-14.js"></script>
+<!-- BUSINESS_OVERVIEW_TRUTH_V1 -->
+<script src="./admin-assets/b9175effbdff/panel-15.js"></script>
+</body>
+</html>
+
+<!-- NP_HOTFIX: RESTORE_EXACT_FUNDED_RESET_CONFIRM_ONLY_2026_09_08 -->
+
+<!-- NP_FIX: ADMIN_TERMINAL_FUNDED_RESET_EXHAUSTION_PRESENTATION_2026_09_08 -->
+
+<!-- NP_FIX: TERMINAL_JOURNEY_ACTION_BAR_LOCK_2026_09_08 -->
+
+<!-- NP_FIX: MULTI_PURCHASE_SECOND_LIFE_ACTION_VISIBILITY_2026_09_08 -->
+
+<!-- NP_FIX: CROSS_PURCHASE_PASS_ENTITLEMENT_VISIBLE_WHILE_SECOND_LIFE_ACTIVE_2026_09_09 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V39_FULL_MT5_POOL_PURCHASE_AND_COCKPIT_2026_09_15 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V40_FAST_COMPLETE_ASSIGNABLE_MT5_2026_09_15 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V41_COCKPIT_CACHE_FIRST_RESILIENT_2026_09_15 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V42_RUNTIME_TESTED_MT5_STAGE_SCOPE_FIX_2026_09_15 -->
+
+<script src="./admin-assets/b9175effbdff/panel-16.js"></script>
+<!-- NAIRAPIPS_ADMIN_RELEASE: V44_LEGACY_PAYOUT_MANUAL_ASSIGNMENT_2026_09_16 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V45_BACKEND_AUTHORITY_PROGRESSION_2026_09_16 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V46_RESET_RECALL_EXACT_ACCOUNT_FIX_2026_09_16 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V47_STAFF_RECOVERY_ASSIGNMENT_FIX_2026_09_16 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V48_EXPLICIT_STAFF_RECOVERY_APPROVAL_2026_09_16 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: EXACT_CURRENT_V50_OPERATIONS_RADAR_FIX_2026_09_17 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V51_AUTOMATION_GUIDE_JOURNEY_CONTROL_2026_09_17 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V52_PAYOUT_REJECTION_RESTORED_2026_09_17 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V53_PAYOUT_REJECTION_CLICK_SAFETY_2026_09_17 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V54_PAYOUT_REJECTION_DELIVERY_STATUS_2026_09_17 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V55_REMOVE_PAYOUT_ADMIN_NOTE_COLUMN_2026_09_17 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V56_MASTER_AUTOMATION_ALIGNMENT_2026_09_17 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V57_FUNDED_RESET_AUTHORITY_FALLBACK_2026_09_18 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V58_DIRECT_FUNDED_RESET_AUTHORITY_2026_09_18 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V59_DURABLE_RESET_RIGHT_AND_ANTI_ABUSE_2026_09_18 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V60_COCKPIT_EXACT_RESET_WORKFLOW_2026_09_18 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V61_FOCUS_EXACT_RESET_ACCOUNT_2026_09_18 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V62_FORENSIC_RESET_FALLBACK_2026_09_18 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: CURRENT_V63_RESET_FULFILLED_RECONCILIATION_2026_09_19 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V34_LIVE_PAYOUT_LIABILITY_INTELLIGENCE_2026_09_20 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V34_1_LIVE_PAYOUT_LIABILITY_INTELLIGENCE_FAILSAFE_2026_09_20 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V35_SECOND_LIFE_COCKPIT_RECONCILIATION_2026_09_21 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V36_PAYOUT_REJECTION_TRADE_SYNC_FALLBACK_2026_09_21 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V37_PAYOUT_REJECTION_SINGLE_NOTE_AND_TRADE_RECOVERY_2026_09_21 -->
+
+<!-- V39: Recall fixed URL; assignment fallback excludes stale/undated MT5; FIFO oldest eligible first. -->
+
+<script src="./admin-assets/b9175effbdff/panel-17.js"></script>
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V50_WAITING_BUTTON_GENERIC_BRANCH_2026_09_22 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V51_EXACT_RESET_WORKAROUND_RECOVERY_2026_09_22 -->
+
+<!-- NAIRAPIPS_ADMIN_RELEASE: V58_BLACK_BOOK_TWO_TIMESTAMPS_SAFE_2026_09_23 -->
+
+
+<script src="./admin-assets/b9175effbdff/panel-18.js"></script>
+
+
+<script src="./admin-assets/b9175effbdff/panel-19.js"></script>
+
+
+<script src="./admin-assets/b9175effbdff/panel-20.js"></script>
+
+<script src="./admin-assets/b9175effbdff/panel-21.js"></script>
