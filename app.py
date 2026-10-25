@@ -60041,3 +60041,6 @@ _np_register_profit_policy(app, globals())
 
 from finance_source import register_finance_source as _np_register_finance_source
 _np_register_finance_source(app, _np_limited_cycle_guard, _require_admin)
+
+from final_assignment_lock import install as _np_install_final_assignment_lock
+_np_install_final_assignment_lock(globals())
