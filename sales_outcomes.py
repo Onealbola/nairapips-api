@@ -33,6 +33,21 @@ def outcome_for(row):
     return "no_recorded_result" if row["assigned"] else "awaiting_account"
 
 
+def recorded_sale_amount(purchase):
+    for key in ('final_fee','amount_paid','payment_amount','amount','challenge_fee','plan_fee','fee','amount_due','price'):
+        value=purchase.get(key)
+        if value is None or value=='':
+            continue
+        try:
+            number=Decimal(str(value))
+            if not number.is_finite() or number<0:
+                raise ValueError('Invalid recorded sale fee')
+            return float(number.quantize(Decimal('0.01')))
+        except (InvalidOperation,TypeError):
+            raise ValueError('Invalid recorded sale fee')
+    return None
+
+
 def sale_day(p):
     for key in ("created_at", "payment_submitted_at", "payment_date", "date", "paid_at", "payment_confirmed_at", "approved_at"):
         value = p.get(key)
@@ -209,13 +224,14 @@ def build_report(purchases, accounts, start, end, payouts=None):
         paid_records = {paid_id: amount for aid in ids for paid_id, amount in paid_by_account.get(aid, [])}
         payout_amount = float(sum(paid_records.values(), Decimal("0")).quantize(Decimal("0.01")))
         position = current_position(p, journey, paid_accounts)
-        rows.append({"trader_id":str(p.get("trader_id") or ""),"trader_name":str(p.get("trader_name") or ""),"email":str(p.get("email") or ""),"current_accounts":current_accounts(p,journey,paid_accounts),"current_position":position,"still_phase1":position=="phase1","still_funded":position=="funded","purchase_id": pid, "sale_date": day, "plan": str(p.get("plan_name") or p.get("plan") or "Unspecified"), "account_size": p.get("account_size") or 0, "mt5_login": str(p.get("mt5_login") or (journey[0].get("mt5_login") if journey else "") or ""), "breached": breached, "passed": passed, "funded": funded, "funded_breached": funded_breached, "collected_payout": bool(paid_records), "paid_then_breached_closed": _paid_then_breached_closed(journey, paid_times) if paid_records else False, "paid_payout_count": len(paid_records), "payout_amount": payout_amount, "assigned": any(a.get("mt5_login") for a in journey)})
+        rows.append({"sale_amount":recorded_sale_amount(p),"trader_id":str(p.get("trader_id") or ""),"trader_name":str(p.get("trader_name") or ""),"email":str(p.get("email") or ""),"current_accounts":current_accounts(p,journey,paid_accounts),"current_position":position,"still_phase1":position=="phase1","still_funded":position=="funded","purchase_id": pid, "sale_date": day, "plan": str(p.get("plan_name") or p.get("plan") or "Unspecified"), "account_size": p.get("account_size") or 0, "mt5_login": str(p.get("mt5_login") or (journey[0].get("mt5_login") if journey else "") or ""), "breached": breached, "passed": passed, "funded": funded, "funded_breached": funded_breached, "collected_payout": bool(paid_records), "paid_then_breached_closed": _paid_then_breached_closed(journey, paid_times) if paid_records else False, "paid_payout_count": len(paid_records), "payout_amount": payout_amount, "assigned": any(a.get("mt5_login") for a in journey)})
     for row in rows:
         row["outcome"] = outcome_for(row)
         row["outcome_label"] = OUTCOMES[row["outcome"]]
     def totals(group):
         sold = len(group)
         result = {"sold": sold}
+        result["sales_amount"] = None if any(r["sale_amount"] is None for r in group) else float(sum((Decimal(str(r["sale_amount"])) for r in group),Decimal("0")))
         for key in ("breached", "passed", "funded", "funded_breached", "collected_payout", "paid_then_breached_closed", "assigned", "still_phase1", "still_funded"):
             result[key] = sum(bool(r[key]) for r in group)
             result[key + "_rate"] = round(result[key] * 100 / sold, 1) if sold else 0

@@ -12725,7 +12725,7 @@ function npSalesScopedReportV224(response,from,to){
  });
  const totals=group=>{
   const t={sold:group.length,breached:0,passed:0,funded:0,funded_breached:0,collected_payout:0,paid_then_breached_closed:0,assigned:0,still_phase1:0,still_funded:0,paid_payout_count:0,payout_amount:0,outcomes:Object.fromEntries(keys.map(k=>[k,0]))};
-  let pennies=0;
+  let pennies=0,salesPennies=0,salesKnown=true;
   for(const row of group){
    if(!keys.includes(row.outcome))throw new Error('An account outcome is missing. No totals are shown.');
    if(typeof row.still_phase1!=='boolean'||typeof row.still_funded!=='boolean')throw new Error('Current account positions are unavailable. Please refresh after the update.');
@@ -12735,8 +12735,12 @@ function npSalesScopedReportV224(response,from,to){
    const amount=Number(row.payout_amount),count=Number(row.paid_payout_count);
    if(!Number.isFinite(amount)||amount<0||!Number.isSafeInteger(count)||count<0)throw new Error('Invalid payment totals. No totals are shown.');
    pennies+=Math.round(amount*100);t.paid_payout_count+=count;
+   if(row.sale_amount==null)salesKnown=false;
+   else{const fee=Number(row.sale_amount);if(!Number.isFinite(fee)||fee<0)throw new Error('Invalid recorded sale fee.');salesPennies+=Math.round(fee*100);}
   }
   if(!Number.isSafeInteger(pennies))throw new Error('Payment total is outside the supported range. No totals are shown.');
+  if(!Number.isSafeInteger(salesPennies))throw new Error('Sales total is outside the supported range.');
+  t.sales_amount=salesKnown?salesPennies/100:null;
   t.payout_amount=pennies/100;
   t.failed_before_funded=t.outcomes.failed_before_funded;
   t.not_funded_yet=t.outcomes.awaiting_account+t.outcomes.no_recorded_result+t.outcomes.passed_not_funded;
@@ -12785,7 +12789,7 @@ async function loadSalesOutcomes(){
   const rate=(count,total)=>total>0?(100*count/total).toFixed(1)+'%':'0.0%';
   const fraction=(count,total)=>count+' out of '+total+' bought · '+rate(count,total);
   const countRate=(count,total)=>count+' <span class="text-gray-400 text-sm">('+rate(count,total)+')</span>';
-  const metricKeys={'TOTAL BOUGHT':'sold','TOTAL BREACHED':'breached','TOTAL REACHED FUNDED':'funded','TOTAL GOT PAYOUT':'collected_payout','STILL IN PHASE 1':'still_phase1','STILL FUNDED':'still_funded','GOT PAID':'collected_payout','GOT PAID → BREACHED → CLOSED':'paid_then_breached_closed'};
+  const metricKeys={'TOTAL SALES':'sales_amount','TOTAL PAYOUT':'payout_amount','TOTAL BOUGHT':'sold','TOTAL BREACHED':'breached','TOTAL REACHED FUNDED':'funded','TOTAL GOT PAYOUT':'collected_payout','STILL IN PHASE 1':'still_phase1','STILL FUNDED':'still_funded','GOT PAID':'collected_payout','GOT PAID → BREACHED → CLOSED':'paid_then_breached_closed'};
   const card=(label,value,note,color)=>`<button type="button" class="card" data-sales-metric="${metricKeys[label]}" aria-expanded="false" aria-controls="np-sales-details" style="text-align:left;cursor:pointer;width:100%;font:inherit"><div class="text-gray-400 text-sm">${label}</div><div style="font-size:32px;font-weight:950;color:${color||'#ffda5c'}">${value}</div><div class="text-gray-400 text-sm">${note}</div><div class="text-xs" style="margin-top:8px;color:#ffda5c">View matching purchases →</div></button>`;
   const line=(label,count,tone)=>`<div style="display:flex;justify-content:space-between;gap:18px;padding:12px 0;border-bottom:1px solid #ffffff16"><span>${label}</span><strong style="color:${tone||'#fff'}">${count}</strong></div>`;
   box.innerHTML=`
@@ -12797,6 +12801,8 @@ async function loadSalesOutcomes(){
     ${card('TOTAL GOT PAYOUT',t.collected_payout,fraction(t.collected_payout,t.sold),'#4ade80')}
     ${card('STILL IN PHASE 1',t.still_phase1,fraction(t.still_phase1,t.sold),'#ffda5c')}
     ${card('STILL FUNDED',t.still_funded,fraction(t.still_funded,t.sold),'#4ade80')}
+    ${card('TOTAL SALES',t.sales_amount==null?'Unavailable':e(money(t.sales_amount)),'Recorded fees · selected purchases','#ffda5c')}
+    ${card('TOTAL PAYOUT',e(money(t.payout_amount)),'Lifetime paid · selected purchases','#4ade80')}
    </div>
    <section id="np-sales-details" class="card mb-4" hidden aria-live="polite"></section>
    <p class="text-gray-400 text-sm mb-4">Current positions for these purchases, checked ${e(r.generated_at?new Date(r.generated_at).toLocaleString():'now')}. Funded includes accounts awaiting payout. Closed, archived, breached and already-paid accounts are excluded.</p>
@@ -12809,10 +12815,10 @@ async function loadSalesOutcomes(){
    <div class="card mb-4" style="overflow:auto"><h2 style="font-size:20px;font-weight:900">Results by plan</h2><p class="text-gray-400 text-sm">Percentages use bought accounts for each plan. Paid-then-closed percentages use accounts that got paid. Breached and paid can overlap.</p><table class="w-full"><thead><tr><th>Plan</th><th>Total bought</th><th>Total breached</th><th>Total reached funded</th><th>Still in Phase 1</th><th>Still Funded</th><th>Total got payout</th><th>Got paid → breached → closed</th><th>Total amount paid</th></tr></thead><tbody>${r.plans.map(p=>`<tr><td>${e(p.plan)}</td><td>${p.sold}</td><td>${countRate(p.breached,p.sold)}</td><td>${countRate(p.funded,p.sold)}</td><td>${countRate(p.still_phase1,p.sold)}</td><td>${countRate(p.still_funded,p.sold)}</td><td>${countRate(p.collected_payout,p.sold)}</td><td>${countRate(p.paid_then_breached_closed,p.collected_payout)}</td><td>${e(money(p.payout_amount))}</td></tr>`).join('')||'<tr><td colspan="9">No approved sales in this period.</td></tr>'}</tbody><tfoot><tr style="border-top:2px solid #b69b36;background:#ffda5c0d;font-weight:950;color:#ffda5c"><th scope="row">TOTAL</th><td>${t.sold}</td><td>${countRate(t.breached,t.sold)}</td><td>${countRate(t.funded,t.sold)}</td><td>${countRate(t.still_phase1,t.sold)}</td><td>${countRate(t.still_funded,t.sold)}</td><td>${countRate(t.collected_payout,t.sold)}</td><td>${countRate(t.paid_then_breached_closed,t.collected_payout)}</td><td>${e(money(t.payout_amount))}</td></tr></tfoot></table></div>
    <div class="card" style="overflow:auto"><h2 style="font-size:20px;font-weight:900">One outcome per purchase</h2><table class="w-full"><thead><tr><th>Sale date</th><th>Plan / size</th><th>Original MT5</th><th>Current position</th><th>Outcome</th><th>Paid payments</th><th>Amount paid</th></tr></thead><tbody>${r.rows.map(p=>`<tr title="Purchase ${e(p.purchase_id)}"><td>${e(p.sale_date)}</td><td>${e(p.plan)} · ${e(money(p.account_size))}</td><td>${e(p.mt5_login)||'Awaiting assignment'}</td><td>${e(({phase1:'Still in Phase 1',phase2:'Still in Phase 2',funded:'Still Funded',closed:'Cycles completed',no_open_account:'No open account',review_required:'Records need review'})[p.current_position]||'Not verified')}</td><td>${e(p.outcome_label)}</td><td>${p.paid_payout_count}</td><td>${e(money(p.payout_amount))}</td></tr>`).join('')||'<tr><td colspan="7">No approved sales in this period.</td></tr>'}</tbody></table></div>`;
   const details=box.querySelector('#np-sales-details');
-  const labels={sold:'Total bought',breached:'Total breached',funded:'Reached funded',collected_payout:'Got payout',still_phase1:'Still in Phase 1',still_funded:'Still Funded',paid_then_breached_closed:'Got paid → breached → closed'};
+  const labels={sales_amount:'Total Sales',payout_amount:'Total Payout',sold:'Total bought',breached:'Total breached',funded:'Reached funded',collected_payout:'Got payout',still_phase1:'Still in Phase 1',still_funded:'Still Funded',paid_then_breached_closed:'Got paid → breached → closed'};
   box.querySelectorAll('[data-sales-metric]').forEach(button=>button.addEventListener('click',()=>{
     const key=button.dataset.salesMetric;
-    const rows=r.rows.filter(row=>key==='sold'||row[key]===true);
+    const rows=r.rows.filter(row=>key==='sold'||key==='sales_amount'||(key==='payout_amount'?row.collected_payout===true:row[key]===true));
     box.querySelectorAll('[data-sales-metric]').forEach(b=>b.setAttribute('aria-expanded',String(b.dataset.salesMetric===key)));
     details.hidden=false;
     details.innerHTML=`<div style="display:flex;align-items:center;justify-content:space-between;gap:12px"><h2 tabindex="-1" style="font-size:20px;font-weight:900">${e(labels[key])} · ${rows.length} purchase${rows.length===1?'':'s'}</h2><button type="button" class="btn btn-ghost" data-sales-close>Close list</button></div><p class="text-gray-400 text-sm">Same sales period: ${e(r.from?npSalesDateLabelv225(r.from):'Beginning')} → ${e(r.to?npSalesDateLabelv225(r.to):'Latest sales')}. Each row is one purchase; a trader may have more than one purchase.</p><div style="overflow:auto"><table class="w-full"><thead><tr><th>Trader</th><th>Plan / size</th><th>Sale date</th><th>Recorded MT5</th><th>Current MT5 / stage</th><th>Purchase</th></tr></thead><tbody>${rows.map(row=>`<tr><td><b>${e(row.trader_name||'Trader '+String(row.trader_id||'').slice(0,8))}</b><div class="text-xs">${e(row.email)}</div></td><td>${e(row.plan)} · ${e(money(row.account_size))}</td><td>${e(npSalesDateLabelv225(row.sale_date))}</td><td>${e(row.mt5_login)||'—'}</td><td>${(row.current_accounts||[]).map(a=>`<div>${e(a.mt5_login)} · ${e(({phase1:'Phase 1',phase2:'Phase 2',funded:'Funded'})[a.stage]||a.stage)}<span class="text-xs"> · ${e(a.status)}</span></div>`).join('')||'No open account'}</td><td>${e(row.purchase_id)}</td></tr>`).join('')||'<tr><td colspan="6">No matching purchases in this sales period.</td></tr>'}</tbody></table></div>`;

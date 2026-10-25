@@ -171,3 +171,11 @@ class DrilldownIdentityTests(SalesOutcomesTests):
         self.assertEqual(row['trader_name'],'Fixture Trader');self.assertEqual(row['trader_id'],'t');self.assertTrue(row['still_funded'])
         self.assertEqual(row['current_accounts'],[dict(id='fresh',mt5_login='456',stage='funded',status='profit_protected')])
         self.assertNotIn('secret',str(report))
+
+    def test_sales_money_uses_recorded_discount_fee_and_preserves_zero(self):
+        r=build_report([self.p(final_fee='15000.25',fee=20000),self.p('free',final_fee=0,fee=20000)],[],'','')
+        self.assertEqual(r['summary']['sales_amount'],15000.25)
+        self.assertEqual(r['summary']['payout_amount'],0)
+    def test_missing_sale_fee_is_unavailable_not_guessed_from_account_size(self):
+        r=build_report([self.p(account_size=500000)],[],'','')
+        self.assertIsNone(r['summary']['sales_amount'])
