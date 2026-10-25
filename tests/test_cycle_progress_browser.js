@@ -11,7 +11,7 @@ try{for(const file of ['funded-cycle-progress.js','admin_clean_cpanel.html']){
   window.api=async(path,method)=>{
    calls.push([path,method]);if(offline)throw Error('Offline');
    if(path==='/mark_payout_paid'){
-    fixture.purchases[0]={...fixture.purchases[0],paid:2,reserved:0,remaining:0,completed:true,status:'completed'};fixture.counts.completed=2;fixture.payouts.next={purchase_id:'p1',blocked:true,reason:'COMPLETED — no further payout'};return {success:true};
+    fixture.purchases[0]={...fixture.purchases[0],paid:2,reserved:0,remaining:0,completed:true,final_cycle_active:false,status:'completed'};fixture.counts.completed=2;fixture.payouts.next={purchase_id:'p1',blocked:true,reason:'COMPLETED — no further payout'};return {success:true};
    }
    return {success:true,data:structuredClone(fixture)};
   };
@@ -22,9 +22,11 @@ try{for(const file of ['funded-cycle-progress.js','admin_clean_cpanel.html']){
  await page.evaluate(()=>document.getElementById('content').innerHTML=npCyclePanel()+npCyclePurchaseCell({id:'p1',payout_cycles:2})+npCyclePayoutCell({id:'next'})+`<button id="pay" ${npCycleActionAttrs('next')}>Mark Paid</button><button id="completed" ${npCycleActionAttrs('excess')}>Mark Paid</button><button id="renew" ${npCycleActionAttrs('first','renewal')}>Retry</button><button id="renew-completed" ${npCycleActionAttrs('excess','renewal')}>Retry</button>`);
  await page.evaluate(()=>npCycleRefresh(true));
  assert((await page.locator('[data-cycle-purchase]').innerText()).includes('1 of 2 paid'));
- assert((await page.locator('[data-cycle-payout]').innerText()).includes('1 remaining'));
+ assert((await page.locator('[data-cycle-payout]').innerText()).includes('1 payout remaining'));
  assert(!await page.locator('#pay').isDisabled());assert(await page.locator('#completed').isDisabled());assert(!await page.locator('#renew').isDisabled());assert(await page.locator('#renew-completed').isDisabled());
  assert.equal(await page.locator('#np-cycle-progress-panel img').count(),0);
+ await page.evaluate(()=>{fixture.purchases[0].final_cycle_active=true;fixture.payouts.first.renewal_blocked=true;return npCycleRefresh(true)});
+ assert((await page.locator('[data-cycle-payout]').innerText()).includes('FINAL ACCOUNT · 1 payout left'));assert(await page.locator('#renew').isDisabled());assert(!await page.locator('#pay').isDisabled());
  // Use the actual financial handler: mark paid must refresh the report immediately.
  const html=fs.readFileSync(__dirname+'/../website-downloads/admin_clean.html','utf8'),a=html.indexOf('window.markPaid = async function(id){'),b=html.indexOf('\n};',a)+4;
  await page.addScriptTag({content:html.slice(a,b)});await page.evaluate(()=>markPaid('next'));

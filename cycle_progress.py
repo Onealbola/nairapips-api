@@ -1,10 +1,11 @@
 """Read-only lifetime cycle progress, using the same ledger verifier as payment gates."""
 from collections import defaultdict
+import re
 from datetime import datetime, timezone
 from flask import jsonify
 from limited_cycle_safety import OPEN
 
-RELEASE='legacy-paid-cycle-display-2026-10-24'
+RELEASE='final-funded-cycle-explicit-2026-10-25'
 # Owner-requested historical display only; this does not grant or cap cycles.
 LEGACY_DISPLAY_PURCHASE_IDS={'4e4c7880-5593-4ffd-8c1a-2c531635d71f'}
 
@@ -46,13 +47,20 @@ def progress_report(guard, purchases, accounts, payouts):
         except Exception as exc:
             row.update(status='review_required',reason=str(exc))
         paid_accounts={str(p['trader_account_id']) for p in ledger if str(p.get('status') or '').lower()=='paid' or p.get('paid_at')}
+        open_statuses={'assigned_active','active','current_active','funded_active','live','funded','approved_active','profit_protected','funded_profit_cap_reached','payout_pending','approved_payout_pending','payment_processing'}
+        active_unpaid=[a for a in scope if str(a.get('trader_id'))==str(purchase.get('trader_id')) and str(a.get('stage')).lower()=='funded' and a.get('mt5_login') and str(a.get('account_status') or '').lower() in open_statuses and str(a['id']) not in paid_accounts]
+        row['final_cycle_active']=bool(row['verified'] and not row['completed'] and row['remaining']==1 and len(active_unpaid)==1)
+        row['final_mt5_login']=str(active_unpaid[0]['mt5_login']) if row['final_cycle_active'] else None
         for payout in ledger:
             status=str(payout.get('status') or '').lower();reason=None
             if not row['verified']:reason='Cycle records require review'
             elif row['completed']:reason='COMPLETED — no further payout'
             elif str(payout.get('trader_account_id')) in paid_accounts:reason='This account already has a paid payout'
             elif row['paid']+row['reserved']-(1 if status in OPEN else 0)>=row['limit']:reason='Remaining cycles already reserved'
-            payout_map[str(payout['id'])]={'purchase_id':pid,'blocked':bool(reason),'reason':reason}
+            source=next((a for a in scope if str(a['id'])==str(payout.get('trader_account_id'))),{})
+            receipt=re.search(r'\[NP_PAYOUT_RENEWAL_DONE_V122:'+re.escape(str(payout['id']))+r':([^:\]]+):([^\]]+)\]',str(source.get('archive_reason') or ''))
+            delivered=bool(receipt and any(str(a['id'])==receipt.group(1) and str(a.get('mt5_login'))==receipt.group(2) and str(a.get('trader_id'))==str(purchase.get('trader_id')) for a in scope))
+            payout_map[str(payout['id'])]={'purchase_id':pid,'blocked':bool(reason),'reason':reason,'renewal_blocked':not row['verified'] or row['completed'] or delivered,'renewal_reason':'Funded replacement already issued' if delivered else 'Purchased cycles completed' if row['completed'] else None}
         result.append(row)
     return {'release':RELEASE,'generated_at':datetime.now(timezone.utc).isoformat(),'scope':'finite_and_recorded_legacy_history',
             'purchases':result,'payouts':payout_map,'counts':{'tracked':len(result),'completed':sum(r['completed'] for r in result),
@@ -67,7 +75,7 @@ def read_progress(guard, trader_id=None):
     accounts=[]
     for start in range(0,len(purchases),100):
         ids=','.join(str(p['id']) for p in purchases[start:start+100])
-        accounts.extend(guard.rows('trader_accounts',{'purchase_id':'in.('+ids+')','select':'id,purchase_id,trader_id,stage,mt5_login'}))
+        accounts.extend(guard.rows('trader_accounts',{'purchase_id':'in.('+ids+')','select':'id,purchase_id,trader_id,stage,mt5_login,account_status,archive_reason'}))
     payouts=[]
     for start in range(0,len(accounts),100):
         ids=','.join(str(a['id']) for a in accounts[start:start+100])
