@@ -60047,3 +60047,6 @@ _np_install_final_assignment_lock(globals())
 
 from announcement_edit import register_announcement_edit as _np_register_announcement_edit
 _np_register_announcement_edit(app, globals())
+
+from trader_access_security import register_trader_access_security as _np_register_trader_access_security
+_np_register_trader_access_security(app, globals())

@@ -30,7 +30,7 @@ BEGIN
   FROM public.trader_access_events WHERE trader_id=p_trader_id AND observed_at>=cutoff GROUP BY ip_address
  ), banned AS (
   SELECT DISTINCT t.id,t.name,t.email,coalesce(public.np_security_parse_ip(to_jsonb(t)->>'registration_ip'),public.np_security_parse_ip(to_jsonb(t)->>'ip_address')) AS historical_ip
-  FROM public.black_book_entries b JOIN public.traders t ON t.id=b.trader_id WHERE b.status='restricted' AND t.id<>p_trader_id
+  FROM public.black_book_entries b JOIN public.traders t ON t.id::text=btrim(lower(b.trader_id::text)) WHERE b.status='restricted' AND t.id<>p_trader_id
  ), matches AS (
   SELECT b.id AS banned_trader_id,b.name AS banned_name,b.email AS banned_email,host(m.ip_address) AS ip,m.first_seen,m.last_seen,
    max(e.observed_at) AS banned_last_seen,'Recorded access IP match'::text AS evidence
@@ -64,7 +64,7 @@ DECLARE result jsonb; cutoff timestamptz:=now()-make_interval(days=>greatest(1,l
 BEGIN
  WITH banned AS (
   SELECT DISTINCT t.id,coalesce(public.np_security_parse_ip(to_jsonb(t)->>'registration_ip'),public.np_security_parse_ip(to_jsonb(t)->>'ip_address')) AS historical_ip
-  FROM public.black_book_entries b JOIN public.traders t ON t.id=b.trader_id WHERE b.status='restricted'
+  FROM public.black_book_entries b JOIN public.traders t ON t.id::text=btrim(lower(b.trader_id::text)) WHERE b.status='restricted'
  ), banned_ips AS (
   SELECT b.id AS banned_id,e.ip_address FROM banned b JOIN public.trader_access_events e ON e.trader_id=b.id AND e.observed_at>=cutoff
   UNION SELECT id,historical_ip FROM banned WHERE historical_ip IS NOT NULL
