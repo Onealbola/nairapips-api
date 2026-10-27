@@ -60044,3 +60044,6 @@ _np_register_finance_source(app, _np_limited_cycle_guard, _require_admin)
 
 from final_assignment_lock import install as _np_install_final_assignment_lock
 _np_install_final_assignment_lock(globals())
+
+from announcement_edit import register_announcement_edit as _np_register_announcement_edit
+_np_register_announcement_edit(app, globals())

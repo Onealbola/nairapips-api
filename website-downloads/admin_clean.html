@@ -15492,7 +15492,7 @@ function renderAnnouncements(){
               <td class="text-xs">${esc(a.audience_label || (a.target_trader_id?'Specific Trader':(a.show_on_dashboard?'All Traders':'Site-wide')))}</td>
               <td class="text-xs">${esc(String(a.created_at||'').slice(0,10))}</td>
               <td class="text-xs">${esc(String(a.expires_at||'').slice(0,10))}</td>
-              <td>${String(a.status||'active').toLowerCase()==='disabled'
+              <td><button class="btn btn-sm btn-gold" onclick='npEditAnnouncement(${JSON.stringify(String(a.id))})'>Edit</button> ${String(a.status||'active').toLowerCase()==='disabled'
                 ? '<span class="text-xs text-gray-400">disabled</span>'
                 : `<button class="btn btn-sm btn-red" onclick='disableAnnouncement(${JSON.stringify(a.id)})'>Disable</button>`}
               </td>
@@ -15503,6 +15503,26 @@ function renderAnnouncements(){
     </div>
   `;
 }
+
+window.npEditAnnouncement=async function(id){
+ try{
+  const row=await api('/admin/edit_announcement?id='+encodeURIComponent(id));
+  if(!row.success)throw Error(row.error||'Announcement could not load');
+  window.NP_ANNOUNCEMENT_EDIT={id:row.id,version:row.version};
+  modal('EDIT ANNOUNCEMENT',`<label>Title</label><input id="np-announcement-edit-title" class="input mb-3" maxlength="250" value="${esc(row.title)}"><label>Message</label><textarea id="np-announcement-edit-message" class="input mb-3" rows="10" maxlength="20000">${esc(row.message)}</textarea><button id="np-announcement-edit-save" class="btn btn-gold" onclick="npSaveAnnouncementEdit()">Save changes</button>`);
+ }catch(e){toast(e.message||'Announcement could not load','err');}
+};
+window.npSaveAnnouncementEdit=async function(){
+ const state=window.NP_ANNOUNCEMENT_EDIT,button=document.getElementById('np-announcement-edit-save');
+ if(!state||!button||button.disabled)return;
+ button.disabled=true;
+ try{
+  const result=await api('/admin/edit_announcement','POST',{...state,title:document.getElementById('np-announcement-edit-title').value,message:document.getElementById('np-announcement-edit-message').value});
+  if(!result.success)throw Error(result.error||'Could not save changes');
+  SESSION.announcements=(SESSION.announcements||[]).map(a=>String(a.id)===String(state.id)?{...a,...result.announcement}:a);
+  document.querySelector('.modal-bg')?.remove();window.NP_ANNOUNCEMENT_EDIT=null;renderAnnouncements();toast('Announcement updated','ok');
+ }catch(e){toast(e.message||'Could not save changes','err');button.disabled=false;}
+};
 
 window.populateInlineAnnouncementTraders = function(){
   const sel = document.getElementById('ia-target-trader');

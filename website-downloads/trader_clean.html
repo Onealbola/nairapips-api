@@ -3584,12 +3584,13 @@ function npStoreAnnouncementCacheV159(){
   }catch(_e){}
 }
 
-async function npRefreshAnnouncementsV159({rerender=true}={}){
+async function npRefreshAnnouncementsV159({rerender=true,onlyChanges=false}={}){
   const t=SESSION.data?.trader||SESSION.trader||{};
   const tid=String(t.id||'').trim();
   if(!tid || SESSION.__announcementRefreshV159) return SESSION.announcements||[];
 
   SESSION.__announcementRefreshV159=true;
+  const previous=JSON.stringify(SESSION.announcements||[]);
   try{
     const r=await safeFetchJson(
       API+'/trader_announcements_v159?trader_id='+encodeURIComponent(tid)+'&_t='+Date.now(),
@@ -3599,10 +3600,12 @@ async function npRefreshAnnouncementsV159({rerender=true}={}){
     );
     const rows=Array.isArray(r)?r:(r?.announcements||r?.data?.announcements||r?.data||[]);
     if(Array.isArray(rows)){
+      const latest=new Map(rows.filter(a=>a?.id).map(a=>[String(a.id),a]));
+      for(const key of ['offers','targetedOffers'])SESSION[key]=(SESSION[key]||[]).map(a=>latest.has(String(a.id))?{...a,...latest.get(String(a.id))}:a);
       npAnnouncementMergeV159(rows);
       npStoreAnnouncementCacheV159();
     }
-    if(rerender && (SESSION.currentTab==='announcements' || SESSION.currentTab==='dashboard')){
+    if(rerender && (!onlyChanges||previous!==JSON.stringify(SESSION.announcements||[])) && (SESSION.currentTab==='announcements' || SESSION.currentTab==='dashboard')){
       renderApp();
     }
     return SESSION.announcements||[];
@@ -10440,7 +10443,7 @@ function renderAnnouncements(){
   const globals=(SESSION.announcements||[]).filter(a=>!a.target_trader_id || (t.id && String(a.target_trader_id)===String(t.id)));
   const priv=npGetPrivateNotices();
   const map=new Map();
-  [...globals,...priv].forEach(a=>{
+  [...priv,...globals].forEach(a=>{
     const key=String(a.id||[a.subject||a.title,a.created_at||a.sent_at].join('|'));
     map.set(key,a);
   });
@@ -12529,4 +12532,8 @@ window.addEventListener('focus',load);
 window.NAIRAPIPS_TRADER_CYCLE_NOTICE_RELEASE='trader-cycle-notice-2026-10-23';
 })();
 
+</script>
+
+<script>
+setInterval(()=>{if(!document.hidden&&SESSION.auth_token&&['dashboard','announcements'].includes(SESSION.currentTab))npRefreshAnnouncementsV159({rerender:true,onlyChanges:true}).catch(()=>{});},30000);
 </script>
