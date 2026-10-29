@@ -8,7 +8,7 @@ MESSAGE='This purchase has received its final funded account. No further MT5 ass
 
 def check_assignment(trader,purchase,note,transport,url,key,approval=False):
     tid=str((trader or {}).get('id') or (trader or {}).get('trader_id') or '')
-    if tid!=LOCKED_OWNER:return
+    locked_owner=tid==LOCKED_OWNER
     headers={'apikey':key,'Authorization':'Bearer '+key}
     def read(table,params):
         try:
@@ -23,13 +23,21 @@ def check_assignment(trader,purchase,note,transport,url,key,approval=False):
         if match:
             rows=read('trader_accounts',{'select':'id,trader_id,purchase_id','id':'eq.'+match.group(1),'trader_id':'eq.'+tid})
             if len(rows)==1:pid=str(rows[0].get('purchase_id') or '')
-    if not pid or pid==LOCKED_PURCHASE:raise ValueError(MESSAGE)
+    if not pid:
+        if locked_owner:raise ValueError(MESSAGE)
+        return  # Existing legacy/manual assignment authority remains in force.
+    if pid==LOCKED_PURCHASE:raise ValueError(MESSAGE)
     # Read only this owner's exact purchase. purchase_type is optional legacy
     # metadata, not a column in the production schema; projecting it rejects
     # otherwise valid new purchases before their entitlement can be checked.
     rows=read('challenge_purchases',{'select':'*','id':'eq.'+pid,'trader_id':'eq.'+tid,'limit':'1'})
     if len(rows)!=1 or str(rows[0].get('id'))!=pid or str(rows[0].get('trader_id'))!=tid:raise ValueError(MESSAGE)
     row=rows[0]
+    # Completion belongs to the purchased entitlement, never to the person.
+    # A separate new purchase starts independently for every trader.
+    if str(row.get('lifecycle_state') or '').lower()=='funded_cycles_completed' or ('[NP_NO_MORE_MT5:'+pid+':') in str(row.get('admin_note') or ''):
+        raise ValueError(MESSAGE)
+    if not locked_owner:return
     valid_statuses={'approved','paid','approved_active','approved_waiting_mt5','assigned'}
     if approval:valid_statuses.update({'pending','pending_review','submitted','awaiting_approval'})
     if str(row.get('status') or '').lower() not in valid_statuses or 'reset' in str(row.get('purchase_type') or '').lower() or 'reset' in str(row.get('plan_name') or '').lower():raise ValueError(MESSAGE)

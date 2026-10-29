@@ -24,6 +24,19 @@ class LockTests(unittest.TestCase):
   self.http.get.side_effect=RuntimeError('https://private-database/rest/v1/challenge_purchases')
   with self.assertRaises(ValueError) as error:self.check({'id':'new'})
   self.assertNotIn('https://',str(error.exception));self.assertIn('could not be verified',str(error.exception))
+ def test_any_trader_can_buy_again_after_a_different_purchase_completes(self):
+  self.http.get.return_value.json.return_value=[dict(id='new',trader_id='another-owner',status='pending_review',plan_name='Starter')]
+  check_assignment({'id':'another-owner'},{'id':'new'},'',self.http,'fixture','key',approval=True)
+ def test_any_completed_purchase_and_exact_final_assignment_marker_block(self):
+  for fields in [dict(lifecycle_state='funded_cycles_completed'),dict(admin_note='[NP_NO_MORE_MT5:old:final_mt5=123]')]:
+   self.http.get.return_value.json.return_value=[dict(id='old',trader_id='another-owner',status='approved',**fields)]
+   with self.assertRaises(ValueError):check_assignment({'id':'another-owner'},{'id':'old'},'',self.http,'fixture','key')
+ def test_global_ownership_and_database_failures_block_before_assignment(self):
+  self.http.get.return_value.json.return_value=[dict(id='new',trader_id='different-owner')]
+  with self.assertRaises(ValueError):check_assignment({'id':'another-owner'},{'id':'new'},'',self.http,'fixture','key')
+ def test_completed_renewal_resolves_source_purchase_for_any_trader(self):
+  self.http.get.return_value.json.side_effect=[[dict(purchase_id='old')],[dict(id='old',trader_id='another-owner',lifecycle_state='funded_cycles_completed')]]
+  with self.assertRaises(ValueError):check_assignment({'id':'another-owner'},None,'source_account=d52cc711-b554-4d29-9ee7-865c78d2494a',self.http,'fixture','key')
  def test_rejected_reset_and_other_owner_cannot_bypass(self):
   for row in [dict(id='new',trader_id='other',status='approved'),dict(id='new',trader_id=LOCKED_OWNER,status='rejected'),dict(id='new',trader_id=LOCKED_OWNER,status='approved',purchase_type='funded_reset')]:
    self.http.get.return_value.json.return_value=[row]
