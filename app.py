@@ -60050,3 +60050,6 @@ _np_register_announcement_edit(app, globals())
 
 from trader_access_security import register_trader_access_security as _np_register_trader_access_security
 _np_register_trader_access_security(app, globals())
+
+from retired_two_lives import install as _np_install_retired_two_lives
+_np_install_retired_two_lives(globals())
