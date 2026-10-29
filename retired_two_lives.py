@@ -1,6 +1,14 @@
 """Owner-directed retirement of two-lives delivery; no payout/history writes."""
 import re
 from functools import wraps
+from datetime import datetime,timezone
+
+# 3 October 2026 00:00 in Nigeria (WAT).
+CURRENT_PRODUCT_START=datetime(2026,10,2,23,tzinfo=timezone.utc)
+
+def current_product(row):
+    try:return datetime.fromisoformat(str((row or {}).get('created_at') or '').replace('Z','+00:00')).astimezone(timezone.utc)>=CURRENT_PRODUCT_START
+    except (ValueError,TypeError):return False
 
 REASON='two_lives_journey_retired'
 MESSAGE='This two-lives journey is inactive and retired. Trading activation, payouts, resets, progression and renewals are unavailable. Contact support about the refund option, or use a separate eligible new purchase.'
@@ -29,20 +37,19 @@ class Retirement:
         if not isinstance(rows,list) or len(rows)!=1 or str(rows[0].get('trader_id'))!=str(owner):raise ValueError('Journey lineage could not be verified')
         return rows[0]
     def blocked(self,owner,purchase=None,source=None,reason=''):
-        if str(reason or '').strip().lower() in {'second_life','free_second_life','second_life_free_reset'}:return True
         p=purchase or {};a=source or {};seen=set()
-        if marked(a):return True
+        retired=marked(a) or marked(p)
         pid=p.get('id') or a.get('purchase_id') or a.get('challenge_purchase_id')
         # Never infer retirement from another purchase belonging to this person.
         for _ in range(12):
-            if not pid:return marked(p)
+            if not pid:return not current_product(p or a) and (retired or str(reason or '').strip().lower() in {'second_life','free_second_life','second_life_free_reset'})
             if str(pid) in seen:raise ValueError('Cyclic journey lineage')
             seen.add(str(pid));p=self.read('challenge_purchases',pid,owner)
-            if marked(p):return True
+            retired=retired or marked(p) or p.get('lifecycle_state')=='retired_two_lives'
             marker=re.search(r'\[NP_RESET_REQUEST:([^:\]]+):([^:\]]+):(phase1|phase2|funded)\]',str(p.get('admin_note') or ''),re.I)
             parent=p.get('reset_parent_purchase_id') or p.get('parent_purchase_id')
             if marker:parent=marker.group(2)
-            if not parent:return False
+            if not parent:return retired and not current_product(p)
             pid=parent
         raise ValueError('Journey lineage exceeds verification limit')
     def stopped(self,*args,**kwargs):
@@ -69,6 +76,12 @@ def install(runtime):
         if policy.stopped(owner(trader,purchase,source_account),purchase,source_account,reason):return None
         return original(trader,stage,purchase,source_account,reason)
     runtime['_np_auto_assign_waiting_stage']=auto
+    clean_root=runtime.get('_np_is_clean_root_v43')
+    if clean_root:
+        def eligible_root(purchase):
+            if policy.stopped(owner(purchase=purchase),purchase=purchase):return False
+            return clean_root(purchase)
+        runtime['_np_is_clean_root_v43']=eligible_root
     original_source=runtime['_np_v122_source_block_reason']
     def source_block(source,payout=None):
         if policy.stopped(owner(source=source),source=source):return REASON
@@ -128,4 +141,4 @@ def install(runtime):
         from flask import jsonify
         @runtime['app'].get('/two_lives_retirement_version')
         def retirement_version():
-            return jsonify(success=True,release='two-lives-retired-2026-10-29',new_delivery_blocked=True,payout_actions_blocked=True,monitoring_activation_blocked=True,automatic_refunds=False)
+            return jsonify(success=True,release='two-lives-retired-cutoff-2026-10-29',current_product_from='2026-10-03',cutoff_timezone='Africa/Lagos',new_delivery_blocked=True,payout_actions_blocked=True,monitoring_activation_blocked=True,automatic_refunds=False)

@@ -19,6 +19,11 @@ class RetirementTests(unittest.TestCase):
  def test_life_two_and_total_two_are_retired(self):
   for p in [{'life_number':2},{'lives_total':'2'},{'second_life_used':'true'}]:self.assertTrue(marked(p))
  def test_new_purchase_for_same_person_unaffected(self):self.assertFalse(self.policy.blocked('owner',{'id':'new'}))
+ def test_current_product_cutoff_overrides_old_flags_but_reset_follows_old_root(self):
+  self.rows['new'].update(created_at='2026-10-02T23:00:00+00:00',second_life_enabled=True,lives_total=2)
+  self.assertFalse(self.policy.blocked('owner',{'id':'new'}))
+  self.rows['reset']['created_at']='2026-10-29T12:00:00+00:00'
+  self.assertTrue(self.policy.blocked('owner',{'id':'reset'}))
  def test_reset_follows_exact_parent(self):self.assertTrue(self.policy.blocked('owner',{'id':'reset'}))
  def test_cycle_and_missing_lineage_fail_closed(self):
   self.rows['reset']['admin_note']='[NP_RESET_REQUEST:source:reset:funded]'
