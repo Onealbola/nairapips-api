@@ -17,6 +17,11 @@ def progress_report(guard, purchases, accounts, payouts):
     for purchase in purchases:
         pid=str(purchase['id']);scope=by_purchase[pid]
         ledger=[p for a in scope for p in by_account[str(a['id'])]]
+        if purchase.get('lifecycle_state')=='retired_two_lives':
+            reason='Retired product — no remaining entitlement'
+            result.append(dict(purchase_id=pid,trader_id=purchase.get('trader_id'),customer=purchase.get('trader_name') or 'Trader',plan=purchase.get('plan_name') or 'Plan',limit=purchase.get('payout_cycles'),paid=None,reserved=0,remaining=0,completed=False,verified=True,status='inactive',retired=True,reason=reason,final_cycle_active=False,final_mt5_login=None))
+            for payout in ledger:payout_map[str(payout['id'])]=dict(purchase_id=pid,blocked=True,reason=reason,renewal_blocked=True,renewal_reason=reason)
+            continue
         if purchase.get('payout_cycles') in (None,0):
             if pid not in LEGACY_DISPLAY_PURCHASE_IDS:continue
             relevant=[p for p in ledger if str(p.get('status') or '').lower() in OPEN|{'paid'} or p.get('paid_at')]

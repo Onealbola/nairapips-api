@@ -5,6 +5,9 @@ from cycle_progress import progress_report,read_progress,register_cycle_progress
 from test_limited_cycle_safety import DB
 
 class ProgressTests(unittest.TestCase):
+    def test_retired_purchase_has_no_remaining_entitlement_or_renewal(self):
+        self.p['lifecycle_state']='retired_two_lives';self.payout('a','paid')
+        r=self.report();self.assertEqual(r['purchases'][0]['remaining'],0);self.assertEqual(r['purchases'][0]['status'],'inactive');self.assertTrue(r['payouts']['paid']['renewal_blocked']);self.assertEqual(self.db.writes,[])
     def setUp(self):
         self.db=DB();self.guard=LimitedCycleSafety(self.db,'https://fixture.invalid','fixture')
         self.p=self.db.tables['challenge_purchases'][0];self.p.update(trader_name='Fixture',plan_name='Legend')

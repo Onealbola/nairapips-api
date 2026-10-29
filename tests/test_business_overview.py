@@ -12,6 +12,10 @@ def purchase(**kw):
     return dict(id='p',trader_id='t',payment_status='approved',status='approved_active',fee=40000,approved_at=NOW,created_at=NOW,**kw)
 
 class OverviewTests(unittest.TestCase):
+    def test_retired_product_has_no_work_but_preserves_recorded_money(self):
+        s=fixture();s['purchases']=[{**purchase(),'lifecycle_state':'retired_two_lives'},{**purchase(),'id':'pending','payment_status':'pending','has_proof':True,'lifecycle_state':'retired_two_lives'}];s['accounts']=[account()]
+        s['payouts']=[dict(id='paid',trader_id='t',trader_account_id='a',status='paid',paid_at=NOW,payout_amount=1000),dict(id='pending',trader_id='t',trader_account_id='a',status='pending',payout_amount=2000)]
+        d=build_overview(s);self.assertEqual(d['counts']['work_waiting'],0);self.assertEqual(d['counts'].get('open_accounts',0),0);self.assertEqual(d['amounts']['approved_receipts'],40000);self.assertEqual(d['amounts']['paid_payouts'],1000)
     def test_history_does_not_inflate_open_accounts_or_work(self):
         s=fixture();s['accounts']=[account()]+[{**account(), 'id':str(i),'account_status':'funded_profit_cap_reached','archived_at':NOW} for i in range(500)]
         d=build_overview(s)

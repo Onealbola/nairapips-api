@@ -64,6 +64,7 @@ def build_overview(source, period='today'):
         d = stamp(value)
         return bool(d and (start is None or start <= d.astimezone(TZ).date() <= day))
     people = {str(t['id']): t for t in source['customers'] if t.get('id')}
+    retired_purchases={str(p['id']) for p in source['purchases'] if p.get('lifecycle_state')=='retired_two_lives'}
     records, groups, meta = {}, defaultdict(list), {}
     def add(key, row, table, label='', when=None, value=None, note=''):
         rid = table + ':' + str(row.get('id') or '')
@@ -104,7 +105,7 @@ def build_overview(source, period='today'):
             assigned_orders.add((str(a['purchase_id']), str(a['trader_id'])))
         state = norm(a.get('account_status'))
         closed = bool(a.get('archived_at') or a.get('breached_at') or a.get('passed_at') or norm(a.get('phase_pass_status')) == 'passed')
-        if state in OPEN and not closed and a.get('mt5_login'):
+        if state in OPEN and not closed and a.get('mt5_login') and str(a.get('purchase_id')) not in retired_purchases:
             if not customer_ok(a):
                 issue(a, 'account', 'Open account has no matching customer profile')
                 continue
@@ -153,7 +154,7 @@ def build_overview(source, period='today'):
             issue(p, 'purchase', 'Payment record has no matching customer profile')
             continue
         value = amount(p, ['final_fee', 'fee', 'amount_due'])
-        if state in PENDING:
+        if state in PENDING and str(p['id']) not in retired_purchases:
             if p.get('has_proof'):
                 add('reset_reviews' if reset else 'purchase_reviews', p, 'purchase', value=value,
                     note='Submitted payment proof awaiting a decision; not recognized as collected money')
@@ -162,7 +163,7 @@ def build_overview(source, period='today'):
         if state in APPROVED:
             paid_customers.add(str(p['trader_id']))
             # A reset order is not a new challenge and must not inflate first-account work.
-            if not reset and raw not in {'archived', 'completed', 'reset_consumed'} and (str(p['id']), str(p['trader_id'])) not in assigned_orders:
+            if str(p['id']) not in retired_purchases and not reset and raw not in {'archived', 'completed', 'reset_consumed'} and (str(p['id']), str(p['trader_id'])) not in assigned_orders:
                 if p.get('mt5_login') or p.get('trader_account_id') or p.get('assigned_mt5_id') or p.get('assigned_at'):
                     issue(p, 'purchase', 'Purchase has legacy assignment evidence but no exact linked account; reconcile the link, do not assign again blindly')
                 else:
@@ -202,6 +203,9 @@ def build_overview(source, period='today'):
             continue
         if rejected:
             continue
+        source_row=next((a for a in source['accounts'] if str(a.get('id'))==str(p.get('trader_account_id'))),{})
+        if str(source_row.get('purchase_id')) in retired_purchases:
+            continue  # Settled retired product: history remains; no new work item.
         if state == 'paid':
             issue(p, 'payout', 'Marked paid but missing the payment timestamp; not counted as a confirmed paid record')
             continue
@@ -249,7 +253,7 @@ def build_overview(source, period='today'):
 FIELDS = {
  'customers': ('traders', 'id,name,email,created_at,deleted_at'),
  'accounts': ('trader_accounts', 'id,trader_id,purchase_id,stage,account_status,mt5_login,mt5_server,archived_at,passed_at,breached_at,phase_pass_status,created_at,updated_at,monitoring_enabled'),
- 'purchases': ('challenge_purchases', 'id,trader_id,plan_name,fee,final_fee,amount_due,payment_status,status,created_at,approved_at,rejected_at,payment_proof_url,admin_note,mark_as_test,excluded_from_revenue,mt5_login,trader_account_id,assigned_mt5_id,assigned_at'),
+ 'purchases': ('challenge_purchases', 'id,trader_id,plan_name,fee,final_fee,amount_due,payment_status,status,created_at,approved_at,rejected_at,payment_proof_url,admin_note,mark_as_test,excluded_from_revenue,mt5_login,trader_account_id,assigned_mt5_id,assigned_at,lifecycle_state'),
  'payouts': ('payouts', 'id,trader_id,trader_account_id,mt5_login,payout_amount,amount,status,created_at,requested_at,approved_at,paid_at,rejected_at,mark_as_test,excluded_from_revenue'),
  'stock': ('mt5_pool', 'id,mt5_login,mt5_server,account_size,pool_class,status,assigned_trader_id,trader_account_id,archived_at'),
  'tickets': ('support_tickets', 'id,trader_id,subject,status,priority,created_at,closed_at,replied_at,admin_reply'),
