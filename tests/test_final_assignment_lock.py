@@ -13,6 +13,17 @@ class LockTests(unittest.TestCase):
   with self.assertRaises(ValueError):self.check(note='source_account=d52cc711-b554-4d29-9ee7-865c78d2494a; exact_once=true')
  def test_separate_new_purchase_allowed_after_database_owner_verification(self):
   self.http.get.return_value.json.return_value=[dict(id='new',trader_id=LOCKED_OWNER,status='approved',purchase_type='challenge',plan_name='Legend')];self.check({'id':'new'})
+ def test_real_schema_new_purchase_approval_does_not_require_purchase_type(self):
+  def get(url,**kwargs):
+   params=kwargs['params'];self.assertEqual(params['select'],'*');self.assertEqual(params['id'],'eq.new');self.assertEqual(params['trader_id'],'eq.'+LOCKED_OWNER);self.assertEqual(params['limit'],'1')
+   response=Mock();response.json.return_value=[dict(id='new',trader_id=LOCKED_OWNER,status='pending_review',plan_name='Starter')];return response
+  self.http.get.side_effect=get
+  check_assignment(self.trader,{'id':'new'},'',self.http,'https://fixture','key',approval=True)
+  with self.assertRaises(ValueError):self.check({'id':'new'})
+ def test_database_failure_fails_closed_without_exposing_internal_url(self):
+  self.http.get.side_effect=RuntimeError('https://private-database/rest/v1/challenge_purchases')
+  with self.assertRaises(ValueError) as error:self.check({'id':'new'})
+  self.assertNotIn('https://',str(error.exception));self.assertIn('could not be verified',str(error.exception))
  def test_rejected_reset_and_other_owner_cannot_bypass(self):
   for row in [dict(id='new',trader_id='other',status='approved'),dict(id='new',trader_id=LOCKED_OWNER,status='rejected'),dict(id='new',trader_id=LOCKED_OWNER,status='approved',purchase_type='funded_reset')]:
    self.http.get.return_value.json.return_value=[row]
