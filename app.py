@@ -60053,3 +60053,7 @@ _np_register_trader_access_security(app, globals())
 
 from retired_two_lives import install as _np_install_retired_two_lives
 _np_install_retired_two_lives(globals())
+
+from package_studio import StudioStore as _NPStudioStore, register_package_studio as _NPRegisterStudio
+_np_studio_store = _NPStudioStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
+_NPRegisterStudio(app, _np_studio_store, _require_admin, _audit_safe)

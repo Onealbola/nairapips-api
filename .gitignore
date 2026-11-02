@@ -1,0 +1,5 @@
+
+# Private owner offer assets are installed into protected storage, never public source.
+/package_studio_assets/defaults.json
+/package_studio_assets/studio.html
+/package_studio_assets/hosted.js

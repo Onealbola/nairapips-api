@@ -1,0 +1,271 @@
+{
+  "revision": 0,
+  "availability": {
+    "250000": {
+      "active": false,
+      "share": {
+        "50": false,
+        "60": false,
+        "70": false
+      },
+      "cycles": {
+        "3": false,
+        "4": false,
+        "5": false
+      },
+      "drawdown": {
+        "5": false,
+        "10": false,
+        "15": false,
+        "20": false,
+        "25": false,
+        "30": false
+      },
+      "profitCap": {
+        "15": false,
+        "20": false,
+        "30": false
+      },
+      "daily": {
+        "0": false,
+        "10": false
+      },
+      "reset": {
+        "0": false,
+        "1": false
+      },
+      "phase1Target": {
+        "8": false,
+        "10": false
+      }
+    },
+    "500000": {
+      "active": false,
+      "share": {
+        "50": false,
+        "60": false,
+        "70": false
+      },
+      "cycles": {
+        "3": false,
+        "4": false,
+        "5": false
+      },
+      "drawdown": {
+        "5": false,
+        "10": false,
+        "15": false,
+        "20": false,
+        "25": false,
+        "30": false
+      },
+      "profitCap": {
+        "15": false,
+        "20": false,
+        "30": false
+      },
+      "daily": {
+        "0": false,
+        "10": false
+      },
+      "reset": {
+        "0": false,
+        "1": false
+      },
+      "phase1Target": {
+        "8": false,
+        "10": false
+      }
+    },
+    "1000000": {
+      "active": false,
+      "share": {
+        "50": false,
+        "60": false,
+        "70": false
+      },
+      "cycles": {
+        "3": false,
+        "4": false,
+        "5": false
+      },
+      "drawdown": {
+        "5": false,
+        "10": false,
+        "15": false,
+        "20": false,
+        "25": false,
+        "30": false
+      },
+      "profitCap": {
+        "15": false,
+        "20": false,
+        "30": false
+      },
+      "daily": {
+        "0": false,
+        "10": false
+      },
+      "reset": {
+        "0": false,
+        "1": false
+      },
+      "phase1Target": {
+        "8": false,
+        "10": false
+      }
+    },
+    "2000000": {
+      "active": false,
+      "share": {
+        "50": false,
+        "60": false,
+        "70": false
+      },
+      "cycles": {
+        "3": false,
+        "4": false,
+        "5": false
+      },
+      "drawdown": {
+        "5": false,
+        "10": false,
+        "15": false,
+        "20": false,
+        "25": false,
+        "30": false
+      },
+      "profitCap": {
+        "15": false,
+        "20": false,
+        "30": false
+      },
+      "daily": {
+        "0": false,
+        "10": false
+      },
+      "reset": {
+        "0": false,
+        "1": false
+      },
+      "phase1Target": {
+        "8": false,
+        "10": false
+      }
+    },
+    "5000000": {
+      "active": false,
+      "share": {
+        "50": false,
+        "60": false,
+        "70": false
+      },
+      "cycles": {
+        "3": false,
+        "4": false,
+        "5": false
+      },
+      "drawdown": {
+        "5": false,
+        "10": false,
+        "15": false,
+        "20": false,
+        "25": false,
+        "30": false
+      },
+      "profitCap": {
+        "15": false,
+        "20": false,
+        "30": false
+      },
+      "daily": {
+        "0": false,
+        "10": false
+      },
+      "reset": {
+        "0": false,
+        "1": false
+      },
+      "phase1Target": {
+        "8": false,
+        "10": false
+      }
+    }
+  },
+  "blockedCombinations": [],
+  "riskPolicy": {
+    "1000000": {
+      "maxShare": 0,
+      "maxCycles": 0,
+      "maxCap": 0,
+      "maxDD": 0,
+      "maxResets": 0,
+      "minTarget": 0,
+      "dailyAboveDD": 0,
+      "maxPayout": 0,
+      "maxPayoutToFee": 0
+    },
+    "2000000": {
+      "maxShare": 0,
+      "maxCycles": 0,
+      "maxCap": 0,
+      "maxDD": 0,
+      "maxResets": 0,
+      "minTarget": 0,
+      "dailyAboveDD": 0,
+      "maxPayout": 0,
+      "maxPayoutToFee": 0
+    },
+    "5000000": {
+      "maxShare": 0,
+      "maxCycles": 0,
+      "maxCap": 0,
+      "maxDD": 0,
+      "maxResets": 0,
+      "minTarget": 0,
+      "dailyAboveDD": 0,
+      "maxPayout": 0,
+      "maxPayoutToFee": 0
+    }
+  },
+  "base": {
+    "250000": 0,
+    "500000": 0,
+    "1000000": 0,
+    "2000000": 0,
+    "5000000": 0
+  },
+  "share": {
+    "50": 0,
+    "60": 0,
+    "70": 0
+  },
+  "cycles": {
+    "3": 0,
+    "4": 0,
+    "5": 0
+  },
+  "drawdown": {
+    "5": 0,
+    "10": 0,
+    "15": 0,
+    "20": 0,
+    "25": 0,
+    "30": 0
+  },
+  "reset": {
+    "0": 0,
+    "1": 0
+  },
+  "profitCap": {
+    "15": 0,
+    "20": 0,
+    "30": 0
+  },
+  "combination": 0,
+  "phase1": 0,
+  "phase2": 0,
+  "grossCap": 0,
+  "dailyEnabled": false,
+  "rounding": 0
+}
