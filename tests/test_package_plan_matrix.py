@@ -1,0 +1,105 @@
+import copy
+import unittest
+from flask import Flask,jsonify
+from package_plan_matrix import (PlanMatrixStore,defaults,make_plan,validate_config,
+    register_plan_matrix,availability,KEY)
+from test_package_studio import StudioDatabase
+
+
+class MatrixTests(unittest.TestCase):
+    def setUp(self):
+        self.db=StudioDatabase();self.db.rows['package_studio_private_settings']=[]
+        self.store=PlanMatrixStore(self.db,'https://fixture.invalid','fixture')
+        self.app=Flask(__name__);self.role='owner';self.audit=[]
+        def owner():
+            if self.role is None:return None,(jsonify(success=False),401)
+            return dict(id='fixture-owner',role=self.role),None
+        register_plan_matrix(self.app,self.store,owner,lambda *a:self.audit.append(a))
+        self.client=self.app.test_client()
+
+    def save(self,c=None,revision=0,**kwargs):
+        return self.client.post('/admin/package_studio/plan_matrix',json={
+            'revision':revision,'config':c or defaults()['config'],**kwargs})
+
+    def test_three_sizes_have_the_agreed_four_complete_prices(self):
+        d=self.client.get('/admin/package_studio/plan_matrix').json
+        self.assertFalse(d['checkout_enabled'])
+        plans=d['data']['config']['plans']
+        self.assertEqual([p['capital'] for p in plans],[500000,1000000,2000000])
+        self.assertEqual([[x['price'] for x in p['packages']] for p in plans],
+            [[10000,14000,12000,16000],[20000,28000,24000,32000],[40000,56000,48000,64000]])
+        self.assertTrue(all(x['payout_mode']=='continuing' for p in plans for x in p['packages']))
+        self.assertEqual(self.db.writes,[])
+
+    def test_names_prices_benefits_and_future_allocations_persist(self):
+        c=defaults()['config'];p=c['plans'][0];p['name']='My 500k'
+        p['packages'][0].update(name='Custom Basic',price=11000,phase1_target=8,phase2_target=5)
+        p['packages'][1].update(drawdown=15,daily_drawdown=10)
+        p['limits']['max_drawdown']=15
+        p['packages'][3]['enabled']=False
+        new=make_plan('future-5m',5000000,100000);new['enabled']=False;c['plans'].append(new)
+        response=self.save(c);self.assertEqual(response.status_code,200,response.json)
+        confirmed=PlanMatrixStore(self.db,'https://fixture.invalid','fixture').read(fresh=True)[0]
+        self.assertEqual(confirmed['config'],c)
+        self.assertEqual(confirmed['revision'],1)
+        self.assertFalse(confirmed['checkout_enabled'])
+        self.assertEqual(self.db.rows['challenge_purchases'],[])
+        self.assertEqual(len(self.db.rows['challenge_plans']),1)
+        self.assertEqual({x['key'] for x in self.db.rows['package_studio_private_settings']},{KEY})
+        self.assertFalse(response.json['availability'][p['id']]['both']['available'])
+        self.assertFalse(response.json['availability']['future-5m']['basic']['available'])
+
+    def test_limit_can_hold_an_enabled_package_until_owner_changes_limit(self):
+        c=defaults()['config'];p=c['plans'][2];p['limits']['max_profit_share']=50
+        r=self.save(c);self.assertEqual(r.status_code,200)
+        self.assertFalse(r.json['availability'][p['id']]['both']['available'])
+        p['limits']['max_profit_share']=60
+        r=self.save(c,revision=1);self.assertTrue(r.json['availability'][p['id']]['both']['available'])
+
+    def test_unsupported_targets_daily_rules_and_duplicate_sizes_rejected(self):
+        mutators=[lambda c:c['plans'][0]['packages'][0].update(phase1_target=10,phase2_target=5),
+            lambda c:c['plans'][0]['packages'][0].update(drawdown=30,daily_drawdown=0),
+            lambda c:c['plans'][0]['packages'][0].update(profit_share=True),
+            lambda c:c['plans'][0]['packages'][0].update(price=-1),
+            lambda c:c['plans'][1].update(capital=500000),
+            lambda c:c['plans'][1].update(id=c['plans'][0]['id']),
+            lambda c:c['plans'][0]['packages'].pop(),
+            lambda c:c['plans'][0]['packages'][0].update(payout_mode='unlimited-checkout')]
+        for change in mutators:
+            c=defaults()['config'];change(c)
+            self.assertEqual(self.save(c).status_code,400)
+        self.assertEqual(self.db.writes,[])
+
+    def test_wider_drawdown_requires_daily_and_account_limit(self):
+        c=defaults()['config'];p=c['plans'][0];x=p['packages'][1]
+        x.update(drawdown=30,daily_drawdown=10)
+        r=self.save(c);self.assertEqual(r.status_code,200)
+        self.assertFalse(r.json['availability'][p['id']]['room']['available'])
+        p['limits']['max_drawdown']=30
+        r=self.save(c,revision=1);self.assertTrue(r.json['availability'][p['id']]['room']['available'])
+
+    def test_conflicts_auth_and_release_attempts_do_not_change_production(self):
+        for role,code in [(None,401),('admin',403),('trader',403)]:
+            self.role=role
+            self.assertEqual(self.save().status_code,code)
+            self.assertEqual(self.client.get('/admin/package_studio/plan_matrix').status_code,code)
+            self.assertEqual(self.client.get('/admin/package_studio/plan_matrix/view').status_code,code)
+        self.role='owner';self.assertEqual(self.save().status_code,200)
+        self.assertEqual(self.save().status_code,409)
+        self.assertEqual(self.save(revision=1,checkout_enabled=True).status_code,400)
+        self.db.race=True;self.assertEqual(self.save(revision=1).status_code,409)
+
+    def test_owner_page_has_cache_and_frame_protection(self):
+        r=self.client.get('/admin/package_studio/plan_matrix/view')
+        self.assertEqual(r.status_code,200)
+        self.assertEqual(r.headers['Cache-Control'],'no-store')
+        self.assertEqual(r.headers['X-Frame-Options'],'DENY')
+        self.assertIn(b'Add account size',r.data)
+
+    def test_database_failure_does_not_return_default_success(self):
+        self.db.fail=True
+        self.assertEqual(self.client.get('/admin/package_studio/plan_matrix').status_code,503)
+        self.assertEqual(self.save().status_code,503)
+
+
+if __name__=='__main__':unittest.main()

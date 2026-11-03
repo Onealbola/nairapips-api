@@ -8,7 +8,8 @@ document.getElementById('login').onsubmit=async event=>{
  try{
   const r=await call('/staff_login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('username').value.trim(),password:document.getElementById('password').value})});
   const data=await r.json();if(!r.ok||!data.token)throw Error('Admin sign-in failed. Check your credentials.');
-  const page=await call('/admin/package_studio/view',{headers:{Authorization:'Bearer '+data.token}});
+  const target=new URLSearchParams(location.search).get('legacy')==='1'?'/admin/package_studio/view':'/admin/package_studio/plan_matrix/view';
+  const page=await call(target,{headers:{Authorization:'Bearer '+data.token}});
   if(!page.ok){const error=await page.json().catch(()=>({}));throw Error(error.error||'Owner or super admin access is required.');}
   const html=await page.text();window.__npStudioToken=data.token;document.open();document.write(html);document.close();
  }catch(error){status.textContent=error.name==='TimeoutError'?'The server took too long. Please try again.':error.message;button.disabled=false;}

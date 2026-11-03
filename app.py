@@ -60057,3 +60057,7 @@ _np_install_retired_two_lives(globals())
 from package_studio import StudioStore as _NPStudioStore, register_package_studio as _NPRegisterStudio
 _np_studio_store = _NPStudioStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
 _NPRegisterStudio(app, _np_studio_store, _require_admin, _audit_safe)
+
+from package_plan_matrix import PlanMatrixStore as _NPPlanMatrixStore, register_plan_matrix as _NPRegisterPlanMatrix
+_np_plan_matrix_store = _NPPlanMatrixStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
+_NPRegisterPlanMatrix(app, _np_plan_matrix_store, _require_admin, _audit_safe)
