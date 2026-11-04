@@ -4,6 +4,15 @@ from flask import Flask,jsonify
 from panel_delivery import register_panel_delivery,RELEASE
 
 class PanelDeliveryTests(unittest.TestCase):
+    def test_sales_outcomes_update_is_a_real_zip_download(self):
+        r=self.client.get('/downloads/sales-outcomes-update.zip')
+        self.assertEqual(r.status_code,200)
+        self.assertEqual(r.data,Path('website-downloads/nairapips-admin-small.zip').read_bytes())
+        self.assertIn('attachment',r.headers['Content-Disposition'])
+        self.assertEqual(r.mimetype,'application/zip')
+        self.assertIn('no-store',r.headers['Cache-Control'])
+        r.close()
+
     def setUp(self):
         self.app=Flask(__name__);register_panel_delivery(self.app)
         @self.app.get('/admin/private_fixture')
