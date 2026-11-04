@@ -2,6 +2,34 @@ import unittest
 from sales_outcomes import build_report
 
 class SalesOutcomesTests(unittest.TestCase):
+    def test_stage_breaches_count_unique_purchases_not_replacement_accounts(self):
+        accounts=[self.a('a',stage='PHASE_1',account_status='breached_archived'),
+            self.a('b',stage='phase 1',breached_at='2026-10-05'),
+            self.a('c',stage='phase2',breach_at='2026-10-06'),
+            self.a('d',stage='funded',account_status='breached_archived')]
+        r=build_report([self.p()],accounts,'','')
+        self.assertEqual(r['summary']['phase1_breached'],1)
+        self.assertEqual(r['summary']['phase2_breached'],1)
+        self.assertEqual(r['summary']['breached'],1)
+        self.assertTrue(r['rows'][0]['phase1_breached'])
+        self.assertEqual(r['plans'][0]['phase2_breached'],1)
+
+    def test_funded_breach_is_not_an_evaluation_stage_breach(self):
+        r=build_report([self.p()],[self.a(stage='funded',breached_at='2026-10-05')],'','')
+        self.assertEqual(r['summary']['breached'],1)
+        self.assertEqual(r['summary']['phase1_breached'],0)
+        self.assertEqual(r['summary']['phase2_breached'],0)
+
+    def test_stage_cards_respect_sale_dates_and_exact_owner(self):
+        purchases=[self.p(),self.p('older',created_at='2026-09-01T00:00:00Z')]
+        accounts=[self.a(stage='phase1',account_status='breached'),
+            self.a('old',purchase_id='older',stage='phase2',account_status='breached'),
+            self.a('wrong',trader_id='other',stage='phase2',account_status='breached')]
+        r=build_report(purchases,accounts,'2026-10-01','2026-10-31')
+        self.assertEqual(r['summary']['sold'],1)
+        self.assertEqual(r['summary']['phase1_breached'],1)
+        self.assertEqual(r['summary']['phase2_breached'],0)
+
     def p(self, id='p', **extra):
         return dict(dict(id=id, trader_id='t', created_at='2026-10-01T23:30:00Z', status='approved', plan_name='Legend'), **extra)
     def a(self,id='a',**extra):

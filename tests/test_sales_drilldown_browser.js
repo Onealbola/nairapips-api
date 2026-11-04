@@ -6,7 +6,7 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
   await page.setContent('<div id="np-sales-result"></div><input id="np-sales-from" value="03/10/2026"><input id="np-sales-to" value="23/10/2026">');
   await page.evaluate(()=>{
    window.money=v=>'₦'+v;window.SESSION={};window.esc=String;
-   const base={sale_date:'2026-10-20',trader_id:'owner',trader_name:'Same Trader <safe>',email:'fixture@example.invalid',plan:'Legend',account_size:500000,mt5_login:'old-login',breached:false,passed:false,funded:false,funded_breached:false,collected_payout:false,paid_then_breached_closed:false,assigned:true,paid_payout_count:0,payout_amount:0,still_phase1:false,still_funded:false,outcome:'no_recorded_result',outcome_label:'Challenge',current_accounts:[]};
+   const base={sale_date:'2026-10-20',trader_id:'owner',trader_name:'Same Trader <safe>',email:'fixture@example.invalid',plan:'Legend',account_size:500000,mt5_login:'old-login',breached:false,phase1_breached:false,phase2_breached:false,passed:false,funded:false,funded_breached:false,collected_payout:false,paid_then_breached_closed:false,assigned:true,paid_payout_count:0,payout_amount:0,still_phase1:false,still_funded:false,outcome:'no_recorded_result',outcome_label:'Challenge',current_accounts:[]};
    window.rows=[{...base,purchase_id:'first',still_phase1:true,current_position:'phase1',current_accounts:[{mt5_login:'phase-one-login',stage:'phase1',status:'assigned_active'}]},
     {...base,purchase_id:'second',still_funded:true,funded:true,passed:true,current_position:'funded',outcome:'funded_no_payout',current_accounts:[{mt5_login:'funded-login',stage:'funded',status:'profit_protected'}]},
     {...base,purchase_id:'outside',sale_date:'2026-09-01',still_funded:true,funded:true,current_position:'funded',outcome:'funded_no_payout'}];
@@ -24,6 +24,24 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
   await details.getByRole('button',{name:'Close list'}).click();assert(await details.isHidden());
   await page.locator('[data-sales-metric="sold"]').click();assert.equal(await details.locator('tbody tr').count(),2);
   await page.locator('[data-sales-metric="breached"]').click();assert((await details.innerText()).includes('No matching purchases'));
+  await page.evaluate(()=>{
+    rows[0].phase1_breached=true;rows[0].breached=true;rows[0].outcome='failed_before_funded';
+    rows[1].phase2_breached=true;rows[1].breached=true;
+    rows[2].phase1_breached=true;rows[2].phase2_breached=true;
+    return loadSalesOutcomes();
+  });
+  assert((await page.locator('[data-sales-metric="phase1_breached"]').innerText()).includes('1 out of 2 bought'));
+  assert((await page.locator('[data-sales-metric="phase2_breached"]').innerText()).includes('1 out of 2 bought'));
+  await page.locator('[data-sales-metric="phase1_breached"]').click();
+  assert((await details.innerText()).includes('Breached Phase 1 · 1 purchase'));
+  assert((await details.innerText()).includes('phase-one-login'));
+  assert(!(await details.innerText()).includes('funded-login'));
+  await page.locator('[data-sales-metric="phase2_breached"]').click();
+  assert((await details.innerText()).includes('Breached Phase 2 · 1 purchase'));
+  assert((await details.innerText()).includes('funded-login'));
+  assert(!(await details.innerText()).includes('phase-one-login'));
+  await page.evaluate(()=>{delete rows[0].phase1_breached;return loadSalesOutcomes()});
+  assert((await page.locator('#np-sales-result').innerText()).includes('Stage breach counts are not available yet'));
   await page.evaluate(()=>npSalesDatesChanged());assert.equal(await page.locator('#np-sales-details').count(),0);
   await page.close();
  }console.log('PASS: mobile/keyboard card drilldowns show names and exact current MT5s, retain cohort, separate repeat purchases, escape names, handle zero counts and clear on date change.');

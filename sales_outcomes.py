@@ -212,10 +212,14 @@ def build_report(purchases, accounts, start, end, payouts=None):
                     continue
                 journey.append(a); ids.add(aid); queue.append(aid)
         breached = passed = funded = funded_breached = False
+        phase1_breached = phase2_breached = False
         for a in journey:
             stage = str(a.get("stage") or a.get("phase") or "").lower().replace("_", "").replace(" ", "")
             state = " ".join(str(a.get(k) or "").lower() for k in ("status", "account_status", "lifecycle_state"))
             account_breached = bool(a.get("breached_at") or a.get("breach_at") or "breach" in state)
+            if str(a.get('trader_id') or '') == str(p.get('trader_id') or ''):
+                phase1_breached |= account_breached and stage == 'phase1'
+                phase2_breached |= account_breached and stage == 'phase2'
             breached |= account_breached
             funded_breached |= account_breached and "funded" in stage
             issued = bool(a.get("mt5_login"))
@@ -224,7 +228,11 @@ def build_report(purchases, accounts, start, end, payouts=None):
         paid_records = {paid_id: amount for aid in ids for paid_id, amount in paid_by_account.get(aid, [])}
         payout_amount = float(sum(paid_records.values(), Decimal("0")).quantize(Decimal("0.01")))
         position = current_position(p, journey, paid_accounts)
+        # Each stage is a purchase-wide historical flag: multiple breached
+        # accounts in the same stage count once, and funded breaches stay out.
+        stage_breaches = dict(phase1_breached=phase1_breached, phase2_breached=phase2_breached)
         rows.append({"sale_amount":recorded_sale_amount(p),"trader_id":str(p.get("trader_id") or ""),"trader_name":str(p.get("trader_name") or ""),"email":str(p.get("email") or ""),"current_accounts":current_accounts(p,journey,paid_accounts),"current_position":position,"still_phase1":position=="phase1","still_funded":position=="funded","purchase_id": pid, "sale_date": day, "plan": str(p.get("plan_name") or p.get("plan") or "Unspecified"), "account_size": p.get("account_size") or 0, "mt5_login": str(p.get("mt5_login") or (journey[0].get("mt5_login") if journey else "") or ""), "breached": breached, "passed": passed, "funded": funded, "funded_breached": funded_breached, "collected_payout": bool(paid_records), "paid_then_breached_closed": _paid_then_breached_closed(journey, paid_times) if paid_records else False, "paid_payout_count": len(paid_records), "payout_amount": payout_amount, "assigned": any(a.get("mt5_login") for a in journey)})
+        rows[-1].update(stage_breaches)
     for row in rows:
         row["outcome"] = outcome_for(row)
         row["outcome_label"] = OUTCOMES[row["outcome"]]
@@ -232,7 +240,7 @@ def build_report(purchases, accounts, start, end, payouts=None):
         sold = len(group)
         result = {"sold": sold}
         result["sales_amount"] = None if any(r["sale_amount"] is None for r in group) else float(sum((Decimal(str(r["sale_amount"])) for r in group),Decimal("0")))
-        for key in ("breached", "passed", "funded", "funded_breached", "collected_payout", "paid_then_breached_closed", "assigned", "still_phase1", "still_funded"):
+        for key in ("breached", "phase1_breached", "phase2_breached", "passed", "funded", "funded_breached", "collected_payout", "paid_then_breached_closed", "assigned", "still_phase1", "still_funded"):
             result[key] = sum(bool(r[key]) for r in group)
             result[key + "_rate"] = round(result[key] * 100 / sold, 1) if sold else 0
         result["paid_payout_count"] = sum(r["paid_payout_count"] for r in group)
@@ -250,4 +258,4 @@ def build_report(purchases, accounts, start, end, payouts=None):
     plans = defaultdict(list)
     for row in rows:
         plans[row["plan"]].append(row)
-    return {"success": True, "generated_at": datetime.now(TZ).isoformat(), "from": start, "to": end, "timezone": "Africa/Lagos", "summary": totals(rows), "outcome_labels": OUTCOMES, "plans": [{"plan": name, **totals(group)} for name, group in sorted(plans.items())], "rows": sorted(rows, key=lambda r: (r["sale_date"], r["purchase_id"]), reverse=True), "undated_sales_excluded": undated, "unlinked_paid_records": unlinked_paid, "definition": "Still in Phase 1 / Still Funded count purchases with a recorded open account in that stage now, including payout holds. Archived, closed, breached, passed evaluation and already-paid accounts are excluded; conflicting open stages require review. Approved original purchases by transaction date. Milestones cover their linked account history up to now; passed means at least one evaluation phase passed. Counts overlap: a funded trader can receive payouts and later breach. Collected payouts are records marked paid, linked by exact account and owner; pending/approved requests are excluded. Amounts cover payments up to now for the selected sales cohort, not payments made only within the sale dates. Resets are excluded as new sales."}
+    return {"success": True, "generated_at": datetime.now(TZ).isoformat(), "from": start, "to": end, "timezone": "Africa/Lagos", "summary": totals(rows), "outcome_labels": OUTCOMES, "plans": [{"plan": name, **totals(group)} for name, group in sorted(plans.items())], "rows": sorted(rows, key=lambda r: (r["sale_date"], r["purchase_id"]), reverse=True), "undated_sales_excluded": undated, "unlinked_paid_records": unlinked_paid, "definition": "Still in Phase 1 / Still Funded count purchases with a recorded open account in that stage now, including payout holds. Archived, closed, breached, passed evaluation and already-paid accounts are excluded; conflicting open stages require review. Approved original purchases by transaction date. Milestones cover their linked account history up to now; passed means at least one evaluation phase passed. Phase 1 and Phase 2 breach counts are distinct purchases with any recorded breach in the named evaluation stage; repeat accounts count once per stage, funded breaches are excluded, and stage totals may overlap. Counts overlap: a funded trader can receive payouts and later breach. Collected payouts are records marked paid, linked by exact account and owner; pending/approved requests are excluded. Amounts cover payments up to now for the selected sales cohort, not payments made only within the sale dates. Resets are excluded as new sales."}
