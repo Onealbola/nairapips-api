@@ -3,7 +3,7 @@
 Financial APIs retain their authentication and authorization; no session is embedded.
 """
 from pathlib import Path
-from flask import send_file
+from flask import send_file, make_response
 
 RELEASE='hosted-admin-mobile-navigation-2026-10-22'
 
@@ -11,7 +11,7 @@ def register_panel_delivery(app, root=None):
     assets=Path(root) if root else Path(__file__).resolve().parent/'website-downloads'
     @app.get('/public/trader-catalogue.js')
     def trader_catalogue_script():
-        r=send_file(assets/'trader-catalog-sync.js',mimetype='application/javascript',conditional=False,etag=False,max_age=0)
+        r=make_response((assets/'account-plan-selector.js').read_text()+'\n'+(assets/'trader-catalog-sync.js').read_text());r.mimetype='application/javascript'
         r.headers['Cache-Control']='no-store, max-age=0'
         r.headers['X-Content-Type-Options']='nosniff'
         return r
@@ -22,7 +22,7 @@ def register_panel_delivery(app, root=None):
 
     @app.get('/public/landing-catalogue.js')
     def landing_catalogue_script():
-        r=send_file(assets/'landing-catalogue-sync.js',mimetype='application/javascript',conditional=False,etag=False,max_age=0)
+        r=make_response((assets/'account-plan-selector.js').read_text()+'\n'+(assets/'landing-catalogue-sync.js').read_text());r.mimetype='application/javascript'
         r.headers['Cache-Control']='no-store, max-age=0'
         r.headers['X-Content-Type-Options']='nosniff'
         return r

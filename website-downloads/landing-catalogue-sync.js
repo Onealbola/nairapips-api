@@ -14,6 +14,13 @@ function card(p,i){
 }
 function paint(){
  const s=document.getElementById('npStandardPlansGrid'),p=document.getElementById('npPremiumPlansGrid');if(!s||!p)return false;
+ if(state.confirmed&&window.NPPlanSelector){
+  const standard=document.getElementById('npStandardPlansSection'),premium=document.getElementById('npPremiumPlansSection');
+  if(standard){const head=standard.querySelector('.np-product-market-head');if(head)head.style.display='none';standard.style.cssText+=';padding:0;border:0;background:none;box-shadow:none';}
+  if(premium)premium.style.display='none';
+  const section=document.getElementById('challenge-plans');const heading=section?.querySelector('.section-header');if(heading)heading.style.display='none';
+  s.style.display='block';p.style.display='none';s.innerHTML=window.NPPlanSelector.render(state.products,{key:'landing',context:'landing'});return true;
+ }
  const products=state.products;window.NP_REAL_PLANS=products.map(p=>({...p.plan,raw:p.plan,catalog_product_id:p.id,purchases_open:p.purchases_open}));
  for(const [grid,premium] of [[s,false],[p,true]]){const rows=products.filter(p=>(p.family==='premium')===premium);grid.innerHTML=rows.length?rows.map(card).join(''):'<div class="np-market-empty" role="status">'+(state.error?'Current offers could not be verified. Retrying automatically. <button type="button" class="btn btn-primary" data-catalogue-retry>Retry now</button>':state.confirmed?'No packages are currently shown.':'Loading current offers…')+'</div>';}
  return true;

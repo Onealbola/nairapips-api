@@ -22,6 +22,7 @@ window.npSharedCatalogueHTML=function(family='all'){
  if(!state.pending&&Date.now()-state.last>10000)queueMicrotask(()=>refresh());
  if(!state.data)return '<section class="card"><h3>Challenge catalogue</h3><p>'+(state.error?'Current prices could not be confirmed. Please retry.':'Loading current prices and package availability…')+'</p><button class="btn" onclick="npRefreshSharedCatalogue(true)">Retry catalogue</button></section>';
  const rows=state.data.products.filter(p=>family==='all'||p.family===family);
+ if(rows.length&&window.NPPlanSelector)return window.NPPlanSelector.render(rows,{key:'trader-'+family,context:'trader'});
  if(!rows.length)return '<section class="card"><p>No '+(family==='progress'?'new packages':'challenge packages')+' are visible right now.</p></section>';
  return '<section data-shared-catalogue><h2 class="np-offer-title">'+(family==='progress'?'Build your package':'Challenge packages')+'</h2><div class="np-offer-grid">'+rows.map(productCard).join('')+'</div></section>';
 };

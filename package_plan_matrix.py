@@ -154,7 +154,9 @@ def register_plan_matrix(app,store,require_admin,audit):
     def plan_matrix_view():
         _,error=owner()
         if error is not None:return error
-        return secure(make_response((ROOT/'plan_matrix.html').read_text()))
+        html=(ROOT/'plan_matrix.html').read_text()
+        component=(ROOT.parent/'website-downloads'/'account-plan-selector.js').read_text()
+        return secure(make_response(html.replace('</head>','<script>'+component+'</script></head>',1)))
 
     @app.route('/admin/package_studio/plan_matrix',methods=['GET','POST'])
     def plan_matrix_settings():
