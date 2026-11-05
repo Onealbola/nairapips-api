@@ -1,6 +1,18 @@
 const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert'),cp=require('child_process'),path=require('path');
 const root=path.resolve(__dirname,'..');
-const initial=JSON.parse(cp.execFileSync('python',['-c','import json;from package_plan_matrix import defaults;print(json.dumps(defaults()))'],{cwd:root,encoding:'utf8'}));
+// Use the actual connected backend response, so editor/API contract drift fails here.
+const fixture=JSON.parse(cp.execFileSync('python',['-c',`
+import json
+from flask import Flask
+from types import SimpleNamespace
+from package_plan_matrix import defaults,register_plan_matrix
+app=Flask(__name__)
+app.config['NP_PROGRESS_PLAN_BRIDGE']=object()
+register_plan_matrix(app,SimpleNamespace(read=lambda **kw:(defaults(),None)),lambda:({'id':'owner','role':'owner'},None),lambda *a:None)
+print(json.dumps(app.test_client().get('/admin/package_studio/plan_matrix').json))
+`],{cwd:root,encoding:'utf8'}));
+const initial=fixture.data;
+assert.equal(fixture.production_effect,'future_offers_only');assert.equal(fixture.purchase_controls_connected,true);
 (async()=>{const browser=await chromium.launch({executablePath:'/usr/bin/chromium',headless:true,args:['--no-sandbox']});try{
  let doc=structuredClone(initial),writes=0,fail=false;const errors=[],requests=[];
  const context=await browser.newContext();
@@ -12,7 +24,7 @@ const initial=JSON.parse(cp.execFileSync('python',['-c','import json;from packag
   if(p==='/admin/package_studio/plan_matrix'){
    if(fail)return route.fulfill({status:503,json:{success:false,error:'Fixture database unavailable'}});
    if(r.method()==='POST'){const b=r.postDataJSON();if(b.revision!==doc.revision)return route.fulfill({status:409,json:{success:false,error:'Another admin saved a newer version'}});doc={...doc,revision:doc.revision+1,config:b.config};writes++}
-   return route.fulfill({json:{success:true,data:doc,checkout_enabled:false,production_effect:'none'}})
+   return route.fulfill({json:{...fixture,data:doc}})
   }throw Error('Unexpected route '+p);
  });
  async function open(){const p=await context.newPage();p.on('pageerror',e=>errors.push(e.message));await p.goto('https://matrix.test/package-studio');await p.fill('#username','owner');await p.fill('#password','fixture');await p.click('#submit');await p.locator('#status').filter({hasText:'Loaded saved revision'}).waitFor();return p;}
