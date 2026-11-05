@@ -10369,7 +10369,7 @@ def create_purchase():
              "original_fee":quote.get("original_fee", original_fee),"discount_percent":quote.get("discount_percent",0),"discount_amount":quote.get("discount_amount",0),
              "final_fee":quote.get("final_fee", original_fee),"amount_due":quote.get("final_fee", original_fee),
              "payment_proof_url":proof,"payment_status":"pending","status":"pending_review","admin_note":"",
-             "challenge_journey": challenge_journey, "journey_source": "purchase_plan_snapshot",
+             "challenge_journey": challenge_journey, "journey_source": (plan_row.get("journey_source") if _np_is_managed_progress_plan(plan_row) else "purchase_plan_snapshot"),
              "created_at":now_iso(),"purchase_month":month(),"purchase_year":year()}
         row.update(second_life_snapshot)
         row.update(plan_rule_snapshot)
@@ -42153,7 +42153,7 @@ def _np_assign_phase_mt5_v60():
                 or "[np_entitlement:admin_recovery]" in _np_kill_blob(source)
             )
         )
-        if not historical_same_stage_recovery:
+        if not historical_same_stage_recovery and not globals().get("_np_progress_phase2_entitlement", lambda _: False)(source):
             return _np_fail(
                 "Phase 2 progression is retired. NairaPips progression is Phase 1 -> Funded. "
                 "Refresh this journey and assign the exact Funded entitlement instead.",
@@ -60067,3 +60067,11 @@ _np_catalog_publication_store = _NPCatalogPublicationStore(requests, SUPABASE_UR
 app.config["NP_SHARED_CATALOG_PLAN_READER"] = _np_public_plan_snapshot_rows
 _np_shared_catalog = _NPSharedCatalog(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, _np_plan_matrix_store, _np_controls_store_v225, _np_package_lab_store_v224, app)
 _NPRegisterCatalogPublication(app, _np_catalog_publication_store, _np_shared_catalog, _require_admin, _authenticated_trader_id_for_request, _audit_safe)
+
+# Managed Progress plans share the established immutable purchase lifecycle.
+from progress_plan_bridge import ProgressPlanBridge as _NPProgressPlanBridge, is_managed as _np_is_managed_progress_plan
+_np_progress_bridge = _NPProgressPlanBridge(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, _np_plan_matrix_store, _np_catalog_publication_store, lambda: _np_owner_catalog_invalidate_v225("public_plans_snapshot", "plans_list", "admin_bootstrap"))
+app.config["NP_PROGRESS_PLAN_BRIDGE"] = _np_progress_bridge
+app.config["NP_PROGRESS_SHARED_CATALOG"] = _np_shared_catalog
+from progress_lifecycle import install as _np_install_progress_lifecycle
+_np_install_progress_lifecycle(globals())

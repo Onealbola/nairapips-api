@@ -8766,7 +8766,7 @@ function npBuyerRender(catalog, cycles=catalog.default_cycles??3){
   select.value=String(cycles);
   NP_BUYER_CHECKOUT.ready=true;
   const toggle=document.getElementById('pur-cycle-toggle');
-  toggle.checked=Number(cycles)!==Number(catalog.default_cycles??3); toggle.disabled=false;
+  toggle.checked=Number(cycles)!==Number(catalog.default_cycles??3); toggle.disabled=Boolean(catalog.managed_progress); toggle.closest("label").hidden=Boolean(catalog.managed_progress); toggle.closest("label").style.display=catalog.managed_progress?"none":"flex";
   document.getElementById('pur-cycle-options').hidden=!toggle.checked;
   select.disabled=!toggle.checked;
   document.getElementById('pur-file').disabled=false;
@@ -8804,7 +8804,7 @@ async function npBuyerLoad(planId, token){
     if(token!==NP_BUYER_CHECKOUT_SEQ || !document.getElementById('pur-cycles') || NP_BUYER_CHECKOUT.element!==document.getElementById('pur-cycles')) return;
     if(!result?.success) throw Error(result?.error||'Could not load current cycle prices');
     npBuyerRender(result.data);
-    document.getElementById('pur-price-status').textContent='';
+    document.getElementById('pur-price-status').textContent=result.data.managed_progress?'Continuing eligible payouts included · '+Number(result.data.payout_split)+'% trader share · 15% gross profit cap per cycle · No resets.':'';
   }catch(e){
     if(token===NP_BUYER_CHECKOUT_SEQ && NP_BUYER_CHECKOUT?.element===document.getElementById('pur-cycles')) document.getElementById('pur-price-status').textContent=(e.message||'Prices unavailable')+'. Close and reopen to retry.';
   }
@@ -9025,6 +9025,10 @@ async function submitPurchase(planId){
 
     const current=await safeFetchJson(API+'/plan_purchase_options?plan_id='+encodeURIComponent(p.id)+'&payout_cycles='+p.payout_cycles,{},15000,false);
     if(!current?.success) throw Error(current?.error||'Current prices could not be verified');
+    if(p.managed_progress && current.data.offer_version!==p.offer_version){
+      checkoutState.ready=false;
+      throw Error('Package terms have changed. Close checkout and select the current package again.');
+    }
     if(Number(current.data.fee)!==Number(p.fee)){
       npBuyerRender(current.data,p.payout_cycles);
       throw Error('The price has changed. Check the updated total before submitting payment proof.');
@@ -9106,6 +9110,7 @@ async function submitPurchase(planId){
       account_size:p.account_size,
       fee:p.fee,
       payout_cycles:p.payout_cycles,
+      plan_offer_version:p.offer_version,
       payment_proof_url:proofUrl,
       status:'pending',
       payment_status:'pending',
@@ -12042,7 +12047,7 @@ async function refresh(force=false){
 }
 window.npRefreshSharedCatalogue=refresh;
 document.addEventListener('click',event=>{const button=event.target.closest('[data-catalog-product]');if(!button)return;const p=state.data?.products.find(x=>x.id===button.dataset.catalogProduct);if(!p?.purchases_open)return;
- if(p.family==='progress'){toast('This package requires its verified purchase flow. Please refresh the catalogue.','err');return}
+
  // Use only the selected, current server plan when opening the existing signed
  // price/payment flow. That flow checks price again, and the API gates submission.
  SESSION.plansList=(SESSION.plansList||[]).filter(x=>String(x.id)!==p.plan_id&&String(x.id)!==p.plan.id);SESSION.plansList.push({...p.plan,status:'active'});purchasePlan(p.plan.id);
@@ -12053,7 +12058,6 @@ window.addEventListener('focus',()=>refresh(true));document.addEventListener('vi
 setInterval(()=>{if(!document.hidden)refresh()},30000);
 window.NPSharedCatalogueState=state;queueMicrotask(()=>{if(current()&&SESSION.trader)refresh(true)});
 })();
-
 </script></body>
 </html>
 <style id="np-funded-modules-final-fix">

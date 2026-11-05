@@ -4,6 +4,7 @@ from decimal import Decimal, InvalidOperation
 from flask import jsonify, request
 from production_controls import ControlsStore, ControlsUnavailable, Conflict
 from plan_cycles import cycle_limit
+from progress_plan_bridge import is_managed, commercial_plan
 
 KEY = 'standard_plan_cycle_prices_v1'
 # Keep the stored key format compatible; 3-cycle price is retained but no longer charged.
@@ -64,6 +65,8 @@ class CyclePriceStore(ControlsStore):
 
 
 def priced_plan(plan, prices, category='standard'):
+    if is_managed(plan):
+        return commercial_plan(plan)
     row = dict(plan)
     if str(row.get('product_category') or 'standard').lower() != category:
         return row
@@ -78,6 +81,10 @@ def priced_plan(plan, prices, category='standard'):
 
 def purchase_plan(plan, prices, cycles=DEFAULT_CYCLES):
     """Price a buyer's selection without changing the saved product or past sales."""
+    if is_managed(plan):
+        if cycles is not None and str(cycles) not in ("0", "3"):
+            raise ValueError("This package includes continuing payouts; its cycle terms cannot be changed")
+        return commercial_plan(plan)
     cycles = cycle_limit(DEFAULT_CYCLES if cycles is None else cycles)
     category = str(plan.get('product_category') or 'standard').lower()
     if category not in {'standard', 'premium'}:
@@ -86,6 +93,8 @@ def purchase_plan(plan, prices, cycles=DEFAULT_CYCLES):
 
 
 def purchase_catalog(plan, prices):
+    if is_managed(plan):
+        return commercial_plan(plan)
     row = purchase_plan(plan, prices, DEFAULT_CYCLES)
     options = []
     for cycles in (1, 2, 3, 4, 5, 0):

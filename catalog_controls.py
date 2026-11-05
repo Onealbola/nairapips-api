@@ -5,6 +5,7 @@ Owners can edit current plans; existing customers retain their purchased terms.
 """
 from decimal import Decimal, InvalidOperation
 from flask import jsonify, request
+from progress_plan_bridge import is_managed
 
 FIELDS = {
     'name', 'description', 'status', 'fee', 'account_size', 'phase1_target',
@@ -120,11 +121,11 @@ def register_catalog_controls(app, transport, url, key, require_admin, invalidat
         if error is not None:
             return error
         try:
-            plans = read('challenge_plans', {'select': 'id,updated_at,' + ','.join(sorted(FIELDS)),
+            plans = read('challenge_plans', {'select': 'id,updated_at,journey_source,' + ','.join(sorted(FIELDS)),
                                             'order': 'account_size.asc,id.asc', 'limit': '1001'})
             if len(plans) > 1000:
                 raise RuntimeError('Catalog too large for a complete edit view')
-            return jsonify(success=True, plans=plans)
+            return jsonify(success=True, plans=[p for p in plans if not is_managed(p)])
         except Exception:
             return jsonify(success=False, error='The complete catalog could not be loaded'), 503
 
@@ -141,6 +142,7 @@ def register_catalog_controls(app, transport, url, key, require_admin, invalidat
             if not rows:
                 return jsonify(success=False, error='Plan not found'), 404
             current = rows[0]
+            if is_managed(current):raise ValueError('Edit this package in Package Studio and use its purchase switch')
             if current.get('updated_at') != body['updated_at']:
                 return jsonify(success=False, error='Plan changed in another session. Reload before editing.'), 409
             changes = validated_plan(current, body['changes'])
@@ -176,6 +178,7 @@ def register_catalog_controls(app, transport, url, key, require_admin, invalidat
             rows = read('challenge_plans', {'select': '*', 'id': 'eq.' + str(body['id']), 'limit': '1'})
             if not rows:
                 return jsonify(success=False, error='Source plan not found'), 404
+            if is_managed(rows[0]):raise ValueError('Add or edit package choices in Package Studio')
             changes = validated_plan(rows[0], {'name': body['name'], 'status': 'inactive'})
             from datetime import datetime, timezone
             from uuid import uuid4
@@ -220,6 +223,7 @@ def register_catalog_controls(app, transport, url, key, require_admin, invalidat
                 if not rows:
                     return jsonify(success=False, error='Plan not found'), 404
                 current = rows[0]
+                if is_managed(current):raise ValueError('Edit this package in Package Studio; use the purchase switch to pause sales')
             if request.path != '/delete_challenge_plan':
                 changes = {k: v for k, v in body.items() if k in FIELDS}
                 if changes:

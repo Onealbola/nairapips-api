@@ -13,7 +13,7 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
    SESSION.plansList=SESSION.plansList.map(p=>catalog(p.id));
    window.submitted=[];window.uploads=0;window.delayPromo=false;window.releasePromo=null;
    window.safeFetchJson=async(url,opts={})=>{
-    if(url.includes('plan_purchase_options')){const u=new URL(url),p=catalog(u.searchParams.get('plan_id')),cycles=Number(u.searchParams.get('payout_cycles')??3),o=p.cycle_options.find(o=>o.cycles===cycles);return {success:true,data:{...p,fee:o.fee,payout_cycles:cycles,payout_cycle_extra:o.extra}};}
+    if(url.includes('plan_purchase_options')){const u=new URL(url),p=catalog(u.searchParams.get('plan_id')),cycles=Number(u.searchParams.get('payout_cycles')??p.default_cycles??3),o=p.cycle_options.find(o=>o.cycles===cycles);return {success:true,data:{...p,fee:o.fee,payout_cycles:cycles,payout_cycle_extra:o.extra}};}
     const body=JSON.parse(opts.body||'{}');
     if(url.includes('quote_challenge_price')){
      const p=catalog(body.plan_id),o=p.cycle_options.find(o=>o.cycles===body.payout_cycles);
@@ -72,6 +72,18 @@ const {chromium}=require('playwright'),fs=require('fs'),assert=require('assert')
   assert.equal(await page.evaluate(()=>uploads),1);assert.equal(await page.evaluate(()=>submitted.length),1);
   assert((await page.locator('#pur-amount-display').innerText()).includes('59,000'));
   assert((await page.evaluate(()=>messages.join('\n'))).includes('price has changed'));
+  await page.evaluate(()=>{
+   const previous=catalog;
+   window.catalog=id=>id==='g'?{...SESSION.plansList.find(p=>p.id===id),base_fee:10000,payout_cycle_extra:0,cycle_options:[{cycles:0,extra:0,available:true,fee:10000}]}:previous(id);
+   SESSION.plansList.push({id:'g',name:'Progress Basic',status:'active',fee:10000,account_size:500000,phase1_target:10,phase2_target:8,max_drawdown:5,managed_progress:true,default_cycles:0,payout_cycles:0,offer_version:'frozen-offer'});
+  });
+  await open('g');assert.equal(await page.locator('#pur-cycles').inputValue(),'0');assert(!await page.locator('#pur-cycle-toggle').isVisible());
+  assert((await page.locator('#modal').innerText()).includes('PHASE 2'));
+  assert((await page.locator('#pur-amount-display').innerText()).includes('10,000'));
+  await page.locator('#pur-file').setInputFiles({name:'proof.png',mimeType:'image/png',buffer:Buffer.from('fixture')});
+  await page.evaluate(()=>submitPurchase('g'));
+  const progressSold=await page.evaluate(()=>submitted.find(p=>p.plan_id==='g'));
+  assert.equal(progressSold.payout_cycles,0);assert.equal(progressSold.fee,10000);assert.equal(progressSold.plan_offer_version,'frozen-offer');
   console.log('PASS: buyer cycles default 3; separate market extras, free 1, unavailable unlimited, promo race, exact purchase payload, and stale-price upload protection.');
  }finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exit(1)});

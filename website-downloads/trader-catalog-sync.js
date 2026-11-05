@@ -34,7 +34,7 @@ async function refresh(force=false){
 }
 window.npRefreshSharedCatalogue=refresh;
 document.addEventListener('click',event=>{const button=event.target.closest('[data-catalog-product]');if(!button)return;const p=state.data?.products.find(x=>x.id===button.dataset.catalogProduct);if(!p?.purchases_open)return;
- if(p.family==='progress'){toast('This package requires its verified purchase flow. Please refresh the catalogue.','err');return}
+
  // Use only the selected, current server plan when opening the existing signed
  // price/payment flow. That flow checks price again, and the API gates submission.
  SESSION.plansList=(SESSION.plansList||[]).filter(x=>String(x.id)!==p.plan_id&&String(x.id)!==p.plan.id);SESSION.plansList.push({...p.plan,status:'active'});purchasePlan(p.plan.id);

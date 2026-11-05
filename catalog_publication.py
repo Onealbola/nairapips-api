@@ -10,12 +10,13 @@ from pathlib import Path
 from flask import jsonify,request,make_response
 from production_controls import ControlsStore,ControlsUnavailable,Conflict
 from package_plan_matrix import availability,SCHEMA
+from progress_plan_bridge import is_managed, plan_row, commercial_plan, readiness, catalog_identity, offer_version
 
 KEY='catalog_purchase_switches_v1'
-RELEASE='shared-trader-catalog-2026-11-05'
+RELEASE='managed-progress-purchases-2026-11-05'
 PLAN_FIELDS=('id','name','description','status','fee','account_size','phase1_target','phase2_target',
              'max_drawdown','drawdown_type','payout_split','reset_fee','funded_reset_fee',
-             'payout_cycles','payout_frequency','challenge_journey','product_category','base_fee','cycle_options','default_cycles')
+             'payout_cycles','payout_frequency','challenge_journey','product_category','base_fee','cycle_options','default_cycles','journey_source','managed_progress','offer_version')
 
 
 def defaults():return dict(revision=0,products={},updated_at=None,updated_by=None)
@@ -74,6 +75,8 @@ class SharedCatalog:
         except Exception as exc:raise ControlsUnavailable('Current challenge plans could not be loaded') from exc
 
     def progress_readiness(self,plan,package):
+        if self.app.config.get('NP_PROGRESS_PLAN_BRIDGE') is not None:
+            return readiness(plan,package)
         probe=self.app.config.get('NP_PROGRESS_PACKAGE_READINESS')
         checkout=self.app.config.get('NP_PROGRESS_PACKAGE_CHECKOUT')
         if not callable(probe) or not callable(checkout):return False,'Continuing-payout checkout and account enforcement are not connected yet'
@@ -86,6 +89,7 @@ class SharedCatalog:
     def products(self,fresh=False):
         result={}
         for p in self.plans(fresh=fresh):
+            if is_managed(p):continue
             identity='plan:'+str(p['id']);category='premium' if str(p.get('product_category') or '').lower()=='premium' else 'standard'
             result[identity]=dict(id=identity,family=category,name=str(p.get('name') or 'Challenge'),
                 visible=str(p.get('status') or '').lower()=='active',checkout_supported=True,release_reason='',
@@ -96,6 +100,7 @@ class SharedCatalog:
                 identity='progress:'+p['id']+':'+x['key'];ready,reason=self.progress_readiness(p,x)
                 result[identity]=dict(id=identity,family='progress',name=p['name']+' · '+x['name'],
                     visible=availability(p,x)['available'],checkout_supported=ready,release_reason=reason,
+                    plan_id=plan_row(p,x)['id'],plan=commercial_plan(plan_row(p,x,True)),
                     proposal=True,package=dict(name=x['name'],allocation_name=p['name'],capital=p['capital'],
                         price=x['price'],drawdown=x['drawdown'],profit_share=x['profit_share'],profit_cap=x['profit_cap'],
                         phase1_target=x['phase1_target'],phase2_target=x['phase2_target'],daily_drawdown=x['daily_drawdown'],
@@ -140,7 +145,7 @@ def register_catalog_publication(app,store,catalog,require_admin,authenticated_t
             for p in products.values():
                 if not p['visible'] or p['family']=='custom':continue
                 row={k:p[k] for k in ('id','family','name','purchases_open')}
-                if p['family']=='progress':row.update(package=p['package'],proposal=not p['purchases_open'])
+                if p['family']=='progress':row.update(package=p['package'],plan=p['plan'],proposal=not p['purchases_open'])
                 else:row['plan']=p['plan']
                 public.append(row)
             return response(dict(success=True,products=public,global_sales_open=sales,
@@ -163,7 +168,19 @@ def register_catalog_publication(app,store,catalog,require_admin,authenticated_t
         try:
             products=catalog.products(fresh=True)
             if request.method=='POST':
-                store.save_switches(request.get_json(silent=True),admin.get('id') or 'owner',products)
+                body=request.get_json(silent=True)
+                # Validate/CAS before staging; private switches stay authoritative
+                # if a physical row write or a later CAS fails.
+                if not isinstance(body,dict) or set(body)!={'revision','products'}:raise ValueError('Supply revision and product switches')
+                validate(dict(body,updated_at=None,updated_by=None))
+                current,_=store.read(fresh=True)
+                if body['revision']!=current['revision']:raise Conflict('Reload the latest purchase switches before saving')
+                for pid,flags in body['products'].items():
+                    if pid not in products:raise Conflict('The product list changed; reload')
+                    if flags['purchases_open'] and not products[pid]['checkout_supported']:raise Conflict('Purchases remain locked: '+products[pid]['release_reason'])
+                bridge=app.config.get('NP_PROGRESS_PLAN_BRIDGE')
+                if bridge is not None:bridge.sync(products,body['products'])
+                store.save_switches(body,admin.get('id') or 'owner',products)
                 audit('catalogue','purchase_switches_saved','New purchases only',admin,KEY)
             doc,products,sales=state(products)
             rows=[{k:v for k,v in p.items() if not k.startswith('_') and k not in ('plan','package')} for p in products.values()]
@@ -175,6 +192,10 @@ def register_catalog_publication(app,store,catalog,require_admin,authenticated_t
     def gate(identity):
         # Financial submissions bypass worker caches. Existing fixed-plan
         # checkout must not depend on loading an unrelated future draft.
+        if identity.startswith('plan:') and app.config.get('NP_PROGRESS_PLAN_BRIDGE') is not None:
+            bridge=app.config['NP_PROGRESS_PLAN_BRIDGE']
+            row=bridge.find(identity[5:])
+            if row is not None and is_managed(row):identity=catalog_identity(row)
         doc,_=store.read(fresh=True);flags,_=catalog.controls.read(fresh=True)
         default_open=identity.startswith('plan:') or identity=='custom'
         opened=doc['products'].get(identity,{'purchases_open':default_open})['purchases_open']
@@ -192,6 +213,11 @@ def register_catalog_publication(app,store,catalog,require_admin,authenticated_t
         elif opened:
             _,products,_=state(fresh=True)
             opened=bool(products.get(identity,{}).get('purchases_open'))
+            bridge=app.config.get('NP_PROGRESS_PLAN_BRIDGE')
+            if opened and bridge is not None:
+                product=products[identity]
+                physical=bridge.find(product['plan_id'])
+                opened=bool(physical and bridge.verified_identity(physical)==identity)
         if not opened:
             return response(dict(success=False,code='PRODUCT_PURCHASES_CLOSED',
                 error='This package is not open for new purchases. Refresh the catalogue.',operation_started=False),403)
@@ -212,7 +238,15 @@ def register_catalog_publication(app,store,catalog,require_admin,authenticated_t
         if path=='/trader/package_checkout':return None
         identity='custom' if custom else 'plan:'+str(body.get('plan_id') or '')
         if not custom and not body.get('plan_id'):return None
-        try:return gate(identity)
+        try:
+            denied=gate(identity)
+            if denied is not None:return denied
+            if legacy:
+                bridge=app.config.get("NP_PROGRESS_PLAN_BRIDGE")
+                row=bridge.find(body["plan_id"]) if bridge is not None else None
+                if row is not None and is_managed(row) and (body.get("plan_offer_version")!=offer_version(row) or (request.environ.get("np_verified_checkout_plan_v221") is not None and offer_version(request.environ["np_verified_checkout_plan_v221"])!=offer_version(row))):
+                    return response(dict(success=False,code="PACKAGE_OFFER_CHANGED",error="Package terms changed. Close checkout and select the current package again.",operation_started=False),409)
+            return None
         except ControlsUnavailable:return response(dict(success=False,error='Purchase availability could not be verified.',operation_started=False),503)
 
     # Existing custom checkout uses this only after confirming that the quote
@@ -232,5 +266,7 @@ def register_catalog_publication(app,store,catalog,require_admin,authenticated_t
             if product['family']!='progress':return response(dict(success=False,error='Use the existing plan checkout'),400)
             # A future verified connector owns signed quotes, frozen contracts,
             # idempotency, payment validation and account-runtime bindings.
+            if app.config.get('NP_PROGRESS_PLAN_BRIDGE') is not None:
+                return response(dict(success=True,plan=product['plan'],next_step='submit_payment_proof',purchase_endpoint='/create_challenge_purchase'))
             return app.config['NP_PROGRESS_PACKAGE_CHECKOUT'](tid,copy.deepcopy(product['_plan']),copy.deepcopy(product['_package']),body)
         except ControlsUnavailable:return response(dict(success=False,error='Package availability could not be verified.'),503)
