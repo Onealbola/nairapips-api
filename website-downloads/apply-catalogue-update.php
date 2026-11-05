@@ -19,10 +19,13 @@ if (!is_file($landing) || !is_file($trader) || !is_file($payload)) fail_install(
 $home = file_get_contents($landing);
 $dashboard = file_get_contents($payload);
 if ($home === false || $dashboard === false || stripos($home,'</body>') === false || strpos($home,'npStandardPlansGrid') === false || strpos($home,'npPremiumPlansGrid') === false) fail_install('The existing landing page could not be safely read. No file was changed.');
-if (hash('sha256',$dashboard) !== 'fea3c3eb60d1446dc6018a8e768f393b7628e3d134bf878cf7508022ec56e28d') fail_install('The trader-page payload could not be verified. Extract the complete ZIP again.');
+if (hash('sha256',$dashboard) !== '9f57075fba44a8553ff45d8ac11919d13b84ae52f79f0d313f04c31adc08c116') fail_install('The trader-page payload could not be verified. Extract the complete ZIP again.');
 $marker = '<!-- NP_LIVE_CATALOGUE_V1 -->';
-$tag = $marker.'<script src="https://nairapips-api.onrender.com/public/landing-catalogue.js?v=20261105"></script>';
-if (strpos($home,$marker) === false) $home = preg_replace('~</body>~i', $tag.'</body>', $home, 1);
+// Replace stale connections on every installation, including previous marked builds.
+$home = preg_replace('~<!-- NP_LIVE_CATALOGUE_V1 -->~', '', $home);
+$home = preg_replace('~<script\b[^>]*src=["\']https://nairapips-api\.onrender\.com/public/landing-catalogue\.js[^"\']*["\'][^>]*>\s*</script>~i', '', $home);
+$tag = $marker.'<script src="https://nairapips-api.onrender.com/public/landing-catalogue.js?v=models-20261105-v2"></script>';
+$home = preg_replace('~</body>~i', $tag.'</body>', $home, 1);
 $backup = dirname($root).'/np-catalogue-backups/'.gmdate('Ymd-His').'-'.bin2hex(random_bytes(4));
 if (!@mkdir($backup,0700,true)) fail_install('A backup folder could not be created beside public_html. No file was changed.');
 $targets = array($landing=>$home, $trader=>$dashboard);

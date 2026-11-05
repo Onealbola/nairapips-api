@@ -14,11 +14,19 @@ from package_studio import number
 KEY='package_studio_plan_matrix_v1'
 SCHEMA='np-progress-plan-matrix-v1'
 KINDS=('basic','room','share','both')
+MODELS=('two_phase','one_phase','instant')
+ROUTES={'two_phase':('phase1','phase2','funded'),'one_phase':('phase1','funded'),'instant':('funded',)}
+
+def model_of(plan):
+    return plan.get('model','two_phase')
+
+def route_for(plan):
+    return ROUTES[model_of(plan)]
 ROOT=Path(__file__).with_name('package_studio_assets')
-RELEASE='editable-plan-matrix-2026-11-03'
+RELEASE='editable-three-model-plans-2026-11-05'
 
 
-def make_plan(identity,capital,base):
+def make_plan(identity,capital,base,model=None):
     variants=[]
     for key,name,multiple,dd,share in (
         ('basic','Basic',1,5,50),('room','More Room',1.4,10,50),
@@ -26,8 +34,15 @@ def make_plan(identity,capital,base):
         variants.append(dict(key=key,name=name,enabled=True,price=math.ceil(base*multiple/50)*50,
             drawdown=dd,profit_share=share,profit_cap=15,daily_drawdown=0,
             phase1_target=10,phase2_target=8,payout_mode='continuing'))
-    return dict(id=identity,name='NGN '+format(capital,','),capital=capital,enabled=True,
+    plan=dict(id=identity,name='NGN '+format(capital,','),capital=capital,enabled=True,
         limits=dict(max_drawdown=10,max_profit_share=60,max_profit_cap=15),packages=variants)
+    if model is not None:
+        if model not in MODELS:raise ValueError('Unknown account model')
+        plan['model']=model
+        for x in variants:
+            if model!='two_phase':x['phase2_target']=0
+            if model=='instant':x['phase1_target']=0
+    return plan
 
 
 def defaults():
@@ -66,14 +81,15 @@ def validate_config(config):
         raise ValueError('Keep between 1 and 30 account sizes')
     seen=set();capitals=set()
     for plan in config['plans']:
-        fields(plan,('id','name','capital','enabled','limits','packages'))
+        fields(plan,('id','name','capital','enabled','limits','packages')+ (('model',) if 'model' in plan else ()))
+        if model_of(plan) not in MODELS:raise ValueError('Choose 1-Phase, 2-Phase or Instant Funded')
         if not isinstance(plan['id'],str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}',plan['id']) or plan['id'] in seen:
             raise ValueError('Duplicate or invalid account-size identity')
         seen.add(plan['id']);text(plan['name'],80);boolean(plan['enabled'])
         number(plan['capital'],1000,1e9)
-        if type(plan['capital']) is not int or plan['capital'] in capitals:
-            raise ValueError('Account sizes must be unique whole amounts')
-        capitals.add(plan['capital'])
+        if type(plan['capital']) is not int or (model_of(plan),plan['capital']) in capitals:
+            raise ValueError('Account sizes must be unique whole amounts within each model')
+        capitals.add((model_of(plan),plan['capital']))
         fields(plan['limits'],('max_drawdown','max_profit_share','max_profit_cap'))
         for key,low,high in [('max_drawdown',.1,30),('max_profit_share',1,100),('max_profit_cap',.1,30)]:
             number(plan['limits'][key],low,high)
@@ -96,9 +112,14 @@ def validate_config(config):
             if package['drawdown']>20 and package['daily_drawdown']!=10:
                 raise ValueError('Drawdown above 20% requires the 10% daily rule')
             for key in ('phase1_target','phase2_target'):
-                number(package[key],1,100)
-            if (package['phase1_target'],package['phase2_target']) not in ((8,5),(10,8)):
+                number(package[key],0,100)
+            targets=(package['phase1_target'],package['phase2_target'])
+            if model_of(plan)=='two_phase' and targets not in ((8,5),(10,8)):
                 raise ValueError('Choose either 8% / 5% or 10% / 8% as a complete target pair')
+            if model_of(plan)=='one_phase' and not (1<=targets[0]<=100 and targets[1]==0):
+                raise ValueError('A 1-Phase package needs one positive target and no Phase 2 target')
+            if model_of(plan)=='instant' and targets!=(0,0):
+                raise ValueError('Instant Funded packages have no evaluation targets')
             if package['payout_mode']!='continuing':
                 raise ValueError('This proposed format uses continuing eligible payouts')
     return copy.deepcopy(config)

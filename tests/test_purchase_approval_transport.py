@@ -111,7 +111,8 @@ class ApprovalTests(unittest.TestCase):
         self.assertEqual(results,[200]);self.assertEqual(len(self.calls),1)
     def test_out_of_stock_preserves_waiting_entitlement_without_stuck_claim(self):
         self.env.update(re=re,now_iso=lambda:'now',_affiliate_create_commission_from_purchase=Mock(),
-            _audit_safe=Mock(),_admin_from_payload=lambda p:{'id':'admin'})
+            _audit_safe=Mock(),_admin_from_payload=lambda p:{'id':'admin'},
+            _np_initial_purchase_stage=__import__('progress_lifecycle').initial_stage)
         extract(self.env,{'_np_mark_purchase_approved_waiting_v60'})
         def waiting():
             p=copy.deepcopy(self.db.purchase)
@@ -124,6 +125,30 @@ class ApprovalTests(unittest.TestCase):
         self.assertIn('[NP_ENTITLEMENT:FIRST_PHASE1:',self.db.purchase['admin_note'])
         self.assertNotIn('[NP_APPROVAL_CLAIM_V216:',self.db.purchase['admin_note'])
         self.assertFalse(self.db.history)
+    def test_each_model_approval_waits_for_its_correct_inventory_pool(self):
+        from package_plan_matrix import make_plan
+        from progress_plan_bridge import plan_row
+        from progress_lifecycle import initial_stage
+        for model,stage in [('two_phase','phase1'),('one_phase','phase1'),('instant','funded')]:
+            allocation=make_plan('approval-'+model,500000,25000,model)
+            row=plan_row(allocation,allocation['packages'][0])
+            self.db.purchase=dict(row,id='purchase',plan_id=row['id'],trader_id='owner',payment_status='pending',status='pending',admin_note=None)
+            picker=Mock(return_value=None)
+            self.env.update(re=re,now_iso=lambda:'now',_affiliate_create_commission_from_purchase=Mock(),
+                _audit_safe=Mock(),_admin_from_payload=lambda p:{'id':'admin'},
+                _np_initial_purchase_stage=initial_stage,_np_pick_fresh_mt5=picker,
+                _second_life_bool=bool,ok=lambda data,message:jsonify(success=True,data=data,message=message))
+            extract(self.env,{'approve_purchase','_np_mark_purchase_approved_waiting_v60'})
+            self.env['_np_approve_purchase_v216_core']=self.env['approve_purchase']
+            result=self.run_approval()
+            self.assertEqual(result.status_code,200,result.get_data(as_text=True))
+            picker.assert_called_once_with(500000,stage)
+            self.assertEqual(result.json['data']['target_stage'],stage)
+            self.assertEqual(self.db.purchase['lifecycle_state'],stage+'_waiting_mt5')
+            self.assertEqual(self.db.purchase['payment_status'],'approved')
+            self.assertNotIn('[NP_APPROVAL_CLAIM_V216:',self.db.purchase['admin_note'])
+            self.assertEqual(self.db.history,[])
+
     def test_post_success_wrapper_does_not_repeat_database_reads(self):
         core=Mock(return_value=SimpleNamespace(status_code=200))
         self.env.update(_np_post9_approve_purchase_core=core,supabase=Mock(),_np_fail=Mock())

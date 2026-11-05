@@ -8,6 +8,7 @@ import json
 from uuid import UUID, uuid5
 from decimal import Decimal, InvalidOperation
 from production_controls import ControlsUnavailable
+from package_plan_matrix import model_of, route_for
 
 PREFIX = 'progress_matrix_v1:'
 NAMESPACE = UUID('79ee22a0-4b9e-4a33-a187-c9958aec91d2')
@@ -46,14 +47,15 @@ def readiness(plan, package):
 
 def plan_row(plan, package, opened=False):
     source = PREFIX + plan['id'] + ':' + package['key']
+    label={'two_phase':'Two-phase challenge','one_phase':'One-phase challenge','instant':'Instant funded account'}[model_of(plan)]
     return dict(id=managed_id(source), journey_source=source,
         name=(plan['name'] + ' · ' + package['name'])[:100],
-        description='Two-phase challenge. Continuing eligible funded payouts. No included resets or second life.',
+        description=label+'. Continuing eligible funded payouts. No included resets or second life.',
         account_size=plan['capital'], fee=package['price'],
         phase1_target=package['phase1_target'], phase2_target=package['phase2_target'],
         max_drawdown=package['drawdown'], daily_drawdown=package.get('daily_drawdown',0), drawdown_type='STATIC',
         payout_split=package['profit_share'], payout_cycles=0, payout_frequency='Daily',
-        challenge_journey=['phase1','phase2','funded'], product_category='standard',
+        challenge_journey=list(route_for(plan)), product_category='standard',
         reset_fee=0, funded_reset_fee=0, second_life_enabled=False, lives_total=1,
         status='active' if opened else 'inactive')
 

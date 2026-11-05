@@ -3731,7 +3731,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
             "status": "approved_active",
             "lifecycle_state": _active_state_for_stage(stage),
             "challenge_journey": challenge_journey,
-            "journey_source": "assigned_account_snapshot",
+            "journey_source": ((purchase or {}).get("journey_source") if _np_is_managed_progress_plan(plan) else "assigned_account_snapshot"),
             "trader_account_id": account.get("id"),
             "assigned_mt5_id": mt5.get("id"),
             "mt5_login": mt5.get("mt5_login"),
@@ -10004,7 +10004,7 @@ def _np_plan_rule_snapshot_v156(plan):
         "drawdown_type": str(plan.get("drawdown_type") or "STATIC").strip().upper(),
         "payout_frequency": str(plan.get("payout_frequency") or "Daily").strip(),
         "payout_cycles": cycle_limit(plan.get("payout_cycles") if plan.get("payout_cycles") is not None else 3),
-        "phase1_target": float(plan.get("phase1_target") or plan.get("profit_target") or 10),
+        "phase1_target": float(plan["phase1_target"] if plan.get("phase1_target") is not None else (plan.get("profit_target") or 10)),
         "phase2_target": float(plan.get("phase2_target") or 0),
         "max_drawdown": float(plan.get("max_drawdown") or plan.get("total_dd") or 20),
         "payout_split": _effective_payout_split(plan.get("payout_split")),
@@ -10950,6 +10950,11 @@ NairaPips Team"""
         return _np_fail(e, 500)
 
 
+def _np_initial_purchase_stage(purchase):
+    from progress_lifecycle import initial_stage
+    return initial_stage(purchase)
+
+
 @app.route("/approve_challenge_purchase", methods=["POST"])
 def approve_purchase():
     try:
@@ -10991,22 +10996,23 @@ def approve_purchase():
                 return bad("Purchase already has Life 1 account history. Do not approve it again — use Activate Second Life.", 409)
             return bad("Purchase already has MT5/account history. Ordinary Purchase Approval is blocked; use the correct lifecycle action.", 409)
 
+        first_stage = _np_initial_purchase_stage(p)
         auto_mode = str(d.get("assignment_mode") or "").lower() in {"auto","auto_after_payment_approval","automatic"}
         if mt5_id:
             mres=_np_renewal_db_v211().table("mt5_pool").select("*").eq("id",mt5_id).limit(1).execute()
             if not mres.data: return bad("Selected MT5 account was not found")
             m=mres.data[0]
         else:
-            m=_np_pick_fresh_mt5(p.get("account_size") or 0, "phase1")
+            m=_np_pick_fresh_mt5(p.get("account_size") or 0, first_stage)
             if not m:
                 waiting=_np_mark_purchase_approved_waiting_v60(
-                    p, d, "No matching fresh Phase 1 MT5 available at approval time"
+                    p, d, f"No matching fresh {first_stage.upper()} MT5 available at approval time"
                 )
                 return ok({
                     "purchase": waiting,
                     "waiting_for_mt5": True,
-                    "target_stage": "phase1",
-                }, "Payment approved. Waiting for the correct fresh Phase 1 MT5; automation will retry.")
+                    "target_stage": first_stage,
+                }, f"Payment approved. Waiting for the correct fresh {first_stage.upper()} MT5; automation will retry.")
         if auto_mode:
             # V179 FORENSIC FIX:
             # If the MT5 came from the server-side fresh picker, it has already
@@ -11029,7 +11035,7 @@ def approve_purchase():
                 )
             else:
                 auto_ok,auto_reason=_np_mt5_auto_eligible(
-                    m,p.get("account_size") or 0,"phase1"
+                    m,p.get("account_size") or 0,first_stage
                 )
                 if not auto_ok:
                     # Browser/cache may contain an MT5 pool row that looks
@@ -11039,19 +11045,19 @@ def approve_purchase():
                         str(m.get("mt5_login") or ""), auto_reason,
                         flush=True,
                     )
-                    m=_np_pick_fresh_mt5(p.get("account_size") or 0,"phase1")
+                    m=_np_pick_fresh_mt5(p.get("account_size") or 0,first_stage)
                     if not m:
                         waiting=_np_mark_purchase_approved_waiting_v60(
-                            p, d, "Approved purchase waiting for genuinely fresh Phase 1 MT5"
+                            p, d, f"Approved purchase waiting for genuinely fresh {first_stage.upper()} MT5"
                         )
                         return ok({
                             "purchase": waiting,
                             "waiting_for_mt5": True,
-                            "target_stage": "phase1",
-                        }, "Payment approved. Waiting for the correct fresh Phase 1 MT5; automation will retry.")
+                            "target_stage": first_stage,
+                        }, f"Payment approved. Waiting for the correct fresh {first_stage.upper()} MT5; automation will retry.")
         print("V179 APPROVAL STEP: pool_stage_guard", str(m.get("mt5_login") or ""), flush=True)
         try:
-            _np_assert_mt5_pool_matches_stage(m, "phase1")
+            _np_assert_mt5_pool_matches_stage(m, first_stage)
         except ValueError as exc:
             return bad(str(exc), 409)
         if str(m.get("status") or "").strip().lower() != "available":
@@ -11066,10 +11072,10 @@ def approve_purchase():
         account, trader_row = _assign_mt5_to_trader(
             trader,
             m,
-            "phase1",
+            first_stage,
             p,
             staff,
-            d.get("admin_note") or "Challenge approved and Phase 1 MT5 assigned"
+            d.get("admin_note") or f"Purchase approved and {first_stage.upper()} MT5 assigned"
         )
         master_password=m.get("mt5_master_password","")
         investor_password=m.get("mt5_investor_password","")
@@ -29773,7 +29779,8 @@ def _np_ja_journey_authority(trader_id, journey_id):
     #
     # This prevents purchase.updated_at / assignment activity from making a later
     # Funded progression look as if a fresh payment was approved.
-    initial_key = f"purchase:{journey_id}:phase1"
+    initial_stage = _np_initial_purchase_stage(purchase)
+    initial_key = f"purchase:{journey_id}:{initial_stage}"
     if _np_ja_purchase_approved(purchase):
         entitlements_created.append(initial_key)
 
@@ -29800,22 +29807,22 @@ def _np_ja_journey_authority(trader_id, journey_id):
                     "message": f"MT5 {mt5} exists before a proven approved purchase.",
                     "account_id": aid,
                 })
-            if stg != "phase1":
+            if stg != initial_stage:
                 problems.append({
                     "code": "INITIAL_STAGE_INVALID",
-                    "message": f"Initial journey account MT5 {mt5} is {stg.upper()}, expected PHASE1.",
+                    "message": f"Initial journey account MT5 {mt5} is {stg.upper()}, expected {initial_stage.upper()}.",
                     "account_id": aid,
                 })
             authority_type = "initial_purchase"
             authority_key = initial_key
-            authority_detail = "PAYMENT APPROVED → NEW PHASE 1 MT5 ASSIGNED"
+            authority_detail = f"PAYMENT APPROVED → NEW {initial_stage.upper()} MT5 ASSIGNED"
         else:
             source_account_id = str(previous.get("id") or "")
             source_mt5 = str(previous.get("mt5_login") or "")
             prev_stage = _np_ja_stage(previous)
 
             if prev_stage in {"phase1", "phase2"} and _np_ja_is_passed(previous):
-                expected = "funded" if prev_stage == "phase1" else "funded"
+                expected = _next_stage_for_lifecycle(prev_stage, previous, purchase) or "funded"
                 authority_type = "phase_pass"
                 authority_key = f"pass:{source_account_id}:{expected}"
                 authority_detail = f"{prev_stage.upper()} PASSED → NEW {expected.upper()} MT5 ASSIGNED"
@@ -30102,9 +30109,9 @@ def _np_ja_journey_authority(trader_id, journey_id):
                     "source_event_type": "purchase_approved",
                     "source_account_id": None,
                     "evidence_id": journey_id,
-                    "target_stage": "phase1",
+                    "target_stage": initial_stage,
                     "status": "AVAILABLE",
-                    "reason": "PAYMENT APPROVED → NEW PHASE 1 MT5 REQUIRED",
+                    "reason": f"PAYMENT APPROVED → NEW {initial_stage.upper()} MT5 REQUIRED",
                 }
                 if initial_key not in entitlements_created:
                     entitlements_created.append(initial_key)
@@ -30115,7 +30122,7 @@ def _np_ja_journey_authority(trader_id, journey_id):
             state = "ACTIVE"
 
         elif _np_ja_stage(last) in {"phase1", "phase2"} and _np_ja_is_passed(last):
-            target = "funded"
+            target = _next_stage_for_lifecycle(_np_ja_stage(last), last, purchase) or "funded"
             key = f"pass:{last.get('id')}:{target}"
             outstanding = {
                 "entitlement_key": key,
@@ -41102,14 +41109,14 @@ def _np_v55_decision(purchase_id):
                 **base,
                 "code": "FIRST_MT5_DUE",
                 "state": "WAITING_MT5",
-                "title": "FIRST PHASE 1 MT5 REQUIRED",
+                "title": "FIRST " + _np_initial_purchase_stage(purchase).upper() + " MT5 REQUIRED",
                 "message": (
                     "Purchase is approved and this journey has no delivered MT5. "
                     + ("Clean automation should assign and retry automatically."
                        if clean_root else
                        "Legacy journey requires protected manual assignment.")
                 ),
-                "target_stage": "phase1",
+                "target_stage": _np_initial_purchase_stage(purchase),
                 "safe_to_assign_now": True,
             }
         return {
@@ -41959,6 +41966,7 @@ def _np_mark_purchase_approved_waiting_v60(purchase, admin_payload=None, reason=
     if not pid:
         raise ValueError("purchase id is required")
 
+    first_stage = _np_initial_purchase_stage(p)
     now = now_iso()
     marker = f"[NP_ENTITLEMENT:FIRST_PHASE1:{pid}]"
     old_note = str(p.get("admin_note") or "").strip()
@@ -41979,7 +41987,7 @@ def _np_mark_purchase_approved_waiting_v60(purchase, admin_payload=None, reason=
         _np_renewal_db_v211().table("challenge_purchases").update({
             "payment_status": "approved",
             "status": "approved_waiting_mt5",
-            "lifecycle_state": "phase1_waiting_mt5",
+            "lifecycle_state": first_stage + "_waiting_mt5",
             "approved_at": p.get("approved_at") or now,
             "updated_at": now,
             "admin_note": note,
@@ -42081,7 +42089,8 @@ def _np_retry_approved_first_phase1_v60(limit=250):
                 summary["blocked"] += 1
                 continue
 
-            mt5 = _np_pick_fresh_mt5(size, "phase1")
+            first_stage = _np_initial_purchase_stage(purchase)
+            mt5 = _np_pick_fresh_mt5(size, first_stage)
             if not mt5:
                 summary["waiting_inventory"] += 1
                 continue
@@ -42089,7 +42098,7 @@ def _np_retry_approved_first_phase1_v60(limit=250):
             account, _ = _assign_mt5_to_trader(
                 trader,
                 mt5,
-                "phase1",
+                first_stage,
                 purchase,
                 actor,
                 f"V60 APPROVED PURCHASE AUTO-FULFIL · purchase={pid}",
@@ -51307,7 +51316,7 @@ def _np_ur_v87_expected_stage(account, purchase, trader):
                     return nxt, "latest_passed_predecessor", True
     elif pid:
         # First account on an exact purchase is Phase 1.
-        return "phase1", "first_delivery_of_purchase", True
+        return _np_initial_purchase_stage(purchase), "first_delivery_of_purchase", True
 
     return current, "current_assignment_snapshot", False
 
