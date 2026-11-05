@@ -9,6 +9,17 @@ RELEASE='hosted-admin-mobile-navigation-2026-10-22'
 
 def register_panel_delivery(app, root=None):
     assets=Path(root) if root else Path(__file__).resolve().parent/'website-downloads'
+    @app.get('/public/trader-catalogue.js')
+    def trader_catalogue_script():
+        r=send_file(assets/'trader-catalog-sync.js',mimetype='application/javascript',conditional=False,etag=False,max_age=0)
+        r.headers['Cache-Control']='no-store, max-age=0'
+        r.headers['X-Content-Type-Options']='nosniff'
+        return r
+
+    @app.get('/downloads/trader-catalogue-page.html')
+    def trader_catalogue_download():
+        return send_file(assets/'trader_clean.html',mimetype='text/html',as_attachment=True,download_name='trader_clean.html',conditional=False,etag=False,max_age=0)
+
     @app.get('/public/landing-catalogue.js')
     def landing_catalogue_script():
         r=send_file(assets/'landing-catalogue-sync.js',mimetype='application/javascript',conditional=False,etag=False,max_age=0)
