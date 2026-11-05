@@ -13,10 +13,10 @@ from package_plan_matrix import availability,SCHEMA
 from progress_plan_bridge import is_managed, plan_row, commercial_plan, readiness, catalog_identity, offer_version
 
 KEY='catalog_purchase_switches_v1'
-RELEASE='managed-progress-purchases-2026-11-05'
+RELEASE='unified-live-catalogue-2026-11-05'
 PLAN_FIELDS=('id','name','description','status','fee','account_size','phase1_target','phase2_target',
              'max_drawdown','drawdown_type','payout_split','reset_fee','funded_reset_fee',
-             'payout_cycles','payout_frequency','challenge_journey','product_category','base_fee','cycle_options','default_cycles','journey_source','managed_progress','offer_version')
+             'payout_cycles','payout_frequency','challenge_journey','product_category','base_fee','cycle_options','default_cycles','journey_source','managed_progress','offer_version','daily_drawdown','second_life_enabled','lives_total','public_badge')
 
 
 def defaults():return dict(revision=0,products={},updated_at=None,updated_by=None)
@@ -98,8 +98,11 @@ class SharedCatalog:
         for p in matrix['config']['plans']:
             for x in p['packages']:
                 identity='progress:'+p['id']+':'+x['key'];ready,reason=self.progress_readiness(p,x)
+                decision=availability(p,x)
+                if not decision['available']:
+                    ready=False;reason='; '.join(decision['reasons'])
                 result[identity]=dict(id=identity,family='progress',name=p['name']+' · '+x['name'],
-                    visible=availability(p,x)['available'],checkout_supported=ready,release_reason=reason,
+                    visible=bool(p['enabled'] and x['enabled']),checkout_supported=ready,release_reason=reason,
                     plan_id=plan_row(p,x)['id'],plan=commercial_plan(plan_row(p,x,True)),
                     proposal=True,package=dict(name=x['name'],allocation_name=p['name'],capital=p['capital'],
                         price=x['price'],drawdown=x['drawdown'],profit_share=x['profit_share'],profit_cap=x['profit_cap'],
@@ -140,7 +143,7 @@ def register_catalog_publication(app,store,catalog,require_admin,authenticated_t
     @app.get('/trader/challenge_catalog')
     def trader_challenge_catalog():
         try:
-            doc,products,sales=state()
+            doc,products,sales=state(fresh=True)
             public=[]
             for p in products.values():
                 if not p['visible'] or p['family']=='custom':continue
@@ -151,6 +154,32 @@ def register_catalog_publication(app,store,catalog,require_admin,authenticated_t
             return response(dict(success=True,products=public,global_sales_open=sales,
                 controls_revision=doc['revision'],refresh_seconds=30,generated_at=datetime.now(timezone.utc).isoformat()))
         except ControlsUnavailable:return response(dict(success=False,error='Current prices and availability could not be verified. Please retry.'),503)
+
+    def published_rows():
+        _,products,_=state(fresh=True)
+        return [dict(p['plan'],status='active',purchases_open=p['purchases_open'],
+                    catalog_product_id=p['id'])
+                for p in products.values() if p['visible'] and p['family']!='custom']
+
+    def published_snapshot():
+        try:
+            rows=published_rows()
+            return response(dict(success=True,plans=rows,count=len(rows),
+                published_at=datetime.now(timezone.utc).isoformat()))
+        except ControlsUnavailable:
+            return response(dict(success=False,error='Current offer terms could not be verified'),503)
+
+    def published_plan_list():
+        try:return response(published_rows())
+        except ControlsUnavailable:return response(dict(success=False,error='Current offer terms could not be verified'),503)
+
+    # Landing, older clients and the new trader UI share one publication source.
+    # This replaces HTTP projections, never the purchase-snapshot runtime reader.
+    for path,endpoint,view in [('/public_plan_snapshot','public_plan_snapshot',published_snapshot),
+                              ('/challenge_plans','challenge_plans',published_plan_list),
+                              ('/plans','plans_alias',published_plan_list)]:
+        if endpoint in app.view_functions:app.view_functions[endpoint]=view
+        else:app.add_url_rule(path,endpoint,view,methods=['GET'])
 
     @app.get('/admin/catalog_publication/view')
     def catalog_publication_view():

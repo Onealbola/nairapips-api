@@ -51,7 +51,7 @@ def plan_row(plan, package, opened=False):
         description='Two-phase challenge. Continuing eligible funded payouts. No included resets or second life.',
         account_size=plan['capital'], fee=package['price'],
         phase1_target=package['phase1_target'], phase2_target=package['phase2_target'],
-        max_drawdown=package['drawdown'], daily_drawdown=0, drawdown_type='STATIC',
+        max_drawdown=package['drawdown'], daily_drawdown=package.get('daily_drawdown',0), drawdown_type='STATIC',
         payout_split=package['profit_share'], payout_cycles=0, payout_frequency='Daily',
         challenge_journey=['phase1','phase2','funded'], product_category='standard',
         reset_fee=0, funded_reset_fee=0, second_life_enabled=False, lives_total=1,

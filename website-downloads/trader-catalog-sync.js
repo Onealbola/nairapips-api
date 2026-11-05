@@ -1,6 +1,7 @@
 /* Saved Business Settings -> trader catalogue. No private underwriting fields. */
 (function(){
 'use strict';
+if(window.NPSharedCatalogueState){window.npRefreshSharedCatalogue?.(true);return;}
 const state={data:null,last:0,pending:false,error:'',sequence:0,needsPaint:false};
 const money=v=>'₦'+Number(v).toLocaleString('en-NG',{maximumFractionDigits:2}),e=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function current(){return ['plans','purchase','packages'].includes(SESSION.currentTab)}
@@ -20,7 +21,7 @@ window.npSharedCatalogueHTML=function(family='all'){
 };
 function repaint(){if(current()&&typeof renderApp==='function')renderApp()}
 async function refresh(force=false){
- if(state.pending||(!force&&Date.now()-state.last<10000)||!current()||!SESSION.trader)return;
+ if(state.pending||(!force&&Date.now()-state.last<10000)||!current()||!(SESSION.trader||SESSION.data?.trader))return;
  state.pending=true;state.last=Date.now();const sequence=++state.sequence;
  try{
   const r=await fetch(API+'/trader/challenge_catalog',{cache:'no-store',signal:AbortSignal.timeout(18000)});const data=await r.json();
@@ -43,5 +44,5 @@ const oldBuilder=window.npRenderPackageBuilderV222;
 if(typeof oldBuilder==='function')window.npRenderPackageBuilderV222=function(){return window.npSharedCatalogueHTML('progress')+'<details style="margin-top:24px"><summary>Other custom-package tools and existing orders</summary>'+oldBuilder()+'</details>'};
 window.addEventListener('focus',()=>refresh(true));document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh(true)});
 setInterval(()=>{if(!document.hidden)refresh()},30000);
-window.NPSharedCatalogueState=state;queueMicrotask(()=>{if(current()&&SESSION.trader)refresh(true)});
+window.NPSharedCatalogueState=state;queueMicrotask(()=>{if(current()&&(SESSION.trader||SESSION.data?.trader))refresh(true)});
 })();

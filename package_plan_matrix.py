@@ -1,7 +1,6 @@
-"""Editable challenge-plan proposals, separate from every production tariff.
+"""Owner-editable future offers shared by landing and trader catalogues.
 
-Continuing payout terms here are draft descriptions, not released entitlements.
-No checkout, assignment, account or payout runtime reads this namespace.
+Purchase switches and immutable issued terms remain separate authorities.
 """
 import copy
 import math
@@ -162,6 +161,7 @@ def register_plan_matrix(app,store,require_admin,audit):
         admin,error=owner()
         if error is not None:return error
         try:
+            connection_warning=''
             if request.method=='POST':
                 if request.content_length and request.content_length>200000:raise ValueError('Draft is too large')
                 doc=store.save_draft(request.get_json(silent=True),admin.get('id') or 'owner')
@@ -171,12 +171,13 @@ def register_plan_matrix(app,store,require_admin,audit):
                     catalog=app.config.get('NP_PROGRESS_SHARED_CATALOG')
                     if catalog is not None:
                         try:bridge.sync(catalog.products(fresh=True),switches['products'])
-                        except ControlsUnavailable as exc:raise ControlsUnavailable('Offer settings were saved, but purchase connection was not confirmed. Reload and save again; changed offers remain blocked until verified.') from exc
+                        except ControlsUnavailable:
+                            connection_warning='Offer edits are saved and visible. Production plan synchronization needs the database repair; changed offers cannot be purchased until synchronized.'
                 audit('package_studio','plan_matrix_draft_saved',str({'revision':doc['revision']}),admin,KEY)
             else:doc,_=store.read(fresh=True)
             decisions={p['id']:{x['key']:availability(p,x) for x in p['packages']} for p in doc['config']['plans']}
             return secure(jsonify(success=True,data=doc,availability=decisions,
-                checkout_enabled=False,purchase_controls_connected=app.config.get('NP_PROGRESS_PLAN_BRIDGE') is not None,production_effect='future_offers_only' if app.config.get('NP_PROGRESS_PLAN_BRIDGE') is not None else 'none',release=RELEASE))
+                checkout_enabled=False,connection_warning=connection_warning,purchase_controls_connected=app.config.get('NP_PROGRESS_PLAN_BRIDGE') is not None,production_effect='future_offers_only' if app.config.get('NP_PROGRESS_PLAN_BRIDGE') is not None else 'none',release=RELEASE))
         except Conflict as exc:return secure(jsonify(success=False,error=str(exc))),409
         except ValueError as exc:return secure(jsonify(success=False,error=str(exc))),400
         except ControlsUnavailable as exc:return secure(jsonify(success=False,error=str(exc))),503

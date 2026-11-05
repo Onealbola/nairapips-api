@@ -116,6 +116,47 @@ class ProgressTests(unittest.TestCase):
         self.assertFalse(terms_match(actual,wanted))
         self.assertNotEqual(offer_version(actual),offer_version(wanted))
 
+    def test_every_public_page_uses_current_saved_matrix_not_stale_physical_rows(self):
+        doc,_=self.matrix.read()
+        p=doc['config']['plans'][0]
+        p['packages'][0]['profit_share']=80
+        p['packages'][3]['drawdown']=15
+        p['packages'][1].update(phase1_target=8,phase2_target=5,price=15500)
+        self.matrix.save_draft(dict(revision=0,config=doc['config']),'owner')
+        # Simulate the failing database trigger leaving physical rows stale.
+        for package in self.allocation['packages']:
+            self.db.rows['challenge_plans'].append(plan_row(self.allocation,package))
+        self.invalidate()
+        for path in ['/public_plan_snapshot','/challenge_plans','/plans']:
+            r=self.client.get(path);self.assertEqual(r.status_code,200,r.json)
+            rows=r.json['plans'] if isinstance(r.json,dict) else r.json
+            basic=next(x for x in rows if x['catalog_product_id']==self.identity)
+            both=next(x for x in rows if x['catalog_product_id']=='progress:ngn-500000:both')
+            room=next(x for x in rows if x['catalog_product_id']=='progress:ngn-500000:room')
+            self.assertEqual(basic['payout_split'],80)
+            self.assertEqual(both['max_drawdown'],15)
+            self.assertEqual((room['phase1_target'],room['phase2_target'],room['fee']),(8,5,15500))
+            self.assertFalse(basic['purchases_open']);self.assertEqual(basic['reset_fee'],0)
+            self.assertEqual(len([x for x in rows if x.get('managed_progress')]),12)
+            self.assertEqual(r.headers['Cache-Control'],'no-store')
+        products=self.load().json['products']
+        self.assertEqual(len([x for x in products if x['family']=='progress']),12)
+        self.assertFalse(next(x for x in products if x['id']==self.identity)['purchases_open'])
+
+    def test_failed_plan_trigger_reports_saved_edits_and_keeps_checkout_blocked(self):
+        from test_production_controls import Response
+        self.db.rows['challenge_plans'].append(plan_row(self.allocation,self.package))
+        patch=self.db.patch
+        self.db.patch=lambda url,**kwargs:Response([],404) if url.endswith('/challenge_plans') else patch(url,**kwargs)
+        doc,_=self.matrix.read();doc['config']['plans'][0]['packages'][0]['profit_share']=80
+        r=self.client.post('/admin/package_studio/plan_matrix',json=dict(revision=0,config=doc['config']))
+        self.assertEqual(r.status_code,200,r.json)
+        self.assertEqual(r.json['data']['config']['plans'][0]['packages'][0]['profit_share'],80)
+        self.assertIn('database repair',r.json['connection_warning'])
+        row=next(p for p in self.load().json['products'] if p['id']==self.identity)
+        self.assertEqual(row['package']['profit_share'],80);self.assertFalse(row['purchases_open'])
+        self.assertEqual(self.db.rows['challenge_purchases'],[])
+
     def test_missing_writes_conflicts_and_collisions_never_open_sales(self):
         from test_production_controls import Response
         realpost=self.db.post
