@@ -3,7 +3,7 @@
 'use strict';
 if(window.NPLandingCatalogue)return;
 const base='https://nairapips-api.onrender.com';
-const state={products:[],pending:false,last:0,confirmed:false};window.NPLandingCatalogue=state;
+const state={products:[],pending:false,last:0,confirmed:false,error:'',sequence:0,retries:0,version:'catalogue-loading-recovery-v2'};window.NPLandingCatalogue=state;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const money=v=>'₦'+Number(v||0).toLocaleString('en-NG',{maximumFractionDigits:2});
 const row=(name,value)=>'<div class="challenge-plan-row"><span>'+esc(name)+'</span><b>'+esc(value)+'</b></div>';
@@ -15,23 +15,34 @@ function card(p,i){
 function paint(){
  const s=document.getElementById('npStandardPlansGrid'),p=document.getElementById('npPremiumPlansGrid');if(!s||!p)return false;
  const products=state.products;window.NP_REAL_PLANS=products.map(p=>({...p.plan,raw:p.plan,catalog_product_id:p.id,purchases_open:p.purchases_open}));
- for(const [grid,premium] of [[s,false],[p,true]]){const rows=products.filter(p=>(p.family==='premium')===premium);grid.innerHTML=rows.length?rows.map(card).join(''):'<div class="np-market-empty">'+(state.confirmed?'No packages are currently shown.':'Verifying current offers…')+'</div>';}
+ for(const [grid,premium] of [[s,false],[p,true]]){const rows=products.filter(p=>(p.family==='premium')===premium);grid.innerHTML=rows.length?rows.map(card).join(''):'<div class="np-market-empty" role="status">'+(state.error?'Current offers could not be verified. Retrying automatically. <button type="button" class="btn btn-primary" data-catalogue-retry>Retry now</button>':state.confirmed?'No packages are currently shown.':'Loading current offers…')+'</div>';}
  return true;
 }
+let retryTimer=null,controller=null;
 async function refresh(force=false){
- if(state.pending||(!force&&Date.now()-state.last<10000))return;
- state.pending=true;state.last=Date.now();
- try{const r=await fetch(base+'/trader/challenge_catalog',{cache:'no-store',signal:AbortSignal.timeout(18000)});const d=await r.json();if(!r.ok||!d.success||!Array.isArray(d.products))throw Error('Catalogue unavailable');state.products=d.products;state.confirmed=true;paint();}
- catch(e){state.products=[];state.confirmed=false;paint();for(const id of ['npStandardPlansGrid','npPremiumPlansGrid']){const el=document.getElementById(id);if(el)el.innerHTML='<div class="np-market-empty">Current offer terms could not be verified. Please refresh to retry.</div>';}}
- finally{state.pending=false;}
+ if(state.pending||(!force&&Date.now()-state.last<5000))return;
+ clearTimeout(retryTimer);state.pending=true;state.last=Date.now();
+ const sequence=++state.sequence;controller=new AbortController();let deadline;
+ try{
+  const request=fetch(base+'/trader/challenge_catalog',{cache:'no-store',signal:controller.signal})
+    .then(async r=>{const d=await r.json();if(!r.ok||!d.success||!Array.isArray(d.products))throw Error('Catalogue unavailable');return d;});
+  const timeout=new Promise((_,reject)=>{deadline=setTimeout(()=>{controller.abort();reject(Error('Catalogue request timed out'));},10000)});
+  const d=await Promise.race([request,timeout]);
+  if(sequence!==state.sequence)return;
+  state.products=d.products;state.confirmed=true;state.error='';state.retries=0;paint();
+ }catch(e){
+  if(sequence!==state.sequence)return;
+  state.products=[];state.confirmed=false;state.error='Current offers could not be verified';state.retries++;paint();
+  retryTimer=setTimeout(()=>refresh(true),Math.min(1500*state.retries,10000));
+ }finally{clearTimeout(deadline);if(sequence===state.sequence)state.pending=false;}
 }
 // Retire the old local-storage snapshot renderer so delayed responses cannot
 // restore stale prices or re-enable an owner-paused purchase button.
 window.npRenderRealPlans=function(){return paint()};window.loadLandingPlans=()=>refresh(true);
 window.npStartRealPlan=function(i){const p=state.products[i];if(!p?.purchases_open)return;start(p)};
 function start(p){try{localStorage.setItem('nairapips_selected_plan',JSON.stringify(p.plan));localStorage.setItem('nairapipsAuthMode','register')}catch(e){}location.href='/dashboard/?mode=register'}
-document.addEventListener('click',event=>{const b=event.target.closest('[data-landing-product]');if(!b)return;const p=state.products.find(p=>p.id===b.dataset.landingProduct);if(p?.purchases_open)start(p)});
+document.addEventListener('click',event=>{if(event.target.closest('[data-catalogue-retry]')){refresh(true);return;}const b=event.target.closest('[data-landing-product]');if(!b)return;const p=state.products.find(p=>p.id===b.dataset.landingProduct);if(p?.purchases_open)start(p)});
 window.npRefreshLandingCatalogue=refresh;
-window.addEventListener('focus',()=>refresh(true));document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh(true)});setInterval(()=>{if(!document.hidden)refresh()},30000);
+window.addEventListener('focus',()=>refresh(true));document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh(true)});setInterval(()=>{if(!document.hidden)refresh()},10000);
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>refresh(true));else refresh(true);
 })();
