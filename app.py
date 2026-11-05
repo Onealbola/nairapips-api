@@ -60061,3 +60061,9 @@ _NPRegisterStudio(app, _np_studio_store, _require_admin, _audit_safe)
 from package_plan_matrix import PlanMatrixStore as _NPPlanMatrixStore, register_plan_matrix as _NPRegisterPlanMatrix
 _np_plan_matrix_store = _NPPlanMatrixStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
 _NPRegisterPlanMatrix(app, _np_plan_matrix_store, _require_admin, _audit_safe)
+
+from catalog_publication import PublicationStore as _NPCatalogPublicationStore, SharedCatalog as _NPSharedCatalog, register_catalog_publication as _NPRegisterCatalogPublication
+_np_catalog_publication_store = _NPCatalogPublicationStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY)
+app.config["NP_SHARED_CATALOG_PLAN_READER"] = _np_public_plan_snapshot_rows
+_np_shared_catalog = _NPSharedCatalog(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, _np_plan_matrix_store, _np_controls_store_v225, _np_package_lab_store_v224, app)
+_NPRegisterCatalogPublication(app, _np_catalog_publication_store, _np_shared_catalog, _require_admin, _authenticated_trader_id_for_request, _audit_safe)

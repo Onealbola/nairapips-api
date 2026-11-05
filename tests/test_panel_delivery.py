@@ -4,6 +4,19 @@ from flask import Flask,jsonify
 from panel_delivery import register_panel_delivery,RELEASE
 
 class PanelDeliveryTests(unittest.TestCase):
+    def test_catalogue_bundle_updates_both_sites_without_replacing_homepage(self):
+        import io
+        r=self.client.get('/downloads/catalogue-sync-update.zip')
+        self.assertEqual(r.status_code,200)
+        self.assertIn('attachment',r.headers['Content-Disposition'])
+        with zipfile.ZipFile(io.BytesIO(r.data)) as z:
+            self.assertIsNone(z.testzip())
+            self.assertIn('admin/admin_clean.html',z.namelist())
+            self.assertIn('dashboard/trader_clean.html',z.namelist())
+            self.assertNotIn('index.html',z.namelist())
+            self.assertEqual(z.read('dashboard/trader_clean.html'),Path('website-downloads/trader_clean.html').read_bytes())
+        r.close()
+
     def test_sales_outcomes_update_is_a_real_zip_download(self):
         r=self.client.get('/downloads/sales-outcomes-update.zip')
         self.assertEqual(r.status_code,200)

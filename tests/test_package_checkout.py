@@ -32,6 +32,14 @@ class Transport:
         raise AssertionError(url)
 
 class PackageCheckoutTests(unittest.TestCase):
+    def test_new_purchase_switch_does_not_block_recovery_of_an_accepted_order(self):
+        from flask import jsonify
+        q=self.quote();body=self.checkout_body(q)
+        self.app.config['NP_CUSTOM_CATALOG_GATE']=lambda:jsonify(success=False)
+        self.assertEqual(self.client.post('/trader/package_checkout',json=body).status_code,409)
+        self.transport.quotes[0]['consumed_purchase_id']=str(uuid4())
+        self.assertEqual(self.client.post('/trader/package_checkout',json=body).status_code,200)
+
     def setUp(self):
         self.app=Flask(__name__);self.transport=Transport();self.tid=str(uuid4());self.authed=True;self.ready=True
         self.cfg=defaults();self.cfg.update(enabled=True,minimum_price=5000,revision=3)

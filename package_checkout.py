@@ -95,6 +95,9 @@ def register_package_checkout(app,store,config_store,controls_store,authenticate
         try:return identity(tid),None
         except ValueError:return None,(jsonify(success=False,error='Trader authentication is required'),401)
     def open_catalog():
+        gate=app.config.get('NP_CUSTOM_CATALOG_GATE')
+        if gate is not None and gate() is not None:
+            raise PackageOrderRejected('New custom-package purchases are paused. Existing orders remain available.')
         config,_=config_store.read(fresh=True)
         flags,_=controls_store.read()
         if not config['enabled'] or not flags['features']['challenge_sales']:

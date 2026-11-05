@@ -1,6 +1,6 @@
 <!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>NairaPips · Package Studio</title>
 <style>body{background:#080d10;color:#edf2f3;font:16px system-ui;margin:0;padding:8vh 20px}main{max-width:480px;margin:auto;border:1px solid #625127;padding:30px;border-radius:20px}h1{color:#f6d36d}label{display:block;margin:20px 0}input,button{box-sizing:border-box;padding:12px;width:100%;border-radius:8px;border:1px solid #68747b}input{display:block;margin-top:8px;background:#111c22;color:white}button{background:#f6d36d;font-weight:700;cursor:pointer}p{line-height:1.6}#status{color:#f6d36d}</style>
-<main><h1>Package Studio</h1><p>Owner draft · Trader purchases closed</p><p>Sign in with your admin account to build packages, adjust prices and save the draft in Business Settings.</p><form id="login"><label>Admin username<input id="username" autocomplete="username" required></label><label>Password<input id="password" type="password" autocomplete="current-password" required></label><button id="submit">Open owner draft</button></form><p id="status" role="status"></p></main>
+<main><h1>Package Studio</h1><p>Owner settings · Catalogue and purchase controls</p><p>Sign in with your owner or super admin account to edit packages, update trader-visible prices and manage new-purchase switches.</p><form id="login"><label>Admin username<input id="username" autocomplete="username" required></label><label>Password<input id="password" type="password" autocomplete="current-password" required></label><button id="submit">Open settings</button></form><p id="status" role="status"></p></main>
 <script>
 document.getElementById('login').onsubmit=async event=>{
  event.preventDefault();const button=document.getElementById('submit'),status=document.getElementById('status');button.disabled=true;status.textContent='Signing in…';
@@ -8,7 +8,8 @@ document.getElementById('login').onsubmit=async event=>{
  try{
   const r=await call('/staff_login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('username').value.trim(),password:document.getElementById('password').value})});
   const data=await r.json();if(!r.ok||!data.token)throw Error('Admin sign-in failed. Check your credentials.');
-  const target=new URLSearchParams(location.search).get('legacy')==='1'?'/admin/package_studio/view':'/admin/package_studio/plan_matrix/view';
+  const query=new URLSearchParams(location.search);
+  const target=query.get('catalog')==='1'?'/admin/catalog_publication/view':query.get('legacy')==='1'?'/admin/package_studio/view':'/admin/package_studio/plan_matrix/view';
   const page=await call(target,{headers:{Authorization:'Bearer '+data.token}});
   if(!page.ok){const error=await page.json().catch(()=>({}));throw Error(error.error||'Owner or super admin access is required.');}
   const html=await page.text();window.__npStudioToken=data.token;document.open();document.write(html);document.close();
