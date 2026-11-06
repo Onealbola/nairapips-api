@@ -15430,15 +15430,7 @@ def create_private_offer():
         # but can no longer pop up, be claimed, or discount checkout.
         if audience_segment == "single" and (target_trader_id or target_email):
             try:
-                old_rows = (
-                    supabase.table("announcements")
-                    .select("*")
-                    .eq("type", "private_offer")
-                    .eq("status", "active")
-                    .order("created_at", desc=True)
-                    .limit(100)
-                    .execute().data or []
-                )
+                old_rows = [r for r in app.config["NP_PRIVATE_RETENTION"].offers() if str(r.get("status") or "").lower() == "active"]
                 for old_raw in old_rows:
                     old_offer = _np_offer_merge_meta(old_raw)
                     if _np_private_offer_matches(
@@ -15448,15 +15440,10 @@ def create_private_offer():
                         str((trader or {}).get("phone") or ""),
                         str((trader or {}).get("account_reference") or ""),
                     ):
-                        try:
-                            supabase.table("announcements").update({
-                                "status": "superseded",
-                                "show_on_dashboard": False,
-                            }).eq("id", old_offer.get("id")).execute()
-                        except Exception as supersede_error:
-                            print("PRIVATE OFFER SUPERSEDE SKIPPED:", supersede_error)
-            except Exception as e:
-                print("PRIVATE OFFER SUPERSEDE LOOKUP SKIPPED:", e)
+                        app.config["NP_PRIVATE_RETENTION"].patch(old_offer['id'],str(old_offer.get('status') or 'active'),{
+                            "status":"superseded", "show_on_dashboard":False})
+            except Exception as exc:
+                raise RuntimeError("Previous offers could not be verified. No new offer was sent.") from exc
 
         delivery_dashboard = _np_offer_bool(d.get("delivery_dashboard"), True)
         delivery_email = _np_offer_bool(d.get("delivery_email"), False)
@@ -15487,6 +15474,7 @@ def create_private_offer():
             "target_account_reference": _np_offer_clean_str(d.get("target_account_reference") or (trader or {}).get("account_reference"), 120) or None,
             "subject": subject,
             "offer_code": offer_code,
+            "discount_percent": d.get("discount_percent"),
             "expires_at": expires_at,
             "cta_label": cta_label,
             "cta_url": cta_url,
@@ -15505,7 +15493,7 @@ def create_private_offer():
         dashboard_saved = True
         created = []
         try:
-            created = supabase.table("announcements").insert(row).execute().data or []
+            created = app.config["NP_PRIVATE_RETENTION"].insert(row)
         except Exception as schema_error:
             print("PRIVATE OFFER ANNOUNCEMENT SCHEMA FALLBACK:", schema_error)
             dashboard_saved = False
@@ -15525,6 +15513,7 @@ def create_private_offer():
                 "target_account_reference": _np_offer_clean_str(d.get("target_account_reference") or (trader or {}).get("account_reference"), 120),
                 "subject": subject,
                 "offer_code": offer_code,
+                "discount_percent": d.get("discount_percent"),
                 "expires_at": _np_offer_clean_str(d.get("expires_at"), 120),
                 "cta_label": cta_label,
                 "cta_url": cta_url,
@@ -15548,9 +15537,12 @@ def create_private_offer():
             }
             dashboard_saved = bool(delivery_dashboard)
             try:
-                created = supabase.table("announcements").insert(safe_row).execute().data or []
+                created = app.config["NP_PRIVATE_RETENTION"].insert(safe_row)
             except Exception as e2:
                 print("PRIVATE OFFER FALLBACK INSERT ERROR:", e2)
+
+        if not created:
+            raise RuntimeError("Private offer could not be saved. No offer was sent.")
 
         email_sent = False
         email_error = ""
@@ -60084,3 +60076,6 @@ app.config["NP_PROGRESS_PLAN_BRIDGE"] = _np_progress_bridge
 app.config["NP_PROGRESS_SHARED_CATALOG"] = _np_shared_catalog
 from progress_lifecycle import install as _np_install_progress_lifecycle
 _np_install_progress_lifecycle(globals())
+
+from private_offer_retention import install as _np_install_private_offer_retention
+_np_install_private_offer_retention(app, globals())
