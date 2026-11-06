@@ -1,6 +1,8 @@
 """Admin-authored business email with private durable drafts and recipient receipts."""
 import copy,hashlib,html,json,re,threading,uuid
 from datetime import datetime,timezone
+from pathlib import Path
+from string import Template
 from flask import jsonify,request
 
 PREFIX='business_email_v1:'
@@ -13,7 +15,12 @@ def now():return datetime.now(timezone.utc).isoformat()
 def render(subject,body,name):
     text=body.replace('{{name}}',name or 'Trader')
     safe=html.escape(text).replace('\n','<br>')
-    return '<!doctype html><html><body style="margin:0;background:#f5f5f2;font-family:Arial,sans-serif;color:#172022"><main style="max-width:620px;margin:24px auto;background:white;padding:32px;border-top:4px solid #c6a64d"><p style="font-weight:bold;color:#8b701d">NAIRAPIPS</p><h1 style="font-size:24px">'+html.escape(subject)+'</h1><div style="line-height:1.7;font-size:16px">'+safe+'</div><hr style="border:0;border-top:1px solid #ddd;margin-top:28px"><p style="font-size:12px;color:#666">NairaPips · Business communication<br><a href="https://nairapips.com/dashboard/">Open your trader dashboard</a></p></main></body></html>',text
+    template=Template((Path(__file__).with_name('email_templates')/'business_update.html').read_text())
+    content=template.substitute(subject=html.escape(subject),content=safe,
+        preheader=html.escape(re.sub(r'\s+',' ',text).strip()[:140]),recipient=html.escape(name or 'Trader'))
+    plain=text+'\n\nNairaPips\nOpen your trader dashboard: https://nairapips.com/dashboard/'
+    return content,plain
+
 
 def summary(doc):
     states={key:sum(r['status']==key for r in doc['recipients']) for key in ('pending','sending','accepted','failed','unconfirmed')}
