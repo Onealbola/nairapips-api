@@ -60079,3 +60079,6 @@ _np_install_progress_lifecycle(globals())
 
 from private_offer_retention import install as _np_install_private_offer_retention
 _np_install_private_offer_retention(app, globals())
+
+from business_email import install as _np_install_business_email
+_np_install_business_email(app, globals())
