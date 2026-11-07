@@ -14,11 +14,15 @@ No existing account has been changed or activated by this release.
 
 1. Extract this ZIP to a staging folder on the DD Windows VPS.
 2. Preserve all existing DD latch, relay and journal folders. Do not delete them.
-3. In PowerShell, run the installer with the exact existing DD worker path:
-   powershell -ExecutionPolicy Bypass -File .\INSTALL.ps1 -WorkerPath "C:\YOUR_DD_FOLDER\DD_POLICE_V3_20_CLEAN_LIVE_STATE_TELEMETRY_20261008.py"
-   This first command checks and prints its proposed changes without installing.
-4. Review the displayed path. Repeat with -Apply to back up the old files and
-   install the new worker under the filename your existing supervisor uses.
+3. Double-click CHECK_ONLY.cmd on the VPS. It detects the exact DD worker from
+   running Python processes and verifies the release/checksums. It changes nothing.
+   Earlier setup folder: C:\Users\Administrator\Documents\nairapips_mt5_rotation_engine (1)
+   Fleet state/logs are separate: C:\NairaPips_DD_Fleet
+4. Review the detected worker path. Double-click INSTALL_UPDATE.cmd to back up
+   and install under the filename your existing supervisor already uses.
+   Multiple different running DD worker paths stop the installer without changes.
+   If the worker is not running, only the check can use the old setup folder;
+   installation then requires an explicitly confirmed -WorkerPath in PowerShell.
 5. Restart the existing DD supervisor only. Do not start a second supervisor or
    change Operations/Target Engine, MT5 passwords, shard counts or assignments.
 6. Verify every shard's fresh dd_health_shard_XX.json reports:

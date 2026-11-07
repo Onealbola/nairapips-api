@@ -1,8 +1,33 @@
 param(
-    [Parameter(Mandatory=$true)][string]$WorkerPath,
+    [string]$WorkerPath = '',
     [switch]$Apply
 )
 $ErrorActionPreference = 'Stop'
+$expectedWorker = 'DD_POLICE_V3_20_CLEAN_LIVE_STATE_TELEMETRY_20261008.py'
+if (-not $WorkerPath) {
+    $found = @()
+    $processes = Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'"
+    foreach ($process in $processes) {
+        foreach ($match in [regex]::Matches([string]$process.CommandLine, '"([^"\r\n]+\.py)"|([A-Za-z]:\\[^\s"]+\.py)')) {
+            $candidate = if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value }
+            if ((Split-Path -Leaf $candidate) -eq $expectedWorker -and (Test-Path -LiteralPath $candidate)) {
+                $found += (Resolve-Path -LiteralPath $candidate).Path
+            }
+        }
+    }
+    $found = @($found | Sort-Object -Unique)
+    if ($found.Count -gt 1) { throw 'Multiple DD worker locations are running. No files changed; resolve the duplicate fleet first.' }
+    if ($found.Count -eq 1) {
+        $WorkerPath = $found[0]
+        Write-Host 'Located the worker from the running DD process.'
+    } else {
+        $known = Join-Path 'C:\Users\Administrator\Documents\nairapips_mt5_rotation_engine (1)' $expectedWorker
+        if (-not (Test-Path -LiteralPath $known)) { throw 'Could not confirm the DD worker location. No files changed. Supply -WorkerPath explicitly after checking the VPS.' }
+        $WorkerPath = $known
+        Write-Host 'Found the worker in the recorded setup folder; no running process location was detected.'
+        if ($Apply) { throw 'Automatic installation requires a detected running worker. Run the check first and supply the confirmed -WorkerPath explicitly.' }
+    }
+}
 $target = (Resolve-Path -LiteralPath $WorkerPath).Path
 if ([IO.Path]::GetExtension($target) -ne '.py') { throw 'Select the existing DD Python worker file.' }
 $current = [IO.File]::ReadAllText($target)
