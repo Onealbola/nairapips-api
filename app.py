@@ -1,4 +1,7 @@
 # V188_TRADER_DASHBOARD_FRESHNESS_2026_10_07
+# Resolve Requests' lazy netrc import before startup workers can contend
+# with the main module import lock. Preserve normal proxy/auth behavior.
+import netrc as _np_netrc_preload
 import urllib.parse
 import threading
 from concurrent.futures import ThreadPoolExecutor

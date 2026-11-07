@@ -1,6 +1,6 @@
 """Read-only business overview: complete paged reads, explicit units and drilldowns."""
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from threading import Lock
 from time import monotonic
 import gzip
@@ -11,6 +11,10 @@ from flask import jsonify, request
 
 RELEASE = 'business-overview-truth-2026-10-22'
 TZ = ZoneInfo('Africa/Lagos')
+READ_DEADLINE_SECONDS = 14
+_reader_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='overview-read')
+_reader_lock = Lock()
+_reader_pending = set()
 OPEN = {'assigned_active', 'active', 'current_active', 'phase1_active', 'phase2_active', 'funded_active',
         'live', 'funded', 'approved_active', 'profit_protected', 'payout_pending', 'approved_payout_pending',
         'payment_processing', 'funded_profit_cap_reached'}
@@ -263,7 +267,7 @@ FIELDS = {
 
 def read_sources(transport, url, key):
     started = datetime.now(timezone.utc).isoformat()
-    deadline = monotonic() + 14
+    deadline = monotonic() + READ_DEADLINE_SECONDS
     headers = {'apikey': key, 'Authorization': 'Bearer ' + key}
     def read(item):
         name, (table, fields) = item
@@ -288,8 +292,21 @@ def read_sources(transport, url, key):
             rows.extend(batch)
             last = current
         raise ValueError('Complete read exceeds its supported size')
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        source = dict(pool.map(read, FIELDS.items()))
+    # A socket timeout does not bound import locks or a stalled transport. Never
+    # wait for executor shutdown in the HTTP request, or queue unlimited batches.
+    global _reader_pending
+    with _reader_lock:
+        _reader_pending = {f for f in _reader_pending if not f.done()}
+        if _reader_pending:
+            raise TimeoutError('Previous complete read is still finishing')
+        futures = [_reader_pool.submit(read, item) for item in FIELDS.items()]
+        _reader_pending = set(futures)
+    _, unfinished = wait(futures, timeout=max(0, deadline - monotonic()))
+    if unfinished:
+        for future in unfinished:
+            future.cancel()
+        raise TimeoutError('Complete read exceeded its deadline')
+    source = dict(f.result() for f in futures)
     observations = {str(r['trader_account_id']): r for r in source.pop('observations')}
     for a in source['accounts']:
         o = observations.get(str(a['id']))
