@@ -49,6 +49,7 @@ class PayoutTests(unittest.TestCase):
                       clean=lambda v:float(v or 0),FUNDED_MAX_GROSS_PROFIT_PERCENT=50,
                       NAIRAPIPS_V195_MT5_477365592_MANAGEMENT_VERIFIED_PAYOUT='management',
                       _np_plan_payout_split_for_account=lambda *args:60,
+                      _safe_purchase_for_account=lambda account:{},
                       _resolve_trader_for_money_action=lambda d:{'id':'owner'},
                       _payout_eligibility=lambda *args,**kw:(True,'ok',dict(self.a)),
                       now_iso=lambda:datetime.now(timezone.utc).isoformat(),
@@ -67,6 +68,18 @@ class PayoutTests(unittest.TestCase):
         for f in funcs: f.decorator_list=[]
         exec(compile(ast.Module(body=funcs,type_ignores=[]),'payout','exec'),self.env)
     def quote(self,snapshot=None): return self.env['_np_verified_payout_quote'](self.a,{'id':'owner'},snapshot)
+    def test_trailing_payout_reserves_the_breach_floor(self):
+        from unittest.mock import Mock,patch
+        self.a['journey_source']='equity_trailing_v1:purchase_or_plan_snapshot'
+        self.env.update(requests=Mock(),SUPABASE_URL='https://fixture.invalid',SUPABASE_KEY='fixture',SUPABASE_SERVICE_ROLE_KEY='')
+        state=dict(breached=False,drawdown_floor='1150',last_observed_at=self.snap['observed_at'])
+        with patch('equity_drawdown.read_saved_state',return_value=state):
+            quote=self.quote()
+        self.assertTrue(quote['verified'])
+        self.assertEqual(quote['available_payout'],49.99)
+        with patch('equity_drawdown.read_saved_state',return_value={**state,'breached':True}):
+            self.assertFalse(self.quote()['verified'])
+
     def test_lost_insert_response_does_not_duplicate_or_unlock_request(self):
         self.db.lose_insert_response=True
         self.env['_set_funded_payout_trade_lock']=lambda *args,**kwargs:None

@@ -36,6 +36,24 @@ class CatalogTests(unittest.TestCase):
         self.catalog.plans_cache=None
         for s in [self.store,self.matrix,self.controls]:s.cached=None
 
+    def test_trailing_terms_visible_but_cannot_open_before_worker_verification(self):
+        from unittest.mock import patch
+        from equity_drawdown import RELEASE
+        self.app.config['NP_PROGRESS_PLAN_BRIDGE']=object()
+        doc,_=self.matrix.read();c=doc['config']
+        c['plans'][0]['packages'][0]['drawdown_type']='TRAILING'
+        self.matrix.save_draft(dict(revision=0,config=c),'owner');self.invalidate()
+        identity='progress:ngn-500000:basic'
+        with patch.dict('os.environ',{'NP_EQUITY_TRAILING_VERIFIED':'','NP_EQUITY_TRAILING_INGEST_KEY':''}):
+            product=next(p for p in self.load().json['products'] if p['id']==identity)
+            self.assertEqual(product['plan']['drawdown_type'],'TRAILING')
+            self.assertFalse(product['purchases_open'])
+            self.assertEqual(self.save({identity:{'purchases_open':True}}).status_code,409)
+        with patch.dict('os.environ',{'NP_EQUITY_TRAILING_VERIFIED':RELEASE,'NP_EQUITY_TRAILING_INGEST_KEY':'fixture-only'}):
+            self.assertTrue(self.catalog.products()[identity]['checkout_supported'])
+            self.assertFalse(next(p for p in self.load().json['products'] if p['id']==identity)['purchases_open'])
+        self.assertEqual(self.db.rows['challenge_purchases'],[])
+
     def test_public_projection_contains_current_prices_without_private_settings(self):
         r=self.load();self.assertEqual(r.status_code,200,r.json)
         self.assertEqual(len(r.json['products']),13)

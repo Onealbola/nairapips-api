@@ -60,10 +60,11 @@ def validated_plan(current, changes):
             result[name] = number(changes[name], name, Decimal(str(lo)), Decimal(str(hi)))
     if 'payout_split' in changes:
         result['payout_split'] = number(changes['payout_split'], 'payout_split', Decimal('0.01'), 100)
-    if 'drawdown_type' in changes and str(changes['drawdown_type']).upper() != 'STATIC':
-        raise ValueError('Only static drawdown is production verified; trailing cannot be released yet')
+    from equity_drawdown import mode, runtime_ready
     if 'drawdown_type' in result:
-        result['drawdown_type'] = 'STATIC'
+        result['drawdown_type'] = mode(result['drawdown_type'])
+    if mode(row.get('drawdown_type')) == 'TRAILING' and row.get('status') == 'active' and not runtime_ready():
+        raise ValueError('Save Trailing as an inactive plan until the broker DD worker update is verified')
     if 'status' in changes and changes['status'] not in ('active', 'inactive'):
         raise ValueError('Plan status must be active or inactive')
     if 'name' in changes and (not isinstance(changes['name'], str) or not 1 <= len(changes['name'].strip()) <= 100):

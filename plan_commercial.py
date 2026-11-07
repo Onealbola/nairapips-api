@@ -81,6 +81,9 @@ def priced_plan(plan, prices, category='standard'):
 
 def purchase_plan(plan, prices, cycles=DEFAULT_CYCLES):
     """Price a buyer's selection without changing the saved product or past sales."""
+    from equity_drawdown import mode, runtime_ready
+    if mode(plan.get('drawdown_type'))=='TRAILING' and not runtime_ready():
+        raise ValueError('Equity Trailing purchases require the verified DD worker update')
     if is_managed(plan):
         if cycles is not None and str(cycles) not in ("0", "3"):
             raise ValueError("This package includes continuing payouts; its cycle terms cannot be changed")

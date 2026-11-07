@@ -44,6 +44,13 @@ def register_panel_delivery(app, root=None):
         response.headers['X-Content-Type-Options']='nosniff'
         return response
 
+    @app.get('/downloads/static-trailing-dd-update.zip')
+    def static_trailing_dd_update():
+        response=send_file(assets/'nairapips-static-trailing-dd-update.zip',mimetype='application/zip',as_attachment=True,
+            download_name='NairaPips-Static-Trailing-DD-Update.zip',conditional=False,etag=False,max_age=0)
+        response.headers['Cache-Control']='no-store, max-age=0'
+        return response
+
     @app.get('/downloads/business-email-update.zip')
     def business_email_update_archive():
         response=send_file(assets/'nairapips-business-email-update.zip',mimetype='application/zip',as_attachment=True,

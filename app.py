@@ -3673,6 +3673,12 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
     )
     challenge_journey = _journey_source_value(_journey_for_lifecycle({"stage": stage}, purchase, plan, trader))
     journey_source = "purchase_or_plan_snapshot" if purchase_id else ("manual_plan_snapshot" if plan else "manual_unknown_legacy_default_review")
+    from equity_drawdown import mode, runtime_ready
+    _risk_mode = mode((purchase or {}).get("drawdown_type") if purchase_id else (plan or {}).get("drawdown_type"))
+    if _risk_mode == "TRAILING":
+        if not runtime_ready():
+            raise ValueError("Trailing account assignment requires the verified broker DD worker update")
+        journey_source = "equity_trailing_v1:" + journey_source
     account_row = {
         "trader_id": trader.get("id"),
         "purchase_id": purchase_id,
@@ -6235,6 +6241,10 @@ def recalculate_drawdown_usage():
                 skipped.append({"account_id": account.get("id"), "reason": "trader not found"})
                 continue
 
+            from equity_drawdown import account_mode
+            if account_mode(account) == "TRAILING":
+                skipped.append({"account_id": account.get("id"), "reason": "Trailing requires its durable observation history"})
+                continue
             dd_limit = _num(account.get("dd_limit_percent"), MAX_DRAWDOWN_LIMIT) or MAX_DRAWDOWN_LIMIT
             actual_dd = _num(account.get("absolute_drawdown_percent"), _num(trader.get("drawdown_percent"), 0))
             if actual_dd <= 0 and _num(trader.get("drawdown_percent"), 0) > 0:
@@ -10004,7 +10014,7 @@ def _np_plan_rule_snapshot_v156(plan):
     plan = plan or {}
     return {
         "product_category": _np_plan_category_v156(plan.get("product_category")),
-        "drawdown_type": str(plan.get("drawdown_type") or "STATIC").strip().upper(),
+        "drawdown_type": __import__("equity_drawdown").mode(plan.get("drawdown_type")),
         "payout_frequency": str(plan.get("payout_frequency") or "Daily").strip(),
         "payout_cycles": cycle_limit(plan.get("payout_cycles") if plan.get("payout_cycles") is not None else 3),
         "phase1_target": float(plan["phase1_target"] if plan.get("phase1_target") is not None else (plan.get("profit_target") or 10)),
@@ -10196,7 +10206,7 @@ def create_plan():
         row={"name":name,"account_size":clean(d.get("account_size")),"fee":clean(d.get("fee")),
              "product_category":_np_plan_category_v156(d.get("product_category")),
              "category_sort":int(d.get("category_sort") or 10),
-             "drawdown_type":str(d.get("drawdown_type") or "STATIC").strip().upper(),
+             "drawdown_type":__import__("equity_drawdown").mode(d.get("drawdown_type")),
              "payout_frequency":str(d.get("payout_frequency") or "Daily").strip(),
              "payout_cycles":cycle_limit(d.get("payout_cycles", 3)),
              "phase1_target":float(d.get("phase1_target") or 10),"phase2_target":phase2_target,
@@ -10231,7 +10241,7 @@ def update_plan():
         if "category_sort" in d:
             upd["category_sort"] = int(d.get("category_sort") or 10)
         if "drawdown_type" in d:
-            upd["drawdown_type"] = str(d.get("drawdown_type") or "STATIC").strip().upper()
+            upd["drawdown_type"] = __import__("equity_drawdown").mode(d.get("drawdown_type"))
         if "payout_frequency" in d:
             upd["payout_frequency"] = str(d.get("payout_frequency") or "Daily").strip()
         if "payout_cycles" in d:
@@ -14617,6 +14627,18 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
             active_account = _decorate_account_for_api(by_login)
     if not active_account:
         active_account = _get_active_account(trader.get("id"), trader)
+    from equity_drawdown import account_mode, DrawdownStateStore
+    _trailing_state = None
+    if active_account:
+        _risk_purchase = None  # New trailing assignments carry immutable account mode metadata.
+        if account_mode(active_account) == "TRAILING":
+            __import__("equity_drawdown").verify_ingest(request)
+            _observed = payload.get("timestamp") or payload.get("observed_at")
+            _equity = payload.get("current_equity") if payload.get("current_equity") is not None else payload.get("equity")
+            _trailing_state = DrawdownStateStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY).assess(
+                active_account, _risk_purchase, _equity, _observed, peak_equity=payload.get("trailing_highest_equity"))
+            if _trailing_state["last_observed_at"] != __import__("equity_drawdown").timestamp(_observed).isoformat():
+                return {"ignored": True, "reason": "out_of_order_trailing_observation"}
     account_start = _num(active_account.get("start_balance"), _num(active_account.get("account_size"), 0)) if active_account else 0
     balance = _num(payload.get("balance"), _num(active_account.get("current_balance") if active_account else trader.get("balance"), _num(trader.get("balance"), _num(trader.get("account_size")))))
     equity = _num(payload.get("equity"), balance)
@@ -14668,6 +14690,19 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
     worst_static_drawdown_percent = _num(payload.get("worst_static_drawdown_percent"), ((max(0, live_base - lowest_equity) / live_base) * 100) if live_base else 0)
     worst_dd_used_percent = _num(payload.get("worst_dd_used_percent"), _safe_dd_used(payload, worst_static_drawdown_percent, dd_limit_percent))
     worst_dd_remaining_percent = _num(payload.get("worst_dd_remaining_percent"), max(0, dd_limit_percent - worst_static_drawdown_percent))
+
+    if _trailing_state is not None:
+        highest_equity = float(_trailing_state["highest_equity"])
+        drawdown_percent = float(_trailing_state["drawdown_percent"])
+        equity_damage = float(_trailing_state["drawdown_amount"])
+        max_dd_used = float(_trailing_state["used_percent"])
+        breach_equity_level = float(_trailing_state["drawdown_floor"])
+        worst_dd_used_percent = float(_trailing_state["worst_used_percent"])
+        worst_static_drawdown_percent = worst_dd_used_percent * dd_limit_percent / 100
+        dd_remaining_percent = max(0, dd_limit_percent - drawdown_percent)
+        worst_dd_remaining_percent = max(0, dd_limit_percent - worst_static_drawdown_percent)
+        if _trailing_state["breached"]:
+            payload = dict(payload, breached=True, reason="Equity-trailing drawdown limit reached")
 
     # Production pass meter. Works globally for every plan size because it uses account_size and target_percent.
     active_stage_for_meter = str((active_account or {}).get("stage") or payload.get("phase_label") or trader.get("phase") or "").lower()
@@ -19030,6 +19065,10 @@ def _iam_process_account(account, force=False):
     """Single-account intelligence decision. Safe to run repeatedly/idempotently."""
     if not account:
         return {"action": "skipped", "reason": "empty account"}
+
+    from equity_drawdown import account_mode
+    if account_mode(account) == "TRAILING":
+        return {"account_id": account.get("id"), "action": "skipped", "reason": "equity_trailing_uses_durable_dd_authority"}
 
     status = str(account.get("account_status") or "").strip().lower()
     if status not in {"assigned_active", "active", "current_active"} and not force:
@@ -58664,6 +58703,17 @@ def _np_v198_overlay_latest(row, trader_id="", batch_observations=None):
     if start > 0 and live_eq > 0:
         out["profit"] = live_eq - start
         out["profit_percent"] = ((live_eq - start) / start) * 100.0
+    if str(out.get("journey_source") or "").startswith("equity_trailing_v1:"):
+        from equity_drawdown import read_saved_state
+        import requests, os
+        out["drawdown_type"] = "TRAILING"
+        try:
+            state = read_saved_state(requests, os.environ["SUPABASE_URL"], os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["SUPABASE_KEY"], out, None)
+            out.update(highest_equity=float(state["highest_equity"]), breach_equity_level=float(state["drawdown_floor"]),
+                worst_dd_used_percent=float(state["worst_used_percent"]), trailing_state_available=True)
+        except Exception:
+            out["trailing_state_available"] = False
+            out["breach_equity_level"] = None
     out["live_metrics_authority"] = NAIRAPIPS_V198_TRADER_BOOTSTRAP_LIVE_METRICS
     return out
 
@@ -58915,6 +58965,17 @@ def _np_verified_payout_quote(account, trader=None, snapshot=None, allow_stale=F
         return unavailable
     profit = min(max(0, equity - start), round(start * FUNDED_MAX_GROSS_PROFIT_PERCENT / 100, 2))
     available = max(0, round(profit * split / 100, 2))
+    from equity_drawdown import account_mode, read_saved_state
+    try:
+        risk_purchase = None
+        if account_mode(a) == "TRAILING":
+            state = read_saved_state(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, a, risk_purchase)
+            if state["breached"] or (observed and __import__("equity_drawdown").timestamp(state["last_observed_at"]) < __import__("equity_drawdown").timestamp(observed)):
+                return unavailable
+            reserve = max(0, min(balance, equity) - float(state["drawdown_floor"]) - .01)
+            available = min(available, max(0, __import__("math").floor(reserve*100)/100))
+    except Exception:
+        return unavailable
     return {"verified": fresh, "last_verified_available": not fresh, "trader_account_id": aid, "start_balance": start,
             "current_equity": equity, "current_balance": balance, "verified_profit": profit, "payout_split": split,
             "available_payout": available, "observed_at": observed,
@@ -59460,6 +59521,12 @@ def _np_live_pass_proof_v214(account, snapshot, purchase, now=None):
                 return None
         for key in ("lowest_equity",):
             if a.get(key) is not None and float(a[key]) <= size * (1-dd/100):
+                return None
+        from equity_drawdown import account_mode, read_saved_state
+        if account_mode(a, p) == "TRAILING":
+            import requests, os
+            state = read_saved_state(requests, os.environ["SUPABASE_URL"], os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["SUPABASE_KEY"], a, p)
+            if state["breached"] or equity <= float(state["drawdown_floor"]) or __import__("equity_drawdown").timestamp(state["last_observed_at"]) < __import__("equity_drawdown").timestamp(live["observed_at"]):
                 return None
         if min(balance, equity) <= size * (1-dd/100) or equity < size * (1+target/100):
             return None
@@ -60088,3 +60155,8 @@ _np_install_business_email(app, globals())
 
 from business_email_delivery import install as _np_install_business_email_delivery
 _np_install_business_email_delivery(app, globals())
+
+@app.get("/drawdown_version")
+def np_drawdown_version_v233():
+    from equity_drawdown import RELEASE, runtime_ready
+    return jsonify(success=True, release=RELEASE, modes=["STATIC", "TRAILING"], trailing_basis="highest_equity", trailing_sales_ready=runtime_ready(), issued_accounts_unchanged=True)

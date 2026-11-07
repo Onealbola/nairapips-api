@@ -21,6 +21,27 @@ class MatrixTests(unittest.TestCase):
         return self.client.post('/admin/package_studio/plan_matrix',json={
             'revision':revision,'config':c or defaults()['config'],**kwargs})
 
+    def test_drawdown_type_round_trips_and_invalid_modes_are_rejected(self):
+        c=defaults()['config'];c['plans'][0]['packages'][0]['drawdown_type']='TRAILING'
+        r=self.save(c);self.assertEqual(r.status_code,200,r.json)
+        confirmed=PlanMatrixStore(self.db,'https://fixture.invalid','fixture').read(fresh=True)[0]
+        self.assertEqual(confirmed['config']['plans'][0]['packages'][0]['drawdown_type'],'TRAILING')
+        c['plans'][0]['packages'][0]['drawdown_type']='PEAK_BALANCE'
+        self.assertEqual(self.save(c,revision=1).status_code,400)
+        self.assertEqual(self.db.rows['challenge_purchases'],[])
+
+    def test_all_future_models_and_new_sizes_offer_both_drawdown_systems(self):
+        from progress_plan_bridge import plan_row
+        for model in ('one_phase','two_phase','instant'):
+            config=defaults()['config']
+            plan=make_plan('future-'+model,5000000,100000,model=model)
+            self.assertTrue(all(x['drawdown_type']=='STATIC' for x in plan['packages']))
+            for package in plan['packages']:package['drawdown_type']='TRAILING'
+            config['plans'].append(plan)
+            checked=validate_config(config)
+            for package in checked['plans'][-1]['packages']:
+                self.assertEqual(plan_row(plan,package)['drawdown_type'],'TRAILING')
+
     def test_three_sizes_have_the_agreed_four_complete_prices(self):
         d=self.client.get('/admin/package_studio/plan_matrix').json
         self.assertFalse(d['checkout_enabled'])

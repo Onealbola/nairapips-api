@@ -23,7 +23,7 @@ def model_of(plan):
 def route_for(plan):
     return ROUTES[model_of(plan)]
 ROOT=Path(__file__).with_name('package_studio_assets')
-RELEASE='editable-three-model-plans-2026-11-05'
+RELEASE='editable-static-equity-trailing-2026-11-07'
 
 
 def make_plan(identity,capital,base,model=None):
@@ -32,7 +32,7 @@ def make_plan(identity,capital,base,model=None):
         ('basic','Basic',1,5,50),('room','More Room',1.4,10,50),
         ('share','More Share',1.2,5,60),('both','Both benefits',1.6,10,60)):
         variants.append(dict(key=key,name=name,enabled=True,price=math.ceil(base*multiple/50)*50,
-            drawdown=dd,profit_share=share,profit_cap=15,daily_drawdown=0,
+            drawdown=dd,drawdown_type='STATIC',profit_share=share,profit_cap=15,daily_drawdown=0,
             phase1_target=10,phase2_target=8,payout_mode='continuing'))
     plan=dict(id=identity,name='NGN '+format(capital,','),capital=capital,enabled=True,
         limits=dict(max_drawdown=10,max_profit_share=60,max_profit_cap=15),packages=variants)
@@ -98,7 +98,10 @@ def validate_config(config):
         kinds=set()
         for package in plan['packages']:
             fields(package,('key','name','enabled','price','drawdown','profit_share','profit_cap',
-                            'daily_drawdown','phase1_target','phase2_target','payout_mode'))
+                            'daily_drawdown','phase1_target','phase2_target','payout_mode') + (('drawdown_type',) if 'drawdown_type' in package else ()))
+            from equity_drawdown import mode
+            if 'drawdown_type' in package and package['drawdown_type'] != mode(package['drawdown_type']):
+                raise ValueError('Choose STATIC or TRAILING')
             if package['key'] not in KINDS or package['key'] in kinds:
                 raise ValueError('Each account size needs Basic, More Room, More Share and Both exactly once')
             kinds.add(package['key']);text(package['name'],60);boolean(package['enabled'])

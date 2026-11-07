@@ -92,7 +92,9 @@ class SharedCatalog:
             if is_managed(p):continue
             identity='plan:'+str(p['id']);category='premium' if str(p.get('product_category') or '').lower()=='premium' else 'standard'
             result[identity]=dict(id=identity,family=category,name=str(p.get('name') or 'Challenge'),
-                visible=str(p.get('status') or '').lower()=='active',checkout_supported=True,release_reason='',
+                visible=str(p.get('status') or '').lower()=='active',
+                checkout_supported=(str(p.get('drawdown_type') or 'STATIC').upper()!='TRAILING' or __import__('equity_drawdown').runtime_ready()),
+                release_reason='Equity Trailing requires the updated broker-side DD worker before purchases can open' if str(p.get('drawdown_type') or 'STATIC').upper()=='TRAILING' else '',
                 plan_id=str(p['id']),plan={k:p.get(k) for k in PLAN_FIELDS})
         matrix,_=self.matrix.read(fresh=fresh)
         for p in matrix['config']['plans']:
@@ -107,7 +109,7 @@ class SharedCatalog:
                     proposal=True,package=dict(name=x['name'],allocation_name=p['name'],capital=p['capital'],
                         price=x['price'],drawdown=x['drawdown'],profit_share=x['profit_share'],profit_cap=x['profit_cap'],
                         phase1_target=x['phase1_target'],phase2_target=x['phase2_target'],daily_drawdown=x['daily_drawdown'],
-                        payout_mode=x['payout_mode']),_plan=p,_package=x)
+                        payout_mode=x['payout_mode'],drawdown_type=x.get('drawdown_type','STATIC')),_plan=p,_package=x)
         if self.custom is not None:
             config,_=self.custom.read(fresh=fresh)
             try:ready=bool(config.get('enabled') and self.custom.readiness and self.custom.readiness().get('ready'))

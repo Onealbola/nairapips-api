@@ -36,6 +36,9 @@ def catalog_identity(plan):
 def readiness(plan, package):
     # The existing deployed risk collector and settlement policy enforce these
     # terms. Other selectable draft terms must not be sold without enforcement.
+    from equity_drawdown import runtime_ready
+    if package.get('drawdown_type','STATIC') == 'TRAILING' and not runtime_ready():
+        return False, 'Equity Trailing requires the updated broker-side DD worker before purchases can open'
     if package['daily_drawdown'] != 0:
         return False, 'Set the daily rule to None; daily drawdown enforcement is not connected yet'
     if package['profit_cap'] != 15:
@@ -53,7 +56,7 @@ def plan_row(plan, package, opened=False):
         description=label+'. Continuing eligible funded payouts. No included resets or second life.',
         account_size=plan['capital'], fee=package['price'],
         phase1_target=package['phase1_target'], phase2_target=package['phase2_target'],
-        max_drawdown=package['drawdown'], daily_drawdown=package.get('daily_drawdown',0), drawdown_type='STATIC',
+        max_drawdown=package['drawdown'], daily_drawdown=package.get('daily_drawdown',0), drawdown_type=package.get('drawdown_type','STATIC'),
         payout_split=package['profit_share'], payout_cycles=0, payout_frequency='Daily',
         challenge_journey=list(route_for(plan)), product_category='standard',
         reset_fee=0, funded_reset_fee=0, second_life_enabled=False, lives_total=1,

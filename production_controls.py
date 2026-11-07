@@ -176,7 +176,7 @@ def register_controls(app, store, require_admin, invalidate, audit):
     def payload(doc):
         return dict(success=True, data=doc,
                     facilities=[{'key': k, 'label': v[0]} for k, v in FEATURES.items()],
-                    unreleased=UNRELEASED, protected=PROTECTED, propagation_seconds=3)
+                    unreleased={k:v for k,v in UNRELEASED.items() if k!='equity_trailing' or not __import__('equity_drawdown').runtime_ready()}, protected=PROTECTED, propagation_seconds=3)
 
     @app.get('/admin/production_controls')
     def production_controls_get():
@@ -213,7 +213,7 @@ def register_controls(app, store, require_admin, invalidate, audit):
         try:
             doc, _ = store.read()
             return jsonify(success=True, revision=doc['revision'], features=doc['features'],
-                           unreleased=list(UNRELEASED), propagation_seconds=3)
+                           unreleased=[k for k in UNRELEASED if k!='equity_trailing' or not __import__('equity_drawdown').runtime_ready()], propagation_seconds=3)
         except ControlsUnavailable:
             return jsonify(success=False, error='Feature availability could not be checked'), 503
 
