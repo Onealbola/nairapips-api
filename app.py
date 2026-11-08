@@ -59620,6 +59620,10 @@ def _np_record_live_passes_v214(limit=250):
         print("V214 LIVE PASS READ ERROR:", type(exc).__name__, flush=True)
     finally:
         _NP_V214_LAST_LIVE_PASS_SCAN = {**summary, "checked_at": now_iso()}
+        try:
+            __import__("target_monitor_health").record_scan(_NP_V214_LAST_LIVE_PASS_SCAN)
+        except Exception as exc:
+            print("TARGET MONITOR HEALTH WRITE ERROR:", type(exc).__name__, flush=True)
         _NP_RENEWAL_REST_V211.reset(token)
     return summary
 
@@ -59960,7 +59964,9 @@ def _np_http_readiness_v218():
     # Public operational metadata only: never include credentials or business rows.
     response = jsonify({"status": "ok", "http_release": "V232_READ_CAPACITY_DIAGNOSTICS",
         "commit": os.getenv("RENDER_GIT_COMMIT"),
-        "request_capacity": app.wsgi_app.capacity_snapshot()})
+        "request_capacity": app.wsgi_app.capacity_snapshot(),
+        "target_monitor": __import__("target_monitor_health").read_report(
+            globals().get("_NP_LIFECYCLE_WORKER_INTERVAL_V40") or 300)})
     response.headers["Cache-Control"] = "no-store"
     return response
 
