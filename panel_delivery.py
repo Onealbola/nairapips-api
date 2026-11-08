@@ -44,6 +44,13 @@ def register_panel_delivery(app, root=None):
         response.headers['X-Content-Type-Options']='nosniff'
         return response
 
+    @app.get('/downloads/operations-recovery.py')
+    def operations_recovery_download():
+        response=send_file(assets/'nairapips-operations-recovery.py',mimetype='text/plain',as_attachment=True,
+            download_name='nairapips-operations-recovery.py',conditional=False,etag=False,max_age=0)
+        response.headers['Cache-Control']='no-store, max-age=0'
+        return response
+
     @app.get('/downloads/dd-supervisor-repair.zip')
     def dd_supervisor_repair_download():
         response=send_file(assets/'nairapips-dd-supervisor-repair.zip',mimetype='application/zip',as_attachment=True,
