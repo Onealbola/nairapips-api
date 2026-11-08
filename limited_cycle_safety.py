@@ -121,7 +121,7 @@ class LimitedCycleSafety:
         if n<=0 or n!=n.quantize(Decimal('.01')):raise CycleBlocked('Payout amount must be positive with at most two decimals.')
         capital=amount(p.get('account_size'));split=amount(p.get('payout_split'))
         if capital<=0 or not 0<split<=100:raise CycleBlocked('Purchased capital or profit split could not be verified.')
-        maximum=(capital*amount(gross_cap_percent)/100*split/100).quantize(Decimal('.01'),rounding=ROUND_HALF_UP)
+        maximum=((capital*amount(gross_cap_percent)/100*split/100).quantize(Decimal('.01'),rounding=ROUND_HALF_UP) if gross_cap_percent is not None else Decimal('Infinity'))
         if quote is not None:
             if not quote.get('verified') or amount(quote.get('start_balance'))!=capital or amount(quote.get('payout_split'))!=split:
                 raise CycleBlocked('Fresh account balance and purchased profit split must be verified before approval or payment.')

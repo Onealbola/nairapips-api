@@ -19,18 +19,19 @@ def identity(plan, package):
 
 
 def managed_id(source):
+    source = __import__('withdrawal_controls').strip(source).split('|np_risk_controls_v1:',1)[0]
     return str(uuid5(NAMESPACE, source))
 
 
 def is_managed(plan):
     source = str(plan.get('journey_source') or '')
-    return source.startswith(PREFIX) and str(plan.get('id')) == managed_id(source.split('|np_risk_controls_v1:',1)[0])
+    return source.startswith(PREFIX) and str(plan.get('id')) == managed_id(__import__('withdrawal_controls').strip(source).split('|np_risk_controls_v1:',1)[0])
 
 
 def catalog_identity(plan):
     if not is_managed(plan):
         return None
-    return 'progress:' + plan['journey_source'].split('|np_risk_controls_v1:',1)[0][len(PREFIX):]
+    return 'progress:' + __import__('withdrawal_controls').strip(plan['journey_source']).split('|np_risk_controls_v1:',1)[0][len(PREFIX):]
 
 
 def readiness(plan, package):
@@ -42,8 +43,9 @@ def readiness(plan, package):
     from plan_risk_controls import selected_terms, daily_runtime_ready
     if float(selected_terms(package)['daily_drawdown']) > 0 and not daily_runtime_ready():
         return False, 'Daily drawdown requires all four updated DD shards to be reporting'
-    if package['profit_cap'] != 15:
-        return False, 'Set the profit cap to 15%; other caps are not connected to settlement yet'
+    from withdrawal_controls import needs_broker_update,ready
+    if needs_broker_update(plan_row(plan,package)) and not ready():
+        return False, 'Custom or disabled profit caps require the updated Operations engine verification'
     if package['drawdown'] > 20 and not (float(selected_terms(package)['daily_drawdown']) > 0 and daily_runtime_ready()):
         return False, 'This drawdown requires verified daily risk enforcement before it can be sold'
     return True, ''
@@ -54,6 +56,7 @@ def plan_row(plan, package, opened=False):
     from plan_risk_controls import selected_terms, freeze
     terms = selected_terms(package)
     frozen_source = freeze(source, terms) if float(terms['daily_drawdown']) > 0 or package.get('payout_schedule_enabled',False) or terms.get('resets') else source
+    frozen_source = __import__('withdrawal_controls').freeze(frozen_source,__import__('withdrawal_controls').selected(dict(package,account_size=plan['capital'],payout_split=package['profit_share'])))
     label={'two_phase':'Two-phase challenge','one_phase':'One-phase challenge','instant':'Instant funded account'}[model_of(plan)]
     return dict(id=managed_id(source), journey_source=frozen_source,
         name=(plan['name'] + ' · ' + package['name'])[:100],
@@ -95,7 +98,7 @@ def commercial_plan(plan):
     fee=float(plan['fee'])
     from plan_risk_controls import frozen_terms
     frozen = frozen_terms(plan) or {}
-    return dict(plan, reset_stage_prices=frozen.get('resets',{}), managed_progress=True, offer_version=offer_version(plan), base_fee=fee, fee=fee,
+    return dict(plan, withdrawal_rules=__import__('withdrawal_controls').read(plan), reset_stage_prices=frozen.get('resets',{}), managed_progress=True, offer_version=offer_version(plan), base_fee=fee, fee=fee,
         payout_cycles=0, payout_cycle_extra=0,
         cycle_options=[dict(cycles=0,available=True,extra=0,fee=fee)],default_cycles=0)
 

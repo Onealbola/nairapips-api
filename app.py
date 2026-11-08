@@ -3673,6 +3673,8 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
     )
     challenge_journey = _journey_source_value(_journey_for_lifecycle({"stage": stage}, purchase, plan, trader))
     journey_source = "purchase_or_plan_snapshot" if purchase_id else ("manual_plan_snapshot" if plan else "manual_unknown_legacy_default_review")
+    if __import__('withdrawal_controls').needs_broker_update(purchase if purchase_id else plan) and not __import__('withdrawal_controls').ready():
+        raise ValueError('Custom profit caps require the verified Operations engine update')
     from plan_risk_controls import inherit, daily_percent, daily_runtime_ready
     journey_source = inherit(journey_source, purchase if purchase_id else plan)
     if daily_percent(purchase if purchase_id else plan) > 0 and not daily_runtime_ready():
@@ -10033,7 +10035,7 @@ def _np_plan_rule_snapshot_v156(plan):
         "plan_snapshot_at": now_iso(),
     }
 
-    if __import__("plan_risk_controls").frozen_terms(plan):
+    if __import__("plan_risk_controls").frozen_terms(plan) or __import__("withdrawal_controls").read(plan):
         snapshot["journey_source"] = plan["journey_source"]
     return snapshot
 
@@ -10233,6 +10235,7 @@ def create_plan():
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
              "status":d.get("status","inactive"),"created_at":now_iso(),"updated_at":now_iso()}
         row = __import__("plan_risk_controls").edit_plan_controls(row, d)
+        row = __import__("withdrawal_controls").edit(row,d)
         result = _NPRenewalRestQueryV211("challenge_plans").insert(row).execute().data
         np_invalidate("public_plans_snapshot", "plans_list", "admin_bootstrap")
         return ok(result, "Challenge plan created")
@@ -10279,6 +10282,11 @@ def update_plan():
             for field in ('daily_drawdown','payout_frequency','journey_source','reset_fee','funded_reset_fee'):
                 if field in edited:
                     upd[field] = edited[field]
+        if __import__('withdrawal_controls').FIELDS.intersection(d):
+            rows = _NPRenewalRestQueryV211('challenge_plans').select('*').eq('id',pid).limit(1).execute().data or []
+            if not rows:return bad('Plan not found',404)
+            edited = __import__('withdrawal_controls').edit(dict(rows[0],**upd),d)
+            upd['journey_source'] = edited['journey_source']
         if "mt5_server" in d and "default_server" not in d:
             upd["default_server"] = d.get("mt5_server")
         if "default_server" in d and "mt5_server" not in d:
@@ -27445,7 +27453,7 @@ def _np_reset_current_plan_for(account, purchase=None):
         return exact[0]
 
     # New configurable offers never borrow reset terms from another product.
-    if __import__('plan_risk_controls').frozen_terms(purchase) or __import__('plan_risk_controls').frozen_terms(account):
+    if __import__('plan_risk_controls').frozen_terms(purchase) or __import__('plan_risk_controls').frozen_terms(account) or __import__('withdrawal_controls').read(purchase) or __import__('withdrawal_controls').read(account):
         return None
 
     # Legacy accounts without an active exact plan retain name/size resolution.
@@ -58986,7 +58994,10 @@ def _np_verified_payout_quote(account, trader=None, snapshot=None, allow_stale=F
             return unavailable
     except (ValueError, TypeError):
         return unavailable
-    profit = min(max(0, equity - start), round(start * FUNDED_MAX_GROSS_PROFIT_PERCENT / 100, 2))
+    cap = (__import__('withdrawal_controls').cap_percent(a) if __import__('withdrawal_controls').read(a) else FUNDED_MAX_GROSS_PROFIT_PERCENT)
+    profit = max(0, equity - start)
+    if cap is not None:
+        profit = min(profit, round(start * float(cap) / 100, 2))
     available = max(0, round(profit * split / 100, 2))
     from equity_drawdown import account_mode, read_saved_state
     try:
@@ -59004,7 +59015,7 @@ def _np_verified_payout_quote(account, trader=None, snapshot=None, allow_stale=F
             "available_payout": available, "observed_at": observed,
             "reason": ("You can submit your request while we verify your latest account balance." if not fresh else
                        "Verified profit is available for payout." if available > 0 else "No verified withdrawable profit yet."),
-            "authority": "V201_EXACT_LIVE_PAYOUT"}
+            "authority": "V201_EXACT_LIVE_PAYOUT", "withdrawal_rules": __import__("withdrawal_controls").read(a)}
 
 _np_v201_bootstrap_base = app.view_functions.get("trader_bootstrap")
 
@@ -59226,6 +59237,13 @@ def _np_v206_payout_guard(base, action):
             others = [row for row in ledger if str(row.get("id") or "") != pid and payout_status(row) in open_states]
             if action in {"create", "approve", "paid"} and others:
                 return bad("Another payout request already exists for this account. Review the existing request; no additional payout was authorized.", 409)
+            if action in {'create','approve','paid'} and __import__('withdrawal_controls').read(account):
+                value = payload.get('amount') if action=='create' else (payout or {}).get('amount')
+                rule_quote = _np_verified_payout_quote(account, {'id':account.get('trader_id')})
+                try:
+                    __import__('withdrawal_controls').validate_request(account,value,rule_quote,require_verified=action!='create')
+                except ValueError as exc:
+                    return bad(str(exc),409)
             cycle_guard = globals().get("_np_limited_cycle_guard")
             if cycle_guard and action in {"create", "approve", "paid"}:
                 cycle_claim = cycle_guard.acquire(account, pid, action)
@@ -59233,7 +59251,7 @@ def _np_v206_payout_guard(base, action):
                     value = payload.get("amount") if action == "create" else (payout or {}).get("amount")
                     quote = (_np_verified_payout_quote(account, {"id":account.get("trader_id")})
                              if action in {"approve", "paid"} else None)
-                    cycle_guard.check_amount(cycle_claim, value, quote, FUNDED_MAX_GROSS_PROFIT_PERCENT)
+                    cycle_guard.check_amount(cycle_claim, value, quote, (__import__('withdrawal_controls').cap_percent(account) if __import__('withdrawal_controls').read(account) else FUNDED_MAX_GROSS_PROFIT_PERCENT))
             return base(*args, **kwargs)
         except CycleBlocked as exc:
             return bad(str(exc), 409)
@@ -60206,7 +60224,7 @@ def np_drawdown_version_v233():
         runtime_verification_configured=os.environ.get("NP_EQUITY_TRAILING_VERIFIED")==RELEASE,
         plan_controls_release=__import__("plan_risk_controls").RELEASE,
         daily_sales_ready=__import__("plan_risk_controls").daily_runtime_ready(),
-        optional_paid_resets=True, payout_schedules=list(__import__("plan_risk_controls").FREQUENCIES))
+        optional_paid_resets=True, withdrawal_controls_release=__import__('withdrawal_controls').RELEASE,custom_profit_caps_ready=__import__('withdrawal_controls').ready(),payout_schedules=list(__import__("plan_risk_controls").FREQUENCIES))
 
 from otp_capacity import install as _np_install_bounded_signup_email
 _np_install_bounded_signup_email(app)
@@ -60219,6 +60237,15 @@ def _payout_eligibility(trader, requested_account_id=None):
     eligible, reason, account = _np_payout_eligibility_risk_controls_base(trader, requested_account_id=requested_account_id)
     from plan_risk_controls import frozen_terms, payout_due
     try:
+        wr = __import__('withdrawal_controls').read(account)
+        if wr and (wr['minimum_profit_enabled'] or wr['minimum_withdrawal_enabled']):
+            q = _np_verified_payout_quote(account,trader)
+            if not q.get('verified'):
+                return False,'Your latest profit must be verified before withdrawal.',account
+            try:
+                __import__('withdrawal_controls').validate_request(account,max(float(wr['minimum_withdrawal']) if wr['minimum_withdrawal_enabled'] else 0,.01),q)
+            except ValueError as exc:
+                return False,str(exc),account
         terms = frozen_terms(account)
         if not account or not terms or terms['payout_frequency'] == 'On Demand':
             return eligible, reason, account

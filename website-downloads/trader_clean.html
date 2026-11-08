@@ -12014,7 +12014,7 @@ window.npPackageHistoryPageV222=async function(delta){state.historyPage=Math.max
 <script>/* NairaPips account selector: public catalogue data, existing checkout actions. */
 (function(){
 'use strict';
-const VERSION='risk-controls-20261108-v1';
+const VERSION='withdrawal-controls-20261108-v1';
 if(window.NPPlanSelector?.version===VERSION)return;
 window.NPPlanSelector?.destroy?.();
 const widgets=new Map();
@@ -12046,7 +12046,9 @@ function html(w){
  const percent=v=>w.unit==='ngn'?money(Number(x.account_size)*Number(v)/100):Number(v)+'%';
  const reset=v=>v==null?'At request':Number(v)>0?money(v):'None';
  const account=field('Evaluation',instant?'Instant Funded':two?'2 phases':'1 phase')+(instant?'':field('Phase 1 target',percent(x.phase1_target??10)))+(two?field('Phase 2 target',percent(x.phase2_target)):'')+field('Max drawdown',percent(x.max_drawdown??20))+field('Daily drawdown',Number(x.daily_drawdown)>0?percent(x.daily_drawdown):'None')+field('Drawdown type',x.drawdown_type||'STATIC');
- const rewards=field('Your profit share',Number(x.payout_split)+'%')+field('Payout cycles',x.payout_cycles===0?'Continuing':String(x.payout_cycles??3))+field('Payout frequency',x.payout_frequency||'Daily')+(progress?field('Gross cap / cycle',percent(selected.package.profit_cap)):'')+(Object.keys(x.reset_stage_prices||{}).length?(instant?'':field('Phase 1 reset',reset(x.reset_stage_prices.phase1||0)))+(two?field('Phase 2 reset',reset(x.reset_stage_prices.phase2||0)):'')+field('Funded reset',reset(x.reset_stage_prices.funded||0)):field('Phase reset',reset(x.reset_fee))+field('Funded reset',reset(x.funded_reset_fee)));
+ const wr=x.withdrawal_rules;
+ const withdrawalFields=wr?(field('Minimum withdrawal',wr.minimum_withdrawal_enabled?money(wr.minimum_withdrawal):'None')+field('Minimum profit target',wr.minimum_profit_enabled?percent(wr.minimum_profit_percent):'None')+field('Gross cap / cycle',wr.profit_cap_enabled?percent(wr.profit_cap):'No cap')):(progress?field('Gross cap / cycle',percent(selected.package.profit_cap)):'');
+ const rewards=field('Your profit share',Number(x.payout_split)+'%')+field('Payout cycles',x.payout_cycles===0?'Continuing':String(x.payout_cycles??3))+field('Payout frequency',x.payout_frequency||'Daily')+withdrawalFields+(Object.keys(x.reset_stage_prices||{}).length?(instant?'':field('Phase 1 reset',reset(x.reset_stage_prices.phase1||0)))+(two?field('Phase 2 reset',reset(x.reset_stage_prices.phase2||0)):'')+field('Funded reset',reset(x.reset_stage_prices.funded||0)):field('Phase reset',reset(x.reset_fee))+field('Funded reset',reset(x.funded_reset_fee)));
  const button=w.context==='preview'?'Preview':selected.purchases_open?'Choose package':'Purchases paused';
  const action=w.context==='landing'?'data-landing-product':w.context==='trader'?'data-catalog-product':'data-preview-product';
  const header='<div class="nps-top"><div><div class="nps-kicker">NAIRAPIPS / ACCOUNTS</div><h2>Choose your account.</h2></div><div class="nps-tabs" role="tablist" aria-label="Account model">'+present.map(([id,label])=>'<button type="button" class="nps-tab" role="tab" tabindex="'+(w.family===id?'0':'-1')+'" aria-selected="'+(w.family===id)+'" data-nps-action="family" data-nps-value="'+id+'">'+label+'</button>').join('')+'</div></div>';

@@ -35,7 +35,7 @@ def make_plan(identity,capital,base,model=None):
             drawdown=dd,drawdown_type='STATIC',profit_share=share,profit_cap=15,daily_drawdown=0,
             phase1_target=10,phase2_target=8,payout_mode='continuing',
             daily_drawdown_enabled=False,payout_schedule_enabled=False,payout_frequency='Daily',phase1_reset_enabled=False,phase1_reset_fee=0,
-            phase2_reset_enabled=False,phase2_reset_fee=0,funded_reset_enabled=False,funded_reset_fee=0))
+            phase2_reset_enabled=False,phase2_reset_fee=0,funded_reset_enabled=False,funded_reset_fee=0,minimum_withdrawal_enabled=False,minimum_withdrawal=0,minimum_profit_enabled=False,minimum_profit_percent=0,profit_cap_enabled=True))
     plan=dict(id=identity,name='NGN '+format(capital,','),capital=capital,enabled=True,
         limits=dict(max_drawdown=10,max_profit_share=60,max_profit_cap=15),packages=variants)
     if model is not None:
@@ -72,6 +72,7 @@ def availability(plan,package):
     if not plan['enabled']:reasons.append('Account size switched off')
     if not package['enabled']:reasons.append('Package switched off')
     for key,limit,label in [('drawdown','max_drawdown','Drawdown'),('profit_share','max_profit_share','Trader share'),('profit_cap','max_profit_cap','Profit cap')]:
+        if key=='profit_cap' and package.get('profit_cap_enabled') is False:continue
         if package[key]>plan['limits'][limit]:reasons.append(label+' exceeds this account size’s draft limit')
     return dict(available=not reasons,reasons=reasons)
 
@@ -100,7 +101,7 @@ def validate_config(config):
         kinds=set()
         for package in plan['packages']:
             fields(package,('key','name','enabled','price','drawdown','profit_share','profit_cap',
-                            'daily_drawdown','phase1_target','phase2_target','payout_mode') + tuple(k for k in ('drawdown_type','daily_drawdown_enabled','payout_schedule_enabled','payout_frequency','phase1_reset_enabled','phase1_reset_fee','phase2_reset_enabled','phase2_reset_fee','funded_reset_enabled','funded_reset_fee') if k in package))
+                            'daily_drawdown','phase1_target','phase2_target','payout_mode') + tuple(k for k in ('drawdown_type','daily_drawdown_enabled','payout_schedule_enabled','payout_frequency','phase1_reset_enabled','phase1_reset_fee','phase2_reset_enabled','phase2_reset_fee','funded_reset_enabled','funded_reset_fee','minimum_withdrawal_enabled','minimum_withdrawal','minimum_profit_enabled','minimum_profit_percent','profit_cap_enabled') if k in package))
             from equity_drawdown import mode
             if 'drawdown_type' in package and package['drawdown_type'] != mode(package['drawdown_type']):
                 raise ValueError('Choose STATIC or TRAILING')
@@ -111,9 +112,10 @@ def validate_config(config):
             if round(package['price']*100,6)!=round(package['price']*100):
                 raise ValueError('Prices can have at most two decimal places')
             for key,low,high in [('drawdown',.1,30),('profit_share',1,100),('profit_cap',.1,30)]:
-                number(package[key],low,high)
+                number(package[key],0 if key=='profit_cap' and package.get('profit_cap_enabled') is False else low,high)
             from plan_risk_controls import selected_terms
             selected_terms(package)
+            __import__('withdrawal_controls').selected(dict(package,account_size=plan['capital'],payout_split=package['profit_share']))
             for key in ('phase1_target','phase2_target'):
                 number(package[key],0,100)
             targets=(package['phase1_target'],package['phase2_target'])

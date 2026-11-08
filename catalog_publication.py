@@ -16,7 +16,7 @@ KEY='catalog_purchase_switches_v1'
 RELEASE='unified-live-catalogue-2026-11-05'
 PLAN_FIELDS=('id','name','description','status','fee','account_size','phase1_target','phase2_target',
              'max_drawdown','drawdown_type','payout_split','reset_fee','funded_reset_fee',
-             'payout_cycles','payout_frequency','reset_stage_prices','challenge_journey','product_category','base_fee','cycle_options','default_cycles','journey_source','managed_progress','offer_version','daily_drawdown','second_life_enabled','lives_total','public_badge')
+             'payout_cycles','payout_frequency','withdrawal_rules','reset_stage_prices','challenge_journey','product_category','base_fee','cycle_options','default_cycles','journey_source','managed_progress','offer_version','daily_drawdown','second_life_enabled','lives_total','public_badge')
 
 
 def defaults():return dict(revision=0,products={},updated_at=None,updated_by=None)
@@ -93,9 +93,9 @@ class SharedCatalog:
             identity='plan:'+str(p['id']);category='premium' if str(p.get('product_category') or '').lower()=='premium' else 'standard'
             result[identity]=dict(id=identity,family=category,name=str(p.get('name') or 'Challenge'),
                 visible=str(p.get('status') or '').lower()=='active',
-                checkout_supported=((str(p.get('drawdown_type') or 'STATIC').upper()!='TRAILING' or __import__('equity_drawdown').runtime_ready()) and (__import__('plan_risk_controls').daily_percent(p)<=0 or __import__('plan_risk_controls').daily_runtime_ready())),
-                release_reason=('Daily drawdown requires four updated DD shards reporting' if __import__('plan_risk_controls').daily_percent(p)>0 and not __import__('plan_risk_controls').daily_runtime_ready() else 'Equity Trailing requires the updated broker-side DD worker before purchases can open' if str(p.get('drawdown_type') or 'STATIC').upper()=='TRAILING' else ''),
-                plan_id=str(p['id']),plan={**{k:p.get(k) for k in PLAN_FIELDS},'reset_stage_prices':(__import__('plan_risk_controls').frozen_terms(p) or {}).get('resets',{})})
+                checkout_supported=((not __import__('withdrawal_controls').needs_broker_update(p) or __import__('withdrawal_controls').ready()) and (str(p.get('drawdown_type') or 'STATIC').upper()!='TRAILING' or __import__('equity_drawdown').runtime_ready()) and (__import__('plan_risk_controls').daily_percent(p)<=0 or __import__('plan_risk_controls').daily_runtime_ready())),
+                release_reason=('Custom or disabled profit caps require the verified Operations engine update' if __import__('withdrawal_controls').needs_broker_update(p) and not __import__('withdrawal_controls').ready() else 'Daily drawdown requires four updated DD shards reporting' if __import__('plan_risk_controls').daily_percent(p)>0 and not __import__('plan_risk_controls').daily_runtime_ready() else 'Equity Trailing requires the updated broker-side DD worker before purchases can open' if str(p.get('drawdown_type') or 'STATIC').upper()=='TRAILING' else ''),
+                plan_id=str(p['id']),plan={**{k:p.get(k) for k in PLAN_FIELDS},'reset_stage_prices':(__import__('plan_risk_controls').frozen_terms(p) or {}).get('resets',{}),'withdrawal_rules':__import__('withdrawal_controls').read(p)})
         matrix,_=self.matrix.read(fresh=fresh)
         for p in matrix['config']['plans']:
             for x in p['packages']:

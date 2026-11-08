@@ -2,7 +2,7 @@
 from pathlib import Path
 import hashlib,json,zipfile
 root=Path(__file__).resolve().parents[1]
-files={name:(root/'drawdown-release'/name).read_bytes() for name in ['DD_POLICE_STATIC_TRAILING_V1_20261107.py','package_dd_runtime.py','package_account_rules.py','package_contracts.py','plan_risk_controls.py','DD_BREACH_RELAY_V1_20261003.py','fleet_instance_lock.py']}
+files={name:(root/'drawdown-release'/name).read_bytes() for name in ['DD_POLICE_STATIC_TRAILING_V1_20261107.py','package_dd_runtime.py','package_account_rules.py','package_contracts.py','plan_risk_controls.py','withdrawal_controls.py','DD_BREACH_RELAY_V1_20261003.py','fleet_instance_lock.py']}
 files['equity_drawdown.py']=(root/'equity_drawdown.py').read_bytes()
 files['SHA256.json']=json.dumps({k:hashlib.sha256(v).hexdigest() for k,v in files.items()},indent=2).encode()
 for name in ['README.txt','INSTALL.ps1','CHECK_ONLY.cmd','INSTALL_UPDATE.cmd','ROLL_UPDATE.cmd']:files[name]=(root/'drawdown-release'/name).read_bytes()

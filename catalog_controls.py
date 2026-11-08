@@ -13,7 +13,8 @@ DB_FIELDS = {
     'challenge_journey', 'drawdown_type', 'payout_cycles', 'product_category', 'daily_drawdown', 'payout_frequency',
 }
 CONTROL_FIELDS = {'daily_drawdown_enabled', 'payout_schedule_enabled'} | {stage+suffix for stage in ('phase1','phase2','funded') for suffix in ('_reset_enabled','_reset_fee')}
-FIELDS = DB_FIELDS | CONTROL_FIELDS
+WITHDRAWAL_FIELDS = __import__('withdrawal_controls').FIELDS
+FIELDS = DB_FIELDS | CONTROL_FIELDS | WITHDRAWAL_FIELDS
 RULE_FIELDS = {'fee', 'reset_fee', 'phase1_target', 'phase2_target', 'max_drawdown', 'payout_split',
                'account_size', 'challenge_journey', 'drawdown_type', 'payout_cycles'}
 
@@ -91,6 +92,12 @@ def validated_plan(current, changes):
             raise ValueError('Save daily limits on an inactive plan until all four broker workers are verified')
     elif {'daily_drawdown','payout_frequency'}.intersection(changes):
         raise ValueError('Use the daily limit and payout schedule checkboxes')
+    if WITHDRAWAL_FIELDS.intersection(changes):
+        updated = __import__('withdrawal_controls').edit(dict(current,**result),changes)
+        result['journey_source'] = updated['journey_source']
+    final = dict(current,**result)
+    if final.get('status')=='active' and __import__('withdrawal_controls').needs_broker_update(final) and not __import__('withdrawal_controls').ready():
+        raise ValueError('Save custom or disabled profit caps on an inactive plan until the Operations update is verified')
     return result
 
 
@@ -139,7 +146,7 @@ def register_catalog_controls(app, transport, url, key, require_admin, invalidat
             if len(plans) > 1000:
                 raise RuntimeError('Catalog too large for a complete edit view')
             from plan_risk_controls import plan_controls_view
-            return jsonify(success=True, plans=[plan_controls_view(p) for p in plans if not is_managed(p)])
+            return jsonify(success=True, plans=[__import__('withdrawal_controls').view(plan_controls_view(p)) for p in plans if not is_managed(p)])
         except Exception:
             return jsonify(success=False, error='The complete catalog could not be loaded'), 503
 
@@ -175,7 +182,7 @@ def register_catalog_controls(app, transport, url, key, require_admin, invalidat
             audit('production_catalog', 'plan_configuration_update',
                   str({'plan_id': body['id'], 'changes': changes}), admin, str(body['id']))
             from plan_risk_controls import plan_controls_view
-            return jsonify(success=True, plan=plan_controls_view({k: v for k, v in saved[0].items() if k in DB_FIELDS | {'id', 'updated_at', 'journey_source'}}))
+            return jsonify(success=True, plan=__import__('withdrawal_controls').view(plan_controls_view({k: v for k, v in saved[0].items() if k in DB_FIELDS | {'id', 'updated_at', 'journey_source'}})))
         except ValueError as exc:
             return jsonify(success=False, error=str(exc)), 400
         except Exception:

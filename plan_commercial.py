@@ -81,6 +81,9 @@ def priced_plan(plan, prices, category='standard'):
 
 def purchase_plan(plan, prices, cycles=DEFAULT_CYCLES):
     """Price a buyer's selection without changing the saved product or past sales."""
+    from withdrawal_controls import needs_broker_update,ready
+    if needs_broker_update(plan) and not ready():
+        raise ValueError('Custom profit caps require the verified Operations engine update')
     from equity_drawdown import mode, runtime_ready
     if mode(plan.get('drawdown_type'))=='TRAILING' and not runtime_ready():
         raise ValueError('Equity Trailing purchases require the verified DD worker update')

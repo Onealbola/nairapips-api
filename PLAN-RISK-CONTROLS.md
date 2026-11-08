@@ -37,3 +37,33 @@ All four authenticated daily-history capability signals are required before new
 daily-rule purchases can open. The capability record is technical installation
 state, not a commercial activation. Existing accounts are not used for deliberate
 breach testing. Broker installation remains pending until performed on the VPS.
+
+## Optional withdrawal thresholds and funded profit cap
+
+All packages and ordinary plans expose independently enabled minimum payout in
+naira, minimum gross profit as a percentage of initial capital, and a gross profit
+cap per funded cycle. Minimum amount is measured after the trader's profit split.
+Minimum profit is measured before that split. Impossible target/cap or minimum
+amount/split combinations are rejected. Disabled minimums impose no threshold.
+Existing saved cap behaviour is retained until the owner changes it.
+
+Withdrawal metadata uses a separate marker before the existing risk marker. This
+keeps old daily/trailing metadata readable and preserves stable managed plan IDs.
+Purchase snapshots, stage assignment and resets inherit the purchased policy;
+editing a plan never rewrites issued account policy.
+
+Exact-account verified payout quotes apply the purchased cap; disabled cap means
+no cap reduction. Existing exposure, payout availability, duplicate, identity,
+trading-lock and paid-account guards remain. Minimums are checked before request,
+approval and marking paid. Approval/payment require a fresh verified quote for
+accounts with these rules. A stale receivable request cannot authorize payment.
+
+The supplied Operations update reads the canonical purchased cap and uses it for
+broker cap detection and scan priority. Legacy accounts keep their former 15%
+cap. Evaluation targets and DD ownership are unchanged. CHECK_ONLY and backup-only
+installation are provided; no existing VPS process is stopped by the installer.
+Custom or disabled caps stay closed to new purchases/assignment until the owner
+verifies the updated Operations engine and sets technical environment flag
+NP_PLAN_WITHDRAWAL_VERIFIED=NP_WITHDRAWAL_RULES_V1_20261108 on the main API.
+This is installation readiness, not a product setting. Minimum-only rules with
+the existing 15% cap require no Operations code change to enforce withdrawals.

@@ -36,7 +36,7 @@ if (-not ($current.Contains('NAIRAPIPS_DD_POLICE_V3_20_CLEAN_LIVE_STATE_TELEMETR
     throw 'This installer expects the existing V3.20 DD worker. A different version needs review; no files changed.'
 }
 $destination = Split-Path -Parent $target
-$files = @('equity_drawdown.py','plan_risk_controls.py','package_dd_runtime.py','package_account_rules.py','package_contracts.py','DD_BREACH_RELAY_V1_20261003.py','fleet_instance_lock.py')
+$files = @('equity_drawdown.py','plan_risk_controls.py','withdrawal_controls.py','package_dd_runtime.py','package_account_rules.py','package_contracts.py','DD_BREACH_RELAY_V1_20261003.py','fleet_instance_lock.py')
 $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'SHA256.json') -Raw | ConvertFrom-Json
 foreach ($item in @('DD_POLICE_STATIC_TRAILING_V1_20261107.py') + $files) {
     $source = Join-Path $PSScriptRoot $item
