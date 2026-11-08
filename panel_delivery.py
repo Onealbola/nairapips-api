@@ -9,6 +9,20 @@ RELEASE='hosted-admin-mobile-navigation-2026-10-22'
 
 def register_panel_delivery(app, root=None):
     assets=Path(root) if root else Path(__file__).resolve().parent/'website-downloads'
+    @app.get('/public/nairapips-luxury-concept.png')
+    def luxury_concept_image():
+        response=send_file(assets/'nairapips-luxury-concept.png',mimetype='image/png',conditional=False,etag=False,max_age=0)
+        response.headers['Cache-Control']='no-store, max-age=0'
+        response.headers['X-Content-Type-Options']='nosniff'
+        return response
+
+    @app.get('/design-preview/luxury')
+    def luxury_concept_view():
+        response=make_response('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>NairaPips — Luxury concept</title><style>body{margin:0;background:#080806;color:#f6e9bc;font:16px/1.5 system-ui}header{display:flex;gap:20px;justify-content:space-between;align-items:center;padding:16px 24px;border-bottom:1px solid #705929}a{color:#ffe29a}main{max-width:1536px;margin:auto}img{display:block;width:100%;height:auto}p{margin:16px 24px;color:#c9c1ad}@media(max-width:600px){header{align-items:start;flex-direction:column;gap:6px}}</style></head><body><header><strong>NAIRAPIPS · Luxury concept</strong><a href="/public/nairapips-luxury-concept.png" target="_blank" rel="noopener">Open full-size image ↗</a></header><main><img src="/public/nairapips-luxury-concept.png" alt="NairaPips luxury design concept: polished gold architecture, black panels and a premium account selector"><p>Visual concept only. Your live website and business settings have not changed.</p></main></body></html>')
+        response.headers['Cache-Control']='no-store, max-age=0'
+        response.headers['X-Robots-Tag']='noindex, nofollow'
+        return response
+
     @app.get('/public/trader-catalogue.js')
     def trader_catalogue_script():
         r=make_response((assets/'account-plan-selector.js').read_text()+'\n'+(assets/'trader-catalog-sync.js').read_text());r.mimetype='application/javascript'
