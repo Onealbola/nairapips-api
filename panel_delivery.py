@@ -44,6 +44,13 @@ def register_panel_delivery(app, root=None):
         response.headers['X-Content-Type-Options']='nosniff'
         return response
 
+    @app.get('/downloads/dd-supervisor-repair.zip')
+    def dd_supervisor_repair_download():
+        response=send_file(assets/'nairapips-dd-supervisor-repair.zip',mimetype='application/zip',as_attachment=True,
+            download_name='NairaPips-DD-Supervisor-Repair.zip',conditional=False,etag=False,max_age=0)
+        response.headers['Cache-Control']='no-store, max-age=0'
+        return response
+
     @app.get('/downloads/static-trailing-dd-update.zip')
     def static_trailing_dd_update():
         response=send_file(assets/'nairapips-static-trailing-dd-update.zip',mimetype='application/zip',as_attachment=True,
