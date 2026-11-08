@@ -21,6 +21,58 @@ class MatrixTests(unittest.TestCase):
         return self.client.post('/admin/package_studio/plan_matrix',json={
             'revision':revision,'config':c or defaults()['config'],**kwargs})
 
+    def test_enabled_phase1_reset_saves_with_unchecked_blank_prices(self):
+        config=defaults()['config'];package=config['plans'][0]['packages'][3]
+        package.update(phase1_reset_enabled=True,phase1_reset_fee=14000,
+                       phase2_reset_enabled=False,phase2_reset_fee='',
+                       funded_reset_enabled=False,funded_reset_fee=None,
+                       minimum_profit_enabled=True,minimum_profit_percent=10,
+                       profit_cap_enabled=True,profit_cap=15,
+                       payout_schedule_enabled=True,payout_frequency='Weekly')
+        response=self.save(config)
+        self.assertEqual(response.status_code,200,response.json)
+        stored=self.store.read(fresh=True)[0]['config']['plans'][0]['packages'][3]
+        self.assertTrue(stored['phase1_reset_enabled'])
+        self.assertEqual(stored['phase1_reset_fee'],14000)
+        for stage in ('phase2','funded'):
+            self.assertFalse(stored[stage+'_reset_enabled'])
+            self.assertEqual(stored[stage+'_reset_fee'],0)
+        self.assertEqual(stored['minimum_profit_percent'],10)
+        self.assertEqual(stored['profit_cap'],15)
+        self.assertEqual(stored['payout_frequency'],'Weekly')
+        self.assertIsNone(package['funded_reset_fee'])
+
+    def test_all_disabled_blank_resets_save_without_enabling_them(self):
+        config=defaults()['config']
+        for plan in config['plans']:
+            for package in plan['packages']:
+                for stage in ('phase1','phase2','funded'):
+                    package[stage+'_reset_enabled']=False
+                    package[stage+'_reset_fee']=None
+        response=self.save(config)
+        self.assertEqual(response.status_code,200,response.json)
+        for plan in self.store.read(fresh=True)[0]['config']['plans']:
+            for package in plan['packages']:
+                for stage in ('phase1','phase2','funded'):
+                    self.assertFalse(package[stage+'_reset_enabled'])
+                    self.assertEqual(package[stage+'_reset_fee'],0)
+
+    def test_reset_validation_names_enabled_stage_and_preserves_inactive_price(self):
+        config=defaults()['config'];package=config['plans'][0]['packages'][3]
+        package.update(phase1_reset_enabled=True,phase1_reset_fee=14000,
+                       funded_reset_enabled=True,funded_reset_fee=None)
+        response=self.save(config)
+        self.assertEqual(response.status_code,400)
+        self.assertIn('Both benefits',response.json['error'])
+        self.assertIn('Funded reset price',response.json['error'])
+        self.assertEqual(self.db.rows['package_studio_private_settings'],[])
+        package.update(funded_reset_enabled=False,funded_reset_fee=7000)
+        response=self.save(config)
+        self.assertEqual(response.status_code,200,response.json)
+        stored=self.store.read(fresh=True)[0]['config']['plans'][0]['packages'][3]
+        self.assertEqual(stored['funded_reset_fee'],7000)
+        self.assertFalse(stored['funded_reset_enabled'])
+
     def test_cap_and_weekly_payout_save_with_both_minimums_off_and_blank(self):
         config=defaults()['config'];package=config['plans'][0]['packages'][0]
         package.update(minimum_withdrawal_enabled=False,minimum_withdrawal=None,

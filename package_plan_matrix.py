@@ -122,8 +122,19 @@ def validate_config(config):
                 raise ValueError('Prices can have at most two decimal places')
             for key,low,high in [('drawdown',.1,30),('profit_share',1,100),('profit_cap',.1,30)]:
                 package_number(plan,package,key,0 if key=='profit_cap' and package.get('profit_cap_enabled') is False else low,high)
-            from plan_risk_controls import selected_terms
+            from plan_risk_controls import selected_terms, reset_terms
             try:
+                # Blank unchecked prices are editor drafts, not purchased terms.
+                # Normalize the copied draft only; retain valid remembered prices.
+                for stage,label in (('phase1','Phase 1'),('phase2','Phase 2'),('funded','Funded')):
+                    fee=stage+'_reset_fee';flag=stage+'_reset_enabled'
+                    raw=package.get(fee)
+                    if package.get(flag,False) is False and fee in package and (raw is None or (isinstance(raw,str) and not raw.strip())):
+                        package[fee]=0
+                    try:
+                        reset_terms({flag:package.get(flag,False),fee:package.get(fee,0)})
+                    except ValueError as exc:
+                        raise ValueError(label+' reset price: '+str(exc)) from exc
                 selected_terms(package)
                 __import__('withdrawal_controls').selected(dict(package,account_size=plan['capital'],payout_split=package['profit_share']))
             except ValueError as exc:
