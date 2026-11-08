@@ -21,6 +21,22 @@ class MatrixTests(unittest.TestCase):
         return self.client.post('/admin/package_studio/plan_matrix',json={
             'revision':revision,'config':c or defaults()['config'],**kwargs})
 
+    def test_daily_schedule_survives_save_reload_and_public_plan_translation(self):
+        from progress_plan_bridge import plan_row,commercial_plan
+        from plan_risk_controls import frozen_terms
+        config=defaults()['config'];package=config['plans'][0]['packages'][1]
+        package.update(payout_schedule_enabled=True,payout_frequency='Daily')
+        response=self.save(config)
+        self.assertEqual(response.status_code,200,response.json)
+        stored=self.store.read(fresh=True)[0]['config']['plans'][0]
+        wanted=stored['packages'][1]
+        self.assertTrue(wanted['payout_schedule_enabled'])
+        self.assertEqual(wanted['payout_frequency'],'Daily')
+        row=plan_row(stored,wanted)
+        self.assertEqual(frozen_terms(row)['payout_frequency'],'Daily')
+        self.assertEqual(commercial_plan(row)['payout_frequency'],'Daily')
+        self.assertEqual(plan_row(stored,stored['packages'][0])['payout_frequency'],'On Demand')
+
     def test_enabled_phase1_reset_saves_with_unchecked_blank_prices(self):
         config=defaults()['config'];package=config['plans'][0]['packages'][3]
         package.update(phase1_reset_enabled=True,phase1_reset_fee=14000,
