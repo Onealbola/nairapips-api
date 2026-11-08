@@ -7,11 +7,13 @@ from decimal import Decimal, InvalidOperation
 from flask import jsonify, request
 from progress_plan_bridge import is_managed
 
-FIELDS = {
+DB_FIELDS = {
     'name', 'description', 'status', 'fee', 'account_size', 'phase1_target',
     'phase2_target', 'max_drawdown', 'payout_split', 'reset_fee', 'funded_reset_fee',
-    'challenge_journey', 'drawdown_type', 'payout_cycles', 'product_category',
+    'challenge_journey', 'drawdown_type', 'payout_cycles', 'product_category', 'daily_drawdown', 'payout_frequency',
 }
+CONTROL_FIELDS = {'daily_drawdown_enabled', 'payout_schedule_enabled'} | {stage+suffix for stage in ('phase1','phase2','funded') for suffix in ('_reset_enabled','_reset_fee')}
+FIELDS = DB_FIELDS | CONTROL_FIELDS
 RULE_FIELDS = {'fee', 'reset_fee', 'phase1_target', 'phase2_target', 'max_drawdown', 'payout_split',
                'account_size', 'challenge_journey', 'drawdown_type', 'payout_cycles'}
 
@@ -46,7 +48,7 @@ def validated_plan(current, changes):
         validated_plan({}, release_fields)
     if 'product_category' in changes and changes['product_category'] not in {'standard', 'premium'}:
         raise ValueError('Choose Standard or Premium')
-    result = dict(changes)
+    result = {k:v for k,v in changes.items() if k in DB_FIELDS}
     if 'funded_reset_fee' in changes:
         from plan_commercial import money
         result['funded_reset_fee'] = None if changes['funded_reset_fee'] is None else money(changes['funded_reset_fee'])
@@ -79,6 +81,16 @@ def validated_plan(current, changes):
         raise ValueError('One-phase plans must have a zero Phase 2 target')
     if journey == 'two_phase' and float(result.get('phase2_target', row.get('phase2_target') or 0)) <= 0:
         raise ValueError('Two-phase plans need a positive Phase 2 target')
+    if CONTROL_FIELDS.intersection(changes) or ({'reset_fee','funded_reset_fee'}.intersection(changes) and '|np_risk_controls_v1:' in str(current.get('journey_source') or '')):
+        from plan_risk_controls import edit_plan_controls, daily_percent, daily_runtime_ready
+        updated = edit_plan_controls(current, changes)
+        for field in ('daily_drawdown','payout_frequency','journey_source','reset_fee','funded_reset_fee'):
+            if field in updated and updated.get(field) != current.get(field):
+                result[field] = updated[field]
+        if row.get('status') == 'active' and daily_percent(updated) > 0 and not daily_runtime_ready():
+            raise ValueError('Save daily limits on an inactive plan until all four broker workers are verified')
+    elif {'daily_drawdown','payout_frequency'}.intersection(changes):
+        raise ValueError('Use the daily limit and payout schedule checkboxes')
     return result
 
 
@@ -122,11 +134,12 @@ def register_catalog_controls(app, transport, url, key, require_admin, invalidat
         if error is not None:
             return error
         try:
-            plans = read('challenge_plans', {'select': 'id,updated_at,journey_source,' + ','.join(sorted(FIELDS)),
+            plans = read('challenge_plans', {'select': 'id,updated_at,journey_source,' + ','.join(sorted(DB_FIELDS)),
                                             'order': 'account_size.asc,id.asc', 'limit': '1001'})
             if len(plans) > 1000:
                 raise RuntimeError('Catalog too large for a complete edit view')
-            return jsonify(success=True, plans=[p for p in plans if not is_managed(p)])
+            from plan_risk_controls import plan_controls_view
+            return jsonify(success=True, plans=[plan_controls_view(p) for p in plans if not is_managed(p)])
         except Exception:
             return jsonify(success=False, error='The complete catalog could not be loaded'), 503
 
@@ -161,7 +174,8 @@ def register_catalog_controls(app, transport, url, key, require_admin, invalidat
             invalidate('public_plans_snapshot', 'plans_list', 'admin_bootstrap')
             audit('production_catalog', 'plan_configuration_update',
                   str({'plan_id': body['id'], 'changes': changes}), admin, str(body['id']))
-            return jsonify(success=True, plan={k: v for k, v in saved[0].items() if k in FIELDS | {'id', 'updated_at'}})
+            from plan_risk_controls import plan_controls_view
+            return jsonify(success=True, plan=plan_controls_view({k: v for k, v in saved[0].items() if k in DB_FIELDS | {'id', 'updated_at', 'journey_source'}}))
         except ValueError as exc:
             return jsonify(success=False, error=str(exc)), 400
         except Exception:

@@ -84,14 +84,14 @@ class ProgressTests(unittest.TestCase):
 
     def test_incompatible_draft_edit_closes_sales_and_can_be_reverted(self):
         self.save({self.identity:{'purchases_open':True}})
-        doc,_=self.matrix.read();x=doc['config']['plans'][0]['packages'][0];x['daily_drawdown']=10
+        doc,_=self.matrix.read();x=doc['config']['plans'][0]['packages'][0];x['daily_drawdown']=10;x['daily_drawdown_enabled']=True
         r=self.client.post('/admin/package_studio/plan_matrix',json=dict(revision=0,config=doc['config']))
         self.assertEqual(r.status_code,200,r.json)
         self.assertFalse(next(p for p in self.load().json['products'] if p['id']==self.identity)['purchases_open'])
         self.assertEqual(self.bridge.find(self.pid)['status'],'inactive')
         self.assertEqual(self.client.post('/create_challenge_purchase',json=dict(plan_id=self.pid,fee=10000)).status_code,403)
         self.assertFalse(readiness(self.allocation,dict(self.package,profit_cap=20))[0])
-        x['daily_drawdown']=0
+        x['daily_drawdown']=0;x['daily_drawdown_enabled']=False
         self.assertEqual(self.client.post('/admin/package_studio/plan_matrix',json=dict(revision=1,config=doc['config'])).status_code,200)
         self.assertEqual(self.bridge.find(self.pid)['status'],'active')
 

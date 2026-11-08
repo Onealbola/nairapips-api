@@ -33,7 +33,9 @@ def make_plan(identity,capital,base,model=None):
         ('share','More Share',1.2,5,60),('both','Both benefits',1.6,10,60)):
         variants.append(dict(key=key,name=name,enabled=True,price=math.ceil(base*multiple/50)*50,
             drawdown=dd,drawdown_type='STATIC',profit_share=share,profit_cap=15,daily_drawdown=0,
-            phase1_target=10,phase2_target=8,payout_mode='continuing'))
+            phase1_target=10,phase2_target=8,payout_mode='continuing',
+            daily_drawdown_enabled=False,payout_schedule_enabled=False,payout_frequency='Daily',phase1_reset_enabled=False,phase1_reset_fee=0,
+            phase2_reset_enabled=False,phase2_reset_fee=0,funded_reset_enabled=False,funded_reset_fee=0))
     plan=dict(id=identity,name='NGN '+format(capital,','),capital=capital,enabled=True,
         limits=dict(max_drawdown=10,max_profit_share=60,max_profit_cap=15),packages=variants)
     if model is not None:
@@ -98,7 +100,7 @@ def validate_config(config):
         kinds=set()
         for package in plan['packages']:
             fields(package,('key','name','enabled','price','drawdown','profit_share','profit_cap',
-                            'daily_drawdown','phase1_target','phase2_target','payout_mode') + (('drawdown_type',) if 'drawdown_type' in package else ()))
+                            'daily_drawdown','phase1_target','phase2_target','payout_mode') + tuple(k for k in ('drawdown_type','daily_drawdown_enabled','payout_schedule_enabled','payout_frequency','phase1_reset_enabled','phase1_reset_fee','phase2_reset_enabled','phase2_reset_fee','funded_reset_enabled','funded_reset_fee') if k in package))
             from equity_drawdown import mode
             if 'drawdown_type' in package and package['drawdown_type'] != mode(package['drawdown_type']):
                 raise ValueError('Choose STATIC or TRAILING')
@@ -110,10 +112,8 @@ def validate_config(config):
                 raise ValueError('Prices can have at most two decimal places')
             for key,low,high in [('drawdown',.1,30),('profit_share',1,100),('profit_cap',.1,30)]:
                 number(package[key],low,high)
-            if type(package['daily_drawdown']) not in (int,float) or package['daily_drawdown'] not in (0,10):
-                raise ValueError('Choose no separate daily rule or the 10% daily rule')
-            if package['drawdown']>20 and package['daily_drawdown']!=10:
-                raise ValueError('Drawdown above 20% requires the 10% daily rule')
+            from plan_risk_controls import selected_terms
+            selected_terms(package)
             for key in ('phase1_target','phase2_target'):
                 number(package[key],0,100)
             targets=(package['phase1_target'],package['phase2_target'])

@@ -1,51 +1,35 @@
-NAIRAPIPS STATIC / EQUITY TRAILING — 7 NOVEMBER 2026
-
-Static: starting capital minus the fixed naira loss allowance.
-Trailing: highest observed equity minus the SAME fixed naira allowance.
-Example: N1m, 10% DD, peak equity N1.2m -> breach at N1.1m.
-Includes open-trade profit. There is no breakeven cap; the floor never falls.
-Withdrawals do not lower the floor. Payout checks reserve the floor plus one kobo.
-New stage/reset accounts start separate journals. Existing accounts keep frozen terms.
+NAIRAPIPS STATIC / TRAILING / OPTIONAL DAILY LIMITS — 8 NOVEMBER 2026
 
 THIS IS A WINDOWS VPS UPDATE, NOT A CPANEL UPDATE.
-The API/editor can display/save Trailing before broker installation, but purchases
-and assignment stay blocked until the runtime verification setting is enabled.
-No existing account has been changed or activated by this release.
+No plan, sales checkbox, account terms or reset price is activated by installation.
 
-1. Extract this ZIP to a staging folder on the DD Windows VPS.
-2. Preserve all existing DD latch, relay and journal folders. Do not delete them.
-3. Double-click CHECK_ONLY.cmd on the VPS. It detects the exact DD worker from
-   running Python processes and verifies the release/checksums. It changes nothing.
-   Earlier setup folder: C:\Users\Administrator\Documents\nairapips_mt5_rotation_engine (1)
-   Fleet state/logs are separate: C:\NairaPips_DD_Fleet
-4. Review the detected worker path. Double-click INSTALL_UPDATE.cmd to back up
-   and install under the filename your existing supervisor already uses.
-   Multiple different running DD worker paths stop the installer without changes.
-   If the worker is not running, only the check can use the old setup folder;
-   installation then requires an explicitly confirmed -WorkerPath in PowerShell.
-5. Restart the existing DD supervisor only. Do not start a second supervisor or
-   change Operations/Target Engine, MT5 passwords, shard counts or assignments.
-6. Verify every shard's fresh dd_health_shard_XX.json reports:
-   NAIRAPIPS_DD_POLICE_STATIC_EQUITY_TRAILING_V1_20261107
-   Verify all existing Static accounts remain covered and normal close/relay
-   operation remains healthy. Never test by intentionally breaching a customer.
-7. The collector uses NP_EQUITY_TRAILING_INGEST_KEY when set; otherwise it uses
-   the existing NP_LIVE_STATE_INGEST_KEY. Configure the matching secret on the
-   main API and monitoring API as NP_EQUITY_TRAILING_INGEST_KEY. The live-state
-   service can keep its existing NP_LIVE_STATE_INGEST_KEY when reusing that key.
-   If you choose a separate trailing key, set NP_EQUITY_TRAILING_INGEST_KEY
-   consistently on the VPS and all three API services. Never paste keys in chat.
-8. Only after ALL shards and the matching server deployments are verified, set
-   NP_EQUITY_TRAILING_VERIFIED=NP_EQUITY_TRAILING_V1_20261107 on the main API.
-   The normal per-package purchase tick/untick controls still decide what sells.
-   Removing this verification setting closes NEW trailing purchases, while
-   monitoring on already-issued accounts continues.
+Static: starting capital minus the fixed naira loss allowance.
+Trailing: highest observed equity minus that same fixed naira allowance.
+Floating profit counts. The trailing floor never falls after a withdrawal/loss.
+Optional daily limits use today's broker trading net (fees included) plus current
+floating P/L, against starting capital. Deposits/withdrawals are excluded.
+The trading day changes at Nigeria midnight (UTC+1). A breach remains latched.
+Existing issued accounts retain their purchased rules; missing old history is
+never silently reconstructed or cleared.
 
-Journal storage: equity_dd_state beside the installed worker, or the existing
-NP_EQUITY_DD_JOURNAL_DIR override. Keep this directory through restarts/upgrades.
-A missing journal can initialize only within five minutes of assignment. An old
-account with missing/corrupt history requires verified recovery, never a reset.
+1. Extract this ZIP into a staging folder on the DD Windows VPS.
+2. Double-click CHECK_ONLY.cmd. Review the detected exact worker path.
+3. Double-click ROLL_UPDATE.cmd. It backs up code, installs the reviewed files,
+   then rolls one of the existing four workers at a time under its supervisor.
+   Each new shard must verify broker daily-history access before the next rolls.
+   The existing relay restarts last. Operations/Target and MT5 terminals stay up.
+   Keep the existing supervisor and Operations windows open/minimized.
+4. If the rollout pauses, keep its output and inspect the reported shard. Do
+   not start another supervisor or delete latch, journal, relay or state files.
+   The backup directory is printed. No automatic rollback erases stored state.
+5. Verify all four fresh health files report:
+   NAIRAPIPS_DD_POLICE_STATIC_TRAILING_DAILY_V1_20261108
+   and daily_history_probe_ready=true.
+   The APIs require all four authenticated shard capability signals before new
+   daily-limit purchases are allowed. Successful installation is recorded as a
+   technical capability; per-plan owner checkboxes still decide what sells.
 
-The installer does not stop processes, launch workers, touch terminals, change
-customer records, or open purchases. Windows broker operation must be verified
-on the VPS; Linux offline/browser checks are not a substitute for that check.
+The existing matching ingest keys remain required on the VPS and APIs. Do not
+paste secrets in chat. Broker verification cannot be replaced by Linux tests.
+Journal directory: equity_dd_state beside the worker or the existing override.
+Preserve it through every restart and upgrade.

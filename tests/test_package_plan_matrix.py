@@ -79,7 +79,7 @@ class MatrixTests(unittest.TestCase):
 
     def test_unsupported_targets_daily_rules_and_duplicate_sizes_rejected(self):
         mutators=[lambda c:c['plans'][0]['packages'][0].update(phase1_target=10,phase2_target=5),
-            lambda c:c['plans'][0]['packages'][0].update(drawdown=30,daily_drawdown=0),
+            lambda c:c['plans'][0]['packages'][0].update(drawdown=30,daily_drawdown=-1),
             lambda c:c['plans'][0]['packages'][0].update(profit_share=True),
             lambda c:c['plans'][0]['packages'][0].update(price=-1),
             lambda c:c['plans'][1].update(capital=500000),

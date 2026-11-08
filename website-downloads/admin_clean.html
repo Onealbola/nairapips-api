@@ -12211,15 +12211,15 @@ window.showCreatePlan = function(){
       <div><div class="kpi-sub">Plan Name *</div><input class="input" id="pl-name" placeholder="₦500,000 Account"></div>
       <div><div class="kpi-sub">Product Market</div><select class="select" id="pl-category" onchange="npLoadPlanCyclePreview('pl')"><option value="standard">Standard Plans</option><option value="premium">Premium Plans</option></select></div>
       <div><div class="kpi-sub">Display Order</div><input class="input" id="pl-category-sort" type="number" min="1" value="10"></div>
-      <div><div class="kpi-sub">Drawdown Type</div><select class="select" id="pl-drawdown-type"><option value="STATIC">STATIC</option><option value="TRAILING" disabled>TRAILING — not released</option></select></div>
-      <div><div class="kpi-sub">Payout Frequency</div><select class="select" id="pl-payout-frequency"><option value="Daily">Daily</option><option value="Weekly">Weekly</option><option value="Biweekly">Biweekly</option><option value="Monthly">Monthly</option><option value="On Demand">On Demand</option></select></div>
+      <div><div class="kpi-sub">Drawdown mode · Static / Trailing</div><select class="select" id="pl-drawdown-type"><option value="STATIC">STATIC</option><option value="TRAILING">TRAILING</option></select></div>
+      <div><label><input type="checkbox" id="pl-payout-enabled" > Apply payout schedule to new purchases</label></div><div><div class="kpi-sub">Payout Frequency</div><select class="select" id="pl-payout-frequency"><option value="Daily">Daily</option><option value="Weekly">Weekly</option><option value="Biweekly">Biweekly</option><option value="Monthly">Monthly</option><option value="On Demand">On Demand</option></select></div>
+      <div><label><input type="checkbox" id="pl-daily-enabled" > Apply daily drawdown</label><div class="kpi-sub">Daily drawdown %</div><input class="input" id="pl-daily" type="number" min="0" max="100" step="any" value="0"></div>
       <div><div class="kpi-sub">Account Size</div><input class="input" id="pl-size" type="number" placeholder="500000"></div>
       <div><div class="kpi-sub">Base Plan Fee</div><input class="input" id="pl-fee" type="number" placeholder="25000" oninput="npSyncFundedResetDoubleV152('pl')"></div>
       <div><div class="kpi-sub">MT5 Server</div><input class="input" id="pl-server" value="Exness-MT5Trial9"></div>
       <div><div class="kpi-sub">Phase 1 Target %</div><input class="input" id="pl-t1" type="number" placeholder="10"></div>
       <div><div class="kpi-sub">After Phase 1</div><select class="select" id="pl-route" onchange="npPlanRouteChanged('pl')"><option value="phase2">Continue to Phase 2</option><option value="funded">Move Directly to Funded (1-Phase)</option></select></div>
       <div id="pl-t2-wrap"><div class="kpi-sub">Phase 2 Target %</div><input class="input" id="pl-t2" type="number" placeholder="8"></div>
-      <div><div class="kpi-sub">Daily DD</div><input class="input" id="pl-ddd" type="text" value="None" placeholder="None" readonly></div>
       <div><div class="kpi-sub">Max DD %</div><input class="input" id="pl-tdd" type="number" placeholder="10"></div>
       <div><div class="kpi-sub">Payout Split %</div><input class="input" id="pl-split" type="number" min="0.01" max="100" step="0.01" placeholder="0.01–100"></div>
       ${npResetControl('pl','phase',0,0)}
@@ -12242,13 +12242,15 @@ window.createPlan = async function(){
     category_sort: Number(document.getElementById('pl-category-sort').value || 10),
     drawdown_type: document.getElementById('pl-drawdown-type').value,
     payout_frequency: document.getElementById('pl-payout-frequency').value,
+      payout_schedule_enabled: document.getElementById('pl-payout-enabled').checked,
+      daily_drawdown_enabled: document.getElementById('pl-daily-enabled').checked,
     payout_cycles: Number(document.getElementById('pl-cycles').value),
     account_size: Number(document.getElementById('pl-size').value),
     fee: Number(document.getElementById('pl-fee').value),
     phase1_target: Number(document.getElementById('pl-t1').value),
     challenge_journey:document.getElementById('pl-route').value==='funded'?'one_phase':'two_phase',
     phase2_target: document.getElementById('pl-route').value === 'funded' ? 0 : Number(document.getElementById('pl-t2').value || 8),
-    daily_drawdown: "None",
+    daily_drawdown: Number(document.getElementById('pl-daily').value || 0),
     max_drawdown: Number(document.getElementById('pl-tdd').value),
     payout_split: Number(document.getElementById('pl-split').value || 60),
     reset_fee: npResetValue('pl','phase'),
@@ -12275,15 +12277,15 @@ window.editPlan = function(id){
       <div><div class="kpi-sub">Plan Name</div><input class="input" id="epl-name" value="${esc(p.name||p.plan_name||'')}"></div>
       <div><div class="kpi-sub">Product Market</div><select class="select" id="epl-category" onchange="npLoadPlanCyclePreview('epl')"><option value="standard" ${String(p.product_category||'standard').toLowerCase()!=='premium'?'selected':''}>Standard Plans</option><option value="premium" ${String(p.product_category||'standard').toLowerCase()==='premium'?'selected':''}>Premium Plans</option></select></div>
       <div><div class="kpi-sub">Display Order</div><input class="input" id="epl-category-sort" type="number" min="1" value="${Number(p.category_sort||10)}"></div>
-      <div><div class="kpi-sub">Drawdown Type</div><select class="select" id="epl-drawdown-type"><option value="STATIC" ${String(p.drawdown_type||'STATIC').toUpperCase()==='STATIC'?'selected':''}>STATIC</option><option value="TRAILING" ${String(p.drawdown_type||'STATIC').toUpperCase()==='TRAILING'?'selected':''}>TRAILING</option></select></div>
-      <div><div class="kpi-sub">Payout Frequency</div><select class="select" id="epl-payout-frequency"><option value="Daily" ${String(p.payout_frequency||'Daily')==='Daily'?'selected':''}>Daily</option><option value="Weekly" ${String(p.payout_frequency||'Daily')==='Weekly'?'selected':''}>Weekly</option><option value="Biweekly" ${String(p.payout_frequency||'Daily')==='Biweekly'?'selected':''}>Biweekly</option><option value="Monthly" ${String(p.payout_frequency||'Daily')==='Monthly'?'selected':''}>Monthly</option><option value="On Demand" ${String(p.payout_frequency||'Daily')==='On Demand'?'selected':''}>On Demand</option></select></div>
+      <div><div class="kpi-sub">Drawdown mode · Static / Trailing</div><select class="select" id="epl-drawdown-type"><option value="STATIC" ${String(p.drawdown_type||'STATIC').toUpperCase()==='STATIC'?'selected':''}>STATIC</option><option value="TRAILING" ${String(p.drawdown_type||'STATIC').toUpperCase()==='TRAILING'?'selected':''}>TRAILING</option></select></div>
+      <div><label><input type="checkbox" id="epl-payout-enabled" ${String(p.journey_source||'').includes('|np_risk_controls_v1:') && String(p.payout_frequency||'On Demand')!=='On Demand'?'checked':''}> Apply payout schedule to new purchases</label></div><div><div class="kpi-sub">Payout Frequency</div><select class="select" id="epl-payout-frequency"><option value="Daily" ${String(p.payout_frequency||'Daily')==='Daily'?'selected':''}>Daily</option><option value="Weekly" ${String(p.payout_frequency||'Daily')==='Weekly'?'selected':''}>Weekly</option><option value="Biweekly" ${String(p.payout_frequency||'Daily')==='Biweekly'?'selected':''}>Biweekly</option><option value="Monthly" ${String(p.payout_frequency||'Daily')==='Monthly'?'selected':''}>Monthly</option><option value="On Demand" ${String(p.payout_frequency||'Daily')==='On Demand'?'selected':''}>On Demand</option></select></div>
+      <div><label><input type="checkbox" id="epl-daily-enabled" ${Number(p.daily_drawdown||0)>0?'checked':''}> Apply daily drawdown</label><div class="kpi-sub">Daily drawdown %</div><input class="input" id="epl-daily" type="number" min="0" max="100" step="any" value="${Number(p.daily_drawdown)||0}"></div>
       <div><div class="kpi-sub">Account Size</div><input class="input" id="epl-size" type="number" value="${p.account_size||p.size||0}"></div>
       <div><div class="kpi-sub">Base Plan Fee</div><input class="input" id="epl-fee" type="number" value="${p.fee||p.price||0}" oninput="npSyncFundedResetDoubleV152('epl')"></div>
       <div><div class="kpi-sub">MT5 Server</div><input class="input" id="epl-server" value="${esc(p.mt5_server||p.default_server||'')}"></div>
       <div><div class="kpi-sub">Phase 1 Target %</div><input class="input" id="epl-t1" type="number" value="${p.profit_target||p.phase1_target||0}"></div>
       <div><div class="kpi-sub">After Phase 1</div><select class="select" id="epl-route" onchange="npPlanRouteChanged('epl')"><option value="phase2" ${Number(p.phase2_target||0)>0?'selected':''}>Continue to Phase 2</option><option value="funded" ${Number(p.phase2_target||0)<=0?'selected':''}>Move Directly to Funded (1-Phase)</option></select></div>
       <div id="epl-t2-wrap" style="${Number(p.phase2_target||0)<=0?'display:none':''}"><div class="kpi-sub">Phase 2 Target %</div><input class="input" id="epl-t2" type="number" value="${p.phase2_target||8}"></div>
-      <div><div class="kpi-sub">Daily DD</div><input class="input" id="epl-ddd" type="text" value="None" readonly></div>
       <div><div class="kpi-sub">Max DD %</div><input class="input" id="epl-tdd" type="number" value="${p.max_drawdown||p.total_dd||0}"></div>
       <div><div class="kpi-sub">Payout Split %</div><input class="input" id="epl-split" type="number" min="0.01" max="100" step="0.01" value="${p.payout_split ?? 60}"></div>
       ${npResetControl('epl','phase',p.reset_fee,p.fee)}
@@ -12308,13 +12310,15 @@ window.savePlan = async function(id){
       category_sort: Number(document.getElementById('epl-category-sort').value || 10),
       drawdown_type: document.getElementById('epl-drawdown-type').value,
       payout_frequency: document.getElementById('epl-payout-frequency').value,
+      payout_schedule_enabled: document.getElementById('epl-payout-enabled').checked,
+      daily_drawdown_enabled: document.getElementById('epl-daily-enabled').checked,
       payout_cycles: document.getElementById('epl-cycles').value===''?null:Number(document.getElementById('epl-cycles').value),
       account_size: Number(document.getElementById('epl-size').value),
       fee: Number(document.getElementById('epl-fee').value),
       phase1_target: Number(document.getElementById('epl-t1').value),
       challenge_journey:document.getElementById('epl-route').value==='funded'?'one_phase':'two_phase',
       phase2_target: document.getElementById('epl-route').value === 'funded' ? 0 : Number(document.getElementById('epl-t2').value || 8),
-      daily_drawdown: "None",
+      daily_drawdown: Number(document.getElementById('epl-daily').value || 0),
       max_drawdown: Number(document.getElementById('epl-tdd').value),
       payout_split: Number(document.getElementById('epl-split').value || 60),
       reset_fee: npResetValue('epl','phase'),

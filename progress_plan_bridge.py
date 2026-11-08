@@ -24,13 +24,13 @@ def managed_id(source):
 
 def is_managed(plan):
     source = str(plan.get('journey_source') or '')
-    return source.startswith(PREFIX) and str(plan.get('id')) == managed_id(source)
+    return source.startswith(PREFIX) and str(plan.get('id')) == managed_id(source.split('|np_risk_controls_v1:',1)[0])
 
 
 def catalog_identity(plan):
     if not is_managed(plan):
         return None
-    return 'progress:' + plan['journey_source'][len(PREFIX):]
+    return 'progress:' + plan['journey_source'].split('|np_risk_controls_v1:',1)[0][len(PREFIX):]
 
 
 def readiness(plan, package):
@@ -39,27 +39,31 @@ def readiness(plan, package):
     from equity_drawdown import runtime_ready
     if package.get('drawdown_type','STATIC') == 'TRAILING' and not runtime_ready():
         return False, 'Equity Trailing requires the updated broker-side DD worker before purchases can open'
-    if package['daily_drawdown'] != 0:
-        return False, 'Set the daily rule to None; daily drawdown enforcement is not connected yet'
+    from plan_risk_controls import selected_terms, daily_runtime_ready
+    if float(selected_terms(package)['daily_drawdown']) > 0 and not daily_runtime_ready():
+        return False, 'Daily drawdown requires all four updated DD shards to be reporting'
     if package['profit_cap'] != 15:
         return False, 'Set the profit cap to 15%; other caps are not connected to settlement yet'
-    if package['drawdown'] > 20:
-        return False, 'This drawdown requires daily risk enforcement before it can be sold'
+    if package['drawdown'] > 20 and not (float(selected_terms(package)['daily_drawdown']) > 0 and daily_runtime_ready()):
+        return False, 'This drawdown requires verified daily risk enforcement before it can be sold'
     return True, ''
 
 
 def plan_row(plan, package, opened=False):
     source = PREFIX + plan['id'] + ':' + package['key']
+    from plan_risk_controls import selected_terms, freeze
+    terms = selected_terms(package)
+    frozen_source = freeze(source, terms) if float(terms['daily_drawdown']) > 0 or package.get('payout_schedule_enabled',False) or terms.get('resets') else source
     label={'two_phase':'Two-phase challenge','one_phase':'One-phase challenge','instant':'Instant funded account'}[model_of(plan)]
-    return dict(id=managed_id(source), journey_source=source,
+    return dict(id=managed_id(source), journey_source=frozen_source,
         name=(plan['name'] + ' · ' + package['name'])[:100],
         description=label+'. Continuing eligible funded payouts. No included resets or second life.',
         account_size=plan['capital'], fee=package['price'],
         phase1_target=package['phase1_target'], phase2_target=package['phase2_target'],
-        max_drawdown=package['drawdown'], daily_drawdown=package.get('daily_drawdown',0), drawdown_type=package.get('drawdown_type','STATIC'),
-        payout_split=package['profit_share'], payout_cycles=0, payout_frequency='Daily',
+        max_drawdown=package['drawdown'], daily_drawdown=float(terms['daily_drawdown']), drawdown_type=package.get('drawdown_type','STATIC'),
+        payout_split=package['profit_share'], payout_cycles=0, payout_frequency=terms['payout_frequency'],
         challenge_journey=list(route_for(plan)), product_category='standard',
-        reset_fee=0, funded_reset_fee=0, second_life_enabled=False, lives_total=1,
+        reset_fee=float(terms.get('resets',{}).get('phase1',0)), funded_reset_fee=float(terms.get('resets',{}).get('funded',0)), second_life_enabled=False, lives_total=1,
         status='active' if opened else 'inactive')
 
 
@@ -89,7 +93,9 @@ def offer_version(plan):
 
 def commercial_plan(plan):
     fee=float(plan['fee'])
-    return dict(plan, managed_progress=True, offer_version=offer_version(plan), base_fee=fee, fee=fee,
+    from plan_risk_controls import frozen_terms
+    frozen = frozen_terms(plan) or {}
+    return dict(plan, reset_stage_prices=frozen.get('resets',{}), managed_progress=True, offer_version=offer_version(plan), base_fee=fee, fee=fee,
         payout_cycles=0, payout_cycle_extra=0,
         cycle_options=[dict(cycles=0,available=True,extra=0,fee=fee)],default_cycles=0)
 
@@ -124,7 +130,7 @@ class ProgressPlanBridge:
                 if current and terms_match(current,wanted):continue
                 if current:
                     r=self.http.patch(self.url,headers=self.headers,
-                        params={'id':'eq.'+wanted['id'],'journey_source':'eq.'+wanted['journey_source']},json=wanted,timeout=(2,5))
+                        params={'id':'eq.'+wanted['id'],'journey_source':'eq.'+current['journey_source']},json=wanted,timeout=(2,5))
                 else:r=self.http.post(self.url,headers=self.headers,json=wanted,timeout=(2,5))
                 r.raise_for_status()
                 confirmed=self.find(wanted['id'])

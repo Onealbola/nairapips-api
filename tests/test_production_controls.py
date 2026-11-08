@@ -53,6 +53,38 @@ class ControlsTests(unittest.TestCase):
         for path in ['/create_challenge_purchase','/create_payout','/mark_payout_paid','/monitoring_update','/create_support_ticket','/update_challenge_plan','/delete_challenge_plan']:
             self.app.add_url_rule(path,path,lambda:self.actions.append(1) or jsonify(success=True),methods=['POST','OPTIONS'])
         self.client=self.app.test_client()
+    def test_per_stage_reset_controls_save_without_virtual_database_columns(self):
+        from plan_risk_controls import frozen_terms
+        response=self.client.post('/admin/production_catalog',json={'id':'p','updated_at':'v1','changes':{
+            'phase1_reset_enabled':False,'phase2_reset_enabled':True,'phase2_reset_fee':8750.5,
+            'funded_reset_enabled':False}})
+        self.assertEqual(response.status_code,200,response.get_json())
+        plan=response.get_json()['plan']
+        self.assertFalse(plan['phase1_reset_enabled'])
+        self.assertEqual(plan['phase2_reset_fee'],8750.5)
+        self.assertFalse(plan['funded_reset_enabled'])
+        patch=self.db.writes[-1][1]
+        self.assertNotIn('phase2_reset_enabled',patch)
+        self.assertNotIn('phase2_reset_fee',patch)
+        self.assertEqual(frozen_terms(self.db.rows['challenge_plans'][0])['resets'],{'phase2':'8750.5'})
+        loaded=self.client.get('/admin/production_catalog').get_json()['plans'][0]
+        self.assertEqual(loaded['phase2_reset_fee'],8750.5)
+        self.assertEqual(self.db.rows['challenge_purchases'],[])
+
+    def test_all_reset_stages_can_be_disabled_without_legacy_funded_fallback(self):
+        response=self.client.post('/admin/production_catalog',json={'id':'p','updated_at':'v1','changes':{
+            'phase1_reset_enabled':False,'phase2_reset_enabled':False,'funded_reset_enabled':False}})
+        self.assertEqual(response.status_code,200,response.get_json())
+        self.assertEqual(response.get_json()['plan']['funded_reset_fee'],0)
+        self.assertEqual(response.get_json()['plan']['reset_fee'],0)
+        self.assertFalse(response.get_json()['plan']['funded_reset_enabled'])
+
+    def test_reset_controls_require_positive_price_when_enabled(self):
+        response=self.client.post('/admin/production_catalog',json={'id':'p','updated_at':'v1','changes':{
+            'phase2_reset_enabled':True,'phase2_reset_fee':0}})
+        self.assertEqual(response.status_code,400)
+        self.assertEqual(self.db.writes,[])
+
     def test_committed_write_with_lost_response_is_confirmed_without_retry(self):
         original = self.db.post
         def lost_response(*args, **kwargs):

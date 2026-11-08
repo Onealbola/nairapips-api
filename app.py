@@ -3673,6 +3673,10 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
     )
     challenge_journey = _journey_source_value(_journey_for_lifecycle({"stage": stage}, purchase, plan, trader))
     journey_source = "purchase_or_plan_snapshot" if purchase_id else ("manual_plan_snapshot" if plan else "manual_unknown_legacy_default_review")
+    from plan_risk_controls import inherit, daily_percent, daily_runtime_ready
+    journey_source = inherit(journey_source, purchase if purchase_id else plan)
+    if daily_percent(purchase if purchase_id else plan) > 0 and not daily_runtime_ready():
+        raise ValueError("Daily drawdown assignment requires four updated DD shards")
     from equity_drawdown import mode, runtime_ready
     _risk_mode = mode((purchase or {}).get("drawdown_type") if purchase_id else (plan or {}).get("drawdown_type"))
     if _risk_mode == "TRAILING":
@@ -3740,7 +3744,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
             "status": "approved_active",
             "lifecycle_state": _active_state_for_stage(stage),
             "challenge_journey": challenge_journey,
-            "journey_source": ((purchase or {}).get("journey_source") if _np_is_managed_progress_plan(plan) else "assigned_account_snapshot"),
+            "journey_source": ((purchase or {}).get("journey_source") if _np_is_managed_progress_plan(plan) else __import__("plan_risk_controls").inherit("assigned_account_snapshot",purchase)),
             "trader_account_id": account.get("id"),
             "assigned_mt5_id": mt5.get("id"),
             "mt5_login": mt5.get("mt5_login"),
@@ -6242,7 +6246,7 @@ def recalculate_drawdown_usage():
                 continue
 
             from equity_drawdown import account_mode
-            if account_mode(account) == "TRAILING":
+            if account_mode(account) == "TRAILING" or __import__("plan_risk_controls").daily_percent(account) > 0:
                 skipped.append({"account_id": account.get("id"), "reason": "Trailing requires its durable observation history"})
                 continue
             dd_limit = _num(account.get("dd_limit_percent"), MAX_DRAWDOWN_LIMIT) or MAX_DRAWDOWN_LIMIT
@@ -10015,7 +10019,7 @@ def _np_plan_rule_snapshot_v156(plan):
     from plan_cycles import cycle_limit
     from plan_commercial import reset_price
     plan = plan or {}
-    return {
+    snapshot = {
         "product_category": _np_plan_category_v156(plan.get("product_category")),
         "drawdown_type": __import__("equity_drawdown").mode(plan.get("drawdown_type")),
         "payout_frequency": str(plan.get("payout_frequency") or "Daily").strip(),
@@ -10028,6 +10032,10 @@ def _np_plan_rule_snapshot_v156(plan):
         "funded_reset_fee": reset_price(plan, "funded"),
         "plan_snapshot_at": now_iso(),
     }
+
+    if __import__("plan_risk_controls").frozen_terms(plan):
+        snapshot["journey_source"] = plan["journey_source"]
+    return snapshot
 
 
 def _np_public_plan_snapshot_rows():
@@ -10224,6 +10232,7 @@ def create_plan():
              "funded_reset_fee":(None if d.get("funded_reset_fee") is None else _np_commercial_money(d["funded_reset_fee"])),
              "mt5_server":mt5_server,"default_server":d.get("default_server") or mt5_server,
              "status":d.get("status","inactive"),"created_at":now_iso(),"updated_at":now_iso()}
+        row = __import__("plan_risk_controls").edit_plan_controls(row, d)
         result = _NPRenewalRestQueryV211("challenge_plans").insert(row).execute().data
         np_invalidate("public_plans_snapshot", "plans_list", "admin_bootstrap")
         return ok(result, "Challenge plan created")
@@ -10262,7 +10271,14 @@ def update_plan():
         if "funded_reset_fee" in d:
             upd["funded_reset_fee"] = None if d["funded_reset_fee"] is None else _np_commercial_money(d["funded_reset_fee"])
 
-        upd["daily_drawdown"] = "None"
+        if {'daily_drawdown_enabled','payout_schedule_enabled','phase1_reset_enabled','phase2_reset_enabled','funded_reset_enabled','reset_fee','funded_reset_fee'}.intersection(d):
+            current_rows = _NPRenewalRestQueryV211('challenge_plans').select('*').eq('id',pid).limit(1).execute().data or []
+            if not current_rows:
+                return bad('Plan not found',404)
+            edited = __import__('plan_risk_controls').edit_plan_controls(current_rows[0],d)
+            for field in ('daily_drawdown','payout_frequency','journey_source','reset_fee','funded_reset_fee'):
+                if field in edited:
+                    upd[field] = edited[field]
         if "mt5_server" in d and "default_server" not in d:
             upd["default_server"] = d.get("mt5_server")
         if "default_server" in d and "mt5_server" not in d:
@@ -14634,12 +14650,12 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
     _trailing_state = None
     if active_account:
         _risk_purchase = None  # New trailing assignments carry immutable account mode metadata.
-        if account_mode(active_account) == "TRAILING":
+        if account_mode(active_account) == "TRAILING" or __import__("plan_risk_controls").daily_percent(active_account) > 0:
             __import__("equity_drawdown").verify_ingest(request)
             _observed = payload.get("timestamp") or payload.get("observed_at")
             _equity = payload.get("current_equity") if payload.get("current_equity") is not None else payload.get("equity")
             _trailing_state = DrawdownStateStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY).assess(
-                active_account, _risk_purchase, _equity, _observed, peak_equity=payload.get("trailing_highest_equity"))
+                active_account, _risk_purchase, _equity, _observed, peak_equity=payload.get("trailing_highest_equity"), balance=payload.get("current_balance", payload.get("balance")), daily_realised=payload.get("daily_realised"))
             if _trailing_state["last_observed_at"] != __import__("equity_drawdown").timestamp(_observed).isoformat():
                 return {"ignored": True, "reason": "out_of_order_trailing_observation"}
     account_start = _num(active_account.get("start_balance"), _num(active_account.get("account_size"), 0)) if active_account else 0
@@ -19070,7 +19086,7 @@ def _iam_process_account(account, force=False):
         return {"action": "skipped", "reason": "empty account"}
 
     from equity_drawdown import account_mode
-    if account_mode(account) == "TRAILING":
+    if account_mode(account) == "TRAILING" or __import__("plan_risk_controls").daily_percent(account) > 0:
         return {"account_id": account.get("id"), "action": "skipped", "reason": "equity_trailing_uses_durable_dd_authority"}
 
     status = str(account.get("account_status") or "").strip().lower()
@@ -27427,6 +27443,10 @@ def _np_reset_current_plan_for(account, purchase=None):
     exact = [r for r in active if exact_plan_id and str(r.get("id") or "") == exact_plan_id]
     if exact:
         return exact[0]
+
+    # New configurable offers never borrow reset terms from another product.
+    if __import__('plan_risk_controls').frozen_terms(purchase) or __import__('plan_risk_controls').frozen_terms(account):
+        return None
 
     # Legacy accounts without an active exact plan retain name/size resolution.
     same_name = [r for r in active if purchase_name and _row_name(r) == purchase_name]
@@ -58706,10 +58726,10 @@ def _np_v198_overlay_latest(row, trader_id="", batch_observations=None):
     if start > 0 and live_eq > 0:
         out["profit"] = live_eq - start
         out["profit_percent"] = ((live_eq - start) / start) * 100.0
-    if str(out.get("journey_source") or "").startswith("equity_trailing_v1:"):
+    if str(out.get("journey_source") or "").startswith("equity_trailing_v1:") or __import__("plan_risk_controls").daily_percent(out) > 0:
         from equity_drawdown import read_saved_state
         import requests, os
-        out["drawdown_type"] = "TRAILING"
+        out["drawdown_type"] = __import__("equity_drawdown").account_mode(out)
         try:
             state = read_saved_state(requests, os.environ["SUPABASE_URL"], os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["SUPABASE_KEY"], out, None)
             out.update(highest_equity=float(state["highest_equity"]), breach_equity_level=float(state["drawdown_floor"]),
@@ -58971,11 +58991,11 @@ def _np_verified_payout_quote(account, trader=None, snapshot=None, allow_stale=F
     from equity_drawdown import account_mode, read_saved_state
     try:
         risk_purchase = None
-        if account_mode(a) == "TRAILING":
+        if account_mode(a) == "TRAILING" or __import__("plan_risk_controls").daily_percent(a) > 0:
             state = read_saved_state(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, a, risk_purchase)
             if state["breached"] or (observed and __import__("equity_drawdown").timestamp(state["last_observed_at"]) < __import__("equity_drawdown").timestamp(observed)):
                 return unavailable
-            reserve = max(0, min(balance, equity) - float(state["drawdown_floor"]) - .01)
+            reserve = max(0, min(balance, equity) - float(state.get("overall_floor", state["drawdown_floor"])) - .01)
             available = min(available, max(0, __import__("math").floor(reserve*100)/100))
     except Exception:
         return unavailable
@@ -59526,7 +59546,7 @@ def _np_live_pass_proof_v214(account, snapshot, purchase, now=None):
             if a.get(key) is not None and float(a[key]) <= size * (1-dd/100):
                 return None
         from equity_drawdown import account_mode, read_saved_state
-        if account_mode(a, p) == "TRAILING":
+        if account_mode(a, p) == "TRAILING" or __import__("plan_risk_controls").daily_percent(a) > 0:
             import requests, os
             state = read_saved_state(requests, os.environ["SUPABASE_URL"], os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["SUPABASE_KEY"], a, p)
             if state["breached"] or equity <= float(state["drawdown_floor"]) or __import__("equity_drawdown").timestamp(state["last_observed_at"]) < __import__("equity_drawdown").timestamp(live["observed_at"]):
@@ -60183,7 +60203,33 @@ def np_drawdown_version_v233():
     import os
     return jsonify(success=True, release=RELEASE, modes=["STATIC", "TRAILING"], trailing_basis="highest_equity", trailing_sales_ready=runtime_ready(), issued_accounts_unchanged=True,
         collector_auth_configured=bool(os.environ.get("NP_EQUITY_TRAILING_INGEST_KEY") or os.environ.get("NP_LIVE_STATE_INGEST_KEY")),
-        runtime_verification_configured=os.environ.get("NP_EQUITY_TRAILING_VERIFIED")==RELEASE)
+        runtime_verification_configured=os.environ.get("NP_EQUITY_TRAILING_VERIFIED")==RELEASE,
+        plan_controls_release=__import__("plan_risk_controls").RELEASE,
+        daily_sales_ready=__import__("plan_risk_controls").daily_runtime_ready(),
+        optional_paid_resets=True, payout_schedules=list(__import__("plan_risk_controls").FREQUENCIES))
 
 from otp_capacity import install as _np_install_bounded_signup_email
 _np_install_bounded_signup_email(app)
+
+
+# Optional schedules apply only to immutable opt-ins on new purchases/accounts.
+_np_payout_eligibility_risk_controls_base = _payout_eligibility
+
+def _payout_eligibility(trader, requested_account_id=None):
+    eligible, reason, account = _np_payout_eligibility_risk_controls_base(trader, requested_account_id=requested_account_id)
+    from plan_risk_controls import frozen_terms, payout_due
+    try:
+        terms = frozen_terms(account)
+        if not account or not terms or terms['payout_frequency'] == 'On Demand':
+            return eligible, reason, account
+        purchases = _np_query_rows_v173('challenge_purchases', filters=[('eq','id',account['purchase_id']),('eq','trader_id',account['trader_id'])], limit=1)
+        if not purchases:
+            return False, 'Your purchased payout schedule could not be verified.', account
+        paid = _np_query_rows_v173('payouts', filters=[('eq','trader_account_id',account['id']),('eq','trader_id',account['trader_id']),('eq','status','paid')], limit=1000)
+        due = payout_due(account, purchases[0], paid)
+        if due and datetime.now(timezone.utc) < due:
+            out = dict(account, next_payout_at=due.isoformat(), payout_frequency=terms['payout_frequency'])
+            return False, 'Your next payout request opens on ' + due.astimezone(__import__('plan_risk_controls').WAT).strftime('%d %b %Y at %H:%M WAT') + '.', out
+        return eligible, reason, account
+    except Exception:
+        return False, 'Your purchased payout schedule could not be verified.', account

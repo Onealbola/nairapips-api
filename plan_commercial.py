@@ -84,6 +84,9 @@ def purchase_plan(plan, prices, cycles=DEFAULT_CYCLES):
     from equity_drawdown import mode, runtime_ready
     if mode(plan.get('drawdown_type'))=='TRAILING' and not runtime_ready():
         raise ValueError('Equity Trailing purchases require the verified DD worker update')
+    from plan_risk_controls import daily_percent, daily_runtime_ready
+    if daily_percent(plan) > 0 and not daily_runtime_ready():
+        raise ValueError('Daily drawdown requires all four updated DD shards to be reporting')
     if is_managed(plan):
         if cycles is not None and str(cycles) not in ("0", "3"):
             raise ValueError("This package includes continuing payouts; its cycle terms cannot be changed")
@@ -129,6 +132,10 @@ def resolve_purchase_plan(stores, plan_id, cycles=DEFAULT_CYCLES):
 def reset_price(plan, stage):
     if not plan:
         return 0.0
+    from plan_risk_controls import frozen_terms
+    terms = frozen_terms(plan)
+    if terms and 'resets' in terms:
+        return float(terms['resets'].get(stage,0))
     if stage != 'funded':
         return money(plan.get('reset_fee') or 0)
     value = plan.get('funded_reset_fee')
