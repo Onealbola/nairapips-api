@@ -111,6 +111,11 @@ def validate_config(config):
             fields(package,('key','name','enabled','price','drawdown','profit_share','profit_cap',
                             'daily_drawdown','phase1_target','phase2_target','payout_mode') + tuple(k for k in ('drawdown_type','daily_drawdown_enabled','payout_schedule_enabled','payout_frequency','phase1_reset_enabled','phase1_reset_fee','phase2_reset_enabled','phase2_reset_fee','funded_reset_enabled','funded_reset_fee','minimum_withdrawal_enabled','minimum_withdrawal','minimum_profit_enabled','minimum_profit_percent','profit_cap_enabled') if k in package))
             package.update(__import__('withdrawal_controls').normalize_inactive(package))
+            # An unchecked optional daily limit can be blank in the editor.
+            # Normalize only this copied draft; do not alter purchased risk terms.
+            daily=package.get('daily_drawdown')
+            if package.get('daily_drawdown_enabled',False) is False and (daily is None or (isinstance(daily,str) and not daily.strip())):
+                package['daily_drawdown']=0
             from equity_drawdown import mode
             if 'drawdown_type' in package and package['drawdown_type'] != mode(package['drawdown_type']):
                 raise ValueError('Choose STATIC or TRAILING')

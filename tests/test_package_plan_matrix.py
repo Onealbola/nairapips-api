@@ -21,6 +21,46 @@ class MatrixTests(unittest.TestCase):
         return self.client.post('/admin/package_studio/plan_matrix',json={
             'revision':revision,'config':c or defaults()['config'],**kwargs})
 
+    def test_disabled_blank_daily_limit_saves_without_enabling_it(self):
+        from progress_plan_bridge import plan_row
+        for blank in (None,'','   '):
+            with self.subTest(blank=blank):
+                config=defaults()['config'];package=config['plans'][2]['packages'][2]
+                package.update(daily_drawdown_enabled=False,daily_drawdown=blank,
+                    drawdown_type='TRAILING',drawdown=10,profit_share=70,
+                    minimum_withdrawal_enabled=False,minimum_withdrawal=10,
+                    minimum_profit_enabled=True,minimum_profit_percent=10,
+                    profit_cap_enabled=True,profit_cap=10,
+                    payout_schedule_enabled=True,payout_frequency='Daily')
+                normalized=validate_config(config)
+                stored=normalized['plans'][2]['packages'][2]
+                self.assertFalse(stored['daily_drawdown_enabled'])
+                self.assertEqual(stored['daily_drawdown'],0)
+                self.assertEqual(stored['payout_frequency'],'Daily')
+                self.assertEqual(stored['minimum_profit_percent'],10)
+                self.assertEqual(stored['drawdown_type'],'TRAILING')
+                self.assertEqual(package['daily_drawdown'],blank)
+                self.assertEqual(plan_row(normalized['plans'][2],stored)['daily_drawdown'],0)
+        config=defaults()['config'];config['plans'][2]['packages'][2].update(daily_drawdown_enabled=False,daily_drawdown=None)
+        response=self.save(config)
+        self.assertEqual(response.status_code,200,response.json)
+        stored=self.store.read(fresh=True)[0]['config']['plans'][2]['packages'][2]
+        self.assertEqual(stored['daily_drawdown'],0)
+        self.assertFalse(stored['daily_drawdown_enabled'])
+
+    def test_enabled_blank_daily_limit_is_rejected_and_off_value_is_remembered(self):
+        config=defaults()['config'];package=config['plans'][2]['packages'][2]
+        package.update(daily_drawdown_enabled=True,daily_drawdown=None)
+        response=self.save(config)
+        self.assertEqual(response.status_code,400)
+        self.assertIn('More Share',response.json['error'])
+        self.assertIn('daily drawdown',response.json['error'])
+        self.assertEqual(self.db.rows['package_studio_private_settings'],[])
+        package.update(daily_drawdown_enabled=False,daily_drawdown=5)
+        stored=validate_config(config)['plans'][2]['packages'][2]
+        self.assertEqual(stored['daily_drawdown'],5)
+        self.assertFalse(stored['daily_drawdown_enabled'])
+
     def test_daily_schedule_survives_save_reload_and_public_plan_translation(self):
         from progress_plan_bridge import plan_row,commercial_plan
         from plan_risk_controls import frozen_terms
