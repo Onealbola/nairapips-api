@@ -67,3 +67,13 @@ verifies the updated Operations engine and sets technical environment flag
 NP_PLAN_WITHDRAWAL_VERIFIED=NP_WITHDRAWAL_RULES_V1_20261108 on the main API.
 This is installation readiness, not a product setting. Minimum-only rules with
 the existing 15% cap require no Operations code change to enforce withdrawals.
+
+
+Verified Operations installations can also be recorded in the existing private
+settings table under withdrawal_controls_runtime_v1. The readiness check is
+read-only: it requires enabled=true, the expected release and exact Operations
+engine SHA256, plus a valid verification timestamp. This records installation
+readiness after the owner has installed the checksum-checked update and shown a
+fresh successful broker scan. It never enables a product or changes a price.
+Revoking the record blocks new custom-cap sales; issued protection continues.
+The explicit Render verification flag remains supported for compatibility.

@@ -1,31 +1,34 @@
-"""Current business-wide funded profit policy; custom-cap add-ons are unreleased."""
+"""Enforce purchased per-plan caps; unmarked legacy accounts retain 15%."""
 from decimal import Decimal,InvalidOperation,ROUND_DOWN
 from functools import wraps
 from flask import request,jsonify
 
 CAP_PERCENT=15
-RELEASE='global-funded-profit-cap-15-2026-10-24'
+RELEASE='purchased-plan-profit-cap-2026-11-08'
 
-def maximum_payout(capital,split):
+def maximum_payout(capital,split,cap_percent=CAP_PERCENT):
     try:
         c,s=Decimal(str(capital)),Decimal(str(split))
         if not c.is_finite() or not s.is_finite() or c<=0 or not 0<s<=100:raise ValueError()
-        return (c*Decimal(CAP_PERCENT)/100*s/100).quantize(Decimal('.01'),rounding=ROUND_DOWN)
+        if cap_percent is None:return Decimal('Infinity')
+        cap=Decimal(str(cap_percent))
+        if not cap.is_finite() or not 0<cap<=100:raise ValueError()
+        return (c*cap/100*s/100).quantize(Decimal('.01'),rounding=ROUND_DOWN)
     except (ValueError,InvalidOperation,TypeError):raise ValueError('Funded capital and payout share must be verified before payment.')
 
-def validate_payout(value,capital,split):
-    limit=maximum_payout(capital,split)
+def validate_payout(value,capital,split,cap_percent=CAP_PERCENT):
+    limit=maximum_payout(capital,split,cap_percent)
     try:
         n=Decimal(str(value))
         if not n.is_finite() or n<=0:raise ValueError()
     except (ValueError,InvalidOperation,TypeError):raise ValueError('A valid payout amount is required.')
-    if n>limit:raise ValueError('Business profit cap is 15% per funded cycle. Maximum trader payout for this account is '+format(limit,'.2f')+'. This request cannot be approved or paid above that amount.')
+    if n>limit:raise ValueError('Purchased profit cap is '+str(cap_percent)+'% per funded cycle. Maximum trader payout for this account is '+format(limit,'.2f')+'. This request cannot be approved or paid above that amount.')
     return limit
 
 def register_profit_policy(app,runtime):
     @app.get('/funded_profit_policy')
     def funded_profit_policy():
-        return jsonify(success=True,release=RELEASE,gross_profit_cap_percent=CAP_PERCENT,scope='all_funded_accounts',paid_custom_caps_available=False)
+        return jsonify(success=True,release=RELEASE,gross_profit_cap_percent=CAP_PERCENT,scope='purchased_plan_with_legacy_default',paid_custom_caps_available=False,owner_configured_caps=True,custom_caps_ready=__import__('withdrawal_controls').ready())
     def protect(base,action):
         @wraps(base)
         def guarded(*args,**kwargs):
@@ -52,7 +55,7 @@ def register_profit_policy(app,runtime):
                     account=accounts[0] if accounts else None;value=payout.get('amount')
                 if not account or str(account.get('trader_id'))!=str(tid):raise ValueError('Exact funded account ownership must be verified.')
                 split=runtime['_np_plan_payout_split_for_account'](account,{'id':tid},{})
-                validate_payout(value,account.get('start_balance') or account.get('account_size'),split)
+                validate_payout(value,account.get('start_balance') or account.get('account_size'),split,__import__('withdrawal_controls').cap_percent(account))
             except ValueError as exc:return runtime['bad'](str(exc),409)
             except Exception:return runtime['bad']('Business profit-cap verification is unavailable. No payout was authorized.',503)
             return base(*args,**kwargs)

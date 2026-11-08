@@ -27085,27 +27085,28 @@ def _np_ops_build():
                     evidence={"last_sync_at": a.get("last_sync_at"), "updated_at": a.get("updated_at")}
                 ))
 
-        # Funded 15% gross profit liability ceiling.
+        # Purchased funded gross-profit ceiling; legacy accounts retain 15%.
         if _np_ops_stage(a) == "funded" and active:
             start = clean(a.get("start_balance") or a.get("account_size") or 0)
             eq = clean(a.get("current_equity") or a.get("current_balance") or start)
             pct = ((eq - start) / start * 100.0) if start > 0 else 0.0
-            if pct >= 15:
+            cap = __import__('withdrawal_controls').cap_percent(a)
+            if cap is not None and pct >= float(cap):
                 actions.append(_np_ops_make_action(
-                    "critical", "money", "FUNDED_15_PERCENT_CAP_REACHED",
-                    "Funded 15% gross-profit ceiling reached",
+                    "critical", "money", "FUNDED_15_PERCENT_CAP_REACHED" if cap == 15 else "FUNDED_PLAN_CAP_REACHED",
+                    f"Funded {cap}% gross-profit ceiling reached",
                     trader, account=a,
                     happened=f"Funded MT5 {a.get('mt5_login') or '—'} is at {round(pct,2)}% gross profit.",
-                    required="Trading must stop at the funded-cycle cap; payout liability is capped at 15% gross profit and split remains 60/40.",
+                    required=f"Trading must stop at the purchased {cap}% funded-cycle cap. Honor the purchased trader profit split.",
                     evidence={"start_balance": start, "current_equity": eq, "gross_profit_percent": round(pct,2)}
                 ))
-            elif pct >= 13.5:
+            elif cap is not None and pct >= float(cap) * .9:
                 actions.append(_np_ops_make_action(
                     "money", "money", "FUNDED_CAP_NEAR",
-                    "Funded account approaching 15% ceiling",
+                    f"Funded account approaching {cap}% ceiling",
                     trader, account=a,
                     happened=f"Funded MT5 {a.get('mt5_login') or '—'} is at {round(pct,2)}% gross profit.",
-                    required="Watch closely; engine should stop the cycle at 15%.",
+                    required=f"Watch closely; engine should stop the cycle at the purchased {cap}% cap.",
                     evidence={"gross_profit_percent": round(pct,2)}
                 ))
 

@@ -21,3 +21,26 @@ class PolicyTests(unittest.TestCase):
    self.assertEqual(calls,[])
    payout['amount']=45000;self.assertEqual(c.post('/approve_payout',json={'id':'p'}).status_code,200)
 if __name__=='__main__':unittest.main()
+
+class PurchasedPolicyTests(unittest.TestCase):
+ def test_custom_cap_and_disabled_cap_do_not_keep_legacy_fifteen_ceiling(self):
+  self.assertEqual(validate_payout(60000,500000,60,20),60000)
+  with self.assertRaises(ValueError):validate_payout(60000.01,500000,60,20)
+  self.assertEqual(validate_payout(100000,500000,60,None),__import__('decimal').Decimal('Infinity'))
+ def test_all_financial_endpoints_use_the_exact_accounts_purchased_cap(self):
+  from withdrawal_controls import edit
+  app=Flask(__name__);calls=[]
+  for endpoint in ['create_payout','approve_payout','mark_paid']:
+   app.add_url_rule('/'+endpoint,endpoint,lambda:calls.append('mutation') or {'success':True},methods=['POST'])
+  account=edit({'id':'a','trader_id':'t','start_balance':500000},{'profit_cap_enabled':True,'profit_cap':20})
+  payout={'id':'p','trader_id':'t','trader_account_id':'a','amount':60000,'status':'pending'}
+  runtime={'bad':lambda msg,code:(app.json.response(error=msg),code),'_require_admin':lambda:({},None),'_authenticated_trader_id_for_request':lambda x:('t',None),'get_trader_by_id':lambda x:{'id':x},'_payout_eligibility':lambda *a,**k:(True,'ok',account),'_np_plan_payout_split_for_account':lambda *a:60,'_np_query_rows_v173':lambda table,**kw:[payout] if table=='payouts' else [account]}
+  register_profit_policy(app,runtime)
+  with app.test_client() as c:
+   for endpoint in ['create_payout','approve_payout','mark_paid']:
+    self.assertEqual(c.post('/'+endpoint,json={'id':'p','amount':60000,'trader_id':'t'}).status_code,200)
+   self.assertEqual(len(calls),3)
+   account.update(edit(account,{'profit_cap_enabled':True,'profit_cap':5}))
+   self.assertEqual(c.post('/approve_payout',json={'id':'p'}).status_code,409)
+   account.update(edit(account,{'profit_cap_enabled':False}))
+   self.assertEqual(c.post('/approve_payout',json={'id':'p'}).status_code,200)

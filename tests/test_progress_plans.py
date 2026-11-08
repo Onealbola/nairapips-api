@@ -90,7 +90,9 @@ class ProgressTests(unittest.TestCase):
         self.assertFalse(next(p for p in self.load().json['products'] if p['id']==self.identity)['purchases_open'])
         self.assertEqual(self.bridge.find(self.pid)['status'],'inactive')
         self.assertEqual(self.client.post('/create_challenge_purchase',json=dict(plan_id=self.pid,fee=10000)).status_code,403)
-        self.assertFalse(readiness(self.allocation,dict(self.package,profit_cap=20))[0])
+        from unittest.mock import patch
+        with patch('withdrawal_controls.ready',return_value=False):
+            self.assertFalse(readiness(self.allocation,dict(self.package,profit_cap=20))[0])
         x['daily_drawdown']=0;x['daily_drawdown_enabled']=False
         self.assertEqual(self.client.post('/admin/package_studio/plan_matrix',json=dict(revision=1,config=doc['config'])).status_code,200)
         self.assertEqual(self.bridge.find(self.pid)['status'],'active')
