@@ -60159,4 +60159,7 @@ _np_install_business_email_delivery(app, globals())
 @app.get("/drawdown_version")
 def np_drawdown_version_v233():
     from equity_drawdown import RELEASE, runtime_ready
-    return jsonify(success=True, release=RELEASE, modes=["STATIC", "TRAILING"], trailing_basis="highest_equity", trailing_sales_ready=runtime_ready(), issued_accounts_unchanged=True)
+    import os
+    return jsonify(success=True, release=RELEASE, modes=["STATIC", "TRAILING"], trailing_basis="highest_equity", trailing_sales_ready=runtime_ready(), issued_accounts_unchanged=True,
+        collector_auth_configured=bool(os.environ.get("NP_EQUITY_TRAILING_INGEST_KEY") or os.environ.get("NP_LIVE_STATE_INGEST_KEY")),
+        runtime_verification_configured=os.environ.get("NP_EQUITY_TRAILING_VERIFIED")==RELEASE)
