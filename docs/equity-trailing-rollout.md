@@ -39,8 +39,10 @@ Dashboard responses show the saved mode and floor for a future trailing account.
 
 The cloud API updates are independent of the Windows DD installation. The
 Windows worker is delivered in `NairaPips-Static-Trailing-DD-Update.zip` with a
-check-only-first PowerShell installer, backups and SHA256 checksums. It has not
-been run on the VPS from this workspace. No broker session was started here.
+check-only-first PowerShell installer, backups and SHA256 checksums. The owner installed it on the Windows VPS with guided checks. All four shards
+reported the new release and ten valid accounts reported monitoring readiness.
+The remaining expired account is intentionally unchanged. No broker session was
+started from this workspace.
 
 The collector authentication secret must match the main API, monitoring API and
 live-state service. Existing `NP_LIVE_STATE_INGEST_KEY` may be reused; the dedicated
@@ -57,3 +59,20 @@ not rewrite or disable risk monitoring on already-issued accounts.
 No new product, feature flag, purchase switch or account has been activated by
 this development. The existing custom-contract package builder retains its other
 release blockers; this update does not silently release it.
+
+## Final verification, 8 November 2026
+
+The live-state health response confirms the current Static/Trailing release and
+collector configuration. The owner configured the same collector value in the
+main and monitoring services; both public version endpoints now confirm presence.
+Presence is not proof of matching values. An authenticated POST to
+`/drawdown_version` on either API verifies the actual deployed credential using
+the same `verify_ingest` function as trailing ingestion. It performs no account,
+journal, broker or commercial writes and returns no secret. GET remains public
+and backward compatible. Missing/incorrect keys fail with 403; responses are
+not cached. The operator can run this check from the live-state Render Shell,
+using its existing environment variable without displaying or copying the key.
+
+Until that authenticated check and the remaining runtime checks are confirmed,
+the verification flag remains unset and trailing sales remain blocked. No live
+trailing customer or broker execution test has been performed.

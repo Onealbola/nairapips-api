@@ -60156,8 +60156,20 @@ _np_install_business_email(app, globals())
 from business_email_delivery import install as _np_install_business_email_delivery
 _np_install_business_email_delivery(app, globals())
 
-@app.get("/drawdown_version")
+@app.route("/drawdown_version", methods=["GET", "POST"])
 def np_drawdown_version_v233():
+    # POST verifies the deployed collector credential without reading or writing accounts.
+    if request.method == "POST":
+        from equity_drawdown import RELEASE, verify_ingest
+        try:
+            verify_ingest(request)
+        except ValueError:
+            response = jsonify(success=False, collector_auth_verified=False)
+            response.headers["Cache-Control"] = "no-store"
+            return response, 403
+        response = jsonify(success=True, release=RELEASE, collector_auth_verified=True)
+        response.headers["Cache-Control"] = "no-store"
+        return response
     from equity_drawdown import RELEASE, runtime_ready
     import os
     return jsonify(success=True, release=RELEASE, modes=["STATIC", "TRAILING"], trailing_basis="highest_equity", trailing_sales_ready=runtime_ready(), issued_accounts_unchanged=True,
