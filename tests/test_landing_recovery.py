@@ -11,7 +11,8 @@ class HomepageRecoveryTests(unittest.TestCase):
   with zipfile.ZipFile(io.BytesIO(reply.data)) as z:
    self.assertEqual(set(z.namelist()),{'restore-landing.php','.np-landing-files/landing-catalogue.js'})
    script=z.read('.np-landing-files/landing-catalogue.js')
-   self.assertEqual(script,Path('website-downloads/account-plan-selector.js').read_bytes()+b'\n'+Path('website-downloads/landing-catalogue-sync.js').read_bytes())
+   from landing_bundle import build_landing_bundle
+   self.assertEqual(script,build_landing_bundle('website-downloads').encode())
    self.assertIn(hashlib.sha256(script).hexdigest().encode(),z.read('restore-landing.php'))
    self.assertNotIn(b'PAYLOAD_SHA256',z.read('restore-landing.php'))
   reply.close()

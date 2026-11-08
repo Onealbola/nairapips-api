@@ -9,6 +9,10 @@ RELEASE='hosted-admin-mobile-navigation-2026-10-22'
 
 def register_panel_delivery(app, root=None):
     assets=Path(root) if root else Path(__file__).resolve().parent/'website-downloads'
+    @app.get('/public/nairapips-gold-architecture.png')
+    def luxury_architecture_asset():
+        return send_file(assets/'nairapips-gold-architecture.png',mimetype='image/png',max_age=86400)
+
     @app.get('/public/nairapips-luxury-concept.png')
     def luxury_concept_image():
         response=send_file(assets/'nairapips-luxury-concept.png',mimetype='image/png',conditional=False,etag=False,max_age=0)
@@ -36,7 +40,8 @@ def register_panel_delivery(app, root=None):
 
     @app.get('/public/landing-catalogue.js')
     def landing_catalogue_script():
-        r=make_response((assets/'account-plan-selector.js').read_text()+'\n'+(assets/'landing-catalogue-sync.js').read_text());r.mimetype='application/javascript'
+        from landing_bundle import build_landing_bundle
+        r=make_response(build_landing_bundle(assets));r.mimetype='application/javascript'
         r.headers['Cache-Control']='no-store, max-age=0'
         r.headers['X-Content-Type-Options']='nosniff'
         return r
