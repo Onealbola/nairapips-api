@@ -87,3 +87,20 @@ class WithdrawalTests(unittest.TestCase):
   patch=validated_plan(dict(status='inactive',phase2_target=0,account_size=1000000,payout_split=60),dict(minimum_withdrawal_enabled=True,minimum_withdrawal=5000))
   self.assertEqual(set(patch),{'journey_source'})
   self.assertTrue(w.read(patch)['minimum_withdrawal_enabled'])
+ def test_unchecked_blank_minimums_do_not_require_a_withdrawal_value(self):
+  for blank in (None,'','   '):
+   row=w.selected(dict(minimum_withdrawal_enabled=False,minimum_withdrawal=blank,minimum_profit_enabled=False,minimum_profit_percent=blank,profit_cap=15))
+   self.assertEqual(row['minimum_withdrawal'],'0');self.assertEqual(row['minimum_profit_percent'],'0')
+   with self.assertRaisesRegex(ValueError,'Minimum withdrawal amount'):
+    w.selected(dict(minimum_withdrawal_enabled=True,minimum_withdrawal=blank))
+ def test_another_packages_invalid_active_value_names_its_account_and_field(self):
+  config=defaults()['config'];package=config['plans'][1]['packages'][2]
+  package.update(minimum_withdrawal_enabled=True,minimum_withdrawal=None)
+  with self.assertRaisesRegex(ValueError,'NGN 1,000,000 / More Share.*Minimum withdrawal amount'):
+   validate_config(config)
+ def test_disabled_null_draft_values_are_normalized_without_mutating_unsaved_input(self):
+  config=defaults()['config'];package=config['plans'][1]['packages'][2]
+  package.update(minimum_withdrawal_enabled=False,minimum_withdrawal=None,minimum_profit_enabled=False,minimum_profit_percent=None)
+  saved=validate_config(config);stored=saved['plans'][1]['packages'][2]
+  self.assertEqual(stored['minimum_withdrawal'],0);self.assertEqual(stored['minimum_profit_percent'],0)
+  self.assertIsNone(package['minimum_withdrawal'])

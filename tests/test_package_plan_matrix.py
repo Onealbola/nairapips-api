@@ -21,6 +21,32 @@ class MatrixTests(unittest.TestCase):
         return self.client.post('/admin/package_studio/plan_matrix',json={
             'revision':revision,'config':c or defaults()['config'],**kwargs})
 
+    def test_cap_and_weekly_payout_save_with_both_minimums_off_and_blank(self):
+        config=defaults()['config'];package=config['plans'][0]['packages'][0]
+        package.update(minimum_withdrawal_enabled=False,minimum_withdrawal=None,
+                       minimum_profit_enabled=False,minimum_profit_percent=None,
+                       profit_cap_enabled=True,profit_cap=15,
+                       payout_schedule_enabled=True,payout_frequency='Weekly')
+        response=self.save(config)
+        self.assertEqual(response.status_code,200,response.json)
+        stored=self.store.read(fresh=True)[0]['config']['plans'][0]['packages'][0]
+        self.assertFalse(stored['minimum_withdrawal_enabled'])
+        self.assertFalse(stored['minimum_profit_enabled'])
+        self.assertEqual(stored['minimum_withdrawal'],0)
+        self.assertEqual(stored['minimum_profit_percent'],0)
+        self.assertEqual(stored['profit_cap'],15)
+        self.assertEqual(stored['payout_frequency'],'Weekly')
+        self.assertIsNone(package['minimum_withdrawal'])
+
+    def test_hidden_package_validation_identifies_account_and_enabled_field(self):
+        config=defaults()['config'];package=config['plans'][2]['packages'][3]
+        package.update(minimum_withdrawal_enabled=True,minimum_withdrawal=None)
+        response=self.save(config)
+        self.assertEqual(response.status_code,400)
+        self.assertIn('NGN 2,000,000 / Both benefits',response.json['error'])
+        self.assertIn('Minimum withdrawal amount',response.json['error'])
+        self.assertEqual(self.db.rows['package_studio_private_settings'],[])
+
     def test_drawdown_type_round_trips_and_invalid_modes_are_rejected(self):
         c=defaults()['config'];c['plans'][0]['packages'][0]['drawdown_type']='TRAILING'
         r=self.save(c);self.assertEqual(r.status_code,200,r.json)

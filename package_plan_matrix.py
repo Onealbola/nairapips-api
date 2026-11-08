@@ -77,8 +77,16 @@ def availability(plan,package):
     return dict(available=not reasons,reasons=reasons)
 
 
+def package_number(plan,package,key,low,high):
+    labels={'price':'Complete fee','drawdown':'Maximum drawdown %','profit_share':'Trader profit share %','profit_cap':'Gross profit cap %','phase1_target':'Phase 1 target %','phase2_target':'Phase 2 target %'}
+    try:number(package[key],low,high)
+    except ValueError as exc:
+        raise ValueError(str(plan['name'])+' / '+str(package['name'])+' — '+labels.get(key,key)+': '+str(exc)) from exc
+
+
 def validate_config(config):
     fields(config,('schema','plans'))
+    config=copy.deepcopy(config)
     if config['schema']!=SCHEMA:raise ValueError('Unsupported plan-matrix version')
     if not isinstance(config['plans'],list) or not 1<=len(config['plans'])<=30:
         raise ValueError('Keep between 1 and 30 account sizes')
@@ -102,22 +110,26 @@ def validate_config(config):
         for package in plan['packages']:
             fields(package,('key','name','enabled','price','drawdown','profit_share','profit_cap',
                             'daily_drawdown','phase1_target','phase2_target','payout_mode') + tuple(k for k in ('drawdown_type','daily_drawdown_enabled','payout_schedule_enabled','payout_frequency','phase1_reset_enabled','phase1_reset_fee','phase2_reset_enabled','phase2_reset_fee','funded_reset_enabled','funded_reset_fee','minimum_withdrawal_enabled','minimum_withdrawal','minimum_profit_enabled','minimum_profit_percent','profit_cap_enabled') if k in package))
+            package.update(__import__('withdrawal_controls').normalize_inactive(package))
             from equity_drawdown import mode
             if 'drawdown_type' in package and package['drawdown_type'] != mode(package['drawdown_type']):
                 raise ValueError('Choose STATIC or TRAILING')
             if package['key'] not in KINDS or package['key'] in kinds:
                 raise ValueError('Each account size needs Basic, More Room, More Share and Both exactly once')
             kinds.add(package['key']);text(package['name'],60);boolean(package['enabled'])
-            number(package['price'],50,1e8)
+            package_number(plan,package,'price',50,1e8)
             if round(package['price']*100,6)!=round(package['price']*100):
                 raise ValueError('Prices can have at most two decimal places')
             for key,low,high in [('drawdown',.1,30),('profit_share',1,100),('profit_cap',.1,30)]:
-                number(package[key],0 if key=='profit_cap' and package.get('profit_cap_enabled') is False else low,high)
+                package_number(plan,package,key,0 if key=='profit_cap' and package.get('profit_cap_enabled') is False else low,high)
             from plan_risk_controls import selected_terms
-            selected_terms(package)
-            __import__('withdrawal_controls').selected(dict(package,account_size=plan['capital'],payout_split=package['profit_share']))
+            try:
+                selected_terms(package)
+                __import__('withdrawal_controls').selected(dict(package,account_size=plan['capital'],payout_split=package['profit_share']))
+            except ValueError as exc:
+                raise ValueError(str(plan['name'])+' / '+str(package['name'])+' — '+str(exc)) from exc
             for key in ('phase1_target','phase2_target'):
-                number(package[key],0,100)
+                package_number(plan,package,key,0,100)
             targets=(package['phase1_target'],package['phase2_target'])
             if model_of(plan)=='two_phase' and targets not in ((8,5),(10,8)):
                 raise ValueError('Choose either 8% / 5% or 10% / 8% as a complete target pair')
