@@ -7343,7 +7343,10 @@ def send_email_otp():
         expires_at = datetime.fromtimestamp(time.time() + 10 * 60, tz=timezone.utc).isoformat()
         row = {'email': email, 'code': code, 'verified': False, 'expires_at': expires_at, 'created_at': now_iso()}
         try:
-            supabase.table('email_verification_codes').insert(row).execute()
+            _otp_response = requests.post(SUPABASE_URL.rstrip('/') + '/rest/v1/email_verification_codes',
+                headers={'apikey': SUPABASE_KEY, 'Authorization': 'Bearer ' + SUPABASE_KEY,
+                         'Prefer': 'return=minimal'}, json=row, timeout=(2, 4))
+            _otp_response.raise_for_status()
         except Exception as e:
             print("EMAIL OTP INSERT ERROR:", str(e))
             return bad("Email OTP save failed: " + str(e), 500)
@@ -60181,3 +60184,6 @@ def np_drawdown_version_v233():
     return jsonify(success=True, release=RELEASE, modes=["STATIC", "TRAILING"], trailing_basis="highest_equity", trailing_sales_ready=runtime_ready(), issued_accounts_unchanged=True,
         collector_auth_configured=bool(os.environ.get("NP_EQUITY_TRAILING_INGEST_KEY") or os.environ.get("NP_LIVE_STATE_INGEST_KEY")),
         runtime_verification_configured=os.environ.get("NP_EQUITY_TRAILING_VERIFIED")==RELEASE)
+
+from otp_capacity import install as _np_install_bounded_signup_email
+_np_install_bounded_signup_email(app)

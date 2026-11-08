@@ -64,7 +64,7 @@ class HTTPWorkerTests(unittest.TestCase):
             code=FIXTURE.replace('ADMISSION_IO_TIMEOUT',repr(io_timeout)).replace('ENABLE_RESERVED',repr(reserved)).replace('ENABLE_ADMISSION',repr(admission)).replace('SOURCE_PATH',repr(str(ROOT/'app.py'))).replace('MARKER_DIR',repr(tmp))
             (path/'http_fixture.py').write_text(code)
             with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
-            env=dict(os.environ,PYTHONPATH=str(ROOT)+os.pathsep+tmp,PYTHONDONTWRITEBYTECODE='1')
+            env=dict(os.environ,PYTHONPATH=os.pathsep.join((str(ROOT),tmp,os.environ.get('PYTHONPATH',''))),PYTHONDONTWRITEBYTECODE='1')
             cmd=[sys.executable,'-m','gunicorn','--bind',f'127.0.0.1:{port}','--workers','1','http_fixture:app']
             if cli_threads is not None:cmd.extend(['--threads',str(cli_threads)])
             # Configured case tests automatic discovery from Render's repository
