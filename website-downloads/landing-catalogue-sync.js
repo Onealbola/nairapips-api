@@ -51,5 +51,5 @@ function start(p){try{localStorage.setItem('nairapips_selected_plan',JSON.string
 document.addEventListener('click',event=>{if(event.target.closest('[data-catalogue-retry]')){refresh(true);return;}const b=event.target.closest('[data-landing-product]');if(!b)return;const p=state.products.find(p=>p.id===b.dataset.landingProduct);if(p?.purchases_open)start(p)});
 window.npRefreshLandingCatalogue=refresh;
 window.addEventListener('focus',()=>refresh(true));document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh(true)});setInterval(()=>{if(!document.hidden)refresh()},10000);
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>refresh(true));else refresh(true);
+if(document.readyState==='loading'&&!document.getElementById('npStandardPlansGrid'))document.addEventListener('DOMContentLoaded',()=>refresh(true));else refresh(true);
 })();

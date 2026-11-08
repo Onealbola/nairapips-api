@@ -19,3 +19,20 @@ class LuxuryDeliveryTests(unittest.TestCase):
   self.assertTrue(reply.data.startswith(b'\x89PNG\r\n\x1a\n'))
   self.assertEqual(reply.data,Path('website-downloads/nairapips-gold-architecture.png').read_bytes())
   self.assertIn('max-age=86400',reply.headers['Cache-Control']);reply.close()
+
+ def test_luxury_local_installer_archive(self):
+  import zipfile,hashlib,io
+  app=Flask(__name__);register_panel_delivery(app)
+  response=app.test_client().get('/downloads/luxury-landing-update.zip')
+  self.assertEqual(response.status_code,200)
+  self.assertIn('no-store',response.headers['Cache-Control'])
+  with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
+   self.assertEqual(set(archive.namelist()),{'install-luxury.php','.np-luxury-files/luxury-bundle.js','.np-luxury-files/luxury-art.png','.np-luxury-files/architecture.png'})
+   installer=archive.read('install-luxury.php').decode()
+   for name in ['luxury-bundle.js','luxury-art.png','architecture.png']:
+    self.assertIn(hashlib.sha256(archive.read('.np-luxury-files/'+name)).hexdigest(),installer)
+   bundle=archive.read('.np-luxury-files/luxury-bundle.js').decode()
+   self.assertIn('/.np-luxury-files/luxury-art.png',bundle)
+   self.assertNotIn('https://nairapips-api.onrender.com/public/nairapips-luxury-concept.png',bundle)
+   self.assertIn('np-lux-architecture',bundle)
+  response.close()

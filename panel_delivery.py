@@ -57,6 +57,13 @@ def register_panel_delivery(app, root=None):
         response.headers['Cache-Control']='no-store, max-age=0'
         return response
 
+    @app.get('/downloads/luxury-landing-update.zip')
+    def luxury_landing_update_download():
+        response=send_file(assets/'nairapips-luxury-landing-update.zip',mimetype='application/zip',as_attachment=True,
+            download_name='NairaPips-Luxury-Landing-Update.zip',conditional=False,etag=False,max_age=0)
+        response.headers['Cache-Control']='no-store, max-age=0'
+        return response
+
     @app.get('/downloads/landing-recovery.zip')
     def landing_recovery_download():
         response=send_file(assets/'nairapips-landing-recovery.zip',mimetype='application/zip',as_attachment=True,

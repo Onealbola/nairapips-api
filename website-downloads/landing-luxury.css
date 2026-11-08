@@ -58,3 +58,27 @@ html.np-luxury-landing .container{padding-inline:0!important}.np-luxury-landing 
 @media(min-width:1101px){html.np-luxury-landing #nav .np-lux-nav-links{display:flex!important}}
 
 @media(min-width:851px){html.np-luxury-landing #np-luxury-hero{background-size:90% auto!important;background-position:right 57%!important}}
+
+/* Original approved artwork, clipped to decoration only. All offer text stays live HTML. */
+html.np-luxury-landing body{background:#080807!important}
+html.np-luxury-landing #nav,html.np-luxury-landing #np-luxury-hero,html.np-luxury-landing #challenge-plans{max-width:1536px;margin-inline:auto}
+html.np-luxury-landing #np-luxury-hero{container-type:inline-size;background:#030302!important;min-height:216px;isolation:isolate}
+html.np-luxury-landing #np-luxury-hero:after{content:'';position:absolute;top:0;bottom:0;right:0;width:48%;z-index:0;pointer-events:none;background-image:url('https://nairapips-api.onrender.com/public/nairapips-luxury-concept.png');background-repeat:no-repeat;background-size:100cqw auto;background-position:right -4.4921875cqw}
+html.np-luxury-landing #np-luxury-hero:before{z-index:1;background:linear-gradient(90deg,#030302 35%,transparent 60%)}
+html.np-luxury-landing #np-luxury-hero .container{z-index:2}
+html.np-luxury-landing #challenge-plans{position:relative;isolation:isolate;overflow:hidden;background:#030302!important}
+html.np-luxury-landing #challenge-plans:after{content:'';position:absolute;bottom:0;left:0;width:300px;height:225px;pointer-events:none;z-index:-1;background:url('https://nairapips-api.onrender.com/public/nairapips-luxury-concept.png') left bottom/1536px 1024px no-repeat;clip-path:polygon(0 20%,0 100%,100% 100%,70% 89%,40% 70%,15% 45%)}
+.np-luxury-landing .nps-summary{container-type:inline-size}
+.np-luxury-landing .nps-summary:before{height:145px;width:60%;clip-path:polygon(0 0,100% 0,100% 100%,80% 65%,50% 30%);background-image:url('https://nairapips-api.onrender.com/public/nairapips-luxury-concept.png');background-repeat:no-repeat;background-size:302.3622047cqw auto;background-position:right -62.2047244cqw}
+.np-luxury-landing .nps-variants .nps-choice[aria-pressed=true]:before{background:linear-gradient(137deg,transparent 40%,#86551b22 41%,#d8a24c55 61%,#e8b85a99 61.3%,#5d390e88 61.8%,transparent 67%)}
+.np-luxury-landing .nps-variants .nps-choice[aria-pressed=true]{box-shadow:inset 0 0 0 1px #ffdd8c,inset 0 2px 5px #fff8d790,0 0 6px #ffe7a8,0 0 25px #df9f3433}
+@media(max-width:850px){html.np-luxury-landing #np-luxury-hero:after{width:100%;background-size:1536px 1024px;background-position:right -69px}html.np-luxury-landing #np-luxury-hero:before{background:linear-gradient(90deg,#030302e6,#03030255)}html.np-luxury-landing #challenge-plans:after{width:220px;height:185px;background-size:1260px 840px}}
+
+html.np-luxury-landing #np-luxury-hero:after{display:none!important}
+.np-lux-architecture{position:absolute!important;top:0!important;right:0!important;left:auto!important;bottom:0!important;width:48%!important;z-index:0!important;pointer-events:none;background-image:url('https://nairapips-api.onrender.com/public/nairapips-luxury-concept.png')!important;background-repeat:no-repeat!important;background-size:100cqw auto!important;background-position:right -4.4921875cqw!important}
+.np-luxury-landing .nps-summary:before{background-position:calc(100% + 12.992126cqw) -62.2047244cqw}
+html.np-luxury-landing #challenge-plans:after{top:535px;bottom:auto}
+@media(max-width:850px){.np-lux-architecture{width:100%!important;background-size:1536px 1024px!important;background-position:right -69px!important}html.np-luxury-landing #challenge-plans:after{top:auto;bottom:0}}
+.np-lux-architecture{-webkit-mask-image:linear-gradient(90deg,transparent,#000 12%);mask-image:linear-gradient(90deg,transparent,#000 12%)}
+
+.np-luxury-landing .nps-summary{position:relative!important}.np-luxury-landing .nps-summary:before{left:auto!important;right:0!important}

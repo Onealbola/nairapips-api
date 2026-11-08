@@ -1,7 +1,7 @@
 /* NairaPips account selector: public catalogue data, existing checkout actions. */
 (function(){
 'use strict';
-const VERSION='luxury-landing-20261108-v2';
+const VERSION='luxury-landing-20261108-v3';
 if(window.NPPlanSelector?.version===VERSION)return;
 window.NPPlanSelector?.destroy?.();
 const widgets=new Map();
