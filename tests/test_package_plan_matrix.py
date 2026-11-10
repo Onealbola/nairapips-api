@@ -204,12 +204,23 @@ class MatrixTests(unittest.TestCase):
         self.assertFalse(response.json['availability'][p['id']]['both']['available'])
         self.assertFalse(response.json['availability']['future-5m']['basic']['available'])
 
-    def test_limit_can_hold_an_enabled_package_until_owner_changes_limit(self):
-        c=defaults()['config'];p=c['plans'][2];p['limits']['max_profit_share']=50
-        r=self.save(c);self.assertEqual(r.status_code,200)
+    def test_package_terms_are_independent_of_legacy_account_caps_and_siblings(self):
+        c=defaults()['config'];p=c['plans'][2]
+        p['limits'].update(max_drawdown=1,max_profit_share=1,max_profit_cap=1)
+        original=copy.deepcopy(p['packages'][0])
+        p['packages'][3].update(drawdown=20,profit_share=70,profit_cap=15)
+        r=self.save(c);self.assertEqual(r.status_code,200,r.json)
+        for key in ('basic','room','share','both'):
+            self.assertTrue(r.json['availability'][p['id']][key]['available'])
+        stored=self.store.read(fresh=True)[0]['config']['plans'][2]
+        self.assertEqual(stored['packages'][0],original)
+        self.assertEqual(stored['packages'][3]['drawdown'],20)
+        self.assertEqual(stored['packages'][3]['profit_share'],70)
+        self.assertEqual(stored['limits'],p['limits'])
+        p['packages'][3]['enabled']=False
+        r=self.save(c,revision=1)
         self.assertFalse(r.json['availability'][p['id']]['both']['available'])
-        p['limits']['max_profit_share']=60
-        r=self.save(c,revision=1);self.assertTrue(r.json['availability'][p['id']]['both']['available'])
+        self.assertTrue(r.json['availability'][p['id']]['basic']['available'])
 
     def test_unsupported_targets_daily_rules_and_duplicate_sizes_rejected(self):
         mutators=[lambda c:c['plans'][0]['packages'][0].update(phase1_target=10,phase2_target=5),
@@ -225,11 +236,11 @@ class MatrixTests(unittest.TestCase):
             self.assertEqual(self.save(c).status_code,400)
         self.assertEqual(self.db.writes,[])
 
-    def test_wider_drawdown_requires_daily_and_account_limit(self):
+    def test_wider_drawdown_visibility_uses_own_rules_not_account_cap(self):
         c=defaults()['config'];p=c['plans'][0];x=p['packages'][1]
         x.update(drawdown=30,daily_drawdown=10)
         r=self.save(c);self.assertEqual(r.status_code,200)
-        self.assertFalse(r.json['availability'][p['id']]['room']['available'])
+        self.assertTrue(r.json['availability'][p['id']]['room']['available'])
         p['limits']['max_drawdown']=30
         r=self.save(c,revision=1);self.assertTrue(r.json['availability'][p['id']]['room']['available'])
 

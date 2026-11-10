@@ -54,6 +54,26 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(self.client.post('/trader/catalog/checkout',json={'product_id':self.identity}).status_code,403)
         self.assertEqual(self.db.rows['challenge_purchases'],[])
 
+    def test_own_package_rules_can_open_without_group_caps_or_sibling_activation(self):
+        doc,_=self.matrix.read();p=doc['config']['plans'][0]
+        sibling=copy.deepcopy(p['packages'][1])
+        p['limits'].update(max_drawdown=1,max_profit_share=1,max_profit_cap=1)
+        p['packages'][0].update(drawdown=20,profit_share=70,profit_cap=15)
+        self.matrix.save_draft(dict(revision=0,config=doc['config']),'owner')
+        opened=self.save({self.identity:{'purchases_open':True}})
+        self.assertEqual(opened.status_code,200,opened.json)
+        products=self.load().json['products']
+        target=next(x for x in products if x['id']==self.identity)
+        other=next(x for x in products if x['id']=='progress:ngn-500000:room')
+        self.assertTrue(target['purchases_open'])
+        self.assertFalse(other['purchases_open'])
+        self.assertEqual((target['plan']['max_drawdown'],target['plan']['payout_split']),(20,70))
+        self.assertEqual(other['plan']['fee'],sibling['price'])
+        self.assertEqual(other['plan']['max_drawdown'],sibling['drawdown'])
+        self.assertEqual(self.save({self.identity:{'purchases_open':False}},revision=1).status_code,200)
+        self.assertFalse(next(x for x in self.load().json['products'] if x['id']==self.identity)['purchases_open'])
+        self.assertEqual(self.db.rows['challenge_purchases'],[])
+
     def test_complete_price_is_not_surcharged_or_changed_to_three_cycles(self):
         row=plan_row(self.allocation,self.package,True)
         for cycles in (0,3,None,'0','3'):

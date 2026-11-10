@@ -71,9 +71,8 @@ def availability(plan,package):
     reasons=[]
     if not plan['enabled']:reasons.append('Account size switched off')
     if not package['enabled']:reasons.append('Package switched off')
-    for key,limit,label in [('drawdown','max_drawdown','Drawdown'),('profit_share','max_profit_share','Trader share'),('profit_cap','max_profit_cap','Profit cap')]:
-        if key=='profit_cap' and package.get('profit_cap_enabled') is False:continue
-        if package[key]>plan['limits'][limit]:reasons.append(label+' exceeds this account size’s draft limit')
+    # Each package carries its own terms. Legacy account-size caps remain
+    # in stored documents for compatibility, but cannot restrict sibling offers.
     return dict(available=not reasons,reasons=reasons)
 
 
