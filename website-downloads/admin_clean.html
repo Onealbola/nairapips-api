@@ -8091,7 +8091,7 @@ function admTraderPortfolioHTML(td, current){
         const st=String(ac.stage||ac.phase||'phase1').toLowerCase();
         const stageTag=st.includes('funded')||st.includes('live')?'funded':(st.includes('phase2')?'phase2':'phase1');
         const zone=admRiskZone(ac,td);
-        const eq=Number(ac.current_equity||ac.current_balance||ac.start_balance||ac.account_size||0);
+        const eq=Number(ac.current_equity??ac.current_balance??ac.start_balance??ac.account_size??0);
         const dd=admDdUsagePercent(ac,td);
         const cur=currentId && String(ac.id||'')===currentId;
 
@@ -8112,11 +8112,11 @@ function admTraderPortfolioHTML(td, current){
             <div style="font-weight:900;color:#fff">${esc(money(eq))}</div>
           </div>
           <div style="text-align:right">
-            <div style="font-size:11px;color:var(--t3)">DD / Risk</div>
+            <div style="font-size:11px;color:var(--t3)">Capital DD / overall limit</div>
             <div style="display:flex;gap:6px;align-items:center;justify-content:flex-end">
-              <span style="font-weight:900;color:${dd>=90?'#dc2626':dd>=75?'#eab308':'#22c55e'}">${pct(dd)}</span>
+              <span style="font-weight:900;color:${dd>=90?'#dc2626':dd>=75?'#eab308':'#22c55e'}">${pct(admDdAbsolutePercent(ac,td))} / ${pct(Number(ac.dd_limit_percent||20))}</span>
               ${admRiskPill(zone)}
-              <span class="tag tag-green">LIVE</span>
+              <span class="tag">${esc(String(ac.live_data_status||"unverified").toUpperCase())}</span><small>${pct(dd)} allowance used</small>
             </div>
           </div>
         </div>`;
@@ -19078,6 +19078,41 @@ async function refresh(identity){try{const r=await call('/campaigns/'+encodeURIC
 window.npOpenBusinessEmail=function(){clearTimeout(poll);const id=++epoch;state={members:[],selected:new Set(),loading:true,draft:null,ready:true};npShowResetModalSafe('<style>.be-wrap{min-width:0}.be-wrap label{display:block;font-size:12px;margin:12px 0 5px}.be-wrap .input,.be-wrap .select{width:100%;box-sizing:border-box}.be-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.be-people{max-height:180px;overflow:auto;border:1px solid #63522455;border-radius:8px;padding:8px}.be-person{display:flex!important;gap:8px;align-items:start;margin:0!important;padding:7px!important}.be-person input{width:auto!important;margin-top:4px}.be-wrap small{display:block;font-size:11px;color:#aab1b6;overflow-wrap:anywhere}.be-wrap button{cursor:pointer}.be-wrap iframe{width:100%;height:310px;border:1px solid #63522455;border-radius:8px;background:white}.be-wrap fieldset{padding:0;border:0;min-width:0}.be-wrap table{width:100%;font-size:12px;border-collapse:collapse}.be-wrap td{padding:9px;border-bottom:1px solid #ffffff18;overflow-wrap:anywhere}.be-wrap th{text-align:left}.be-history{display:grid;gap:6px}.be-history button{padding:10px;text-align:left;border:1px solid #63522455;border-radius:8px;background:#121719;color:inherit}.be-actions{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}.be-wrap [hidden]{display:none!important}@media(max-width:600px){.be-grid{grid-template-columns:1fr}}</style><div class="be-wrap"><button type="button" onclick="this.closest(\'.modal-bg\').remove()" style="position:absolute;right:14px;top:8px;background:none;border:0;color:white;font-size:24px">×</button><h2>Email Traders</h2><p style="font-size:12px;color:#b4bcc2">Send a business message to everyone or selected registered members.</p><fieldset id="be-form"><label>Recipients</label><select class="select" id="be-mode"><option value="selected">Selected traders</option><option value="all">All registered traders</option></select><div id="be-picker"><label>Search members</label><input class="input" id="be-search" placeholder="Name, email, phone or account reference"><div id="be-members" class="be-people"></div></div><small id="be-member-count"></small><label>Subject</label><input class="input" id="be-subject" maxlength="200" placeholder="Email subject"><label>Message</label><textarea class="input" id="be-body" rows="6" maxlength="15000" placeholder="Write your business message here…"></textarea><small>Use {{name}} to insert the trader’s name. Each address receives a separate email.</small></fieldset><div class="be-actions"><button type="button" class="btn btn-gold" id="be-preview" disabled>Preview email</button><button type="button" class="btn" id="be-new">New message</button></div><p id="be-note" role="status" style="font-size:12px"></p><section id="be-review" hidden><h3 id="be-review-count"></h3><small id="be-skipped"></small><iframe id="be-preview-frame" title="Business email preview" sandbox></iframe><p id="be-totals" style="font-size:12px"></p><div class="be-actions"><button type="button" class="btn btn-gold" id="be-send" disabled>Send email</button><button type="button" class="btn" id="be-pause" hidden>Pause sending</button><button type="button" class="btn" id="be-delivery" hidden>Check delivery</button></div><details><summary>Recipients &amp; results</summary><table><thead><tr><th>Trader</th><th>Result</th></tr></thead><tbody id="be-receipts"></tbody></table></details></section><details style="margin-top:20px"><summary>Recent business emails</summary><div id="be-history" class="be-history">Loading history…</div></details></div>');const root=el('be-body').closest('.modal-card')||el('be-body').closest('.modal');if(root){root.style.maxHeight='92vh';root.style.overflowY='auto';root.style.width='min(760px,95vw)';root.style.maxWidth='760px'}el('be-mode').onchange=()=>{el('be-picker').hidden=el('be-mode').value==='all';members();dirty()};el('be-search').oninput=members;el('be-members').onchange=event=>{const box=event.target.closest('[data-be-member]');if(!box)return;if(box.checked)state.selected.add(box.dataset.beMember);else state.selected.delete(box.dataset.beMember);members();dirty()};for(const field of ['be-subject','be-body'])el(field).oninput=dirty;el('be-new').onclick=()=>npOpenBusinessEmail();el('be-preview').onclick=async()=>{if(state.loading)return;const subject=el('be-subject').value.trim(),body=el('be-body').value.trim();if(!subject||!body){note('Enter a subject and message.');return}if(el('be-mode').value==='selected'&&!state.selected.size){note('Select at least one trader.');return}el('be-preview').disabled=true;note('Preparing a saved preview…');try{const r=await call('/campaigns','POST',{id:uuid(),mode:el('be-mode').value,trader_ids:[...state.selected],subject,body});if(epoch!==id||!valid())return;results(r);note(state.ready===false?'Preview saved. The email sender must be configured before sending.':'Review the message and recipient count. No emails have been sent.')}catch(err){if(valid())note(err.message)}finally{if(valid())el('be-preview').disabled=false}};el('be-send').onclick=async()=>{const c=state.draft;if(!c)return;el('be-send').disabled=true;note('Starting this reviewed campaign…');try{const r=await call('/campaigns/'+c.id+'/start','POST',{revision:c.revision});if(epoch!==id||!valid())return;results(r);refresh(c.id)}catch(err){if(valid()){note(err.message+' Reopen this campaign to verify its state before trying again.');el('be-send').disabled=true}}};el('be-pause').onclick=async()=>{const c=state.draft;if(!c)return;try{await call('/campaigns/'+c.id+'/pause','POST',{});clearTimeout(poll);refresh(c.id)}catch(err){note(err.message)}};el('be-delivery').onclick=async()=>{const c=state.draft;if(!c)return;try{await call('/campaigns/'+c.id+'/check-delivery','POST',{});if(!valid())return;state.deliveryChecks=5;note('Checking provider delivery events. This will not resend the message.');clearTimeout(poll);poll=setTimeout(()=>refresh(c.id),2000)}catch(err){note(err.message)}};el('be-history').onclick=async event=>{const button=event.target.closest('[data-be-job]');if(!button)return;try{const r=await call('/campaigns/'+button.dataset.beJob);if(!valid())return;el('be-subject').value=r.campaign.subject;el('be-body').value=r.campaign.body;state.draft=r.campaign;el('be-mode').value=r.campaign.mode;state.selected=new Set(r.recipients.map(t=>t.trader_id));members();el('be-picker').hidden=r.campaign.mode==='all';results(r);if(r.campaign.status==='draft')el('be-form').disabled=false;else refresh(r.campaign.id)}catch(err){note(err.message)}};loadMembers(id);history()};
 function nav(){if(!['owner','super_admin','superadmin','admin','admin_manager'].includes(String(SESSION.admin?.role||'').toLowerCase()))return;for(const anchor of document.querySelectorAll('button[data-mod="offers"]')){if(anchor.parentElement.querySelector('[data-business-email-nav]'))continue;const button=document.createElement('button');button.className=anchor.className;button.dataset.businessEmailNav='1';button.textContent='✉ Email Traders';button.onclick=()=>window.npOpenBusinessEmail();anchor.insertAdjacentElement('afterend',button)}}
 const watch=new MutationObserver(nav);watch.observe(document.body,{childList:true,subtree:true});nav();
+})();
+
+</script>
+
+<!-- NP_ACCOUNT_REPORTING_V1 -->
+<script>
+/* Exact-account breach reporting; no trading or lifecycle writes. */
+(function(){
+'use strict';
+if(window.NP_ACCOUNT_REPORTING_RELEASE)return;
+window.NP_ACCOUNT_REPORTING_RELEASE='account-reporting-20261111';
+const breached=a=>!!(a&&(a.recorded_breach||a.breached_at||String(a.account_status||'').toLowerCase().includes('breach')));
+if(typeof admAccountLifecycle==='function'){
+ const base=admAccountLifecycle;window.admAccountLifecycle=function(a){return breached(a)?'breached':base(a)};
+ const authority=admAccountBreachAuthority;window.admAccountBreachAuthority=function(a,t){return breached(a)||authority(a,t)};
+ window.admComputedAbsoluteDd=function(a){a=a||{};const start=Number(a.start_balance||a.account_size||0),values=[a.current_balance??a.balance,a.current_equity??a.equity].filter(x=>x!=null&&Number.isFinite(Number(x))).map(Number);return start>0&&values.length?Math.max(0,(start-Math.min(...values))/start*100):Math.max(0,Number(a.absolute_drawdown_percent||a.drawdown_percent||0))};
+ window.admDdAbsolutePercent=function(a){return admComputedAbsoluteDd(a)};
+ const riskCore=admRiskZone;window.admRiskZone=function(a,t){if(breached(a))return 'breached';if(a?.lifecycle_data_status&&a.lifecycle_data_status!=='verified')return 'unverified';return riskCore(a,t)};
+}
+// Also updates previously installed trader pages through their existing hosted script.
+const truths=new Map();
+if(typeof safeFetchJson==='function'){
+ const fetchCore=safeFetchJson;
+ window.safeFetchJson=async function(...args){const result=await fetchCore.apply(this,args);const x=result?.truth||result?.data?.truth;if(String(args[0]).includes('/account_truth_v116')&&x?.trader_account_id){truths.set(String(x.trader_account_id),x);setTimeout(paint,0)}return result};
+}
+function paint(){
+ const card=document.getElementById('np-historic-truth-card');if(!card)return;
+ const id=String(card.dataset.accountId||'');const x=truths.get(id);if(!x)return;
+ const badge=card.querySelector('.np-smart-panel-head .pill'),verdict=card.querySelectorAll('.np-smart-card')[3]?.querySelector('strong');
+ const label=x.recorded_breach?'BREACHED':x.ever_crossed_dd_limit?'OVERALL LIMIT CROSSED':x.monitoring_observation_present===false?'AWAITING BROKER UPDATE':'NO OVERALL CROSS RECORDED';
+ if(verdict&&verdict.textContent!==label)verdict.textContent=label;
+ if(badge){const value=x.recorded_breach?'BREACHED':x.ever_crossed_dd_limit?'OVERALL LIMIT CROSSED':x.monitoring_observation_present===false?'AWAITING BROKER UPDATE':'NO OVERALL CROSS RECORDED';if(badge.textContent!==value)badge.textContent=value;badge.className='pill '+(x.recorded_breach||x.ever_crossed_dd_limit?'pill-red':'pill-yellow')}
+ const cr=card.querySelector('#ht-cross');if(cr&&x.recorded_breach){const value='Recorded breach: '+(x.breached_at?new Date(x.breached_at).toLocaleString('en-GB'):'time unavailable');if(cr.textContent!==value)cr.textContent=value}
+}
+setInterval(()=>{if(!document.hidden)paint()},2000);
 })();
 
 </script>

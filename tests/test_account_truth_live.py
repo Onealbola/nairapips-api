@@ -71,3 +71,10 @@ class TruthTests(unittest.TestCase):
         self.live={};self.a['last_sync_at']=None
         self.history=[dict(equity=510000,created_at='2026-10-15T11:00:00+03:00'),dict(equity=520000,created_at='2026-10-15T08:30:00Z')]
         self.assertEqual(self.truth()['last_monitored_at'],'2026-10-15T08:30:00Z')
+
+    def test_recorded_daily_breach_is_not_disguised_as_no_breach(self):
+        self.a.update(account_status='breached_archived',breached_at='2026-11-11T07:25:20Z',archive_reason='DAILY_DRAWDOWN_BREACH')
+        t=self.truth()
+        self.assertTrue(t['recorded_breach'])
+        self.assertFalse(t['ever_crossed_dd_limit'])
+        self.assertEqual(t['breach_reason'],'DAILY_DRAWDOWN_BREACH')

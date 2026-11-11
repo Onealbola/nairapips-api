@@ -30878,13 +30878,9 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
                 pass
             raise ValueError("ASSIGNMENT QUARANTINED — new MT5 was not bound to the exact purchase journey")
 
-        try:
-            _np_renewal_db_v211().table("trader_accounts").update({
-                "journey_source": "post9_purchase_root_immutable",
-                "updated_at": now_iso(),
-            }).eq("id", aid).eq("trader_id", tid).eq("purchase_id", pid).execute()
-        except Exception:
-            pass
+        # The base assignment already persisted the immutable purchased snapshot.
+        # Ownership is enforced above; replacing journey_source here erased both
+        # risk/withdrawal terms and the trailing drawdown mode. Leave it intact.
 
     return result
 
@@ -57409,6 +57405,9 @@ def account_truth_v122_compat():
                 "mt5_login": mt5_login,
                 "stage": account.get("stage") or account.get("phase"),
                 "account_status": account.get("account_status") or account.get("status"),
+                "recorded_breach": __import__("account_reporting").recorded_breach(account),
+                "breached_at": account.get("breached_at"),
+                "breach_reason": account.get("archive_reason") if __import__("account_reporting").recorded_breach(account) else None,
                 "start_balance": start,
                 "current_equity": current,
                 "lowest_equity": lowest,
@@ -59086,24 +59085,21 @@ def _np_v204_live_refresh_response(resp):
         response.headers["Cache-Control"] = "no-store"
         return response
     root = data.get("data", data)
-    trader = root.get("trader", {}) if isinstance(root, dict) else {}
-    cache = {}
-    def overlay(row):
-        if not isinstance(row, dict) or not _np_v198_is_live_row(row):
-            return row
-        key = (str(row.get("id") or ""), str(row.get("mt5_login") or ""))
-        if key not in cache:
-            cache[key] = _np_v198_overlay_latest(row, trader.get("id") or row.get("trader_id") or "")
-        return dict(row, **cache[key])
-    if isinstance(root, list):
-        data["data"] = [overlay(row) for row in root]
-    elif isinstance(root, dict):
+    if isinstance(root, dict):
+        from admin_account_live import overlay_account_lists
+        # Use one exact-account read for all aliases, including current/history.
+        aliases = dict(root)
         for key in ("current_account", "account"):
             if isinstance(root.get(key), dict):
-                root[key] = overlay(root[key])
+                aliases["_single_" + key] = [root[key]]
+        decorated = overlay_account_lists(aliases, requests, SUPABASE_URL,
+            SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, _np_v198_is_live_row)
         for key in ("active_accounts", "accounts", "all_accounts", "trader_accounts"):
-            if isinstance(root.get(key), list):
-                root[key] = [overlay(row) for row in root[key]]
+            if key in decorated:
+                root[key] = decorated[key]
+        for key in ("current_account", "account"):
+            if decorated.get("_single_" + key):
+                root[key] = decorated["_single_" + key][0]
         current = root.get("current_account") or root.get("account") or {}
         if current.get("latest_monitoring_snapshot"):
             root["latest_monitoring"] = current["latest_monitoring_snapshot"]
@@ -59120,7 +59116,7 @@ def _np_v204_wrap_live_refresh(base):
         return _np_v204_live_refresh_response(base(*args, **kwargs))
     return wrapped
 
-for _np_v204_endpoint in ("trader_current_account", "trader_dashboard_payload", "admin_trader_accounts_feed"):
+for _np_v204_endpoint in ("trader_bootstrap", "trader_current_account", "trader_dashboard_payload", "admin_trader_accounts_feed"):
     if _np_v204_endpoint in app.view_functions:
         app.view_functions[_np_v204_endpoint] = _np_v204_wrap_live_refresh(app.view_functions[_np_v204_endpoint])
 

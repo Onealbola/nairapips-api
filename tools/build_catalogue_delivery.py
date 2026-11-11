@@ -11,7 +11,7 @@ marker=html.index('/* Saved Business Settings -> trader catalogue.')
 start=html.rfind('<script>',0,marker)+len('<script>')
 end=html.index('</script>',marker)
 assert start>=len('<script>')
-html=html[:start]+(root/'account-plan-selector.js').read_text()+'\n'+(root/'trader-catalog-sync.js').read_text()+html[end:]
+html=html[:start]+(root/'account-plan-selector.js').read_text()+'\n'+(root/'trader-catalog-sync.js').read_text()+'\n'+(root/'account-reporting.js').read_text()+html[end:]
 remote='<script src="https://nairapips-api.onrender.com/public/trader-catalogue.js"></script>'
 assert html.count(remote)==1
 page.write_text(html)

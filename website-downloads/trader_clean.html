@@ -12014,7 +12014,7 @@ window.npPackageHistoryPageV222=async function(delta){state.historyPage=Math.max
 <script>/* NairaPips account selector: public catalogue data, existing checkout actions. */
 (function(){
 'use strict';
-const VERSION='luxury-landing-20261108-v1';
+const VERSION='luxury-landing-20261108-v3';
 if(window.NPPlanSelector?.version===VERSION)return;
 window.NPPlanSelector?.destroy?.();
 const widgets=new Map();
@@ -12045,19 +12045,19 @@ function html(w){
  const x=pval(selected),two=Number(x.phase2_target)>0,instant=model(selected)==='instant',progress=selected.family==='progress';
  const percent=v=>w.unit==='ngn'?money(Number(x.account_size)*Number(v)/100):Number(v)+'%';
  const reset=v=>v==null?'At request':Number(v)>0?money(v):'None';
- const account=field('Evaluation',instant?'Instant Funded':two?'2 phases':'1 phase')+(instant?'':field('Phase 1 target',percent(x.phase1_target??10)))+(two?field('Phase 2 target',percent(x.phase2_target)):'')+field('Max drawdown',percent(x.max_drawdown??20))+field('Daily drawdown',Number(x.daily_drawdown)>0?percent(x.daily_drawdown):'None')+field('Drawdown type',x.drawdown_type||'STATIC');
+ const account=(w.context==='landing'&&!instant?'':field('Evaluation',instant?'Instant Funded':two?'2 phases':'1 phase'))+(instant?'':field('Phase 1 target',percent(x.phase1_target??10)))+(two?field('Phase 2 target',percent(x.phase2_target)):'')+field('Max drawdown',percent(x.max_drawdown??20))+field('Daily drawdown',Number(x.daily_drawdown)>0?percent(x.daily_drawdown):'None')+field('Drawdown type',x.drawdown_type||'STATIC');
  const wr=x.withdrawal_rules;
  const withdrawalFields=wr?(field('Minimum withdrawal',wr.minimum_withdrawal_enabled?money(wr.minimum_withdrawal):'None')+field('Minimum profit target',wr.minimum_profit_enabled?percent(wr.minimum_profit_percent):'None')+field('Gross cap / cycle',wr.profit_cap_enabled?percent(wr.profit_cap):'No cap')):(progress?field('Gross cap / cycle',percent(selected.package.profit_cap)):'');
  const rewards=field('Your profit share',Number(x.payout_split)+'%')+field('Payout cycles',x.payout_cycles===0?'Continuing':String(x.payout_cycles??3))+field('Payout frequency',x.payout_frequency||'Daily')+withdrawalFields+(Object.keys(x.reset_stage_prices||{}).length?(instant?'':field('Phase 1 reset',reset(x.reset_stage_prices.phase1||0)))+(two?field('Phase 2 reset',reset(x.reset_stage_prices.phase2||0)):'')+field('Funded reset',reset(x.reset_stage_prices.funded||0)):field('Phase reset',reset(x.reset_fee))+field('Funded reset',reset(x.funded_reset_fee)));
- const button=w.context==='preview'?'Preview':selected.purchases_open?'Choose package':'Purchases paused';
+ const button=w.context==='preview'?'Preview':selected.purchases_open?(w.context==='landing'?'View package →':'Choose package'):'Purchases paused';
  const action=w.context==='landing'?'data-landing-product':w.context==='trader'?'data-catalog-product':'data-preview-product';
  const header='<div class="nps-top"><div><div class="nps-kicker">'+(w.context==='landing'?'YOUR ACCOUNT. YOUR AMBITION.':'NAIRAPIPS / ACCOUNTS')+'</div><h2>'+(w.context==='landing'?'Choose your edge.':'Choose your account.')+'</h2></div><div class="nps-tabs" role="tablist" aria-label="Account model">'+present.map(([id,label])=>'<button type="button" class="nps-tab" role="tab" tabindex="'+(w.family===id?'0':'-1')+'" aria-selected="'+(w.family===id)+'" data-nps-action="family" data-nps-value="'+id+'">'+label+'</button>').join('')+'</div></div>';
  const sizesHTML=sizes.map(cap=>{const low=Math.min(...group.filter(p=>Number(pval(p).account_size)===cap).map(p=>Number(pval(p).fee)));return '<button type="button" class="nps-choice" aria-pressed="'+(w.capital===cap)+'" data-nps-action="capital" data-nps-value="'+cap+'"><strong>'+short(cap)+'</strong><small>From '+money(low)+'</small></button>'}).join('');
  const variantsHTML=variants.map(p=>'<button type="button" class="nps-choice" aria-pressed="'+(p.id===w.selected)+'" data-nps-action="product" data-nps-value="'+e(p.id)+'"><span class="nps-variant-head"><strong>'+e(name(p))+'</strong>'+(p.id===w.selected?'<span class="nps-check" aria-hidden="true">✓</span>':'')+'</span><span class="nps-variant-price">'+money(pval(p).fee)+'</span><span class="nps-variant-detail"><span>'+e(pval(p).max_drawdown)+'% DD</span><span>'+e(pval(p).payout_split)+'% share</span></span></button>').join('');
- const summary='<aside class="nps-summary" data-nps-selected="'+e(selected.id)+'"><div class="nps-summary-top"><div class="nps-summary-line"><span class="nps-name">'+e(name(selected))+'</span><span class="nps-status '+(selected.purchases_open?'open':'')+'">'+(w.context==='preview'?'Preview':selected.purchases_open?'Open':'Paused')+'</span></div><div class="nps-capital">'+money(x.account_size)+'</div><div class="nps-summary-sub">'+(instant?'Instant Funded':two?'2-phase challenge':'1-phase challenge')+'</div></div><div class="nps-rule-tabs" role="tablist" aria-label="Selected account rules">'+[['account','Account rules'],['rewards','Payout rules']].map(([id,label])=>'<button type="button" class="nps-rule-tab" role="tab" tabindex="'+(w.detail===id?'0':'-1')+'" aria-selected="'+(w.detail===id)+'" data-nps-action="detail" data-nps-value="'+id+'">'+label+'</button>').join('')+'</div><div class="nps-rules"><dl>'+(w.detail==='rewards'?rewards:account)+'</dl><div class="nps-unit-bar"><span>Display values</span><div class="nps-unit-switch" aria-label="Rule value units">'+[['percent','%'],['ngn','₦']].map(([id,label])=>'<button type="button" class="nps-unit" aria-pressed="'+(w.unit===id)+'" data-nps-action="unit" data-nps-value="'+id+'">'+label+'</button>').join('')+'</div></div></div><div class="nps-checkout"><div class="nps-price-row"><span class="nps-price-label">'+(instant?'Account fee':'Challenge fee')+'</span><strong class="nps-price">'+money(x.fee)+'</strong></div><button type="button" class="nps-buy" '+action+'="'+e(selected.id)+'" '+(!selected.purchases_open||w.context==='preview'?'disabled':'')+'>'+button+'</button></div></aside>';
+ const summary='<aside class="nps-summary" data-nps-selected="'+e(selected.id)+'"><div class="nps-summary-top"><div class="nps-summary-line"><span class="nps-name">'+e(name(selected))+(w.context==='landing'?' · '+(instant?'FUNDED':two?'2-PHASE':'1-PHASE'):'')+'</span><span class="nps-status '+(selected.purchases_open?'open':'')+'">'+(w.context==='preview'?'Preview':selected.purchases_open?'Open':'Paused')+'</span></div><div class="nps-capital">'+money(x.account_size)+'</div><div class="nps-summary-sub">'+(instant?'Instant Funded':two?'2-phase challenge':'1-phase challenge')+'</div></div><div class="nps-rule-tabs" role="tablist" aria-label="Selected account rules">'+[['account','Account rules'],['rewards','Payout rules']].map(([id,label])=>'<button type="button" class="nps-rule-tab" role="tab" tabindex="'+(w.detail===id?'0':'-1')+'" aria-selected="'+(w.detail===id)+'" data-nps-action="detail" data-nps-value="'+id+'">'+label+'</button>').join('')+'</div><div class="nps-rules"><dl>'+(w.detail==='rewards'?rewards:account)+'</dl><div class="nps-unit-bar"><span>Display values</span><div class="nps-unit-switch" aria-label="Rule value units">'+[['percent','%'],['ngn','₦']].map(([id,label])=>'<button type="button" class="nps-unit" aria-pressed="'+(w.unit===id)+'" data-nps-action="unit" data-nps-value="'+id+'">'+label+'</button>').join('')+'</div></div></div><div class="nps-checkout"><div class="nps-price-row"><span class="nps-price-label">'+(instant?'Account fee':'Challenge fee')+'</span><strong class="nps-price">'+money(x.fee)+'</strong></div><button type="button" class="nps-buy" '+action+'="'+e(selected.id)+'" '+(!selected.purchases_open||w.context==='preview'?'disabled':'')+'>'+button+'</button></div></aside>';
  const compareRows=[['Price',p=>money(pval(p).fee)],['Phase 1 target',p=>model(p)==='instant'?'—':pval(p).phase1_target+'%'],['Phase 2 target',p=>Number(pval(p).phase2_target)>0?pval(p).phase2_target+'%':'—'],['Max drawdown',p=>pval(p).max_drawdown+'%'],['Daily drawdown',p=>Number(pval(p).daily_drawdown)>0?pval(p).daily_drawdown+'%':'None'],['Profit share',p=>pval(p).payout_split+'%'],['Payout cycles',p=>pval(p).payout_cycles===0?'Continuing':String(pval(p).payout_cycles??3)],['Phase reset',p=>reset(pval(p).reset_fee)],['Funded reset',p=>reset(pval(p).funded_reset_fee)]];
  const comparison=w.compare?'<div class="nps-comparison" role="region" aria-label="Package comparison" tabindex="0"><table><thead><tr><th>'+short(w.capital)+'</th>'+variants.map(p=>'<th>'+e(name(p))+'</th>').join('')+'</tr></thead><tbody>'+compareRows.map(([label,get])=>'<tr><td>'+label+'</td>'+variants.map(p=>'<td>'+e(get(p))+'</td>').join('')+'</tr>').join('')+'</tbody></table></div>':'';
- return '<section class="nps" data-nps-widget="'+e(w.key)+'">'+header+'<div class="nps-layout"><div><div class="nps-panel"><div class="nps-label"><span class="nps-step">01</span>Account size</div><div class="nps-sizes">'+sizesHTML+'</div></div><div class="nps-panel"><div class="nps-label"><span class="nps-step">02</span>Package</div><div class="nps-variants">'+variantsHTML+'</div></div><button type="button" class="nps-compare-button" data-nps-action="compare" aria-expanded="'+w.compare+'">'+(w.compare?'Close comparison':'Compare packages')+' <svg aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor"><path d="M3 9 9 3M3 3h6v6"/></svg></button></div>'+summary+'</div>'+comparison+'</section>';
+ return '<section class="nps" data-nps-widget="'+e(w.key)+'">'+header+'<div class="nps-layout"><div><div class="nps-panel"><div class="nps-label"><span class="nps-step">01</span>Account size</div><div class="nps-sizes">'+sizesHTML+'</div></div><div class="nps-panel"><div class="nps-label"><span class="nps-step">02</span>'+(w.context==='landing'?'Your package':'Package')+'</div><div class="nps-variants">'+variantsHTML+'</div></div><button type="button" class="nps-compare-button" data-nps-action="compare" aria-expanded="'+w.compare+'">'+(w.compare?'Close comparison':'Compare packages')+' <svg aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor"><path d="M3 9 9 3M3 3h6v6"/></svg></button></div>'+summary+'</div>'+comparison+'</section>';
 }
 window.NPPlanSelector={version:VERSION,destroy(){document.removeEventListener('click',onClick,true);document.removeEventListener('keydown',onKey,true)},render(products,options={}){style();const key=options.key||'catalogue';let w=widgets.get(key);if(!w){w={key,products:[],family:'',capital:0,selected:'',variant:'basic',unit:'percent',detail:'account',compare:false,context:options.context||'trader'};widgets.set(key,w)}w.products=products.filter(p=>p.plan&&Number(p.plan.account_size)>0);w.context=options.context||w.context;if(options.selectedId)w.selected=options.selectedId;return html(w)},getState(key){return widgets.get(key)}};
 function onClick(event){const button=event.target.closest('[data-nps-action]');if(!button)return;event.stopImmediatePropagation();const root=button.closest('[data-nps-widget]');const w=root&&widgets.get(root.dataset.npsWidget);if(!w)return;event.preventDefault();const action=button.dataset.npsAction,value=button.dataset.npsValue;if(action==='family'){w.family=value;w.selected=''}else if(action==='capital'){w.capital=Number(value);w.selected=''}else if(action==='product')w.selected=value;else if(action==='unit')w.unit=value;else if(action==='detail')w.detail=value;else if(action==='compare')w.compare=!w.compare;else return;root.outerHTML=html(w);const next=document.querySelector('[data-nps-widget="'+CSS.escape(w.key)+'"]');if(next){const target=[...next.querySelectorAll('[data-nps-action]')].find(x=>x.dataset.npsAction===action&&(action==='compare'||x.dataset.npsValue===value));target?.focus({preventScroll:true})}}
@@ -12120,6 +12120,37 @@ if(typeof oldBuilder==='function')window.npRenderPackageBuilderV222=function(){r
 window.addEventListener('focus',()=>refresh(true));document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh(true)});
 setInterval(()=>{if(!document.hidden)refresh()},30000);
 window.NPSharedCatalogueState=state;queueMicrotask(()=>{if(current()&&(SESSION.trader||SESSION.data?.trader))refresh(true)});
+})();
+
+/* Exact-account breach reporting; no trading or lifecycle writes. */
+(function(){
+'use strict';
+if(window.NP_ACCOUNT_REPORTING_RELEASE)return;
+window.NP_ACCOUNT_REPORTING_RELEASE='account-reporting-20261111';
+const breached=a=>!!(a&&(a.recorded_breach||a.breached_at||String(a.account_status||'').toLowerCase().includes('breach')));
+if(typeof admAccountLifecycle==='function'){
+ const base=admAccountLifecycle;window.admAccountLifecycle=function(a){return breached(a)?'breached':base(a)};
+ const authority=admAccountBreachAuthority;window.admAccountBreachAuthority=function(a,t){return breached(a)||authority(a,t)};
+ window.admComputedAbsoluteDd=function(a){a=a||{};const start=Number(a.start_balance||a.account_size||0),values=[a.current_balance??a.balance,a.current_equity??a.equity].filter(x=>x!=null&&Number.isFinite(Number(x))).map(Number);return start>0&&values.length?Math.max(0,(start-Math.min(...values))/start*100):Math.max(0,Number(a.absolute_drawdown_percent||a.drawdown_percent||0))};
+ window.admDdAbsolutePercent=function(a){return admComputedAbsoluteDd(a)};
+ const riskCore=admRiskZone;window.admRiskZone=function(a,t){if(breached(a))return 'breached';if(a?.lifecycle_data_status&&a.lifecycle_data_status!=='verified')return 'unverified';return riskCore(a,t)};
+}
+// Also updates previously installed trader pages through their existing hosted script.
+const truths=new Map();
+if(typeof safeFetchJson==='function'){
+ const fetchCore=safeFetchJson;
+ window.safeFetchJson=async function(...args){const result=await fetchCore.apply(this,args);const x=result?.truth||result?.data?.truth;if(String(args[0]).includes('/account_truth_v116')&&x?.trader_account_id){truths.set(String(x.trader_account_id),x);setTimeout(paint,0)}return result};
+}
+function paint(){
+ const card=document.getElementById('np-historic-truth-card');if(!card)return;
+ const id=String(card.dataset.accountId||'');const x=truths.get(id);if(!x)return;
+ const badge=card.querySelector('.np-smart-panel-head .pill'),verdict=card.querySelectorAll('.np-smart-card')[3]?.querySelector('strong');
+ const label=x.recorded_breach?'BREACHED':x.ever_crossed_dd_limit?'OVERALL LIMIT CROSSED':x.monitoring_observation_present===false?'AWAITING BROKER UPDATE':'NO OVERALL CROSS RECORDED';
+ if(verdict&&verdict.textContent!==label)verdict.textContent=label;
+ if(badge){const value=x.recorded_breach?'BREACHED':x.ever_crossed_dd_limit?'OVERALL LIMIT CROSSED':x.monitoring_observation_present===false?'AWAITING BROKER UPDATE':'NO OVERALL CROSS RECORDED';if(badge.textContent!==value)badge.textContent=value;badge.className='pill '+(x.recorded_breach||x.ever_crossed_dd_limit?'pill-red':'pill-yellow')}
+ const cr=card.querySelector('#ht-cross');if(cr&&x.recorded_breach){const value='Recorded breach: '+(x.breached_at?new Date(x.breached_at).toLocaleString('en-GB'):'time unavailable');if(cr.textContent!==value)cr.textContent=value}
+}
+setInterval(()=>{if(!document.hidden)paint()},2000);
 })();
 </script>
 <script src="https://nairapips-api.onrender.com/public/trader-catalogue.js"></script></body>
@@ -12578,10 +12609,14 @@ async function htLoad(a){
     });
     if(lo)lo.textContent=htWhen(x.lowest_equity_at);
     if(hi)hi.textContent=htWhen(x.highest_equity_at);
-    if(cr)cr.textContent=x.ever_crossed_dd_limit?'First crossed: '+htWhen(x.first_crossed_dd_limit_at||x.first_crossed_at):'No observed crossing';
+    if(cr)cr.textContent=x.recorded_breach?'Recorded breach: '+htWhen(x.breached_at):x.ever_crossed_dd_limit?'First crossed: '+htWhen(x.first_crossed_dd_limit_at||x.first_crossed_at):'No observed crossing';
     if(live)live.textContent=x.monitoring_observation_present===false?'Awaiting first broker update':htWhen(x.last_monitored_at);
     const badge=card.querySelector('.np-smart-panel-head .pill');
-    if(x.monitoring_observation_present===false){
+    const verdict=boxes[3]?.querySelector('strong');
+    if(verdict)verdict.textContent=x.recorded_breach?'BREACHED':x.ever_crossed_dd_limit?'OVERALL LIMIT CROSSED':'NO OVERALL CROSS RECORDED';
+    if(x.recorded_breach){
+      if(badge){badge.textContent='BREACHED';badge.className='pill pill-red';}
+    }else if(x.monitoring_observation_present===false){
       if(lo)lo.textContent='No broker observation recorded';
       if(hi)hi.textContent='No broker observation recorded';
       if(cr)cr.textContent='Awaiting first broker update';
@@ -12589,6 +12624,7 @@ async function htLoad(a){
     }else if(badge){badge.textContent=x.ever_crossed_dd_limit?'LIMIT CROSSED':'WITHIN LIMIT';badge.className='pill '+(x.ever_crossed_dd_limit?'pill-red':'pill-green');}
   }catch(e){
     if(!ownsCard())return;
+    const verdict=card.querySelectorAll('.np-smart-card')[3]?.querySelector('strong');if(verdict)verdict.textContent='HISTORY UNAVAILABLE';const badge=card.querySelector('.np-smart-panel-head .pill');if(badge){badge.textContent='UNVERIFIED';badge.className='pill pill-yellow';}
     ['ht-low','ht-high','ht-cross','ht-live'].forEach(id=>{const el=card.querySelector('#'+id);if(el)el.textContent='Exact account history unavailable';});
   }
 }

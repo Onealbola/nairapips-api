@@ -9,12 +9,15 @@ class AdminAccountLiveTests(unittest.TestCase):
  def setUp(self):
   self.a={'id':'11111111-1111-4111-8111-111111111111','trader_id':'owner','mt5_login':'123','account_status':'assigned_active','stage':'funded','start_balance':500000,'current_equity':500000}
   self.snap={'trader_account_id':self.a['id'],'trader_id':'owner','mt5_login':'123','balance':512000,'equity':510000,'observed_at':datetime.now(timezone.utc).isoformat(),'dd_used_percent':4}
-  self.http=Mock();self.http.get.return_value.json.side_effect=lambda:[self.snap]
+  self.http=Mock()
+  def read(url,**kwargs):
+   response=Mock();response.json.return_value=[self.a] if url.endswith('/trader_accounts') else [self.snap];return response
+  self.http.get.side_effect=read
   self.payload={key:[copy.deepcopy(self.a)] for key in ['data','accounts','trader_accounts']}
  def decorate(self):return overlay_account_lists(self.payload,self.http,'https://db.test','key',lambda a:a['account_status']=='assigned_active')
  def test_aliases_share_verified_metrics_in_one_batch(self):
   result=self.decorate()
-  self.assertEqual(self.http.get.call_count,1)
+  self.assertEqual(self.http.get.call_count,2)
   for key in self.payload:
    if key=='live_data_read_failed':continue
    self.assertEqual(result[key][0]['current_equity'],510000)
@@ -32,6 +35,31 @@ class AdminAccountLiveTests(unittest.TestCase):
   self.assertEqual(self.decorate()['accounts'][0]['live_data_status'],'stale')
   self.http.get.side_effect=RuntimeError('offline')
   self.assertEqual(self.decorate()['accounts'][0]['live_data_status'],'unavailable')
+ def test_canonical_breach_overrides_stale_active_aliases(self):
+  self.a.update(account_status='breached_archived',breached_at='2026-11-11T07:25:20Z',archive_reason='MAX_DRAWDOWN_BREACH')
+  for key in ('data','accounts','trader_accounts'):
+   out=self.decorate()[key][0]
+   self.assertEqual(out['account_status'],'breached_archived')
+   self.assertEqual(out['risk_zone'],'breached')
+   self.assertTrue(out['recorded_breach'])
+ def test_breached_account_removed_from_active_collection_but_retained_in_history(self):
+  self.payload['active_accounts']=[copy.deepcopy(self.a)]
+  self.a.update(account_status='breached_archived',breached_at='2026-11-11T07:25:20Z')
+  result=self.decorate()
+  self.assertEqual(result['active_accounts'],[])
+  self.assertEqual(len(result['accounts']),1)
+ def test_report_separates_capital_loss_and_budget_usage(self):
+  self.a['start_balance']=5000000;self.a['dd_limit_percent']=20
+  for rows in self.payload.values():rows[0].update(start_balance=5000000,dd_limit_percent=20)
+  self.snap.update(balance=4769271,equity=4289477,dd_used_percent=71.0523)
+  out=self.decorate()['accounts'][0]
+  self.assertAlmostEqual(out['capital_drawdown_percent'],14.21046)
+  self.assertAlmostEqual(out['loss_allowance_used_percent'],71.0523)
+ def test_recovered_daily_breach_is_still_breached_below_overall_limit(self):
+  self.a.update(account_status='breached_archived',breached_at='2026-11-11T07:00:00Z',archive_reason='DAILY_DRAWDOWN_BREACH')
+  self.snap.update(equity=510000,balance=510000,risk_zone='safe')
+  out=self.decorate()['accounts'][0]
+  self.assertTrue(out['recorded_breach']);self.assertEqual(out['risk_zone'],'breached')
  def test_actual_response_wrapper_updates_browser_alias(self):
   tree=ast.parse((Path(__file__).resolve().parents[1]/'app.py').read_bytes())
   node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_np_v204_live_refresh_response')

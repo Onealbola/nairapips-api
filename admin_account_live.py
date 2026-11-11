@@ -2,21 +2,23 @@
 from datetime import datetime, timezone
 from math import isfinite
 from uuid import UUID
+from account_reporting import refresh_lifecycle, metrics, recorded_breach
 
 
 def overlay_account_lists(payload, transport, url, key, is_live):
     collections=[]
     if isinstance(payload.get('data'),list):collections.append(('data',payload['data']))
-    for name in ('accounts','trader_accounts','active_accounts','all_accounts'):
+    for name in ('accounts','trader_accounts','active_accounts','all_accounts','_single_current_account','_single_account'):
         if isinstance(payload.get(name),list):collections.append((name,payload[name]))
     accounts={}
     for _,rows in collections:
         for row in rows:
-            if not isinstance(row,dict) or not is_live(row):continue
+            if not isinstance(row,dict):continue
             aid=str(row.get('id') or '')
             try:UUID(aid)
             except (ValueError,TypeError):continue
             accounts[aid]=row
+    canonical,lifecycle_failed=refresh_lifecycle(accounts,transport,url,key)
     snapshots={};failed=False
     ids=sorted(accounts)
     try:
@@ -38,28 +40,41 @@ def overlay_account_lists(payload, transport, url, key, is_live):
         # A partially read fleet must not appear fully live.
         failed=True
     def overlay(row):
-        if not isinstance(row,dict) or not is_live(row):return row
-        out=dict(row);snap=snapshots.get(str(row.get('id') or ''))
+        if not isinstance(row,dict):return row
+        out=dict(row);aid=str(row.get('id') or '')
+        fresh=canonical.get(aid)
+        if fresh:
+            out.update(fresh)
+            out['lifecycle_data_status']='verified'
+        else:
+            out['lifecycle_data_status']='unavailable' if lifecycle_failed else 'unverified'
+        # A stale payload must not erase a previously recorded permanent breach.
+        if recorded_breach(row):
+            out['account_status']=row.get('account_status') if 'breach' in str(row.get('account_status') or '').lower() else 'breached_archived'
+            out['breached_at']=row.get('breached_at') or out.get('breached_at')
+        snap=snapshots.get(aid)
         out['live_data_status']='unavailable' if failed else 'missing'
-        if not snap:return out
+        if not snap:return metrics(out)
         try:
             balance=float(snap['balance']);equity=float(snap['equity'])
             observed=datetime.fromisoformat(str(snap['observed_at']).replace('Z','+00:00'))
             if observed.tzinfo is None:raise ValueError('Missing observation timezone')
             age=(datetime.now(timezone.utc)-observed).total_seconds()
             if not all(isfinite(v) and v>=0 for v in (balance,equity)) or age < -60:raise ValueError('Invalid observation')
-        except (ValueError,TypeError,KeyError):return out
+        except (ValueError,TypeError,KeyError):return metrics(out)
         out.update(current_balance=balance,current_equity=equity,balance=balance,equity=equity,
             latest_monitoring_snapshot=snap,last_sync_at=snap['observed_at'],
             live_monitor_update_at=snap['observed_at'],live_metrics_authority='EXACT_ADMIN_LIVE_STATE',
             live_data_status='live' if age<=180 else 'stale')
         for field in ('dd_used_percent','drawdown_percent','highest_equity','lowest_equity','risk_zone'):
             if snap.get(field) is not None:out[field]=snap[field]
-        start=float(row.get('start_balance') or row.get('account_size') or 0)
+        start=float(out.get('start_balance') or out.get('account_size') or 0)
         out['profit']=equity-start
         out['profit_percent']=(equity-start)/start*100 if start>0 else None
-        return out
-    for name,rows in collections:payload[name]=[overlay(row) for row in rows]
+        return metrics(out)
+    for name,rows in collections:
+        decorated=[overlay(row) for row in rows]
+        payload[name]=[r for r in decorated if is_live(r) and not recorded_breach(r)] if name=='active_accounts' else decorated
     payload['live_data_read_failed']=failed
     return payload
 
