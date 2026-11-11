@@ -85,6 +85,18 @@ class OverviewTests(unittest.TestCase):
             r=client.get('/admin/business_overview?fresh=1');self.assertEqual(r.status_code,200);self.assertEqual(r.headers['Cache-Control'],'no-store')
         self.assertEqual(client.get('/admin/business_overview?period=invalid').status_code,400)
 
+    def test_deadline_failure_has_retry_diagnostics_without_partial_totals(self):
+        app=Flask(__name__)
+        register_business_overview(app,Mock(),'https://fixture.invalid','fixture',lambda:({'id':'fixture-admin'},None))
+        with patch('business_overview.read_sources',side_effect=TimeoutError('private diagnostic')),self.assertLogs(app.logger,level='WARNING'):
+            response=app.test_client().get('/admin/business_overview')
+        self.assertEqual(response.status_code,503)
+        self.assertEqual(response.json['code'],'OVERVIEW_READ_TIMEOUT')
+        self.assertNotIn('data',response.json)
+        self.assertNotIn('private diagnostic',response.get_data(as_text=True))
+        self.assertEqual(response.headers['Retry-After'],'2')
+        self.assertIn('no-store',response.headers['Cache-Control'])
+
     def test_all_pages_and_exact_live_identity_without_credentials_in_payload(self):
         from business_overview import read_sources
         from threading import Lock

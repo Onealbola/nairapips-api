@@ -328,7 +328,7 @@ def register_business_overview(app, transport, url, key, require_admin):
     lock = Lock()
     @app.get('/business_overview_version')
     def business_overview_version():
-        return jsonify(success=True, release=RELEASE, refresh_seconds=30, read_only=True)
+        return jsonify(success=True, release=RELEASE, refresh_seconds=30, read_only=True, read_deadline_seconds=READ_DEADLINE_SECONDS, database_dns_deadline_seconds=2)
 
     @app.get('/admin/business_overview')
     def business_overview():
@@ -357,5 +357,12 @@ def register_business_overview(app, transport, url, key, require_admin):
                 result.headers['Content-Encoding'] = 'gzip'
                 result.headers['Vary'] = 'Accept-Encoding'
             return result
-        except Exception:
-            return jsonify(success=False, error='The complete business snapshot could not be verified. No estimated or partial totals are shown.'), 503
+        except Exception as exc:
+            code='OVERVIEW_READ_TIMEOUT' if isinstance(exc,TimeoutError) else 'OVERVIEW_READ_FAILED'
+            # Operational type only: never log customer records or credentials.
+            app.logger.warning('Business overview refresh failed: %s (%s)',code,type(exc).__name__)
+            response=jsonify(success=False, code=code, error='The complete business snapshot could not be verified. No estimated or partial totals are shown.')
+            response.status_code=503
+            response.headers['Cache-Control']='no-store'
+            response.headers['Retry-After']='2'
+            return response
