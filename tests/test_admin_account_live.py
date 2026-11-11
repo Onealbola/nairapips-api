@@ -24,6 +24,34 @@ class AdminAccountLiveTests(unittest.TestCase):
    self.assertEqual(result[key][0]['current_equity'],510000)
    self.assertEqual(result[key][0]['profit'],10000)
    self.assertEqual(result[key][0]['live_data_status'],'live')
+ def test_request_local_prefetch_avoids_duplicate_reads_and_keeps_breach(self):
+  fresh=dict(self.a,account_status='breached_archived',breached_at='2026-11-11T07:00:00Z')
+  result=overlay_account_lists(self.payload,self.http,'https://db.test','key',lambda a:True,
+      fresh_rows=[fresh],live_rows=[self.snap])
+  self.http.get.assert_not_called()
+  self.assertEqual(result['accounts'][0]['risk_zone'],'breached')
+  self.assertEqual(result['accounts'][0]['equity'],510000)
+ def test_prefetch_still_audits_exact_purchased_daily_rule(self):
+  from plan_risk_controls import freeze
+  fresh=dict(self.a,journey_source='post9_purchase_root_immutable',purchase_id='exact-purchase')
+  self.purchases=[dict(id='exact-purchase',trader_id='owner',drawdown_type='STATIC',journey_source=freeze('purchase',dict(daily_drawdown='5',payout_frequency='Daily')))]
+  result=overlay_account_lists(self.payload,self.http,'https://db.test','key',lambda a:True,
+      fresh_rows=[fresh],live_rows=[self.snap])
+  self.assertEqual(result['accounts'][0]['trading_rule_snapshot_status'],'repair_required')
+  self.assertEqual(self.http.get.call_count,1)
+  self.assertTrue(self.http.get.call_args.args[0].endswith('/challenge_purchases'))
+ def test_prefetched_telemetry_still_rejects_foreign_identity(self):
+  for field in ('trader_id','mt5_login'):
+   snap=dict(self.snap,**{field:'foreign'})
+   result=overlay_account_lists(self.payload,self.http,'https://db.test','key',lambda a:True,
+       fresh_rows=[self.a],live_rows=[snap])
+   self.assertEqual(result['accounts'][0]['live_data_status'],'missing')
+  self.http.get.assert_not_called()
+ def test_prefetch_failure_cannot_claim_live_data(self):
+  result=overlay_account_lists(self.payload,self.http,'https://db.test','key',lambda a:True,
+      fresh_rows=[self.a],live_rows=[],live_failed=True)
+  self.assertEqual(result['accounts'][0]['live_data_status'],'unavailable')
+  self.assertTrue(result['live_data_read_failed'])
  def test_zero_equity_is_not_replaced_with_starting_capital(self):
   self.snap['balance']=self.snap['equity']=0
   a=self.decorate()['accounts'][0];self.assertEqual(a['current_equity'],0);self.assertEqual(a['profit'],-500000)
@@ -120,9 +148,9 @@ class CompleteFleetTests(unittest.TestCase):
   def get(url,**kwargs):
    table=url.rsplit('/',1)[-1];params=kwargs['params'];calls.append((table,params))
    if table=='trader_accounts':
-    if params['offset']=='0':rows=[{'id':str(i),'trader_id':'t','stage':'funded','account_status':'archived','mt5_password':'must-not-leak'} for i in range(1000)]
+    if params['offset']=='0':rows=[{'id':str(__import__('uuid').UUID(int=i+1)),'trader_id':'t','stage':'funded','account_status':'archived','mt5_password':'must-not-leak'} for i in range(1000)]
     elif fail_second:raise RuntimeError('database failed')
-    else:rows=[{'id':'last','trader_id':'t','stage':'funded','account_status':'archived'}]
+    else:rows=[{'id':str(__import__('uuid').UUID(int=1001)),'trader_id':'t','stage':'funded','account_status':'archived'}]
    elif table=='traders':rows=[{'id':'t','name':'Trader'}]
    else:rows=[]
    response=Mock();response.json.return_value=rows;return response
@@ -134,6 +162,7 @@ class CompleteFleetTests(unittest.TestCase):
   client,calls=self.fixture();response=client.get('/admin/account_state')
   self.assertEqual(response.status_code,200);self.assertEqual(len(response.json['accounts']),1001)
   self.assertTrue(response.json['complete']);self.assertEqual(response.json['accounts'][-1]['trader_name'],'Trader')
+  self.assertEqual(len(calls),5)  # 2 fleet pages + names + registry + one telemetry page
   self.assertNotIn('must-not-leak',response.get_data(as_text=True))
   self.assertEqual([p['offset'] for t,p in calls if t=='trader_accounts'],['0','1000'])
  def test_failure_never_presents_partial_totals(self):

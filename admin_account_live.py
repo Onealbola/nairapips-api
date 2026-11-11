@@ -5,7 +5,7 @@ from uuid import UUID
 from account_reporting import refresh_lifecycle, metrics, recorded_breach
 
 
-def overlay_account_lists(payload, transport, url, key, is_live):
+def overlay_account_lists(payload, transport, url, key, is_live, *, fresh_rows=None, live_rows=None, live_failed=False):
     collections=[]
     if isinstance(payload.get('data'),list):collections.append(('data',payload['data']))
     for name in ('accounts','trader_accounts','active_accounts','all_accounts','_single_current_account','_single_account'):
@@ -18,16 +18,20 @@ def overlay_account_lists(payload, transport, url, key, is_live):
             try:UUID(aid)
             except (ValueError,TypeError):continue
             accounts[aid]=row
-    canonical,lifecycle_failed=refresh_lifecycle(accounts,transport,url,key)
-    snapshots={};failed=False
+    canonical,lifecycle_failed=refresh_lifecycle(accounts,transport,url,key,fresh_rows=fresh_rows)
+    snapshots={};failed=live_failed
     ids=sorted(accounts)
     try:
-        for offset in range(0,len(ids),100):
-            batch=ids[offset:offset+100]
-            response=transport.get(url.rstrip('/')+'/rest/v1/np_live_account_state',
-                headers={'apikey':key,'Authorization':'Bearer '+key},
-                params={'select':'*','trader_account_id':'in.('+','.join(batch)+')','limit':str(len(batch))},timeout=(2,4))
-            response.raise_for_status();rows=response.json()
+        batches = [None] if live_rows is not None else range(0,len(ids),100)
+        for offset in batches:
+            batch=ids if offset is None else ids[offset:offset+100]
+            if live_rows is not None:
+                rows=live_rows
+            else:
+                response=transport.get(url.rstrip('/')+'/rest/v1/np_live_account_state',
+                    headers={'apikey':key,'Authorization':'Bearer '+key},
+                    params={'select':'*','trader_account_id':'in.('+','.join(batch)+')','limit':str(len(batch))},timeout=(2,4))
+                response.raise_for_status();rows=response.json()
             if not isinstance(rows,list):raise ValueError('Invalid live telemetry response')
             for snap in rows:
                 aid=str(snap.get('trader_account_id') or '')
@@ -118,7 +122,15 @@ def register_admin_account_state(app, transport, url, key, require_admin, is_liv
                 out['trader_name']=trader.get('name') or trader.get('email') or ''
                 out['live_monitoring_registered']=str(account.get('id')) in registered
                 rows.append(out)
-            payload=overlay_account_lists({'success':True,'accounts':rows,'complete':True},transport,url,key,is_live)
+            # Reuse this request's complete authoritative reads instead of
+            # rereading the fleet in dozens of sequential UUID batches.
+            try:
+                observations=read('np_live_account_state',order='trader_account_id.asc')
+                live_failed=False
+            except Exception:
+                observations=[];live_failed=True
+            payload=overlay_account_lists({'success':True,'accounts':rows,'complete':True},transport,url,key,is_live,
+                fresh_rows=accounts,live_rows=observations,live_failed=live_failed)
             response=jsonify(payload);response.headers['Cache-Control']='no-store'
             return response
         except Exception:

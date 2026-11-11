@@ -48,18 +48,22 @@ def metrics(row):
     return out
 
 
-def refresh_lifecycle(accounts, transport, url, key):
+def refresh_lifecycle(accounts, transport, url, key, *, fresh_rows=None):
     """Batch exact identities; never accept a different owner, purchase or MT5 login."""
     result = {}; failed = False
     ids = sorted(accounts)
     try:
-        for offset in range(0,len(ids),100):
-            batch=ids[offset:offset+100]
-            response=transport.get(url.rstrip('/')+'/rest/v1/trader_accounts',
-                headers={'apikey':key,'Authorization':'Bearer '+key},
-                params={'select':','.join(LIFECYCLE_FIELDS)+',journey_source','id':'in.('+','.join(batch)+')','limit':str(len(batch))},timeout=(2,4))
-            response.raise_for_status()
-            rows=response.json()
+        batches = [None] if fresh_rows is not None else range(0,len(ids),100)
+        for offset in batches:
+            batch=ids if offset is None else ids[offset:offset+100]
+            if fresh_rows is not None:
+                rows=fresh_rows
+            else:
+                response=transport.get(url.rstrip('/')+'/rest/v1/trader_accounts',
+                    headers={'apikey':key,'Authorization':'Bearer '+key},
+                    params={'select':','.join(LIFECYCLE_FIELDS)+',journey_source','id':'in.('+','.join(batch)+')','limit':str(len(batch))},timeout=(2,4))
+                response.raise_for_status()
+                rows=response.json()
             if not isinstance(rows,list):raise ValueError('Invalid lifecycle feed')
             for row in rows:
                 aid=str(row.get('id') or '')
@@ -85,8 +89,8 @@ def refresh_lifecycle(accounts, transport, url, key):
         for offset in range(0,len(pids),100):
             batch=pids[offset:offset+100]
             response=transport.get(url.rstrip('/')+'/rest/v1/challenge_purchases',
-                headers={'apikey':key,'Authorization':'Bearer '+key},
-                params={'select':'id,trader_id,journey_source,drawdown_type','id':'in.('+','.join(batch)+')','limit':str(len(batch))},timeout=(2,4))
+                    headers={'apikey':key,'Authorization':'Bearer '+key},
+                    params={'select':'id,trader_id,journey_source,drawdown_type','id':'in.('+','.join(batch)+')','limit':str(len(batch))},timeout=(2,4))
             response.raise_for_status();purchases=response.json()
             if not isinstance(purchases,list):raise ValueError('Invalid purchase metadata feed')
             for purchase in purchases:
