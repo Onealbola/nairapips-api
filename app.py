@@ -78,8 +78,6 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
-from database_dns import install_database_dns_guard as _np_install_database_dns_guard
-_np_install_database_dns_guard(SUPABASE_URL)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY,
     options=_NPClientOptionsV218(postgrest_client_timeout=8))
 
