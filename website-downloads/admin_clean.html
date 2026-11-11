@@ -12714,6 +12714,21 @@ function exportPurchaseSalesCSV(){
 
 
 let npSalesReportSequence=0;
+let npSalesLiveTimer=null,npSalesPending=0;
+function npSalesLiveStatus(text){
+ const box=document.getElementById('np-sales-result');if(!box)return;
+ let status=document.getElementById('np-sales-live-status');
+ if(!status){status=document.createElement('p');status.id='np-sales-live-status';status.setAttribute('role','status');status.className='text-sm mb-3';box.before(status);}
+ status.textContent=text;
+}
+function npSalesScheduleRefresh(){
+ clearTimeout(npSalesLiveTimer);
+ npSalesLiveTimer=setTimeout(()=>{
+  if(SESSION.currentMod!=='salesOutcomes'||!document.getElementById('np-sales-result'))return;
+  if(document.hidden||npSalesPending||['np-sales-from','np-sales-to'].includes(document.activeElement?.id)){npSalesScheduleRefresh();return;}
+  loadSalesOutcomes(true);
+ },30000);
+}
 
 function npSalesDateISOv225(raw){
  const value=String(raw||'').trim();
@@ -12791,9 +12806,13 @@ function npSalesDatesChanged(){
 }
 function renderSalesOutcomes(){
  document.getElementById('content').innerHTML=`<div class="vault mb-6"><div class="badge">SALES OUTCOMES</div><h1 style="font-size:28px;font-weight:900;margin:12px 0">Where your sold accounts ended up</h1><p class="text-gray-400">Total bought, breached, reached funded, and got payout for your selected sales period.</p></div><div class="card mb-4"><div class="flex flex-wrap gap-3 items-end"><label>Sold from (DD/MM/YYYY)<br><input id="np-sales-from" type="text" inputmode="numeric" placeholder="DD/MM/YYYY" maxlength="10" oninput="npSalesDatesChanged()" onchange="npSalesDatesChanged()" class="input" value="${npSalesDateInputv225(window.npSalesFrom)}"></label><label>Sold through (DD/MM/YYYY)<br><input id="np-sales-to" type="text" inputmode="numeric" placeholder="DD/MM/YYYY" maxlength="10" oninput="npSalesDatesChanged()" onchange="npSalesDatesChanged()" class="input" value="${npSalesDateInputv225(window.npSalesTo)}"></label><button class="btn btn-gold" onclick="loadSalesOutcomes()">Show results</button><button class="btn btn-ghost" onclick="document.getElementById('np-sales-from').value='';document.getElementById('np-sales-to').value='';loadSalesOutcomes()">All time</button></div><p class="text-gray-400 text-sm mt-3">Enter day/month/year. Example: 03/10/2026 means 3 October 2026. Dates use Nigerian business days. Results include their linked history up to today. Resets do not count as new sales.</p></div><div id="np-sales-result" aria-live="polite">Choose a period, then Show results.</div>`;
+ npSalesScheduleRefresh();
+ loadSalesOutcomes();
 }
-async function loadSalesOutcomes(){
+async function loadSalesOutcomes(background=false){
+ if(background&&npSalesPending)return;
  clearTimeout(npSalesDateTimer);
+ npSalesDateTimer=null;
  const sequence=++npSalesReportSequence;
  const box=document.getElementById('np-sales-result');
  let from,to;
@@ -12803,7 +12822,11 @@ async function loadSalesOutcomes(){
  }catch(err){box.textContent=err.message;return;}
  if(from&&to&&from>to){box.textContent='The start date must come before the end date.';return;}
  window.npSalesFrom=from;window.npSalesTo=to;
- box.textContent='Loading complete purchase, account and payout history…';
+ const expanded=background?box.querySelector('[data-sales-metric][aria-expanded="true"]')?.dataset.salesMetric:null;
+ const hadComplete=!!box.dataset.completeAt;
+ npSalesPending++;
+ npSalesLiveStatus(hadComplete?'Refreshing report…':'Loading current records…');
+ if(!background||!hadComplete)box.textContent='Loading complete purchase, account and payout history…';
  try{
   const response=await api('/admin/sales_outcomes?'+new URLSearchParams({from,to}));
   if(sequence!==npSalesReportSequence||!box.isConnected)return;
@@ -12852,9 +12875,17 @@ async function loadSalesOutcomes(){
     details.innerHTML=`<div style="display:flex;align-items:center;justify-content:space-between;gap:12px"><h2 tabindex="-1" style="font-size:20px;font-weight:900">${e(labels[key])} · ${rows.length} purchase${rows.length===1?'':'s'}</h2><button type="button" class="btn btn-ghost" data-sales-close>Close list</button></div><p class="text-gray-400 text-sm">Same sales period: ${e(r.from?npSalesDateLabelv225(r.from):'Beginning')} → ${e(r.to?npSalesDateLabelv225(r.to):'Latest sales')}. Each row is one purchase; a trader may have more than one purchase.</p><div style="overflow:auto"><table class="w-full"><thead><tr><th>Trader</th><th>Plan / size</th><th>Sale date</th><th>Recorded MT5</th><th>Current MT5 / stage</th><th>Purchase</th></tr></thead><tbody>${rows.map(row=>`<tr><td><b>${e(row.trader_name||'Trader '+String(row.trader_id||'').slice(0,8))}</b><div class="text-xs">${e(row.email)}</div></td><td>${e(row.plan)} · ${e(money(row.account_size))}</td><td>${e(npSalesDateLabelv225(row.sale_date))}</td><td>${e(row.mt5_login)||'—'}</td><td>${(row.current_accounts||[]).map(a=>`<div>${e(a.mt5_login)} · ${e(({phase1:'Phase 1',phase2:'Phase 2',funded:'Funded'})[a.stage]||a.stage)}<span class="text-xs"> · ${e(a.status)}</span></div>`).join('')||'No open account'}</td><td>${e(row.purchase_id)}</td></tr>`).join('')||'<tr><td colspan="6">No matching purchases in this sales period.</td></tr>'}</tbody></table></div>`;
     details.querySelector('[data-sales-close]').addEventListener('click',()=>{details.hidden=true;box.querySelectorAll('[data-sales-metric]').forEach(b=>b.setAttribute('aria-expanded','false'));button.focus();});
     details.querySelector('h2').focus({preventScroll:true});
-    details.scrollIntoView({behavior:'smooth',block:'start'});
+    if(!background)details.scrollIntoView({behavior:'smooth',block:'start'});
   }));
- }catch(err){if(sequence===npSalesReportSequence&&box.isConnected)box.textContent=err.message||'Unable to load the complete report. Please retry.';}
+  box.dataset.completeAt=response.generated_at||new Date().toISOString();
+  npSalesLiveStatus('Last updated: '+new Date(box.dataset.completeAt).toLocaleTimeString('en-GB',{timeZone:'Africa/Lagos'})+' WAT · Refreshes every 30 seconds');
+  if(expanded)box.querySelector('[data-sales-metric="'+expanded+'"]')?.click();
+ }catch(err){
+  if(sequence===npSalesReportSequence&&box.isConnected){
+   if(!background||!hadComplete)box.textContent=err.message||'Unable to load the complete report. Please retry.';
+   npSalesLiveStatus(hadComplete&&background?'Update delayed. Showing the last complete report from '+new Date(box.dataset.completeAt).toLocaleTimeString('en-GB',{timeZone:'Africa/Lagos'})+' WAT. Retrying automatically.':'Report unavailable. Retrying automatically; you can also use Show results.');
+  }
+ }finally{npSalesPending--;npSalesScheduleRefresh();}
 }
 
 /* FUNDED_CYCLE_PROGRESS_START */
