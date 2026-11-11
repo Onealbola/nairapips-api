@@ -38,7 +38,7 @@ def metrics(row):
     if out['recorded_breach']:
         out['risk_zone'] = 'breached'
         out['reporting_status'] = 'BREACHED'
-    elif row.get('rule_snapshot_status') == 'repair_required':
+    elif row.get('trading_rule_snapshot_status') == 'repair_required':
         out['risk_zone'] = 'rule_review_required'
         out['reporting_status'] = 'RULE_REVIEW_REQUIRED'
     elif row.get('live_data_status') != 'live':
@@ -68,14 +68,16 @@ def refresh_lifecycle(accounts, transport, url, key):
                 if any(str(row.get(k) or '')!=str(original.get(k) or '') for k in ('trader_id','mt5_login')):continue
                 if original.get('purchase_id') and str(row.get('purchase_id') or '')!=str(original['purchase_id']):continue
                 result[aid]={k:v for k,v in row.items() if k in LIFECYCLE_FIELDS}
-                if str(row.get('journey_source') or '')=='post9_purchase_root_immutable':
+                result[aid].update(rule_snapshot_status='not_applicable',trading_rule_snapshot_status='not_applicable')
+                source=str(row.get('journey_source') or '')
+                if source=='post9_purchase_root_immutable' or '|np_risk_controls_v1:' in source or '|np_withdrawal_v1:' in source or source.startswith('equity_trailing_v1:'):
                     result[aid]['_snapshot_source']=row.get('journey_source')
     except Exception:
         failed=True
     # Only the known destructive ownership label needs this compatibility audit.
     # Match the exact immutable purchase; never use mutable current plan settings.
     candidates={aid:r for aid,r in result.items() if '_snapshot_source' in r and r.get('purchase_id')}
-    for row in candidates.values():row['rule_snapshot_status']='unverified'
+    for row in candidates.values():row.update(rule_snapshot_status='unverified',trading_rule_snapshot_status='unverified')
     pids=sorted({str(r['purchase_id']) for r in candidates.values()})
     try:
         from plan_risk_controls import frozen_terms
@@ -90,8 +92,16 @@ def refresh_lifecycle(accounts, transport, url, key):
             for purchase in purchases:
                 for row in candidates.values():
                     if str(purchase.get('id'))!=str(row['purchase_id']) or str(purchase.get('trader_id'))!=str(row['trader_id']):continue
-                    missing=bool(frozen_terms(purchase) or withdrawal_terms(purchase) or str(purchase.get('drawdown_type') or '').upper()=='TRAILING')
-                    row['rule_snapshot_status']='repair_required' if missing else 'verified'
+                    source_row=dict(row,journey_source=row['_snapshot_source'])
+                    purchased=frozen_terms(purchase);assigned=frozen_terms(source_row)
+                    from equity_drawdown import account_mode, mode
+                    from decimal import Decimal
+                    daily_missing=Decimal((purchased or {}).get('daily_drawdown',0))!=Decimal((assigned or {}).get('daily_drawdown',0))
+                    trading_missing=daily_missing or account_mode(source_row)!=mode(purchase.get('drawdown_type'))
+                    controls_missing=purchased!=assigned or withdrawal_terms(purchase)!=withdrawal_terms(source_row)
+                    row['rule_snapshot_status']='repair_required' if controls_missing or trading_missing else 'verified'
+                    row['trading_rule_snapshot_status']='repair_required' if trading_missing else 'verified'
+                    row['snapshot_repair_scope']='trading_rules' if trading_missing else 'payout_controls' if controls_missing else None
     except Exception:
         pass  # Unavailable evidence stays unverified, never labelled repaired.
     for row in result.values():row.pop('_snapshot_source',None)

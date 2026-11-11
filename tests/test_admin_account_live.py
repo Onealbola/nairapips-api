@@ -76,6 +76,31 @@ class AdminAccountLiveTests(unittest.TestCase):
   self.a.update(journey_source='post9_purchase_root_immutable',purchase_id='exact-purchase')
   self.purchases=[dict(id='exact-purchase',trader_id='owner',drawdown_type='STATIC',journey_source='legacy')]
   self.assertEqual(self.decorate()['accounts'][0]['rule_snapshot_status'],'verified')
+ def test_commercial_only_missing_snapshot_does_not_claim_trading_rules_missing(self):
+  from plan_risk_controls import freeze
+  self.a.update(journey_source='post9_purchase_root_immutable',purchase_id='exact-purchase')
+  self.purchases=[dict(id='exact-purchase',trader_id='owner',drawdown_type='STATIC',journey_source=freeze('purchase',dict(daily_drawdown='0',payout_frequency='Daily',resets={'phase1':'9000'})))]
+  out=self.decorate()['accounts'][0]
+  self.assertEqual(out['rule_snapshot_status'],'repair_required')
+  self.assertEqual(out['trading_rule_snapshot_status'],'verified')
+  self.assertEqual(out['snapshot_repair_scope'],'payout_controls')
+  self.assertNotEqual(out['reporting_status'],'RULE_REVIEW_REQUIRED')
+ def test_restored_snapshot_clears_cached_warning_from_response(self):
+  from plan_risk_controls import freeze
+  source=freeze('post9_purchase_root_immutable',dict(daily_drawdown='0',payout_frequency='Daily'))
+  self.a.update(journey_source=source,purchase_id='exact-purchase')
+  self.purchases=[dict(id='exact-purchase',trader_id='owner',drawdown_type='STATIC',journey_source=source)]
+  for rows in self.payload.values():rows[0].update(rule_snapshot_status='repair_required',trading_rule_snapshot_status='repair_required')
+  out=self.decorate()['accounts'][0]
+  self.assertEqual(out['trading_rule_snapshot_status'],'verified')
+  self.assertEqual(out['rule_snapshot_status'],'verified')
+ def test_lost_trailing_prefix_requires_trading_history_even_without_daily_rule(self):
+  from plan_risk_controls import freeze
+  self.a.update(journey_source='post9_purchase_root_immutable',purchase_id='exact-purchase')
+  self.purchases=[dict(id='exact-purchase',trader_id='owner',drawdown_type='TRAILING',journey_source=freeze('purchase',dict(daily_drawdown='0',payout_frequency='Daily')))]
+  out=self.decorate()['accounts'][0]
+  self.assertEqual(out['trading_rule_snapshot_status'],'repair_required')
+  self.assertEqual(out['reporting_status'],'RULE_REVIEW_REQUIRED')
  def test_actual_response_wrapper_updates_browser_alias(self):
   tree=ast.parse((Path(__file__).resolve().parents[1]/'app.py').read_bytes())
   node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_np_v204_live_refresh_response')
