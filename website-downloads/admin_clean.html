@@ -19008,11 +19008,31 @@ if(document.readyState==='loading'){
    if(!b||(Number.isFinite(b.fromMs)?npFinanceDay(new Date(b.fromMs)):'')!==f.from_date||npFinanceDay(new Date(b.toMs))!==f.to_date)window.NP_FINANCE_PERIOD={range:'custom',from:f.from_date,to:f.to_date};
   }
  }
+ let financeRetryTimer=null;
+ function financeLoadFailed(content,key,mod,args,error){
+  if(SESSION.currentMod!==mod||!content)return;
+  clearTimeout(financeRetryTimer);
+  const token=SESSION.token;
+  const card=document.createElement('div');card.className='card';card.setAttribute('role','status');
+  const title=document.createElement('h2');title.textContent='Financial records temporarily unavailable';
+  const message=document.createElement('p');message.textContent=error.message||'The complete records could not be loaded.';
+  const note=document.createElement('p');note.textContent='No totals are shown until the complete records arrive.';
+  const button=document.createElement('button');button.className='btn btn-gold';button.textContent='Try again';
+  const retry=()=>{
+   clearTimeout(financeRetryTimer);
+   if(SESSION.currentMod===mod&&SESSION.token===token&&card.isConnected)return window[key](...args);
+  };
+  button.onclick=retry;card.append(title,message,note,button);content.replaceChildren(card);
+  if(/handling other requests|capacity|busy|temporar|timeout|taking longer|network|failed to fetch|HTTP 50[234]/i.test(message.textContent)){
+   note.textContent+=' Retrying automatically in 10 seconds.';
+   financeRetryTimer=setTimeout(()=>{if(!document.hidden)retry();},10000);
+  }
+ }
  const wrap=(key,mod)=>{const core=window[key];if(typeof core!=='function')return;window[key]=function(...args){
   prepare(mod);const state=npFinanceSourceState();
   if(!state.data||Date.now()-state.at>60000){
    const content=document.getElementById('content');if(content)content.innerHTML='<div class="card" role="status">Loading complete financial records…</div>';
-   return npFinanceLoad().then(()=>{if(SESSION.currentMod===mod)return window[key](...args);}).catch(e=>{if(SESSION.currentMod===mod&&content)content.textContent=e.message||'Financial totals unavailable. Please reload.';});
+   return npFinanceLoad().then(()=>{if(SESSION.currentMod===mod)return window[key](...args);}).catch(e=>{financeLoadFailed(content,key,mod,args,e);});
   }
   const decorate=()=>{const content=document.getElementById('content');if(!content)return;content.querySelector('[data-finance-source-note]')?.remove();const note=document.createElement('div');note.dataset.financeSourceNote='1';note.className='card mb-4';note.style.cssText='padding:12px;border:1px solid #b69b36;font-size:12px';note.textContent='Shared financial records · '+new Date(state.data.generated_at).toLocaleString('en-GB',{timeZone:'Africa/Lagos'})+' WAT. Sales use transaction dates; payouts use paid dates. Test/excluded records are omitted. Sales Outcomes shows lifetime payouts for its selected purchases, not cash paid during this period.';content.prepend(note);};
   const result=core.apply(this,args);if(result?.then)return result.then(decorate);decorate();return result;
