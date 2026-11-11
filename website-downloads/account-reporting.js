@@ -11,6 +11,11 @@ if(typeof admAccountLifecycle==='function'){
  window.admDdAbsolutePercent=function(a){return admComputedAbsoluteDd(a)};
  const riskCore=admRiskZone;window.admRiskZone=function(a,t){if(breached(a))return 'breached';if(a?.lifecycle_data_status&&a.lifecycle_data_status!=='verified')return 'unverified';return riskCore(a,t)};
 }
+// All trader status helpers give an exact recorded breach priority over pass flags.
+for(const name of ['npIsBreached','npIsPassed','npTargetAwaitingPassVerification','npDisplayStatus','npFriendlyAccountStatus']){
+ const core=window[name];if(typeof core!=='function')continue;
+ window[name]=function(a,...args){if(breached(a))return name==='npIsBreached'?true:name==='npIsPassed'||name==='npTargetAwaitingPassVerification'?false:'BREACHED';return core.call(this,a,...args)};
+}
 // Also updates previously installed trader pages through their existing hosted script.
 const truths=new Map();
 if(typeof safeFetchJson==='function'){

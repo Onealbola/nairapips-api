@@ -7765,15 +7765,14 @@ function renderDashboard(){
     SESSION.data.current_account=acct;
   }
   const startBal=Number(acct.start_balance||acct.initial_balance||acct.account_size||0);
-  const balance=Number(acct.current_balance||acct.balance||startBal);
-  const equity=Number(acct.current_equity||acct.equity||balance||startBal);
+  const balance=Number(acct.current_balance??acct.balance??startBal);
+  const equity=Number(acct.current_equity??acct.equity??balance??startBal);
   const profit=equity-startBal;
   const profitPct=startBal?(profit/startBal)*100:0;
   const stage=String(acct._np_display_stage||acct.stage||t.phase||'phase1').toLowerCase();
   const stageLabel={phase1:'PHASE 1',phase2:'PHASE 2',funded:'FUNDED'}[stage]||stage.toUpperCase();
   const ddLimit=npDDLimitFor(acct);
-  const ddRaw=Number(acct.dd_used_percent||acct.absolute_drawdown_percent||0);
-  const dd=(Number(ddRaw||0)/100)*ddLimit;
+  const dd=Number(acct.drawdown_percent??acct.absolute_drawdown_percent??(Number(acct.dd_used_percent||0)/100*ddLimit));
   const target=Number(npTargetFor(acct))||0;
   const passProgress=Number(acct.pass_progress_percent || (target && startBal ? (profitPct/target)*100 : 0));
   const ddProgress=ddLimit?Math.min(100,Math.max(0,(dd/ddLimit)*100)):0;
@@ -7783,12 +7782,12 @@ function renderDashboard(){
   const accountStatusRaw=String(acct.account_status||acct.status||'').toLowerCase();
   const isCurrentPassed = npIsPassed(acct);
   const verificationPending = npTargetAwaitingPassVerification(acct);
-  const isTerminalBreach=accountStatusRaw.includes('breach')||accountStatusRaw.includes('locked')||accountStatusRaw.includes('disabled')||Boolean(acct.mt5_access_disabled);
+  const isTerminalBreach=Boolean(acct.recorded_breach||acct.breached_at)||accountStatusRaw.includes('breach')||accountStatusRaw.includes('locked')||accountStatusRaw.includes('disabled')||Boolean(acct.mt5_access_disabled);
   const riskZone = isTerminalBreach || dd>=ddLimit
     ? 'breached'
-    : dd>=15
+    : dd>=ddLimit*0.75
       ? 'critical'
-      : dd>=10
+      : dd>=ddLimit*0.5
         ? 'warning'
         : 'safe';
   const riskText = verificationPending ? 'VERIFICATION PENDING' : isCurrentPassed
@@ -10673,7 +10672,7 @@ window.openBreachIntelligence=function(accountId){
   const winRate=closed.length?(wins.length/closed.length)*100:0;
   const peakBalance=Number(a.peak_balance||a.highest_balance||a.max_balance||Math.max(start,balance));
   const lossFromStart=Math.max(0,start-accountValue);
-  const condition=absoluteDD>=20?'BREACHED':absoluteDD>=15?'CRITICAL':absoluteDD>=10?'WARNING':'SAFE';
+  const condition=npIsBreached(a)?'BREACHED':absoluteDD>=ddLimit?'LIMIT REACHED':absoluteDD>=ddLimit*.75?'CRITICAL':absoluteDD>=ddLimit*.5?'WARNING':'SAFE';
 
   const body=`
   <div class="np-audit-head">
@@ -12134,6 +12133,11 @@ if(typeof admAccountLifecycle==='function'){
  window.admComputedAbsoluteDd=function(a){a=a||{};const start=Number(a.start_balance||a.account_size||0),values=[a.current_balance??a.balance,a.current_equity??a.equity].filter(x=>x!=null&&Number.isFinite(Number(x))).map(Number);return start>0&&values.length?Math.max(0,(start-Math.min(...values))/start*100):Math.max(0,Number(a.absolute_drawdown_percent||a.drawdown_percent||0))};
  window.admDdAbsolutePercent=function(a){return admComputedAbsoluteDd(a)};
  const riskCore=admRiskZone;window.admRiskZone=function(a,t){if(breached(a))return 'breached';if(a?.lifecycle_data_status&&a.lifecycle_data_status!=='verified')return 'unverified';return riskCore(a,t)};
+}
+// All trader status helpers give an exact recorded breach priority over pass flags.
+for(const name of ['npIsBreached','npIsPassed','npTargetAwaitingPassVerification','npDisplayStatus','npFriendlyAccountStatus']){
+ const core=window[name];if(typeof core!=='function')continue;
+ window[name]=function(a,...args){if(breached(a))return name==='npIsBreached'?true:name==='npIsPassed'||name==='npTargetAwaitingPassVerification'?false:'BREACHED';return core.call(this,a,...args)};
 }
 // Also updates previously installed trader pages through their existing hosted script.
 const truths=new Map();

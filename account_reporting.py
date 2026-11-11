@@ -32,6 +32,8 @@ def metrics(row):
         if limit and limit > 0:
             usage = number(row.get('dd_used_percent'))
             out['loss_allowance_used_percent'] = usage if usage is not None else loss / limit * 100
+            if out.get('dd_used_percent') is None:
+                out['dd_used_percent'] = out['loss_allowance_used_percent']
     out['recorded_breach'] = recorded_breach(row)
     if out['recorded_breach']:
         out['risk_zone'] = 'breached'
