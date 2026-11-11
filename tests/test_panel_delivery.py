@@ -26,6 +26,23 @@ class PanelDeliveryTests(unittest.TestCase):
         self.assertIn('no-store',r.headers['Cache-Control'])
         r.close()
 
+    def test_read_only_history_check_download_has_real_attachment(self):
+        import io
+        r=self.client.get('/downloads/rule-history-check.zip')
+        self.assertEqual(r.status_code,200)
+        self.assertEqual(r.mimetype,'application/zip')
+        self.assertIn('attachment',r.headers['Content-Disposition'])
+        self.assertIn('NairaPips-Rule-History-Check.zip',r.headers['Content-Disposition'])
+        self.assertIn('no-store',r.headers['Cache-Control'])
+        with zipfile.ZipFile(io.BytesIO(r.data)) as z:
+            self.assertIsNone(z.testzip())
+            self.assertEqual(set(z.namelist()),{'CHECK_ONLY.cmd','CHECK_RISK_HISTORY.py','README.txt'})
+            script=z.read('CHECK_RISK_HISTORY.py').decode()
+            self.assertNotIn('import MetaTrader5',script)
+            self.assertNotIn('import requests',script)
+            self.assertNotIn('subprocess',script)
+        r.close()
+
     def setUp(self):
         self.app=Flask(__name__);register_panel_delivery(self.app)
         @self.app.get('/admin/private_fixture')

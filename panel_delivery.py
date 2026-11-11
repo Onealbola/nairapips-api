@@ -50,6 +50,14 @@ def register_panel_delivery(app, root=None):
     def plan_editing_database_repair():
         return send_file(Path(__file__).resolve().parent/'migrations'/'20261105_fix_text_plan_share.sql',mimetype='text/plain',as_attachment=True,download_name='NairaPips-Repair-Plan-Editing.sql',conditional=False,etag=False,max_age=0)
 
+    @app.get('/downloads/rule-history-check.zip')
+    def rule_history_check_download():
+        response=send_file(assets/'nairapips-rule-history-check.zip',mimetype='application/zip',as_attachment=True,
+            download_name='NairaPips-Rule-History-Check.zip',conditional=False,etag=False,max_age=0)
+        response.headers['Cache-Control']='no-store, max-age=0'
+        response.headers['X-Content-Type-Options']='nosniff'
+        return response
+
     @app.get('/downloads/operations-withdrawal-update.zip')
     def operations_withdrawal_download():
         response=send_file(assets/'nairapips-operations-withdrawal-update.zip',mimetype='application/zip',as_attachment=True,
