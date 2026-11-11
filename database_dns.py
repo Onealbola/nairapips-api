@@ -33,6 +33,8 @@ class DatabaseDNSGuard:
         self.runner=runner or subprocess.run
         self.lock=Lock()
         self.cache={}
+        self.last_failure=None
+        self.lookups=0
 
     def __call__(self, host, port, family=0, type=0, proto=0, flags=0):
         normalized=host.decode('ascii') if isinstance(host,bytes) else host
@@ -52,14 +54,18 @@ class DatabaseDNSGuard:
             if remaining<=0:raise socket.gaierror(socket.EAI_AGAIN,'Database DNS lookup deadline exceeded')
             payload=dict(host=normalized,port=port,family=int(family),type=int(type),proto=int(proto),flags=int(flags))
             try:
+                self.lookups+=1
                 result=self.runner([sys.executable,'-c',_RESOLVE],input=json.dumps(payload),
                     capture_output=True,text=True,timeout=remaining,check=True)
                 answer=json.loads(result.stdout)
             except subprocess.TimeoutExpired as exc:
+                self.last_failure={'kind':'deadline','seconds':self.timeout}
                 raise socket.gaierror(socket.EAI_AGAIN,'Database DNS lookup deadline exceeded') from exc
             except (subprocess.SubprocessError,ValueError) as exc:
+                self.last_failure={'kind':'resolver_process','type':type(exc).__name__}
                 raise socket.gaierror(socket.EAI_AGAIN,'Database DNS lookup failed') from exc
             if 'rows' not in answer:
+                self.last_failure={'kind':'resolver_error','errno':answer.get('errno')}
                 raise socket.gaierror(answer.get('errno') or socket.EAI_AGAIN,'Database DNS lookup failed')
             rows=[(int(r[0]),int(r[1]),int(r[2]),str(r[3]),tuple(r[4])) for r in answer['rows']]
             if not rows:raise socket.gaierror(socket.EAI_NONAME,'Database DNS lookup returned no addresses')
@@ -67,6 +73,7 @@ class DatabaseDNSGuard:
             # clients retain their original hostname, certificate checks and SNI.
             self.cache={k:v for k,v in self.cache.items() if v[0]>monotonic()}
             self.cache[key]=(monotonic()+self.ttl,tuple(rows))
+            self.last_failure=None
             return rows
         finally:
             self.lock.release()
@@ -83,3 +90,11 @@ def install_database_dns_guard(url):
     guard=DatabaseDNSGuard(host,original)
     socket.getaddrinfo=guard
     return guard
+
+
+def database_dns_status():
+    guard=socket.getaddrinfo
+    if not isinstance(guard,DatabaseDNSGuard):return {'configured':False}
+    return {'configured':True,'lookup_count':guard.lookups,
+        'cached_queries':sum(1 for deadline,_ in guard.cache.values() if deadline>monotonic()),
+        'last_failure':guard.last_failure}

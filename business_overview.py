@@ -328,7 +328,7 @@ def register_business_overview(app, transport, url, key, require_admin):
     lock = Lock()
     @app.get('/business_overview_version')
     def business_overview_version():
-        return jsonify(success=True, release=RELEASE, refresh_seconds=30, read_only=True, read_deadline_seconds=READ_DEADLINE_SECONDS, database_dns_deadline_seconds=2)
+        return jsonify(success=True, release=RELEASE, refresh_seconds=30, read_only=True, read_deadline_seconds=READ_DEADLINE_SECONDS, database_dns_deadline_seconds=2, database_connection=__import__('database_dns').database_dns_status())
 
     @app.get('/admin/business_overview')
     def business_overview():
