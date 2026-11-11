@@ -16,7 +16,7 @@ class DatabaseDNSTests(unittest.TestCase):
   self.assertEqual(rows[0],(2,1,6,'',('127.0.0.1',443)))
   self.assertEqual(rows[1],(10,1,6,'',('::1',443,0,0)))
   self.assertEqual(g('database.example',443,type=socket.SOCK_STREAM),rows);self.assertEqual(self.runner.call_count,1)
-  request=json.loads(self.runner.call_args.kwargs['input']);self.assertEqual(request['host'],'database.example');self.assertEqual(request['type'],1)
+  request=json.loads(self.runner.call_args.kwargs['input']);self.assertEqual(request['host'],'database.example.');self.assertEqual(request['type'],1)
   self.assertLessEqual(self.runner.call_args.kwargs['timeout'],.2)
  def test_expired_addresses_are_not_reused_when_resolution_fails(self):
   g=self.guard(ttl=0);g('database.example',443)

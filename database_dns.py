@@ -52,7 +52,11 @@ class DatabaseDNSGuard:
             if cached and cached[0]>monotonic():return list(cached[1])
             remaining=deadline-monotonic()
             if remaining<=0:raise socket.gaierror(socket.EAI_AGAIN,'Database DNS lookup deadline exceeded')
-            payload=dict(host=normalized,port=port,family=int(family),type=int(type),proto=int(proto),flags=int(flags))
+            # Resolve the configured public hostname as an absolute DNS name.
+            # Container search domains/ndots must not multiply this lookup into
+            # a long sequence of irrelevant internal-domain requests.
+            query_host=normalized.rstrip('.')+'.' if '.' in normalized else normalized
+            payload=dict(host=query_host,port=port,family=int(family),type=int(type),proto=int(proto),flags=int(flags))
             try:
                 self.lookups+=1
                 result=self.runner([sys.executable,'-c',_RESOLVE],input=json.dumps(payload),
