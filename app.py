@@ -60069,7 +60069,7 @@ def _np_sales_outcomes_v219():
 # V220: ordinary slow requests must leave threads for sign-in and readiness.
 from request_admission import RequestAdmissionMiddleware as _NPAdmissionV220
 app.wsgi_app = _NPAdmissionV220(app.wsgi_app,
-    reserved_paths=("/admin_bootstrap", "/admin/business_overview", "/approve_challenge_purchase", "/admin/sales_outcomes", "/admin/breach_intelligence"))
+    reserved_paths=("/admin_bootstrap", "/approve_challenge_purchase"))
 
 # V224: private owner test page, independent of customer package publication.
 from package_configuration import PackageStore as _NPLabPackageStoreV224, register_package_configuration as _NPRegisterLabConfigV224

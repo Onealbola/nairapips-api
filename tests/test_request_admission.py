@@ -20,6 +20,31 @@ class AdmissionTests(unittest.TestCase):
                 self.assertEqual(list(middleware({'PATH_INFO':path,'REQUEST_METHOD':'POST'},lambda *a:None)),[b'ok'])
             self.assertNotIn('/approve_challenge_purchase',calls)
         finally:release.set();first.join(3)
+    def test_shared_reads_use_six_slots_while_approval_bootstrap_and_login_remain_available(self):
+        release=threading.Event();started=[threading.Event() for _ in range(6)]
+        def handler(env,start):
+            if env.get('index') is not None:
+                started[env['index']].set();release.wait(3)
+            return [b'ok']
+        import ast
+        from pathlib import Path
+        tree=ast.parse((Path(__file__).resolve().parents[1]/'app.py').read_bytes())
+        production=next(n for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=='_NPAdmissionV220')
+        reserved=ast.literal_eval(next(k.value for k in production.keywords if k.arg=='reserved_paths'))
+        app=RequestAdmissionMiddleware(handler,8,reserved_paths=reserved)
+        threads=[threading.Thread(target=lambda i=i:list(app({'PATH_INFO':'/trader_current_account/example','index':i},lambda *a:None))) for i in range(6)]
+        try:
+            for thread,event in zip(threads,started):
+                thread.start();self.assertTrue(event.wait(1))
+            self.assertEqual(app.capacity_snapshot()['ordinary_slots'],6)
+            blocked=b''.join(app({'PATH_INFO':'/admin/finance_source'},lambda *a:None))
+            self.assertFalse(json.loads(blocked)['operation_started'])
+            for path in ('/admin_bootstrap','/approve_challenge_purchase','/staff_login','/healthz/http'):
+                self.assertEqual(list(app({'PATH_INFO':path},lambda *a:None)),[b'ok'])
+        finally:
+            release.set()
+            for thread in threads:thread.join(3)
+
     def test_exception_and_stream_failure_release_slot(self):
         def handler(env,start):
             if env.get('broken'):raise RuntimeError('test')
