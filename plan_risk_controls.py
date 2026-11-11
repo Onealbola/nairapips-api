@@ -112,6 +112,27 @@ def inherit(source, row):
     return freeze(source, terms) if terms else source
 
 
+def assert_assignment_snapshot(account, purchase):
+    """Refuse a new assignment that would drop its exact purchased controls.
+
+    This validates the proposed insert only; it never edits existing accounts or
+    reconstructs missing broker history from current values.
+    """
+    if not purchase or not purchase.get('id'):
+        return
+    if (str(account.get('purchase_id') or '') != str(purchase['id'])
+            or str(account.get('trader_id') or '') != str(purchase.get('trader_id') or '')):
+        raise ValueError('Assignment risk snapshot belongs to another purchase or owner')
+    if frozen_terms(account) != frozen_terms(purchase):
+        raise ValueError('Assignment stopped: purchased daily, payout or reset rules were not preserved')
+    from withdrawal_controls import read as withdrawal_terms
+    if withdrawal_terms(account) != withdrawal_terms(purchase):
+        raise ValueError('Assignment stopped: purchased withdrawal rules were not preserved')
+    from equity_drawdown import account_mode, mode
+    if account_mode(account) != mode(purchase.get('drawdown_type')):
+        raise ValueError('Assignment stopped: purchased drawdown mode was not preserved')
+
+
 def plan_controls_view(row):
     result = dict(row)
     terms = frozen_terms(row) or {}

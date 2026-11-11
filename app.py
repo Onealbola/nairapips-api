@@ -3726,6 +3726,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         "created_at": now,
         "updated_at": now,
     }
+    __import__("plan_risk_controls").assert_assignment_snapshot(account_row, purchase)
     print("V175 ASSIGN STEP: create_trader_account", mt5.get("mt5_login"), flush=True)
     account = (_np_renewal_db_v211().table("trader_accounts").insert(account_row).execute().data or [None])[0]
     if not account:
