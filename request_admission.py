@@ -61,7 +61,9 @@ class RequestAdmissionMiddleware:
         return {'business_slots': self.capacity,
             'ordinary_slots': self.capacity - len(self.reserved_slots),
             'reserved_paths': list(self.reserved_slots), 'active_lanes': lanes,
-            'long_requests': stuck}
+            'long_requests': stuck,
+            'active_requests': [{'route': route, 'seconds': round(now-started, 1)}
+                for route, started, _ in executions]}
 
     def __call__(self, environ, start_response):
         # Gthread changes the accepted socket back to blocking mode. Without an
