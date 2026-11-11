@@ -9,12 +9,16 @@ if(typeof admAccountLifecycle==='function'){
  const authority=admAccountBreachAuthority;window.admAccountBreachAuthority=function(a,t){return breached(a)||authority(a,t)};
  window.admComputedAbsoluteDd=function(a){a=a||{};const start=Number(a.start_balance||a.account_size||0),values=[a.current_balance??a.balance,a.current_equity??a.equity].filter(x=>x!=null&&Number.isFinite(Number(x))).map(Number);return start>0&&values.length?Math.max(0,(start-Math.min(...values))/start*100):Math.max(0,Number(a.absolute_drawdown_percent||a.drawdown_percent||0))};
  window.admDdAbsolutePercent=function(a){return admComputedAbsoluteDd(a)};
- const riskCore=admRiskZone;window.admRiskZone=function(a,t){if(breached(a))return 'breached';if(a?.lifecycle_data_status&&a.lifecycle_data_status!=='verified')return 'unverified';return riskCore(a,t)};
+ const riskCore=admRiskZone;window.admRiskZone=function(a,t){if(breached(a))return 'breached';if(a?.rule_snapshot_status==='repair_required')return 'rule review required';if(a?.lifecycle_data_status&&a.lifecycle_data_status!=='verified')return 'unverified';return riskCore(a,t)};
 }
 // All trader status helpers give an exact recorded breach priority over pass flags.
 for(const name of ['npIsBreached','npIsPassed','npTargetAwaitingPassVerification','npDisplayStatus','npFriendlyAccountStatus']){
  const core=window[name];if(typeof core!=='function')continue;
  window[name]=function(a,...args){if(breached(a))return name==='npIsBreached'?true:name==='npIsPassed'||name==='npTargetAwaitingPassVerification'?false:'BREACHED';return core.call(this,a,...args)};
+}
+if(typeof window.renderDashboard==='function'){
+ const renderCore=window.renderDashboard;
+ window.renderDashboard=function(...args){const html=renderCore.apply(this,args);if(typeof html!=='string')return html;const rows=typeof SESSION!=='undefined'?(SESSION.allAccounts||[]):[];const id=typeof SESSION!=='undefined'?String(SESSION.selectedAccountId||SESSION.data?.current_account?.id||''):'';const account=rows.find(a=>String(a.id||'')===id);if(account?.rule_snapshot_status!=='repair_required')return html;return '<section role="alert" style="padding:16px;margin:12px 0;border:1px solid #facc15;border-radius:12px;background:#29220d;color:#fff3bf"><strong>Trading rule verification required</strong><p>This account’s saved rule metadata needs repair. The overall drawdown shown does not confirm compliance with its daily or trailing rule. Please contact support.</p></section>'+html};
 }
 // Also updates previously installed trader pages through their existing hosted script.
 const truths=new Map();

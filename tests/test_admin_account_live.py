@@ -9,9 +9,10 @@ class AdminAccountLiveTests(unittest.TestCase):
  def setUp(self):
   self.a={'id':'11111111-1111-4111-8111-111111111111','trader_id':'owner','mt5_login':'123','account_status':'assigned_active','stage':'funded','start_balance':500000,'current_equity':500000}
   self.snap={'trader_account_id':self.a['id'],'trader_id':'owner','mt5_login':'123','balance':512000,'equity':510000,'observed_at':datetime.now(timezone.utc).isoformat(),'dd_used_percent':4}
+  self.purchases=[]
   self.http=Mock()
   def read(url,**kwargs):
-   response=Mock();response.json.return_value=[self.a] if url.endswith('/trader_accounts') else [self.snap];return response
+   response=Mock();response.json.return_value=[self.a] if url.endswith('/trader_accounts') else self.purchases if url.endswith('/challenge_purchases') else [self.snap];return response
   self.http.get.side_effect=read
   self.payload={key:[copy.deepcopy(self.a)] for key in ['data','accounts','trader_accounts']}
  def decorate(self):return overlay_account_lists(self.payload,self.http,'https://db.test','key',lambda a:a['account_status']=='assigned_active')
@@ -60,6 +61,21 @@ class AdminAccountLiveTests(unittest.TestCase):
   self.snap.update(equity=510000,balance=510000,risk_zone='safe')
   out=self.decorate()['accounts'][0]
   self.assertTrue(out['recorded_breach']);self.assertEqual(out['risk_zone'],'breached')
+ def test_lost_purchased_rule_is_flagged_not_silently_reported_safe(self):
+  from plan_risk_controls import freeze
+  self.a.update(journey_source='post9_purchase_root_immutable',purchase_id='exact-purchase')
+  self.purchases=[dict(id='exact-purchase',trader_id='owner',drawdown_type='STATIC',journey_source=freeze('purchase',dict(daily_drawdown='5',payout_frequency='Weekly')))]
+  out=self.decorate()['accounts'][0]
+  self.assertEqual(out['rule_snapshot_status'],'repair_required')
+  self.assertEqual(out['reporting_status'],'RULE_REVIEW_REQUIRED')
+  self.assertFalse(out['recorded_breach'])
+  # A different purchaser cannot supply the missing rule evidence.
+  self.purchases[0]['trader_id']='foreign'
+  self.assertEqual(self.decorate()['accounts'][0]['rule_snapshot_status'],'unverified')
+ def test_legacy_ownership_label_without_opt_in_terms_is_not_a_rule_mismatch(self):
+  self.a.update(journey_source='post9_purchase_root_immutable',purchase_id='exact-purchase')
+  self.purchases=[dict(id='exact-purchase',trader_id='owner',drawdown_type='STATIC',journey_source='legacy')]
+  self.assertEqual(self.decorate()['accounts'][0]['rule_snapshot_status'],'verified')
  def test_actual_response_wrapper_updates_browser_alias(self):
   tree=ast.parse((Path(__file__).resolve().parents[1]/'app.py').read_bytes())
   node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_np_v204_live_refresh_response')

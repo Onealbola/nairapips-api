@@ -38,6 +38,9 @@ def metrics(row):
     if out['recorded_breach']:
         out['risk_zone'] = 'breached'
         out['reporting_status'] = 'BREACHED'
+    elif row.get('rule_snapshot_status') == 'repair_required':
+        out['risk_zone'] = 'rule_review_required'
+        out['reporting_status'] = 'RULE_REVIEW_REQUIRED'
     elif row.get('live_data_status') != 'live':
         out['reporting_status'] = 'AWAITING_UPDATE' if row.get('live_data_status') in ('missing','unavailable') else 'STALE'
     else:
@@ -54,7 +57,7 @@ def refresh_lifecycle(accounts, transport, url, key):
             batch=ids[offset:offset+100]
             response=transport.get(url.rstrip('/')+'/rest/v1/trader_accounts',
                 headers={'apikey':key,'Authorization':'Bearer '+key},
-                params={'select':','.join(LIFECYCLE_FIELDS),'id':'in.('+','.join(batch)+')','limit':str(len(batch))},timeout=(2,4))
+                params={'select':','.join(LIFECYCLE_FIELDS)+',journey_source','id':'in.('+','.join(batch)+')','limit':str(len(batch))},timeout=(2,4))
             response.raise_for_status()
             rows=response.json()
             if not isinstance(rows,list):raise ValueError('Invalid lifecycle feed')
@@ -65,6 +68,31 @@ def refresh_lifecycle(accounts, transport, url, key):
                 if any(str(row.get(k) or '')!=str(original.get(k) or '') for k in ('trader_id','mt5_login')):continue
                 if original.get('purchase_id') and str(row.get('purchase_id') or '')!=str(original['purchase_id']):continue
                 result[aid]={k:v for k,v in row.items() if k in LIFECYCLE_FIELDS}
+                if str(row.get('journey_source') or '')=='post9_purchase_root_immutable':
+                    result[aid]['_snapshot_source']=row.get('journey_source')
     except Exception:
         failed=True
+    # Only the known destructive ownership label needs this compatibility audit.
+    # Match the exact immutable purchase; never use mutable current plan settings.
+    candidates={aid:r for aid,r in result.items() if '_snapshot_source' in r and r.get('purchase_id')}
+    for row in candidates.values():row['rule_snapshot_status']='unverified'
+    pids=sorted({str(r['purchase_id']) for r in candidates.values()})
+    try:
+        from plan_risk_controls import frozen_terms
+        from withdrawal_controls import read as withdrawal_terms
+        for offset in range(0,len(pids),100):
+            batch=pids[offset:offset+100]
+            response=transport.get(url.rstrip('/')+'/rest/v1/challenge_purchases',
+                headers={'apikey':key,'Authorization':'Bearer '+key},
+                params={'select':'id,trader_id,journey_source,drawdown_type','id':'in.('+','.join(batch)+')','limit':str(len(batch))},timeout=(2,4))
+            response.raise_for_status();purchases=response.json()
+            if not isinstance(purchases,list):raise ValueError('Invalid purchase metadata feed')
+            for purchase in purchases:
+                for row in candidates.values():
+                    if str(purchase.get('id'))!=str(row['purchase_id']) or str(purchase.get('trader_id'))!=str(row['trader_id']):continue
+                    missing=bool(frozen_terms(purchase) or withdrawal_terms(purchase) or str(purchase.get('drawdown_type') or '').upper()=='TRAILING')
+                    row['rule_snapshot_status']='repair_required' if missing else 'verified'
+    except Exception:
+        pass  # Unavailable evidence stays unverified, never labelled repaired.
+    for row in result.values():row.pop('_snapshot_source',None)
     return result, failed
