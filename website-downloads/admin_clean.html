@@ -3378,6 +3378,26 @@ window.addEventListener('pageshow', ()=>{
 
 /* ====== API ====== */
 const ADMIN_INFLIGHT = new Map();
+// Coordinate reads across every Admin module, including background refreshes.
+// Keep writes outside this queue; they are never retried automatically.
+const NP_ADMIN_READ_QUEUE=[];
+let NP_ADMIN_READ_ACTIVE=0;
+function npAdminRunRead(task){
+  return new Promise((resolve,reject)=>{
+    NP_ADMIN_READ_QUEUE.push({task,resolve,reject});
+    npAdminDrainReads();
+  });
+}
+function npAdminDrainReads(){
+  while(NP_ADMIN_READ_ACTIVE<2 && NP_ADMIN_READ_QUEUE.length){
+    const next=NP_ADMIN_READ_QUEUE.shift();
+    NP_ADMIN_READ_ACTIVE++;
+    Promise.resolve().then(next.task).then(next.resolve,next.reject).finally(()=>{
+      NP_ADMIN_READ_ACTIVE--;
+      npAdminDrainReads();
+    });
+  }
+}
 async function api(path, method, body){
   // Traders League V1: accept either (path, method, body) or (path, opts).
   let opts = null;
@@ -3493,7 +3513,7 @@ async function api(path, method, body){
     throw lastError || new Error('NairaPips request failed');
   };
 
-  const run = execute().finally(()=>ADMIN_INFLIGHT.delete(key));
+  const run = (verb === 'GET' ? npAdminRunRead(execute) : execute()).finally(()=>ADMIN_INFLIGHT.delete(key));
   if(verb === 'GET') ADMIN_INFLIGHT.set(key, run);
   return run;
 }
