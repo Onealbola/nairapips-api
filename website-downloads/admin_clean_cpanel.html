@@ -1829,7 +1829,7 @@ const watch=new MutationObserver(nav);watch.observe(document.body,{childList:tru
 /* Exact-account breach reporting; no trading or lifecycle writes. */
 (function(){
 'use strict';
-const release='account-reporting-20261111-status-v2';
+const release='account-reporting-20261111-private-diagnostics-v3';
 if(window.NP_ACCOUNT_REPORTING_RELEASE===release)return;
 window.NP_ACCOUNT_REPORTING_RELEASE=release;
 const breached=a=>!!(a&&(a.recorded_breach||a.breached_at||String(a.account_status||'').toLowerCase().includes('breach')));
@@ -1847,19 +1847,19 @@ for(const name of ['npIsBreached','npIsPassed','npTargetAwaitingPassVerification
 }
 function pendingRisk(a){return !breached(a)&&!/(archived|passed|closed|disabled|reset)/i.test(String(a?.account_status||''))&&(a?.trading_rule_snapshot_status==='repair_required'||['missing','unavailable','stale'].includes(a?.live_data_status))}
 function presentRisk(html,a){
- if(typeof html!=='string'||!pendingRisk(a))return html;
- const label=a?.trading_rule_snapshot_status==='repair_required'?'RISK CHECK PENDING':a?.live_data_status==='stale'?'UPDATE DELAYED':'AWAITING BROKER UPDATE';
+ if(typeof html!=='string')return html;
  const template=document.createElement('template');template.innerHTML=html;
- for(const pill of template.content.querySelectorAll('.np-smart-hero-status .pill,.badge-row .pill')){
-  if(/^(SAFE|WARNING|CRITICAL|RULE REVIEW REQUIRED|RISK CHECK PENDING|AWAITING BROKER UPDATE|UPDATE DELAYED)$/i.test(pill.textContent.trim())){pill.textContent=label;pill.className='pill pill-yellow'}
+ // Internal rule investigations belong in admin, including notices injected by
+ // an older installed inline patch. Preserve unrelated account/payout notices.
+ for(const notice of template.content.querySelectorAll('[data-rule-check-notice],[role="alert"]')){
+  if(notice.hasAttribute('data-rule-check-notice')||/saved rule metadata needs repair|Trading rule verification required|Account risk check in progress/.test(notice.textContent))notice.remove();
  }
- // Upgrade the old notice when an installed page contains the previous patch.
- const notices=[...template.content.querySelectorAll('[data-rule-check-notice],[role="alert"]')].filter(n=>n.dataset.ruleCheckNotice!==undefined||n.textContent.includes('saved rule metadata needs repair'));
- for(const notice of notices)notice.remove();
- const notice=document.createElement('section');notice.setAttribute('data-rule-check-notice','');notice.setAttribute('role','status');notice.style.cssText='padding:16px;margin:12px 0;border:1px solid #facc15;border-radius:12px;background:#29220d;color:#fff3bf';
- const title=document.createElement('strong');title.textContent=label==='RISK CHECK PENDING'?'Account risk check in progress':label==='UPDATE DELAYED'?'Broker update delayed':'Awaiting broker update';notice.appendChild(title);
- const message=document.createElement('p');message.textContent=label==='RISK CHECK PENDING'?'Our team is verifying this account’s trading limits. Its risk status is pending confirmation.':'The account’s risk status will be confirmed when a verified broker update is received.';notice.appendChild(message);
- template.content.prepend(notice);return template.innerHTML;
+ if(pendingRisk(a)){
+  for(const pill of template.content.querySelectorAll('.np-smart-hero-status .pill,.badge-row .pill')){
+   if(/^(SAFE|WARNING|CRITICAL|RULE REVIEW REQUIRED|RISK CHECK PENDING|AWAITING BROKER UPDATE|UPDATE DELAYED|UPDATING)$/i.test(pill.textContent.trim())){pill.textContent='Updating';pill.className='pill pill-gray'}
+  }
+ }
+ return template.innerHTML;
 }
 if(typeof window.renderDashboard==='function'){
  const renderCore=window.renderDashboard;
@@ -1878,9 +1878,9 @@ function paint(){
  const card=document.getElementById('np-historic-truth-card');if(!card)return;
  const id=String(card.dataset.accountId||'');const x=truths.get(id);if(!x)return;
  const badge=card.querySelector('.np-smart-panel-head .pill'),verdict=card.querySelectorAll('.np-smart-card')[3]?.querySelector('strong');
- const label=x.recorded_breach?'BREACHED':x.ever_crossed_dd_limit?'OVERALL LIMIT CROSSED':x.monitoring_observation_present===false?'AWAITING BROKER UPDATE':'NO OVERALL CROSS RECORDED';
+ const label=x.recorded_breach?'BREACHED':x.ever_crossed_dd_limit?'OVERALL LIMIT CROSSED':x.monitoring_observation_present===false?'Updating':'NO OVERALL CROSS RECORDED';
  if(verdict&&verdict.textContent!==label)verdict.textContent=label;
- if(badge){const value=x.recorded_breach?'BREACHED':x.ever_crossed_dd_limit?'OVERALL LIMIT CROSSED':x.monitoring_observation_present===false?'AWAITING BROKER UPDATE':'NO OVERALL CROSS RECORDED';if(badge.textContent!==value)badge.textContent=value;badge.className='pill '+(x.recorded_breach||x.ever_crossed_dd_limit?'pill-red':'pill-yellow')}
+ if(badge){const value=x.recorded_breach?'BREACHED':x.ever_crossed_dd_limit?'OVERALL LIMIT CROSSED':x.monitoring_observation_present===false?'Updating':'NO OVERALL CROSS RECORDED';if(badge.textContent!==value)badge.textContent=value;badge.className='pill '+(x.recorded_breach||x.ever_crossed_dd_limit?'pill-red':'pill-yellow')}
  const cr=card.querySelector('#ht-cross');if(cr&&x.recorded_breach){const value='Recorded breach: '+(x.breached_at?new Date(x.breached_at).toLocaleString('en-GB'):'time unavailable');if(cr.textContent!==value)cr.textContent=value}
 }
 setInterval(()=>{if(!document.hidden)paint()},2000);
