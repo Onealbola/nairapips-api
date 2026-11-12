@@ -36,6 +36,23 @@ def install(g):
             'trader_id':'eq.'+str(a['trader_id']),'limit':'1'})
         return rows[0] if rows else {}
 
+    def recorded_pass(account,purchase,stage):
+        if (account.get('stage')!=stage or account.get('account_status')!='archived_'+stage
+                or account.get('phase_pass_status')!=stage+'_passed' or not account.get('passed_at')
+                or account.get('breached_at') or str(account.get('trader_id'))!=str(purchase.get('trader_id'))
+                or str(account.get('purchase_id'))!=str(purchase.get('id'))):return False
+        if '[NP_LIVE_PASS_V214]' in str(account.get('archive_reason') or ''):return True
+        try:
+            rows=g['_np_v214_rows']('np_live_account_state',{'trader_account_id':'eq.'+str(account['id']),'limit':'1'})
+            if len(rows)!=1:return False
+            from equity_drawdown import spec,read_saved_state
+            rules=spec(account,purchase);journal=None
+            if rules['drawdown_type']=='TRAILING' or rules.get('daily_drawdown'):
+                journal=read_saved_state(g['requests'],g['SUPABASE_URL'],g.get('SUPABASE_SERVICE_ROLE_KEY') or g['SUPABASE_KEY'],account,purchase)
+            from recorded_phase_pass import verify
+            return verify(account,purchase,rows[0],journal)
+        except Exception:return False
+
     def journey(account=None,purchase=None,plan=None,trader=None):
         p=exact_purchase(account,purchase)
         if is_progress_purchase(p) or (not p and is_managed(plan or {})):
@@ -83,11 +100,7 @@ def install(g):
                     raise ValueError('The exact paid payout is required for instant funded renewal')
             if normalized in route[1:]:
                 required=route[route.index(normalized)-1]
-                passed=[a for a in real if a.get('stage')==required
-                    and a.get('account_status')=='archived_'+required
-                    and a.get('phase_pass_status')==required+'_passed'
-                    and a.get('passed_at') and not a.get('breached_at')
-                    and '[NP_LIVE_PASS_V214]' in str(a.get('archive_reason') or '')]
+                passed=[a for a in real if recorded_pass(a,purchase,required)]
                 if not passed:raise ValueError('The exact preceding package phase has not passed broker verification')
                 if normalized=='phase2' and any(a.get('stage') in ('phase2','funded') for a in real):
                     raise ValueError('This phase-pass entitlement has already been used')
@@ -95,13 +108,9 @@ def install(g):
         return old_assign(trader,mt5,stage,purchase,staff,note)
 
     def phase2_entitlement(source):
-        return bool(source and source.get('stage')=='phase1'
-            and source.get('account_status')=='archived_phase1'
-            and source.get('phase_pass_status')=='phase1_passed' and source.get('passed_at')
-            and not source.get('breached_at')
-            and '[NP_LIVE_PASS_V214]' in str(source.get('archive_reason') or '')
-            and is_progress_purchase(exact_purchase(source,None))
-            and purchase_route(exact_purchase(source,None))==ROUTE)
+        p=exact_purchase(source,None,force=True)
+        return bool(source and is_progress_purchase(p) and purchase_route(p)==ROUTE
+            and recorded_pass(source,p,'phase1'))
 
     g['_np_initial_purchase_stage']=initial_stage
     g['_np_progress_phase2_entitlement']=phase2_entitlement

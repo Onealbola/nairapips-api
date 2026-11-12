@@ -42226,8 +42226,8 @@ def _np_assign_phase_mt5_v60():
         )
         if not historical_same_stage_recovery and not globals().get("_np_progress_phase2_entitlement", lambda _: False)(source):
             return _np_fail(
-                "Phase 2 progression is retired. NairaPips progression is Phase 1 -> Funded. "
-                "Refresh this journey and assign the exact Funded entitlement instead.",
+                "This purchase has no verified Phase 2 entitlement. "
+                "Refresh the journey and follow its saved purchased stages.",
                 409,
             )
 

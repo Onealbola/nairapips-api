@@ -1063,11 +1063,7 @@ function npMT5PickerOptions(rows,targetStage,targetSize){
 window.smartAssignPhase = async function(queueId, traderId, targetPhase, accountRef, completedAccountId){
   targetPhase = String(targetPhase||'funded').toLowerCase();
   const completedId = String(completedAccountId||'').trim();
-  if(targetPhase==='phase2'){
-    toast('Phase 2 progression is retired. Phase 1 progresses directly to Funded. Refresh this journey.','err');
-    return;
-  }
-  const isFundedOrLive = targetPhase==='funded' || targetPhase==='live';
+  const isFundedOrLive = ['phase2','funded','live'].includes(targetPhase);
 
   // Cockpit must never assign from the small/stale bootstrap pool.
   let fullPool=[];
@@ -1130,7 +1126,7 @@ window.smartAssignPhase = async function(queueId, traderId, targetPhase, account
     npShowResetModalSafe(`
       <button onclick="this.closest('.modal-bg').remove()" style="position:absolute;top:10px;right:14px;background:0;border:0;color:#fff;font-size:24px;cursor:pointer">✕</button>
       <h2 style="font-size:18px;font-weight:900;color:var(--gold);margin:6px 0 4px">⚡ Manual ${targetPhase.toUpperCase()} Assignment</h2>
-      <p style="font-size:12px;color:var(--t3);margin-bottom:8px">Loaded the complete available FUNDED vault for the exact required size.</p>
+      <p style="font-size:12px;color:var(--t3);margin-bottom:8px">Loaded the complete available ${esc(npMT5ExpectedPoolForStage(targetPhase).toUpperCase())} vault for the exact required size.</p>
       ${source?`<div style="padding:8px 10px;border:1px solid rgba(212,175,55,.25);border-radius:9px;margin-bottom:10px;font-size:12px;color:#f7f1df">
         Recovery source: <b>MT5 ${esc(String(source.mt5_login||'—'))}</b> · <b>${esc(money(targetSize))}</b> · ${esc(String(source.account_status||source.status||'').toUpperCase())}
       </div>`:''}
