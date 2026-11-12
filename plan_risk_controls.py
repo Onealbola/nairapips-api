@@ -231,7 +231,7 @@ def broker_daily_realised(mt5, row, observed_at):
     after=money(info.balance)
     if abs(after-before)>Decimal('.01'):
         raise ValueError('Broker balance changed during daily history read; retry required')
-    if abs(capital+ledger-after)>Decimal('.01'):
+    if not deals or abs(capital+ledger-after)>Decimal('.01'):
         # Some brokers timestamp initial funding after delivery. Verify the
         # complete balance ledger independently instead of counting funding twice.
         full=mt5.history_deals_get(datetime(1970,1,1,tzinfo=timezone.utc),observed)

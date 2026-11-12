@@ -125,6 +125,15 @@ class PlanRiskControlsTests(unittest.TestCase):
         terminal.history_deals_get.return_value=[]
         with self.assertRaisesRegex(ValueError,'does not reconcile'):broker_daily_realised(terminal,account,observed.isoformat())
 
+    def test_empty_day_history_needs_real_funding_evidence_even_at_starting_balance(self):
+        terminal=Mock();terminal.account_info.return_value=SimpleNamespace(login=123,balance=1000000)
+        observed=datetime(2026,2,2,12,tzinfo=timezone.utc)
+        terminal.history_deals_get.return_value=[]
+        with self.assertRaisesRegex(ValueError,'does not reconcile'):broker_daily_realised(terminal,self.account,observed.isoformat())
+        funding=SimpleNamespace(ticket=1,time=int((self.start-timedelta(minutes=1)).timestamp()),type=2,profit=1000000)
+        terminal.history_deals_get.side_effect=[[],[funding]]
+        self.assertEqual(broker_daily_realised(terminal,self.account,observed.isoformat()),Decimal(0))
+
     def test_full_ledger_verifies_initial_funding_after_delivery_without_double_count(self):
         terminal=Mock();terminal.account_info.return_value=SimpleNamespace(login=123,balance=4702014.48)
         account=dict(self.account,start_balance=5000000,started_at='2026-11-10T11:09:45+00:00')
