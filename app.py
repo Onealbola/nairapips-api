@@ -59749,6 +59749,14 @@ def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
     progression = {"deferred_cross_process_busy": True}
     if lock:
         try:
+            # Give already-passed, waiting traders priority over broad history scans.
+            from phase_handover_queue import retry_waiting
+            try:
+                globals()["_NP_WAITING_HANDOVER_LAST"] = retry_waiting(
+                    _np_v214_rows, _np_auto_assign_waiting_stage, _np_is_clean_root_v43)
+            except Exception as exc:
+                globals()["_NP_WAITING_HANDOVER_LAST"] = {"errors": 1}
+                print("WAITING PHASE HANDOVER READ:", type(exc).__name__, flush=True)
             progression = _np_retry_clean_pass_funded_v19(limit=100)
         finally:
             if callable(unlock_fn):
@@ -60004,6 +60012,7 @@ def _np_http_readiness_v218():
     response = jsonify({"status": "ok", "http_release": "V232_READ_CAPACITY_DIAGNOSTICS",
         "commit": os.getenv("RENDER_GIT_COMMIT"),
         "request_capacity": app.wsgi_app.capacity_snapshot(),
+        "waiting_phase_handover": dict(globals().get("_NP_WAITING_HANDOVER_LAST") or {}),
         "target_monitor": __import__("target_monitor_health").read_report(
             globals().get("_NP_LIFECYCLE_WORKER_INTERVAL_V40") or 300)})
     response.headers["Cache-Control"] = "no-store"
