@@ -10,29 +10,32 @@ def marker(purchase_id,trader_id):
 
 def voided(row):
     try:
-        return row.get('account_status')=='archived' and marker(str(row['purchase_id']),str(row['trader_id'])) in str(row.get('archive_reason') or '')
+        return (row.get('account_status')=='archived' and marker(str(row['purchase_id']),str(row['trader_id'])) in str(row.get('archive_reason') or '')) or __import__('daily_breach_corrections').voided(row)
     except (KeyError,TypeError,ValueError):return False
 
 def trader_view(root):
     """Hide only identified company-error deliveries, never generic archives."""
-    excluded=set()
+    excluded=set();replacement_stages={}
     for key in ('accounts','all_accounts','active_accounts','trader_accounts'):
         rows=root.get(key)
         if isinstance(rows,list):
             excluded.update(str(r['id']) for r in rows if isinstance(r,dict) and voided(r))
+            replacement_stages.update({str(r['id']):('phase2' if __import__('daily_breach_corrections').voided(r) else 'phase1') for r in rows if isinstance(r,dict) and voided(r)})
             root[key]=[r for r in rows if not isinstance(r,dict) or not voided(r)]
     for key in ('account','current_account'):
         if isinstance(root.get(key),dict) and voided(root[key]):
+            replacement_stages[str(root[key]['id'])]='phase2' if __import__('daily_breach_corrections').voided(root[key]) else 'phase1'
             excluded.add(str(root[key]['id']));root[key]=None
     if excluded:
         root['correction_excluded_account_ids']=sorted(excluded)
         trader=root.get('trader')
         if isinstance(trader,dict) and str(trader.get('current_account_id')) in excluded:
             current=root.get('current_account') or root.get('account') or {}
+            target_stage=replacement_stages.get(str(trader.get('current_account_id')),'phase1')
             trader['current_account_id']=current.get('id')
             trader['mt5_login']=current.get('mt5_login')
             if not current:
-                trader.update(phase='phase1',challenge_state='phase1_waiting_mt5')
+                trader.update(phase=target_stage,challenge_state=target_stage+'_waiting_mt5')
                 for field in ('profit','profit_percent','current_profit','current_profit_percent'):
                     if field in trader:trader[field]=0
                 for field in ('balance','equity','current_balance','current_equity'):

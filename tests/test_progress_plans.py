@@ -244,6 +244,20 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.call('phase1',dict(self.purchase,trader_id='other'))
         self.assigned.assert_not_called()
 
+    def test_phase2_replacement_requires_exact_withdrawn_company_error(self):
+        from daily_breach_corrections import marker
+        tid='22222222-2222-4222-8222-222222222222';pid='33333333-3333-4333-8333-333333333333';aid='44444444-4444-4444-8444-444444444444'
+        self.purchase.update(id=pid,trader_id=tid)
+        parent=dict(self.passed('phase1'),purchase_id=pid,trader_id=tid)
+        old=dict(id=aid,purchase_id=pid,trader_id=tid,stage='phase2',mt5_login='old',account_status='breached_archived',breached_at='now')
+        self.chain=[parent,old]
+        with self.assertRaises(ValueError):self.g['_assign_mt5_to_trader']({'id':tid},{'id':'fresh'},'phase2',self.purchase)
+        old.update(account_status='archived',breached_at=None,archive_reason=marker(pid,tid,aid))
+        self.g['_assign_mt5_to_trader']({'id':tid},{'id':'fresh'},'phase2',self.purchase)
+        self.assigned.assert_called_once()
+        self.chain.append(dict(old,id='new',archive_reason='',account_status='assigned_active'))
+        with self.assertRaises(ValueError):self.g['_assign_mt5_to_trader']({'id':tid},{'id':'another'},'phase2',self.purchase)
+
     def test_existing_legacy_route_untouched_even_with_old_phase2_metadata(self):
         old=dict(self.purchase,journey_source='purchase_plan_snapshot',challenge_journey=list(ROUTE))
         self.assertEqual(self.g['_journey_for_lifecycle'](None,old),('phase1','funded'))

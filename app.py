@@ -59754,7 +59754,7 @@ def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
                     response = requests.patch(SUPABASE_URL.rstrip('/')+'/rest/v1/package_studio_private_settings',
                         headers={"apikey":SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY,"Authorization":"Bearer "+(SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY),"Prefer":"return=representation"},
                         params={"key":"eq."+stored['key'],"value":"eq."+stored['value']},
-                        json={"value":json.dumps(case,sort_keys=True),"updated_at":now_iso(),"updated_by":"pool_capital_correction_worker"},timeout=(2,7))
+                        json={"value":json.dumps(case,sort_keys=True),"updated_at":now_iso(),"updated_by":"technical_correction_worker"},timeout=(2,7))
                     response.raise_for_status()
                     changed = response.json()
                     if not isinstance(changed,list) or len(changed)!=1:return False
@@ -59763,6 +59763,8 @@ def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
                 token = _NP_RENEWAL_REST_V211.set(True)
                 try:
                     globals()["_NP_CAPITAL_CORRECTION_LAST"] = retry_pending(_np_v214_rows,save_correction,_np_pick_fresh_mt5,_assign_mt5_to_trader)
+                    from daily_breach_corrections import retry_pending as retry_daily_corrections
+                    globals()["_NP_DAILY_CORRECTION_LAST"] = retry_daily_corrections(_np_v214_rows,save_correction,_np_pick_fresh_mt5,_assign_mt5_to_trader)
                 finally:
                     _NP_RENEWAL_REST_V211.reset(token)
             except Exception as exc:

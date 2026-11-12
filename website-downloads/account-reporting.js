@@ -1,16 +1,17 @@
 /* Exact-account breach reporting; no trading or lifecycle writes. */
 (function(){
 'use strict';
-const release='account-reporting-20261112-correction-history-v4';
+const release='account-reporting-20261112-audited-corrections-v5';
 if(window.NP_ACCOUNT_REPORTING_RELEASE===release)return;
 window.NP_ACCOUNT_REPORTING_RELEASE=release;
+const corrected=a=>a?.reporting_status==='ASSIGNMENT_CORRECTED';
 const breached=a=>!!(a&&(a.recorded_breach||a.breached_at||String(a.account_status||'').toLowerCase().includes('breach')));
 if(typeof admAccountLifecycle==='function'){
- const base=admAccountLifecycle;window.admAccountLifecycle=function(a){return breached(a)?'breached':base(a)};
- const authority=admAccountBreachAuthority;window.admAccountBreachAuthority=function(a,t){return breached(a)||authority(a,t)};
+ const base=admAccountLifecycle;window.admAccountLifecycle=function(a){return corrected(a)?'archived':breached(a)?'breached':base(a)};
+ const authority=admAccountBreachAuthority;window.admAccountBreachAuthority=function(a,t){return corrected(a)?false:breached(a)||authority(a,t)};
  window.admComputedAbsoluteDd=function(a){a=a||{};const start=Number(a.start_balance||a.account_size||0),values=[a.current_balance??a.balance,a.current_equity??a.equity].filter(x=>x!=null&&Number.isFinite(Number(x))).map(Number);return start>0&&values.length?Math.max(0,(start-Math.min(...values))/start*100):Math.max(0,Number(a.absolute_drawdown_percent||a.drawdown_percent||0))};
  window.admDdAbsolutePercent=function(a){return admComputedAbsoluteDd(a)};
- const riskCore=admRiskZone;window.admRiskZone=function(a,t){if(breached(a))return 'breached';if(a?.trading_rule_snapshot_status==='repair_required')return 'risk check pending';if(a?.lifecycle_data_status&&a.lifecycle_data_status!=='verified')return 'status check pending';if(admAccountLifecycle(a)==='live'&&['missing','unavailable'].includes(a?.live_data_status))return 'awaiting broker update';if(admAccountLifecycle(a)==='live'&&a?.live_data_status==='stale')return 'stale update';return riskCore(a,t)};
+ const riskCore=admRiskZone;window.admRiskZone=function(a,t){if(corrected(a))return 'corrected';if(breached(a))return 'breached';if(a?.trading_rule_snapshot_status==='repair_required')return 'risk check pending';if(a?.lifecycle_data_status&&a.lifecycle_data_status!=='verified')return 'status check pending';if(admAccountLifecycle(a)==='live'&&['missing','unavailable'].includes(a?.live_data_status))return 'awaiting broker update';if(admAccountLifecycle(a)==='live'&&a?.live_data_status==='stale')return 'stale update';return riskCore(a,t)};
 }
 // All trader status helpers give an exact recorded breach priority over pass flags.
 for(const name of ['npIsBreached','npIsPassed','npTargetAwaitingPassVerification','npDisplayStatus','npFriendlyAccountStatus']){

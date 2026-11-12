@@ -53,7 +53,7 @@ def overlay_account_lists(payload, transport, url, key, is_live, *, fresh_rows=N
         else:
             out['lifecycle_data_status']='unavailable' if lifecycle_failed else 'unverified'
         # A stale payload must not erase a previously recorded permanent breach.
-        if recorded_breach(row):
+        if recorded_breach(row) and not (fresh and __import__('assignment_corrections').voided(out)):
             out['account_status']=row.get('account_status') if 'breach' in str(row.get('account_status') or '').lower() else 'breached_archived'
             out['breached_at']=row.get('breached_at') or out.get('breached_at')
         snap=snapshots.get(aid)

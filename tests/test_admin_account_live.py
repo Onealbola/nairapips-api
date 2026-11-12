@@ -77,6 +77,17 @@ class AdminAccountLiveTests(unittest.TestCase):
   result=self.decorate()
   self.assertEqual(result['active_accounts'],[])
   self.assertEqual(len(result['accounts']),1)
+ def test_only_exact_canonical_correction_withdraws_cached_false_breach(self):
+  from daily_breach_corrections import marker
+  tid='22222222-2222-4222-8222-222222222222';pid='33333333-3333-4333-8333-333333333333'
+  stale=dict(self.a,trader_id=tid,purchase_id=pid,account_status='breached_archived',breached_at='2026-11-12T14:42:54Z')
+  fresh=dict(stale,account_status='archived',breached_at=None,breach_reason=None,archive_reason=marker(pid,tid,stale['id']))
+  result=overlay_account_lists({'accounts':[stale]},self.http,'https://db.test','key',lambda a:False,fresh_rows=[fresh],live_rows=[])
+  self.assertEqual(result['accounts'][0]['reporting_status'],'ASSIGNMENT_CORRECTED')
+  self.assertFalse(result['accounts'][0]['recorded_breach'])
+  fresh['archive_reason']='unverified correction'
+  result=overlay_account_lists({'accounts':[stale]},self.http,'https://db.test','key',lambda a:False,fresh_rows=[fresh],live_rows=[])
+  self.assertTrue(result['accounts'][0]['recorded_breach'])
  def test_report_separates_capital_loss_and_budget_usage(self):
   self.a['start_balance']=5000000;self.a['dd_limit_percent']=20
   for rows in self.payload.values():rows[0].update(start_balance=5000000,dd_limit_percent=20)
