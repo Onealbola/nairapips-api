@@ -677,20 +677,21 @@ def authenticate(row, master_only=False):
             continue
         info=verified_live_info(login,server,pwd,row)
         if info is None:continue
-        info=live_session()
-        if info is None:
-            time.sleep(.1);info=live_session()
+        for settle_attempt in range(11):
+            info=live_session()
+            if info is not None:break
+            if settle_attempt<10:time.sleep(.2)
         if info is None:
             log(f"AUTH SESSION UNREADY MT5={login} source={source} | cached account data rejected | NO DD DECISION","WARNING")
             continue
         if require_history:
             history_ok=False
-            for attempt in range(2):
+            for attempt in range(3):
                 try:
                     realised=broker_daily_realised(mt5,row,now_iso())
                     history_ok=True;break
                 except Exception as exc:
-                    if attempt==0:time.sleep(.1)
+                    if attempt<2:time.sleep(.2)
                     else:log(f"AUTH HISTORY UNREADY MT5={login} source={source}: {type(exc).__name__}: {str(exc)[:160]} | trying next credential","WARNING")
             info=live_session()
             if info is None:continue
@@ -1063,7 +1064,26 @@ def inspect(row):
             _daily_probe_ready = True
         except Exception as exc:
             if daily_enabled:
-                log(f"DAILY HISTORY UNAVAILABLE MT5={login}: {type(exc).__name__}; overall breach protection retained", "ERROR")
+                log(f"DAILY HISTORY UNAVAILABLE MT5={login}: {type(exc).__name__}: {str(exc)[:160]}; overall breach protection retained", "ERROR")
+
+    if daily_enabled:
+        # Do not count a just-closed loss both as old floating loss and as new
+        # realised loss. A changed balance needs another coherent inspection.
+        latest=mt5.account_info();terminal=mt5.terminal_info()
+        if (latest is None or terminal is None or not getattr(terminal,'connected',False)
+                or norm(getattr(latest,'login',''))!=login
+                or norm(getattr(latest,'server','')).lower()!=norm(row.get('mt5_server')).lower()):
+            return AUTH_RETRY_SECONDS
+        import math
+        try:
+            new_balance,new_equity,profit,credit=(float(getattr(latest,k)) for k in ('balance','equity','profit','credit'))
+            if not all(math.isfinite(v) for v in (new_balance,new_equity,profit,credit)):return AUTH_RETRY_SECONDS
+            if abs(new_equity-(new_balance+profit+credit))>max(.05,abs(new_equity)*1e-10):return AUTH_RETRY_SECONDS
+        except (TypeError,ValueError,AttributeError):return AUTH_RETRY_SECONDS
+        if daily_realised is not None and new_balance!=bal:
+            log(f"DAILY SNAPSHOT CHANGED MT5={login}; retrying without a DD verdict","WARNING")
+            return AUTH_RETRY_SECONDS
+        bal,eq=new_balance,new_equity
 
     if package_account:
         try:
