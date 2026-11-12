@@ -9,7 +9,7 @@ class CorrectionTests(unittest.TestCase):
   self.saved=Mock();self.pick=Mock(return_value={'mt5_login':'fresh'});self.assign=Mock(return_value=({'id':'fresh-account','mt5_login':'fresh'},{}));self.chain=[self.old]
  def read(self,t,p):
   if t=='package_studio_private_settings':return [dict(key=PREFIX+PID,value=json.dumps(self.case))]
-  if t=='challenge_purchases':return [dict(id=PID,trader_id=OWNER,account_size=5000000)]
+  if t=='challenge_purchases':return [dict(id=PID,trader_id=OWNER,account_size=5000000,payment_status='approved',status='approved_waiting_mt5')]
   if t=='traders':return [dict(id=OWNER)]
   return copy.deepcopy(self.chain)
  def run_case(self):return retry_pending(self.read,self.saved,self.pick,self.assign)
@@ -27,6 +27,23 @@ class CorrectionTests(unittest.TestCase):
  def test_missing_void_marker_or_changed_capital_blocks(self):
   self.old['archive_reason']='ordinary archive';r=self.run_case();self.assertEqual(r['errors'],1);self.assign.assert_not_called()
   self.old['archive_reason']=marker(PID,OWNER);self.case['account_size']='50000000';self.run_case();self.assign.assert_not_called()
+ def test_changed_purchase_payment_or_current_pointer_blocks(self):
+  original=self.read
+  for patch in ({'payment_status':'pending'},{'status':'rejected'},{'trader_account_id':'another-current'}):
+   def changed(table,params):
+    rows=original(table,params)
+    if table=='challenge_purchases':rows[0].update(patch)
+    return rows
+   self.read=changed;self.run_case();self.assign.assert_not_called();self.read=original
+ def test_progress_assignment_allows_only_exact_voided_first_deliveries(self):
+  from test_progress_plans import LifecycleTests
+  test=LifecycleTests();test.setUp()
+  test.purchase.update(id=PID,trader_id=OWNER)
+  test.chain=[dict(self.old,stage='phase1')]
+  result=test.g['_assign_mt5_to_trader']({'id':OWNER},{'id':'fresh'},'phase1',test.purchase)
+  self.assertEqual(result,('account','trader'))
+  test.chain[0]['archive_reason']='ordinary archive'
+  with self.assertRaises(ValueError):test.g['_assign_mt5_to_trader']({'id':OWNER},{'id':'fresh'},'phase1',test.purchase)
  def test_lost_case_claim_never_assigns(self):
   self.saved.return_value=False;self.run_case();self.assign.assert_not_called()
  def test_uncertain_assignment_is_not_retried_automatically(self):

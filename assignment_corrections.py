@@ -66,6 +66,9 @@ def retry_pending(read,save,pick,assign):
                 if len(survivors)!=1 or survivors[0].get('stage')!='phase1':raise ValueError('Existing successor requires review; never assign twice')
                 account=survivors[0];summary['already_fulfilled']+=1
             else:
+                if purchase.get('payment_status')!='approved' or purchase.get('status')!='approved_waiting_mt5':raise ValueError('Correction requires the approved waiting purchase')
+                pointers=(purchase.get('trader_account_id'),traders[0].get('current_account_id'))
+                if any(value and str(value) not in originals for value in pointers):raise ValueError('Another current delivery requires review')
                 mt5=pick(float(case['account_size']),'phase1')
                 if not mt5:summary['waiting_inventory']+=1;continue
                 # Cross-process claim before any allocation. A lost/uncertain
