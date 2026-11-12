@@ -1311,7 +1311,16 @@ def main():
             # behind a permanently busy risk lane.
             coverage_overdue = []
             for x in rows:
-                if x not in verified or x in invalid_live_capital:
+                # NP_BOUNDED_LOGIN_RETRY_20261112
+                # An initial failed login must not remain behind always-due
+                # verified accounts. Existing rescue/risk alternation is retained.
+                if x not in verified:
+                    if (x in first_attempted and next_due.get(x,0)<=now
+                            and auth_quarantine_until.get(x,0)<=now
+                            and now-last_attempted_at.get(x,now)>=120.0):
+                        coverage_overdue.append(x)
+                    continue
+                if x in invalid_live_capital:
                     continue
                 last_good=last_valid_dd_read.get(x)
                 age=(now-last_good) if last_good is not None else float("inf")
@@ -1319,7 +1328,7 @@ def main():
                     coverage_overdue.append(x)
 
             coverage_overdue.sort(
-                key=lambda x: last_valid_dd_read.get(x,0.0)
+                key=lambda x: (last_valid_dd_read.get(x,0.0) if x in verified else last_attempted_at.get(x,0.0))
             )
 
             if not ordinary_due and not coverage_overdue:
