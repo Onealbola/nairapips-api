@@ -2,6 +2,16 @@ import json, threading, unittest
 from request_admission import RequestAdmissionMiddleware, configure_worker_capacity
 
 class AdmissionTests(unittest.TestCase):
+    def test_priority_response_closes_files_on_completion_and_client_disconnect(self):
+        closed=[]
+        class Response:
+            def __iter__(self):return iter([b'first',b'second'])
+            def close(self):closed.append(True)
+        middleware=RequestAdmissionMiddleware(lambda *args:Response(),1)
+        env={'PATH_INFO':'/downloads/dd-login-retry.ps1','REQUEST_METHOD':'GET'}
+        self.assertEqual(list(middleware(env,lambda *args:None)),[b'first',b'second'])
+        iterator=middleware(env,lambda *args:None);self.assertEqual(next(iterator),b'first');iterator.close()
+        self.assertEqual(closed,[True,True])
     def test_recovery_installer_remains_readable_when_business_slots_are_full(self):
         from flask import Flask
         from panel_delivery import register_panel_delivery

@@ -79,7 +79,13 @@ class RequestAdmissionMiddleware:
         method = environ.get('REQUEST_METHOD', 'GET')
         recovery_download = path in self.RECOVERY_DOWNLOAD_PATHS and method in {'GET', 'HEAD'}
         if path in self.PRIORITY_PATHS or method == 'OPTIONS' or recovery_download:
-            yield from self.application(environ, start_response)
+            response = self.application(environ, start_response)
+            try:
+                yield from response
+            finally:
+                close = getattr(response, 'close', None)
+                if close:
+                    close()
             return
         slots = self.reserved_slots.get(path, self.slots)
         lane = path if path in self.reserved_slots else 'ordinary'
