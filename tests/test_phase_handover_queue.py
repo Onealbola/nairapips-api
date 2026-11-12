@@ -33,3 +33,22 @@ class HandoverTests(unittest.TestCase):
  def test_independent_item_failure_is_counted(self):
   self.assign.side_effect=RuntimeError('verification unavailable');result=self.run_queue();self.assertEqual(result['errors'],1);self.assertEqual(result['assigned'],0)
 if __name__=='__main__':unittest.main()
+
+class StartupOrderingTests(unittest.TestCase):
+ def test_assignment_workers_start_once_after_all_final_guards(self):
+  import ast
+  from pathlib import Path
+  tree=ast.parse((Path(__file__).resolve().parents[1]/'app.py').read_bytes())
+  final_definition=max(n.end_lineno for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef)))
+  for name in ('_np_start_lifecycle_worker_v40','_np_start_reset_autofire_v43'):
+   calls=[n for n in tree.body if isinstance(n,ast.Expr) and isinstance(n.value,ast.Call) and isinstance(n.value.func,ast.Name) and n.value.func.id==name]
+   self.assertEqual(len(calls),1);self.assertGreater(calls[0].lineno,final_definition)
+ def test_pending_handover_precedes_live_and_broad_scans_under_the_existing_lock(self):
+  import ast
+  from pathlib import Path
+  from unittest.mock import patch
+  node=[n for n in ast.parse((Path(__file__).resolve().parents[1]/'app.py').read_bytes()).body if isinstance(n,ast.FunctionDef) and n.name=='_np_run_verified_lifecycle_cycle_v40'][-1]
+  order=[];ns={'_np_v74_try_file_lock':lambda:True,'_np_v74_release_file_lock':lambda lock:order.append('unlock'),'_np_v214_rows':Mock(),'_np_auto_assign_waiting_stage':Mock(),'_np_is_clean_root_v43':Mock(),'_np_record_live_passes_v214':lambda:order.append('monitor') or {},'_np_retry_clean_pass_funded_v19':lambda limit:order.append('broad-passes') or {},'_np_v214_cycle_core':lambda trigger:order.append('legacy') or {}}
+  exec(compile(ast.Module(body=[node],type_ignores=[]),'actual-priority-cycle','exec'),ns)
+  with patch('phase_handover_queue.retry_waiting',side_effect=lambda *args:order.append('waiting') or {'assigned':1}):ns['_np_run_verified_lifecycle_cycle_v40']()
+  self.assertEqual(order,['waiting','unlock','monitor','broad-passes','unlock','legacy'])

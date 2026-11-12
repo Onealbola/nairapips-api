@@ -38226,8 +38226,7 @@ def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
 
 
 def _np_lifecycle_worker_loop_v40():
-    # Let Render/Gunicorn finish app startup before the first DB cycle.
-    time.sleep(8)
+    # Started at EOF: final assignment authorities are already installed.
     while True:
         try:
             if _NP_LIFECYCLE_WORKER_LOCK_V40.acquire(blocking=False):
@@ -38294,7 +38293,7 @@ def admin_automation_v40_run_now():
         _NP_LIFECYCLE_WORKER_LOCK_V40.release()
 
 
-_np_start_lifecycle_worker_v40()
+# Started after final assignment authorities are installed at EOF.
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_LIFECYCLE_WORKER_RELEASE_V40
 
 # ============================================================================
@@ -38842,7 +38841,7 @@ def admin_automation_v43_status():
         "last_reset_summary":_NP_RESET_AUTOFIRE_LAST_V43,
     })
 
-_np_start_reset_autofire_v43()
+# Started after final assignment authorities are installed at EOF.
 NAIRAPIPS_CLEAN_AUTOMATION_RELEASE = NAIRAPIPS_AUTOMATION_GUIDE_RELEASE_V43
 
 
@@ -59740,16 +59739,13 @@ def _np_retry_clean_pass_funded_v19(limit=250):
 _np_v214_cycle_core = _np_run_verified_lifecycle_cycle_v40
 
 def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
-    live_passes = _np_record_live_passes_v214()
-    # Complete verified passes before older purchase/reset scans can stall.
-    # Use the existing cross-process lifecycle lock, never a second worker.
+    # Existing passed/waiting entitlements get their own short turn before
+    # monitoring reconciliation and broad history scans can occupy the worker.
     lock_fn = globals().get("_np_v74_try_file_lock")
     unlock_fn = globals().get("_np_v74_release_file_lock")
     lock = lock_fn() if callable(lock_fn) else True
-    progression = {"deferred_cross_process_busy": True}
     if lock:
         try:
-            # Give already-passed, waiting traders priority over broad history scans.
             from phase_handover_queue import retry_waiting
             try:
                 globals()["_NP_WAITING_HANDOVER_LAST"] = retry_waiting(
@@ -59757,16 +59753,23 @@ def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
             except Exception as exc:
                 globals()["_NP_WAITING_HANDOVER_LAST"] = {"errors": 1}
                 print("WAITING PHASE HANDOVER READ:", type(exc).__name__, flush=True)
+        finally:
+            if callable(unlock_fn):unlock_fn(lock)
+    else:
+        globals()["_NP_WAITING_HANDOVER_LAST"] = {"deferred_cross_process_busy": True}
+    live_passes = _np_record_live_passes_v214()
+    lock = lock_fn() if callable(lock_fn) else True
+    progression = {"deferred_cross_process_busy": True}
+    if lock:
+        try:
             progression = _np_retry_clean_pass_funded_v19(limit=100)
         finally:
-            if callable(unlock_fn):
-                unlock_fn(lock)
+            if callable(unlock_fn):unlock_fn(lock)
     result = _np_v214_cycle_core(trigger)
     if isinstance(result, dict):
         result["live_pass_reconciliation"] = live_passes
         result["verified_pass_priority_recovery"] = progression
     return result
-
 
 # V215: keep interactive overview reads out of shared SDK connection queues.
 _NP_ADMIN_BOOTSTRAP_EXECUTOR_V215 = None
@@ -60267,3 +60270,7 @@ def _payout_eligibility(trader, requested_account_id=None):
         return eligible, reason, account
     except Exception:
         return False, 'Your purchased payout schedule could not be verified.', account
+
+# Start these existing workers only after every final assignment guard is installed.
+_np_start_lifecycle_worker_v40()
+_np_start_reset_autofire_v43()

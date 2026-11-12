@@ -112,7 +112,7 @@ class CycleTests(unittest.TestCase):
  def test_passes_reconciled_and_assigned_before_legacy_scans(self):
   order=[]
   ns={'_np_record_live_passes_v214':lambda:order.append('record') or {'recorded':1},'_np_v74_try_file_lock':lambda:True,'_np_v74_release_file_lock':lambda lock:order.append('unlock'),'_np_retry_clean_pass_funded_v19':lambda limit:order.append('assign') or {'assigned':1},'_np_v214_cycle_core':lambda trigger:order.append('legacy') or {}}
-  extract(['_np_run_verified_lifecycle_cycle_v40'],ns);r=ns['_np_run_verified_lifecycle_cycle_v40']();self.assertEqual(order,['record','assign','unlock','legacy']);self.assertEqual(r['verified_pass_priority_recovery']['assigned'],1)
+  extract(['_np_run_verified_lifecycle_cycle_v40'],ns);r=ns['_np_run_verified_lifecycle_cycle_v40']();self.assertEqual(order,['unlock','record','assign','unlock','legacy']);self.assertEqual(r['verified_pass_priority_recovery']['assigned'],1)
  def test_cross_process_busy_defers_assignment(self):
   retry=Mock();ns={'_np_record_live_passes_v214':lambda:{'recorded':0},'_np_v74_try_file_lock':lambda:None,'_np_retry_clean_pass_funded_v19':retry,'_np_v214_cycle_core':lambda trigger:{}}
   extract(['_np_run_verified_lifecycle_cycle_v40'],ns);ns['_np_run_verified_lifecycle_cycle_v40']();retry.assert_not_called()
