@@ -16,6 +16,11 @@ from datetime import datetime, timezone
 import os, random, uuid, re, time, hmac, hashlib, base64, secrets, string, json, json
 import html
 import requests
+# Resolve side-effect-free reporting/correction modules before startup threads
+# and concurrent account reads can contend for their lazy import locks.
+import assignment_corrections as _np_corrections_preload
+import daily_breach_corrections as _np_daily_corrections_preload
+import account_reporting as _np_reporting_preload
 app = Flask(__name__)
 NAIRAPIPS_RELEASE = "V167_SURGICAL_PLAN_LOOKUP_FIX_2026_10_06"
 CORS(app)
