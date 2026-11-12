@@ -232,7 +232,33 @@ def broker_daily_realised(mt5, row, observed_at):
     if abs(after-before)>Decimal('.01'):
         raise ValueError('Broker balance changed during daily history read; retry required')
     if abs(capital+ledger-after)>Decimal('.01'):
-        raise ValueError('Broker history does not reconcile to the assigned capital and current balance')
+        # Some brokers timestamp initial funding after delivery. Verify the
+        # complete balance ledger independently instead of counting funding twice.
+        full=mt5.history_deals_get(datetime(1970,1,1,tzinfo=timezone.utc),observed)
+        if full is None:raise ValueError('Full broker balance ledger unavailable')
+        full_net=Decimal(0);initial_funds=Decimal(0);daily_net=Decimal(0);full_seen=set();first_trade=False
+        ordered=sorted(full,key=lambda d:(getattr(d,'time_msc',0) or getattr(d,'time',0)*1000,getattr(d,'ticket',0)))
+        for deal in ordered:
+            ticket=getattr(deal,'ticket',None);kind=getattr(deal,'type',None)
+            if ticket is None or ticket in full_seen:raise ValueError('Full broker deal identity missing or duplicated')
+            full_seen.add(ticket)
+            if isinstance(kind,bool) or not isinstance(kind,int):raise ValueError('Full broker deal type missing')
+            raw_time=getattr(deal,'time_msc',0)
+            raw_time=money(raw_time)/1000 if raw_time else money(getattr(deal,'time',0))
+            when=datetime.fromtimestamp(float(raw_time),timezone.utc)
+            if when>observed:raise ValueError('Full broker ledger includes a future deal')
+            net=sum((money(getattr(deal,field,0) or 0) for field in ('profit','commission','swap','fee')),Decimal(0))
+            if kind in (0,1):first_trade=True
+            if kind!=3:
+                full_net+=net
+                if not first_trade:initial_funds+=net
+            if kind in (0,1) and max(day_start,start)<=when<=observed:daily_net+=net
+        checked=mt5.account_info()
+        if (checked is None or str(checked.login)!=expected or money(checked.balance)!=after):
+            raise ValueError('Broker account changed during full balance-ledger verification')
+        if abs(full_net-after)>Decimal('.01') or abs(initial_funds-capital)>Decimal('.01'):
+            raise ValueError('Broker history does not reconcile to the assigned capital and current balance')
+        total=daily_net
     return total
 
 _ready_cache = (0, False)

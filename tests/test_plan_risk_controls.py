@@ -125,6 +125,19 @@ class PlanRiskControlsTests(unittest.TestCase):
         terminal.history_deals_get.return_value=[]
         with self.assertRaisesRegex(ValueError,'does not reconcile'):broker_daily_realised(terminal,account,observed.isoformat())
 
+    def test_full_ledger_verifies_initial_funding_after_delivery_without_double_count(self):
+        terminal=Mock();terminal.account_info.return_value=SimpleNamespace(login=123,balance=4702014.48)
+        account=dict(self.account,start_balance=5000000,started_at='2026-11-10T11:09:45+00:00')
+        observed=datetime(2026,11,12,15,tzinfo=timezone.utc)
+        full=[SimpleNamespace(ticket=1,time=int(datetime(2026,11,10,11,10,tzinfo=timezone.utc).timestamp()),type=2,profit=5000000),SimpleNamespace(ticket=2,time=int(datetime(2026,11,11,20,tzinfo=timezone.utc).timestamp()),type=1,profit=-190189.84),SimpleNamespace(ticket=3,time=int(datetime(2026,11,12,7,tzinfo=timezone.utc).timestamp()),type=1,profit=-107795.68)]
+        for first in (full,[]):
+            terminal.history_deals_get.side_effect=[first,full]
+            self.assertEqual(broker_daily_realised(terminal,account,observed.isoformat()),Decimal('-107795.68'))
+        # A complete ledger from an incorrectly capitalised pool account is rejected.
+        full[0].profit=50000000;terminal.account_info.return_value.balance=49702014.48
+        terminal.history_deals_get.side_effect=[full,full]
+        with self.assertRaisesRegex(ValueError,'does not reconcile'):broker_daily_realised(terminal,account,observed.isoformat())
+
     def test_transfers_are_reconciled_but_do_not_disguise_daily_breach(self):
         terminal=Mock();terminal.account_info.return_value=SimpleNamespace(login=123,balance=4900000)
         observed=datetime(2026,2,2,12,tzinfo=timezone.utc);stamp=int((observed-timedelta(hours=1)).timestamp())
