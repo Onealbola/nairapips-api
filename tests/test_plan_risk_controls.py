@@ -125,6 +125,21 @@ class PlanRiskControlsTests(unittest.TestCase):
         terminal.history_deals_get.return_value=[]
         with self.assertRaisesRegex(ValueError,'does not reconcile'):broker_daily_realised(terminal,account,observed.isoformat())
 
+    def test_realised_profit_offsets_floating_loss_on_first_phase2_trading_day(self):
+        observed=datetime(2026,11,12,14,42,50,tzinfo=timezone.utc)
+        terms=dict(daily_drawdown='5',payout_frequency='Weekly')
+        purchase=dict(self.purchase,journey_source=freeze('purchase',terms))
+        account=dict(self.account,stage='phase2',start_balance=1500000,started_at='2026-11-12T09:19:48+00:00',journey_source=inherit('account',purchase))
+        terminal=Mock();terminal.account_info.return_value=SimpleNamespace(login=123,balance=1564920.76)
+        terminal.history_deals_get.return_value=[SimpleNamespace(ticket=1,time=int(datetime(2026,11,12,10,21,41,tzinfo=timezone.utc).timestamp()),type=1,profit=64920.76)]
+        realised=broker_daily_realised(terminal,account,observed.isoformat())
+        self.assertEqual(realised,Decimal('64920.76'))
+        rules=spec(account,purchase)
+        correct=evaluate(rules,initial(rules),Decimal('1484783.01'),observed.isoformat(),balance=Decimal('1564920.76'),daily_realised=realised)
+        self.assertFalse(correct['breached']);self.assertEqual(Decimal(correct['daily_floor']),Decimal('1425000'));self.assertEqual(Decimal(correct['daily_loss_percent']),Decimal('1.014466'))
+        wrong=evaluate(rules,initial(rules),Decimal('1484783.01'),observed.isoformat(),balance=Decimal('1564920.76'),daily_realised=0)
+        self.assertTrue(wrong['breached'])
+
     def test_empty_day_history_needs_real_funding_evidence_even_at_starting_balance(self):
         terminal=Mock();terminal.account_info.return_value=SimpleNamespace(login=123,balance=1000000)
         observed=datetime(2026,2,2,12,tzinfo=timezone.utc)
