@@ -106,6 +106,12 @@ def register_panel_delivery(app, root=None):
         response.headers['Cache-Control']='no-store, max-age=0'
         return response
 
+    @app.get('/downloads/dd-daily-audit.ps1')
+    def dd_daily_audit_download():
+        response=send_file(assets/'nairapips-dd-daily-audit.ps1',mimetype='text/plain',as_attachment=True,download_name='NairaPips-DD-Daily-Audit.ps1',conditional=False,etag=False,max_age=0)
+        response.headers['Cache-Control']='no-store, max-age=0'
+        return response
+
     @app.get('/downloads/dd-daily-history.ps1')
     def dd_daily_history_download():
         response=send_file(assets/'nairapips-dd-daily-history.ps1',mimetype='text/plain',as_attachment=True,download_name='NairaPips-DD-Daily-History.ps1',conditional=False,etag=False,max_age=0)
