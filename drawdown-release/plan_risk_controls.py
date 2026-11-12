@@ -158,38 +158,61 @@ def edit_plan_controls(row, body):
 
 
 def broker_daily_realised(mt5, row, observed_at):
-    """Trading net P/L since WAT midnight; deposits and withdrawals are excluded."""
+    """Verify the assigned account's balance ledger before accepting daily P/L.
+
+    An empty/stale history after account switching is not evidence of zero loss.
+    Reconcile all post-assignment balance entries, then select this WAT day.
+    Transfers affect the balance proof but are excluded from trading P/L.
+    """
     observed = parse_time(observed_at)
-    start = observed.astimezone(WAT).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    day_start = observed.astimezone(WAT).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     assigned = row.get('account_started_at') or row.get('started_at') or row.get('created_at')
-    if assigned:
-        start = max(start, parse_time(assigned))
+    if not assigned:
+        raise ValueError('Exact account assignment time is required for daily history')
+    start = parse_time(assigned)
     if start > observed:
         raise ValueError('Account assignment is in the future')
     expected = str(row.get('mt5_login'))
+    def money(value):
+        if isinstance(value,bool):raise ValueError('Invalid broker ledger amount')
+        amount=Decimal(str(value))
+        if not amount.is_finite():raise ValueError('Invalid broker ledger amount')
+        return amount
+    capital=money(row.get('start_balance') or row.get('account_size') or 0)
+    if capital<=0:raise ValueError('Exact initial capital is required for daily history')
     info = mt5.account_info()
     if info is None or str(info.login) != expected:
         raise ValueError('Daily history account identity mismatch')
+    before=money(info.balance)
     deals = mt5.history_deals_get(start, observed)
     if deals is None:
         raise ValueError('Daily broker trading history unavailable')
-    total = Decimal(0)
+    ledger=Decimal(0);total=Decimal(0);seen=set()
     for deal in deals:
-        if getattr(deal, 'type', None) not in (0, 1):
-            continue
-        for field in ('profit', 'commission', 'swap', 'fee'):
-            value = getattr(deal, field, 0) or 0
-            if isinstance(value, bool):
-                raise ValueError('Invalid daily trading evidence')
-            amount = Decimal(str(value))
-            if not amount.is_finite():
-                raise ValueError('Invalid daily trading evidence')
-            total += amount
+        ticket=getattr(deal,'ticket',None)
+        if ticket is None or ticket in seen:raise ValueError('Broker deal identity missing or duplicated')
+        seen.add(ticket)
+        kind=getattr(deal,'type',None)
+        if isinstance(kind,bool) or not isinstance(kind,int):raise ValueError('Broker deal type missing')
+        raw_time=getattr(deal,'time_msc',0)
+        raw_time=money(raw_time)/1000 if raw_time else money(getattr(deal,'time',0))
+        when=datetime.fromtimestamp(float(raw_time),timezone.utc)
+        # MT5 ranges have second precision while assignment/observation timestamps
+        # can include fractions. Boundary deals belong to this same lifecycle.
+        if when < start.replace(microsecond=0) or when > observed:
+            raise ValueError('Broker deal lies outside the verified history window')
+        net=sum((money(getattr(deal,field,0) or 0) for field in ('profit','commission','swap','fee')),Decimal(0))
+        if kind!=3:ledger+=net # MT5 CREDIT changes account credit, not balance.
+        if kind in (0,1) and when>=day_start:total+=net
     info = mt5.account_info()
     if info is None or str(info.login) != expected:
         raise ValueError('Terminal account changed during daily history read')
+    after=money(info.balance)
+    if abs(after-before)>Decimal('.01'):
+        raise ValueError('Broker balance changed during daily history read; retry required')
+    if abs(capital+ledger-after)>Decimal('.01'):
+        raise ValueError('Broker history does not reconcile to the assigned capital and current balance')
     return total
-
 
 _ready_cache = (0, False)
 

@@ -101,16 +101,53 @@ class PlanRiskControlsTests(unittest.TestCase):
 
     def test_broker_day_net_excludes_transfers_and_includes_fees(self):
         terminal = Mock()
-        terminal.account_info.return_value=SimpleNamespace(login=123)
+        terminal.account_info.return_value=SimpleNamespace(login=123,balance=1999463)
         terminal.history_deals_get.return_value=[
-            SimpleNamespace(type=0,profit=-1000,commission=-20,swap=-5,fee=-2),
-            SimpleNamespace(type=1,profit=500,commission=-10,swap=0,fee=0),
-            SimpleNamespace(type=2,profit=1000000)]
+            SimpleNamespace(ticket=1,time=int(datetime(2026,2,2,10,tzinfo=timezone.utc).timestamp()),type=0,profit=-1000,commission=-20,swap=-5,fee=-2),
+            SimpleNamespace(ticket=2,time=int(datetime(2026,2,2,11,tzinfo=timezone.utc).timestamp()),type=1,profit=500,commission=-10,swap=0,fee=0),
+            SimpleNamespace(ticket=3,time=int(datetime(2026,2,2,9,tzinfo=timezone.utc).timestamp()),type=2,profit=1000000)]
         observed = datetime(2026,2,2,12,tzinfo=timezone.utc)
         self.assertEqual(broker_daily_realised(terminal,self.account,observed.isoformat()),Decimal('-537'))
-        self.assertEqual(terminal.history_deals_get.call_args.args[0],datetime(2026,2,1,23,tzinfo=timezone.utc))
+        self.assertEqual(terminal.history_deals_get.call_args.args[0],self.start)
         terminal.history_deals_get.return_value=None
         with self.assertRaises(ValueError):broker_daily_realised(terminal,self.account,observed.isoformat())
+
+    def test_daily_history_reconciles_prior_day_losses_without_counting_them_today(self):
+        terminal=Mock();terminal.account_info.return_value=SimpleNamespace(login=123,balance=4702014.48)
+        account=dict(self.account,start_balance=5000000,started_at='2026-11-10T11:09:45+00:00')
+        yesterday=datetime(2026,11,11,20,tzinfo=timezone.utc);today=datetime(2026,11,12,7,25,12,tzinfo=timezone.utc)
+        terminal.history_deals_get.return_value=[SimpleNamespace(ticket=1,time=int(yesterday.timestamp()),type=1,profit=-190189.84),SimpleNamespace(ticket=2,time=int(today.timestamp()),type=1,profit=-107795.68)]
+        observed=datetime(2026,11,12,15,tzinfo=timezone.utc)
+        self.assertEqual(broker_daily_realised(terminal,account,observed.isoformat()),Decimal('-107795.68'))
+        # A genuine empty trading day is accepted only with the complete prior ledger.
+        self.assertEqual(broker_daily_realised(terminal,account,(observed+timedelta(days=1)).isoformat()),Decimal(0))
+        # A stale empty broker cache cannot turn known balance losses into zero DD.
+        terminal.history_deals_get.return_value=[]
+        with self.assertRaisesRegex(ValueError,'does not reconcile'):broker_daily_realised(terminal,account,observed.isoformat())
+
+    def test_transfers_are_reconciled_but_do_not_disguise_daily_breach(self):
+        terminal=Mock();terminal.account_info.return_value=SimpleNamespace(login=123,balance=4900000)
+        observed=datetime(2026,2,2,12,tzinfo=timezone.utc);stamp=int((observed-timedelta(hours=1)).timestamp())
+        terminal.history_deals_get.return_value=[SimpleNamespace(ticket=1,time=stamp,type=2,profit=200000),SimpleNamespace(ticket=2,time=stamp,type=2,profit=-50000),SimpleNamespace(ticket=3,time=stamp,type=0,profit=-250000)]
+        account=dict(self.account,start_balance=5000000,journey_source=freeze('test',dict(daily_drawdown='5',payout_frequency='Weekly')))
+        realised=broker_daily_realised(terminal,account,observed.isoformat())
+        self.assertEqual(realised,Decimal('-250000'))
+        rules=spec(account,self.purchase);state=evaluate(rules,initial(rules),4900000,observed.isoformat(),balance=4900000,daily_realised=realised)
+        self.assertTrue(state['breached']);self.assertEqual(Decimal(state['daily_used_percent']),Decimal(100))
+        recovered=evaluate(rules,state,5000000,(observed+timedelta(days=1)).isoformat(),balance=5000000,daily_realised=0)
+        self.assertEqual(recovered,state)
+
+    def test_history_identity_conflicts_and_incomplete_pages_fail_closed(self):
+        terminal=Mock();observed=datetime(2026,2,2,12,tzinfo=timezone.utc)
+        terminal.account_info.return_value=SimpleNamespace(login=123,balance=1000000)
+        deal=SimpleNamespace(ticket=1,time=int(observed.timestamp()),type=0,profit=0)
+        terminal.history_deals_get.return_value=[deal,deal]
+        with self.assertRaisesRegex(ValueError,'duplicated'):broker_daily_realised(terminal,self.account,observed.isoformat())
+        terminal.history_deals_get.return_value=[SimpleNamespace(ticket=1,type=0,profit=0)]
+        with self.assertRaisesRegex(ValueError,'outside'):broker_daily_realised(terminal,self.account,observed.isoformat())
+        terminal.history_deals_get.return_value=[]
+        terminal.account_info.side_effect=[SimpleNamespace(login=123,balance=1000000),SimpleNamespace(login=999,balance=1000000)]
+        with self.assertRaisesRegex(ValueError,'changed'):broker_daily_realised(terminal,self.account,observed.isoformat())
 
     def test_daily_limit_counts_realised_and_floating_loss_and_is_latched(self):
         rules = spec(self.account)
