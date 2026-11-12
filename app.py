@@ -59100,6 +59100,8 @@ def _np_v204_live_refresh_response(resp):
         for key in ("current_account", "account"):
             if decorated.get("_single_" + key):
                 root[key] = decorated["_single_" + key][0]
+        from assignment_corrections import trader_view
+        trader_view(root)
         current = root.get("current_account") or root.get("account") or {}
         if current.get("latest_monitoring_snapshot"):
             root["latest_monitoring"] = current["latest_monitoring_snapshot"]
@@ -59746,6 +59748,25 @@ def _np_run_verified_lifecycle_cycle_v40(trigger="server_worker"):
     lock = lock_fn() if callable(lock_fn) else True
     if lock:
         try:
+            from assignment_corrections import retry_pending
+            try:
+                def save_correction(stored, case):
+                    response = requests.patch(SUPABASE_URL.rstrip('/')+'/rest/v1/package_studio_private_settings',
+                        headers={"apikey":SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY,"Authorization":"Bearer "+(SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY),"Prefer":"return=representation"},
+                        params={"key":"eq."+stored['key'],"value":"eq."+stored['value']},
+                        json={"value":json.dumps(case,sort_keys=True),"updated_at":now_iso(),"updated_by":"pool_capital_correction_worker"},timeout=(2,7))
+                    response.raise_for_status()
+                    changed = response.json()
+                    if not isinstance(changed,list) or len(changed)!=1:return False
+                    stored['value'] = changed[0]['value']
+                    return True
+                token = _NP_RENEWAL_REST_V211.set(True)
+                try:
+                    globals()["_NP_CAPITAL_CORRECTION_LAST"] = retry_pending(_np_v214_rows,save_correction,_np_pick_fresh_mt5,_assign_mt5_to_trader)
+                finally:
+                    _NP_RENEWAL_REST_V211.reset(token)
+            except Exception as exc:
+                print("POOL CORRECTION QUEUE:",type(exc).__name__,flush=True)
             from phase_handover_queue import retry_waiting
             try:
                 globals()["_NP_WAITING_HANDOVER_LAST"] = retry_waiting(

@@ -80,7 +80,8 @@ def install(g):
             chain=g['_np_v214_rows']('trader_accounts',{'purchase_id':'eq.'+str(purchase['id']),
                 'trader_id':'eq.'+tid,'order':'created_at.asc','limit':'1000'})
             if len(chain)>=1000:raise ValueError('Complete package account history is required')
-            real=[a for a in chain if a.get('mt5_login') and a.get('account_status')!='assignment_sync_error']
+            from assignment_corrections import voided
+            real=[a for a in chain if a.get('mt5_login') and a.get('account_status')!='assignment_sync_error' and not voided(a)]
             route=purchase_route(purchase)
             if normalized not in route:raise ValueError('This stage is not part of the purchased model')
             if normalized==route[0] and real and normalized!='funded':

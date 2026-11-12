@@ -136,6 +136,8 @@ def build_report(purchases, accounts, start, end, payouts=None):
     if start and end and start > end:
         raise ValueError("Start date must be on or before end date")
     linked = defaultdict(list)
+    from assignment_corrections import voided
+    accounts = [a for a in accounts if not voided(a)]
     by_id = {str(a.get("id")): a for a in accounts if a.get("id")}
     children = defaultdict(list)
     for a in accounts:

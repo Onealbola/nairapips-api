@@ -38,6 +38,9 @@ def metrics(row):
     if out['recorded_breach']:
         out['risk_zone'] = 'breached'
         out['reporting_status'] = 'BREACHED'
+    elif __import__('assignment_corrections').voided(row):
+        out['risk_zone'] = 'corrected'
+        out['reporting_status'] = 'ASSIGNMENT_CORRECTED'
     elif row.get('trading_rule_snapshot_status') == 'repair_required':
         out['risk_zone'] = 'rule_review_required'
         out['reporting_status'] = 'RULE_REVIEW_REQUIRED'

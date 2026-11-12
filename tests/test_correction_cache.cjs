@@ -1,0 +1,6 @@
+const fs=require('fs'),vm=require('vm'),assert=require('node:assert/strict');
+(async()=>{
+ const old={id:'bad'},valid={id:'good'};const c={document:{getElementById:()=>null},setInterval:()=>{},setTimeout:()=>{},SESSION:{allAccounts:[old,valid],accounts:[old,valid],selectedAccountId:'bad',snapshots:[{id:'snapshot',trader_account_id:'bad'}],trades:[{id:'trade',trader_account_id:'bad'},{id:'other',trader_account_id:'good'}],data:{all_accounts:[old,valid],current_account:old}},safeFetchJson:async()=>({data:{correction_excluded_account_ids:['bad'],current_account:valid}})};c.window=c;vm.createContext(c);vm.runInContext(fs.readFileSync('website-downloads/account-reporting.js','utf8'),c);await c.safeFetchJson('/trader_bootstrap');
+ assert.deepEqual(c.SESSION.allAccounts,[valid]);assert.equal(c.SESSION.selectedAccountId,'good');assert.equal(c.SESSION.data.current_account,valid);assert.equal(c.SESSION.snapshots.length,0);assert.equal(c.SESSION.trades.length,1);assert.equal(c.SESSION.trades[0].id,'other');
+ console.log('PASS: server-identified erroneous deliveries are removed from cached account, trade, snapshot and selection data without removing valid history.');
+})().catch(e=>{console.error(e);process.exitCode=1});

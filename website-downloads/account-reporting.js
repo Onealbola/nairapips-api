@@ -1,7 +1,7 @@
 /* Exact-account breach reporting; no trading or lifecycle writes. */
 (function(){
 'use strict';
-const release='account-reporting-20261111-private-diagnostics-v3';
+const release='account-reporting-20261112-correction-history-v4';
 if(window.NP_ACCOUNT_REPORTING_RELEASE===release)return;
 window.NP_ACCOUNT_REPORTING_RELEASE=release;
 const breached=a=>!!(a&&(a.recorded_breach||a.breached_at||String(a.account_status||'').toLowerCase().includes('breach')));
@@ -44,7 +44,19 @@ if(typeof window.acctCard==='function'){
 const truths=new Map();
 if(typeof safeFetchJson==='function'){
  const fetchCore=safeFetchJson;
- window.safeFetchJson=async function(...args){const result=await fetchCore.apply(this,args);const x=result?.truth||result?.data?.truth;if(String(args[0]).includes('/account_truth_v116')&&x?.trader_account_id){truths.set(String(x.trader_account_id),x);setTimeout(paint,0)}return result};
+ window.safeFetchJson=async function(...args){const result=await fetchCore.apply(this,args);
+ const root=result?.data||result;
+ if(typeof SESSION!=='undefined'&&Array.isArray(root?.correction_excluded_account_ids)){
+  const ids=new Set(root.correction_excluded_account_ids.map(String));
+  const keep=r=>!['id','trader_account_id','account_id','source_account_id','completed_account_id'].some(k=>ids.has(String(r?.[k]||'')));
+  for(const key of ['allAccounts','accounts','trades','snapshots','previousResetActions'])if(Array.isArray(SESSION[key]))SESSION[key]=SESSION[key].filter(keep);
+  if(SESSION.data){
+   for(const key of ['all_accounts','accounts','active_accounts'])if(Array.isArray(SESSION.data[key]))SESSION.data[key]=SESSION.data[key].filter(keep);
+   if(ids.has(String(SESSION.data.current_account?.id||'')))SESSION.data.current_account=root.current_account||null;
+  }
+  for(const key of ['selectedAccountId','lifecycleAccountId','adminFocusAccountId'])if(ids.has(String(SESSION[key]||'')))SESSION[key]=root.current_account?.id||null;
+ }
+ const x=result?.truth||result?.data?.truth;if(String(args[0]).includes('/account_truth_v116')&&x?.trader_account_id){truths.set(String(x.trader_account_id),x);setTimeout(paint,0)}return result};
 }
 function paint(){
  const card=document.getElementById('np-historic-truth-card');if(!card)return;
