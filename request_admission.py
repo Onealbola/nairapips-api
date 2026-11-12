@@ -19,6 +19,9 @@ def configure_worker_capacity(threads):
 
 class RequestAdmissionMiddleware:
     PRIORITY_PATHS = frozenset({'/staff_login', '/healthz/http', '/admin/auth_check'})
+    # This small public installer performs no database work. Deliver it even
+    # when ordinary business lanes are occupied, so recovery stays reachable.
+    RECOVERY_DOWNLOAD_PATHS = frozenset({'/downloads/dd-login-retry.ps1'})
     ALLOWED_ORIGINS = frozenset({'https://nairapips.com', 'https://www.nairapips.com'})
 
     def __init__(self, application, capacity=6, reserved_paths=(), io_idle_timeout=15):
@@ -73,7 +76,9 @@ class RequestAdmissionMiddleware:
         if connection is not None:
             connection.settimeout(self.io_idle_timeout)
         path = str(environ.get('PATH_INFO') or '')
-        if path in self.PRIORITY_PATHS or environ.get('REQUEST_METHOD') == 'OPTIONS':
+        method = environ.get('REQUEST_METHOD', 'GET')
+        recovery_download = path in self.RECOVERY_DOWNLOAD_PATHS and method in {'GET', 'HEAD'}
+        if path in self.PRIORITY_PATHS or method == 'OPTIONS' or recovery_download:
             yield from self.application(environ, start_response)
             return
         slots = self.reserved_slots.get(path, self.slots)

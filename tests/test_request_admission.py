@@ -2,6 +2,22 @@ import json, threading, unittest
 from request_admission import RequestAdmissionMiddleware, configure_worker_capacity
 
 class AdmissionTests(unittest.TestCase):
+    def test_recovery_installer_remains_readable_when_business_slots_are_full(self):
+        from flask import Flask
+        from panel_delivery import register_panel_delivery
+        from pathlib import Path
+        app=Flask(__name__);register_panel_delivery(app)
+        middleware=RequestAdmissionMiddleware(app.wsgi_app,1);app.wsgi_app=middleware
+        self.assertTrue(middleware.slots.acquire(blocking=False))
+        try:
+            client=app.test_client()
+            expected=(Path(__file__).resolve().parents[1]/'website-downloads/nairapips-dd-login-retry.ps1').read_bytes()
+            response=client.get('/downloads/dd-login-retry.ps1')
+            self.assertEqual(response.status_code,200);self.assertEqual(response.data,expected)
+            self.assertEqual(client.head('/downloads/dd-login-retry.ps1').status_code,200)
+            for method,path in [('POST','/downloads/dd-login-retry.ps1'),('GET','/downloads/other.ps1'),('POST','/approve_challenge_purchase')]:
+                result=client.open(path,method=method);self.assertEqual(result.status_code,503);self.assertFalse(result.json['operation_started'])
+        finally:middleware.slots.release()
     def test_busy_does_not_start_any_business_write_and_priority_bypasses(self):
         started=threading.Event(); release=threading.Event();calls=[]
         def handler(env,start):
