@@ -626,8 +626,6 @@ def verified_live_info(login,server,password,row):
     return info
 
 def authenticate(row, master_only=False):
-    # V3.5: bad/stale credentials are isolated per account. They must never
-    # hard-reset the shard terminal or delay valid traders.
     login=norm(row.get("mt5_login")); server=norm(row.get("mt5_server"))
     now=time.monotonic()
     if not master_only and now < auth_quarantine_until.get(login, 0.0):
@@ -649,17 +647,73 @@ def authenticate(row, master_only=False):
         if rm and rm not in [x[1] for x in candidates]: candidates.append(("row-master-fallback",rm))
         pm=pool_master(login)
         if pm and pm not in [x[1] for x in candidates]: candidates.append(("pool-master-fallback",pm))
-    first_error=None
+    # NP_VERIFIED_HISTORY_SESSION_20261112: a cached login is not a live session.
+    from plan_risk_controls import daily_percent, broker_daily_realised
+    require_history=not master_only and daily_percent(row)>0
+    def live_session():
+        terminal=mt5.terminal_info();account=mt5.account_info()
+        if (terminal is None or not getattr(terminal,'connected',False)
+                or account is None or norm(getattr(account,'login',''))!=login
+                or norm(getattr(account,'server','')).lower()!=server.lower()):return None
+        # A cached balance with zero/old equity is not a coherent MT5 snapshot.
+        # Genuine zero equity remains valid when the reported floating loss
+        # reconciles it to balance and credit; breach thresholds are unchanged.
+        import math
+        try:
+            balance,equity,profit,credit=(float(getattr(account,k)) for k in ('balance','equity','profit','credit'))
+            if not all(math.isfinite(v) for v in (balance,equity,profit,credit)):return None
+            if abs(equity-(balance+profit+credit))>max(.05,abs(equity)*1e-10):return None
+        except (TypeError,ValueError,AttributeError):return None
+        return account
+    preferred=getattr(authenticate,'_history_sources',{})
+    cache_key=(login,server)
+    if require_history:
+        candidates.sort(key=lambda candidate:candidate[0]!=preferred.get(cache_key))
+    first_error=None;history_fallback=None
     for source,pwd in candidates:
         ok=mt5.login(login=int(login),password=pwd,server=server)
         if not ok:
             if first_error is None: first_error=mt5.last_error()
             continue
         info=verified_live_info(login,server,pwd,row)
+        if info is None:continue
+        info=live_session()
+        if info is None:
+            time.sleep(.1);info=live_session()
+        if info is None:
+            log(f"AUTH SESSION UNREADY MT5={login} source={source} | cached account data rejected | NO DD DECISION","WARNING")
+            continue
+        if require_history:
+            history_ok=False
+            for attempt in range(2):
+                try:
+                    realised=broker_daily_realised(mt5,row,now_iso())
+                    history_ok=True;break
+                except Exception as exc:
+                    if attempt==0:time.sleep(.1)
+                    else:log(f"AUTH HISTORY UNREADY MT5={login} source={source}: {type(exc).__name__}: {str(exc)[:160]} | trying next credential","WARNING")
+            info=live_session()
+            if info is None:continue
+            if not history_ok:
+                history_fallback={"info":info,"password":pwd,"source":source,"server":server,"daily_history_unavailable":True}
+                continue
+        if require_history:
+            if preferred.get(cache_key)!=source:
+                log(f"AUTH HISTORY VERIFIED MT5={login} source={source} daily_net={realised}")
+            if len(preferred)>=2048:preferred.clear()
+            preferred[cache_key]=source
+            authenticate._history_sources=preferred
+        auth_fail_count.pop(login, None)
+        auth_quarantine_until.pop(login, None)
+        return {"info":info,"password":pwd,"source":source,"server":server}
+    # Preserve overall-DD policing from a connected exact account even when
+    # daily history is unavailable. inspect() still refuses a daily-safe quote
+    # and does not mark a complete valid DD read until its journal succeeds.
+    if history_fallback:
+        info=live_session()
         if info is not None:
-            auth_fail_count.pop(login, None)
-            auth_quarantine_until.pop(login, None)
-            return {"info":info,"password":pwd,"source":source,"server":server}
+            history_fallback['info']=info
+            return history_fallback
     if not master_only:
         failures=auth_fail_count.get(login,0)+1
         auth_fail_count[login]=failures
@@ -669,6 +723,7 @@ def authenticate(row, master_only=False):
     else:
         log(f"AUTH PENDING MT5={login} master_only=1 | first={first_error} final={mt5.last_error()} | NO DD DECISION","WARNING")
     return None
+
 
 def verify_master_close_readiness(row, force=False):
     """Credential-only safety check. NEVER sends, changes, cancels or closes an order."""
@@ -988,7 +1043,6 @@ def inspect(row):
         return max(AUTH_RETRY_SECONDS, quarantine_left)
 
     first=login not in verified
-    verified.add(login); last_ok[login]=time.monotonic()
     info=a["info"]
     bal=float(info.balance or 0); eq=float(info.equity or 0)
     start=starting_capital(row,bal)
@@ -1002,11 +1056,6 @@ def inspect(row):
     if positions is None:
         log(f"POSITION READ FAILED MT5={login} | NO DD DECISION","ERROR")
         return AUTH_RETRY_SECONDS
-
-    # V3.13 true coverage timestamp: only a complete, usable live DD observation
-    # counts as protected coverage.
-    last_valid_dd_read[login]=time.monotonic()
-    last_inspected[login]=last_valid_dd_read[login]
 
     if daily_enabled or not _daily_probe_ready:
         try:
@@ -1047,6 +1096,13 @@ def inspect(row):
         dd=max(((start-risk)/start)*100.0,0.0)
         used=(dd/limit)*100.0 if limit>0 else 0.0
         breach_level=start*(1-limit/100.0)
+
+    # NP_VERIFIED_HISTORY_SESSION_20261112: coverage follows usable rule evidence.
+    verified.add(login); last_ok[login]=time.monotonic()
+    # V3.13 true coverage timestamp: only a complete, usable live DD observation
+    # counts as protected coverage.
+    last_valid_dd_read[login]=time.monotonic()
+    last_inspected[login]=last_valid_dd_read[login]
 
     # V3.17: publish the same already-computed valid MT5 observation asynchronously.
     _account_id = row.get("trader_account_id") or row.get("current_account_id")

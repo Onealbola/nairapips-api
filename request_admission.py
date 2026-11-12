@@ -21,7 +21,7 @@ class RequestAdmissionMiddleware:
     PRIORITY_PATHS = frozenset({'/staff_login', '/healthz/http', '/admin/auth_check'})
     # This small public installer performs no database work. Deliver it even
     # when ordinary business lanes are occupied, so recovery stays reachable.
-    RECOVERY_DOWNLOAD_PATHS = frozenset({'/downloads/dd-login-retry.ps1', '/downloads/dd-daily-history.ps1', '/downloads/dd-daily-audit.ps1'})
+    RECOVERY_DOWNLOAD_PATHS = frozenset({'/downloads/dd-login-retry.ps1', '/downloads/dd-daily-history.ps1', '/downloads/dd-daily-audit.ps1', '/downloads/dd-history-session.ps1'})
     ALLOWED_ORIGINS = frozenset({'https://nairapips.com', 'https://www.nairapips.com'})
 
     def __init__(self, application, capacity=6, reserved_paths=(), io_idle_timeout=15):
