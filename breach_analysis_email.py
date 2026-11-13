@@ -199,7 +199,10 @@ class Notifier:
         if not self.save(stored,claimed):return False
         # Re-read the canonical account immediately before external delivery; an
         # audited correction or a changed breach identity cancels this message.
-        try:self.prepare(case)
+        try:
+            confirmed=self.prepare(case)
+            if confirmed['recipient']!=mail['recipient'] or confirmed['context']['rules_hash']!=mail['context']['rules_hash']:
+                raise ValueError('Recipient or purchased rules changed before delivery')
         except Exception as exc:
             self.save(stored,dict(claimed,state='needs_review',error=str(exc)[:250]));return False
         try:
