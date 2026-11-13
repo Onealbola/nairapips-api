@@ -79,6 +79,33 @@ class Retention:
         row=self.member(tid) or {}
         if str(row.get('id') or '')!=str(tid):raise ValueError('Registered trader could not be verified')
         return row
+    def account_scope(self,trader,account_id,cutoff=None):
+        rows=self.read('trader_accounts',{'select':'id,trader_id,purchase_id,account_size,stage,mt5_login,account_status,breached_at,created_at','id':'eq.'+str(account_id),'trader_id':'eq.'+str(trader['id']),'limit':'1'})
+        if len(rows)!=1:raise ValueError('Exact breached account could not be verified')
+        a=rows[0]
+        if str(a.get('trader_id'))!=str(trader['id']) or not a.get('breached_at'):raise ValueError('Choose a genuinely breached account belonging to this trader')
+        if cutoff and (expiry(a['breached_at']) is None or expiry(a['breached_at'])>cutoff):raise ValueError('The account was not breached when this offer was issued')
+        purchases=self.read('challenge_purchases',{'select':'id,trader_id,plan_id,plan_name,account_size,payout_cycles,payment_status','id':'eq.'+str(a['purchase_id']),'trader_id':'eq.'+str(trader['id']),'limit':'1'})
+        if len(purchases)!=1:raise ValueError('Exact source purchase could not be verified')
+        p=purchases[0]
+        if (p.get('id')!=a['purchase_id'] or str(p.get('trader_id'))!=str(trader['id']) or p.get('payment_status')!='approved' or not p.get('plan_id') or Decimal(str(p['account_size']))!=Decimal(str(a['account_size']))):raise ValueError('The breached purchase does not match this account')
+        return dict(source_account_id=a['id'],source_purchase_id=p['id'],eligible_plan_id=p['plan_id'],account_size=str(p['account_size']),payout_cycles=int(p.get('payout_cycles') if p.get('payout_cycles') is not None else 3),plan_name=p.get('plan_name') or '',mt5_login=a.get('mt5_login') or '')
+    def scope(self,row,trader):
+        saved=row.get('recovery_scope')
+        if not isinstance(saved,dict) or not saved.get('source_account_id'):raise ValueError('This recovery offer needs its exact breached account linked by admin')
+        actual=self.account_scope(trader,saved['source_account_id'],expiry(row.get('created_at')))
+        for key in ('source_account_id','source_purchase_id','eligible_plan_id','payout_cycles'):
+            if str(saved.get(key))!=str(actual[key]):raise ValueError('Recovery offer account or purchase scope changed')
+        if Decimal(str(saved.get('account_size')))!=Decimal(actual['account_size']):raise ValueError('Recovery offer account size changed')
+        return actual
+    def eligible(self,row,trader,data):
+        scope=self.scope(row,trader)
+        if str(data.get('plan_id') or '')!=str(scope['eligible_plan_id']):raise ValueError('This discount applies only to '+scope['plan_name']+' for the linked breached account')
+        verified=request.environ.get('np_verified_checkout_plan_v221') if has_request_context() else None
+        if verified and (str(verified.get('id'))!=str(scope['eligible_plan_id']) or Decimal(str(verified.get('account_size')))!=Decimal(scope['account_size'])):raise ValueError('Verified checkout does not match this recovery offer')
+        if data.get('account_size') is not None and Decimal(str(data['account_size']))!=Decimal(scope['account_size']):raise ValueError('This discount does not apply to another account size')
+        if int(data['payout_cycles'] if data.get('payout_cycles') is not None else 3)!=scope['payout_cycles']:raise ValueError('This discount applies only to the original payout-cycle option')
+        return scope
     def find(self,data,code):
         held=self.reservation.get()
         if held and code==held['code']:
@@ -98,10 +125,12 @@ class Retention:
             if not row:
                 return self.invalid(base,code,'This private offer belongs to another trader') if foreign else None
             if not self.g['_np_private_offer_usable'](row):return self.invalid(base,code,'Private offer expired, already used, or unavailable')
+            scope=self.eligible(row,self.trader(data),data)
             pct=discount(self.g['_np_offer_discount_percent'](row,code));amount=round(float(base)*pct/100,2);fee=round(float(base)-amount,2)
             return dict(valid=True,code=code,message=f'{pct:g}% private discount applied',original_fee=float(base),discount_percent=pct,
                 discount_amount=amount,final_fee=fee,fee=fee,commission_percent=0,commission_amount=0,
-                affiliate_owner='NairaPips Private Offer',campaign_type='private_recovery_offer',offer_id=row['id'],expires_at=row.get('expires_at'),source=row)
+                affiliate_owner='NairaPips Private Offer',campaign_type='private_recovery_offer',offer_id=row['id'],expires_at=row.get('expires_at'),recovery_scope=scope,source=row)
+        except ValueError as exc:return self.invalid(base,code,str(exc))
         except Exception:return self.invalid(base,code,'Private offer could not be verified. Sign in and retry.')
     @staticmethod
     def invalid(base,code,message):return dict(valid=False,code=code,message=message,original_fee=float(base),final_fee=float(base),fee=float(base),discount_percent=0,discount_amount=0)
@@ -137,6 +166,23 @@ def install(app,g):
             r.headers['Cache-Control']='no-store, private';return r
         except Exception:return jsonify(success=False,error='Registered members could not be loaded. Retry.'),503
 
+    @app.get('/admin/private_offer_accounts')
+    def private_offer_accounts():
+        _,error=g['_require_admin']()
+        if error is not None:return error
+        try:
+            trader=service.member(request.args.get('trader_id',''))
+            if not trader:return jsonify(success=False,error='Registered trader required'),400
+            rows=service.read('trader_accounts',{'select':'id,breached_at','trader_id':'eq.'+str(trader['id']),'order':'created_at.desc','limit':'1001'})
+            if len(rows)>1000:raise ValueError('Account history requires review')
+            scopes=[]
+            for row in rows:
+                if not row.get('breached_at'):continue
+                try:scopes.append(service.account_scope(trader,row['id']))
+                except ValueError:continue
+            response=jsonify(success=True,accounts=scopes);response.headers['Cache-Control']='no-store, private';return response
+        except Exception:return jsonify(success=False,error='Breached accounts could not be verified'),503
+
     # Read all relevant history instead of only the latest 100 offers globally.
     for endpoint in ('private_offers_for_trader','trader_targeted_offers'):
         if endpoint not in app.view_functions:continue
@@ -161,7 +207,11 @@ def install(app,g):
                                 try:account=g['_get_active_account'](trader['id']) or {}
                                 except Exception:account={}
                             if not g['_np_notice_audience_matches'](row,trader,account):continue
-                        visible.append(g['_trader_safe_offer_row'](row))
+                        safe=g['_trader_safe_offer_row'](row)
+                        if not row.get('message_only'):
+                            try:safe['recovery_scope']=service.scope(row,trader)
+                            except ValueError:continue
+                        visible.append(safe)
                     visible.sort(key=lambda row:str(row.get('created_at') or ''),reverse=True)
                     r=jsonify(visible);r.headers['Cache-Control']='no-store, private';return r
                 except ValueError as exc:return jsonify(success=False,error=str(exc)),401
@@ -186,6 +236,12 @@ def install(app,g):
                 target=g['_np_find_offer_trader'](str(d.get('target_trader_id') or ''),str(d.get('target_email') or ''))
                 if not target or (d.get('target_trader_id') and str(target['id'])!=str(d['target_trader_id'])):raise ValueError('Choose a registered member')
                 d.update(target_trader_id=str(target['id']),target_email=target.get('email') or '',target_name=target.get('name') or '')
+                # Older installed admin pages identify only the member. Their
+                # exact current account may supply the scope only if verified
+                # breached; never turn this compatibility path into a broad offer.
+                source=str(d.get('source_account_id') or (d.get('recovery_scope') or {}).get('source_account_id') or target.get('current_account_id') or '')
+                if not source:raise ValueError('Choose the exact breached account for this recovery discount')
+                d['recovery_scope']=service.account_scope(target,source)
             request._cached_json=(d,d)
             return original_create()
         except ValueError as exc:return jsonify(success=False,error=str(exc)),400
@@ -205,6 +261,7 @@ def install(app,g):
                     rows.sort(key=lambda r:str(r.get('created_at') or ''),reverse=True)
                     chosen=next((r for r in rows if matches(r,t) and g['_np_private_offer_usable'](r)),None)
                     if not chosen:return jsonify(success=False,error='Offer expired, already used, or not assigned to you'),404
+                    scope=service.scope(chosen,t) if not chosen.get('message_only') else None
                     stamp=datetime.now(timezone.utc).isoformat()
                     audit={key:stamp for key in ('read_at','claimed_at') if key in chosen and (key=='read_at' or kind=='claim_private_offer')}
                     if audit:
@@ -213,7 +270,7 @@ def install(app,g):
                     if kind=='mark_private_offer_read':return jsonify(success=True,data={'read':True,'offer_id':chosen['id']})
                     code=g['_aff_code'](chosen.get('offer_code') or 'PHASEHELP')
                     return jsonify(success=True,data=dict(claimed=True,offer_id=chosen['id'],offer_code=code,promo_code=code,
-                        discount_percent=g['_np_offer_discount_percent'](chosen,code),expires_at=chosen.get('expires_at') or chosen.get('offer_expires_at'),redirect='plans'))
+                        discount_percent=g['_np_offer_discount_percent'](chosen,code),expires_at=chosen.get('expires_at') or chosen.get('offer_expires_at'),recovery_scope=scope,redirect='plans'))
                 except ValueError as exc:return jsonify(success=False,error=str(exc)),401
                 except Exception:return jsonify(success=False,error='Offer could not be verified. Retry.'),503
             return protected
@@ -230,7 +287,10 @@ def install(app,g):
             offer,foreign=service.find(d,code)
             if not offer:return (jsonify(success=False,error='This private offer belongs to another trader'),403) if foreign else core()
             if not g['_np_private_offer_usable'](offer):return jsonify(success=False,error='Private offer expired or already used'),409
-            trader=service.trader(d);token='offer_reserved_'+uuid.uuid4().hex;started=datetime.now(timezone.utc).isoformat()
+            trader=service.trader(d)
+            try:service.eligible(offer,trader,d)
+            except ValueError as exc:return jsonify(success=False,error=str(exc)),409
+            token='offer_reserved_'+uuid.uuid4().hex;started=datetime.now(timezone.utc).isoformat()
             rows=service.patch(offer['id'],str(offer.get('status') or 'active'),{'status':token})
             if len(rows)!=1:return jsonify(success=False,error='This private offer is already being used'),409
         except Exception:return jsonify(success=False,error='Offer availability could not be verified. Retry.'),503

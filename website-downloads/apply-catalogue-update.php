@@ -19,7 +19,7 @@ if (!is_file($landing) || !is_file($trader) || !is_file($payload)) fail_install(
 $home = file_get_contents($landing);
 $dashboard = file_get_contents($payload);
 if ($home === false || $dashboard === false || stripos($home,'</body>') === false || strpos($home,'npStandardPlansGrid') === false || strpos($home,'npPremiumPlansGrid') === false) fail_install('The existing landing page could not be safely read. No file was changed.');
-if (hash('sha256',$dashboard) !== '11ea606846b615e42617757266e50363fdcf19e5b01db203821f0e756563b1c0') fail_install('The trader-page payload could not be verified. Extract the complete ZIP again.');
+if (hash('sha256',$dashboard) !== '33a96a2eec4ef47c7b2b1db66edbfc9dcb979edbd23f332c1fc43cf3b9189e45') fail_install('The trader-page payload could not be verified. Extract the complete ZIP again.');
 $marker = '<!-- NP_LIVE_CATALOGUE_V1 -->';
 // Replace stale connections on every installation, including previous marked builds.
 $home = preg_replace('~<!-- NP_LIVE_CATALOGUE_V1 -->~', '', $home);

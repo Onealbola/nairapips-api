@@ -11,7 +11,7 @@ class Response:
     def json(self):return copy.deepcopy(self.rows)
     def raise_for_status(self):pass
 class HTTP:
-    def __init__(self):self.rows={'traders':[],'announcements':[],'challenge_purchases':[]};self.lock=threading.Lock();self.fail=False;self.fallback=False
+    def __init__(self):self.rows={'traders':[],'announcements':[],'challenge_purchases':[],'trader_accounts':[]};self.lock=threading.Lock();self.fail=False;self.fallback=False
     def get(self,url,params,**kw):
         if self.fail:raise TimeoutError()
         rows=copy.deepcopy(self.rows[url.rsplit('/',1)[1]])
@@ -37,6 +37,10 @@ class RetentionTests(unittest.TestCase):
         self.t={'id':'owner','name':'Owner','email':'owner@example.test'}
         self.offer=dict(id='offer',type='private_offer',status='active',target_trader_id='owner',target_email='owner@example.test',discount_percent=37.5,offer_code='RETURN1',expires_at=(datetime.now(timezone.utc)+timedelta(days=1)).isoformat(),created_at='2026-11-06',delivery_dashboard=True)
         self.http.rows['announcements']=[self.offer];self.http.rows['traders']=[self.t]
+        self.account=dict(id='source',trader_id='owner',purchase_id='root',plan_id='plan',account_size=500000,stage='phase1',mt5_login='123',account_status='breached_archived',breached_at='2026-11-05T12:00:00Z',created_at='2026-11-01T00:00:00Z')
+        self.root=dict(id='root',trader_id='owner',plan_id='plan',plan_name='LEGEND',account_size=500000,payout_cycles=3,payment_status='approved')
+        self.http.rows['trader_accounts']=[self.account];self.http.rows['challenge_purchases']=[self.root]
+        self.offer['recovery_scope']=dict(source_account_id='source',source_purchase_id='root',eligible_plan_id='plan',account_size='500000',payout_cycles=3,plan_name='LEGEND')
         self.g={'requests':self.http,'SUPABASE_URL':'https://db.test','SUPABASE_KEY':'fixture','_np_offer_merge_meta':lambda r:dict(r),
             '_authenticated_trader_id_for_request':lambda requested:(self.owner,None) if self.owner and (not requested or requested==self.owner) else (None,'forbidden'),
             '_get_trader_by_id':lambda tid:next((r for r in self.http.rows['traders'] if r['id']==tid),None),
@@ -64,8 +68,8 @@ class RetentionTests(unittest.TestCase):
         install(self.app,self.g);self.service=self.app.config['NP_PRIVATE_RETENTION'];self.c=self.app.test_client()
     def test_percentage_identity_and_expiry_at_quote(self):
         with self.app.test_request_context():
-            q=self.service.quote({'trader_id':'owner'},20000,'RETURN1');self.assertEqual(q['final_fee'],12500);self.assertEqual(q['discount_percent'],37.5)
-            self.offer['expires_at']='broken';self.assertFalse(self.service.quote({'trader_id':'owner'},20000,'RETURN1')['valid'])
+            q=self.service.quote({'trader_id':'owner','plan_id':'plan'},20000,'RETURN1');self.assertEqual(q['final_fee'],12500);self.assertEqual(q['discount_percent'],37.5)
+            self.offer['expires_at']='broken';self.assertFalse(self.service.quote({'trader_id':'owner','plan_id':'plan'},20000,'RETURN1')['valid'])
             for end in [None,'',datetime.now(timezone.utc).isoformat()]:self.assertTrue(expired({'expires_at':end}))
             self.offer['expires_at']=(datetime.now(timezone.utc)+timedelta(days=1)).isoformat()
             self.owner='other';self.http.rows['traders'].append({'id':'other','email':'owner@example.test'})
@@ -73,11 +77,11 @@ class RetentionTests(unittest.TestCase):
             self.owner=None;self.assertIsNone(self.service.quote({},20000,'AFFILIATE'))
     def test_single_use_at_purchase_and_claim_does_not_consume(self):
         r=self.c.post('/claim_private_offer',json={'trader_id':'owner','email':'forged@example.test'});self.assertEqual(r.status_code,200);self.assertEqual(r.json['data']['offer_id'],'offer');self.assertEqual(self.offer['status'],'active')
-        r=self.c.post('/create_challenge_purchase',json={'trader_id':'owner','promo_code':'RETURN1'});self.assertEqual(r.status_code,200,r.json);self.assertEqual(r.json['data']['final_fee'],12500);self.assertEqual(self.offer['status'],'used')
-        self.assertEqual(self.c.post('/create_challenge_purchase',json={'trader_id':'owner','promo_code':'RETURN1'}).status_code,409)
-        self.assertEqual(len(self.http.rows['challenge_purchases']),1)
+        r=self.c.post('/create_challenge_purchase',json={'trader_id':'owner','plan_id':'plan','promo_code':'RETURN1'});self.assertEqual(r.status_code,200,r.json);self.assertEqual(r.json['data']['final_fee'],12500);self.assertEqual(self.offer['status'],'used')
+        self.assertEqual(self.c.post('/create_challenge_purchase',json={'trader_id':'owner','plan_id':'plan','promo_code':'RETURN1'}).status_code,409)
+        self.assertEqual(len(self.http.rows['challenge_purchases']),2)
     def test_failed_validation_releases_only_when_no_purchase_exists(self):
-        r=self.c.post('/create_challenge_purchase',json={'trader_id':'owner','promo_code':'RETURN1','bad':True});self.assertEqual(r.status_code,400);self.assertEqual(self.offer['status'],'active')
+        r=self.c.post('/create_challenge_purchase',json={'trader_id':'owner','plan_id':'plan','promo_code':'RETURN1','bad':True});self.assertEqual(r.status_code,400);self.assertEqual(self.offer['status'],'active')
     def test_duplicate_concurrent_submissions_only_create_one_purchase(self):
         entered=threading.Event();release=threading.Event();base=self.app.view_functions['create_purchase'].__wrapped__
         # Pause the real purchase core after its reservation is committed.
@@ -87,11 +91,11 @@ class RetentionTests(unittest.TestCase):
         self.service.quote=blocked;self.g['_np_private_offer_quote']=blocked
         results=[]
         def send():
-            with self.app.test_client() as c:results.append(c.post('/create_challenge_purchase',json={'trader_id':'owner','promo_code':'RETURN1'}).status_code)
+            with self.app.test_client() as c:results.append(c.post('/create_challenge_purchase',json={'trader_id':'owner','plan_id':'plan','promo_code':'RETURN1'}).status_code)
         thread=threading.Thread(target=send);thread.start();self.assertTrue(entered.wait(1))
-        try:self.assertEqual(self.c.post('/create_challenge_purchase',json={'trader_id':'owner','promo_code':'RETURN1'}).status_code,409)
+        try:self.assertEqual(self.c.post('/create_challenge_purchase',json={'trader_id':'owner','plan_id':'plan','promo_code':'RETURN1'}).status_code,409)
         finally:release.set();thread.join(4)
-        self.assertEqual(results,[200]);self.assertEqual(len(self.http.rows['challenge_purchases']),1)
+        self.assertEqual(results,[200]);self.assertEqual(len(self.http.rows['challenge_purchases']),2)
     def test_member_pages_include_every_registered_status_and_auth(self):
         self.http.rows['traders']=[dict(id=str(uuid.UUID(int=i+1)),name=f'Member {i}',email=f'{i}@example.test',status='breached' if i%2 else 'inactive') for i in range(621)]
         rows=[];after=''
@@ -101,17 +105,17 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(len(rows),621);self.assertEqual(len({r['id'] for r in rows}),621)
         self.role=False;self.assertEqual(self.c.get('/admin/private_offer_members').status_code,401)
     def test_create_validates_percentage_member_and_future_date(self):
-        base=dict(target_trader_id='owner',discount_percent=23.5,expires_at=(datetime.now(timezone.utc)+timedelta(hours=1)).isoformat())
+        base=dict(target_trader_id='owner',source_account_id='source',discount_percent=23.5,expires_at=(datetime.now(timezone.utc)+timedelta(hours=1)).isoformat())
         for bad in [dict(discount_percent=100),dict(discount_percent=-1),dict(discount_percent=True),dict(expires_at='bad'),dict(expires_at='2020-01-01'),dict(target_trader_id='other')]:
             self.assertEqual(self.c.post('/create_private_offer',json=dict(base,**bad)).status_code,400)
         r=self.c.post('/create_private_offer',json=base);self.assertEqual(r.status_code,200);self.assertEqual(self.created[0]['discount_percent'],23.5);self.assertTrue(self.created[0]['expires_at'].endswith('+00:00'))
-        self.owner=None;self.assertEqual(self.c.post('/claim_private_offer',json={'trader_id':'owner'}).status_code,401)
+        self.owner=None;self.assertEqual(self.c.post('/claim_private_offer',json={'trader_id':'owner','plan_id':'plan'}).status_code,401)
         self.http.fail=True;self.assertEqual(self.c.get('/admin/private_offer_members').status_code,503)
     def test_quote_finds_targeted_offer_beyond_first_page(self):
         strangers=[dict(self.offer,id=f'{i:06}',target_trader_id='other',offer_code='OTHER') for i in range(450)]
         self.http.rows['announcements']=strangers+[self.offer]
         with self.app.test_request_context():
-            q=self.service.quote({'trader_id':'owner'},20000,'RETURN1')
+            q=self.service.quote({'trader_id':'owner','plan_id':'plan'},20000,'RETURN1')
         self.assertTrue(q['valid']);self.assertEqual(q['final_fee'],12500)
 
     def test_real_creation_keeps_percentage_in_schema_fallback_and_sends_only_after_save(self):
@@ -129,10 +133,10 @@ class RetentionTests(unittest.TestCase):
         for route,endpoint in [('/claim_private_offer','claim_private_offer'),('/mark_private_offer_read','mark_private_offer_read'),('/create_challenge_purchase','create_purchase')]:
             app.add_url_rule(route,endpoint,lambda:jsonify(success=True),methods=['POST'])
         install(app,self.g);self.http.fallback=True
-        payload=dict(target_trader_id='owner',discount_percent=23.5,expires_at=(datetime.now(timezone.utc)+timedelta(hours=1)).isoformat(),title='Come back',message='A second opportunity',offer_code='RETURN2',delivery_email=True)
+        payload=dict(target_trader_id='owner',source_account_id='source',discount_percent=23.5,expires_at=(datetime.now(timezone.utc)+timedelta(hours=1)).isoformat(),title='Come back',message='A second opportunity',offer_code='RETURN2',delivery_email=True)
         result=app.test_client().post('/create_private_offer',json=payload);self.assertEqual(result.status_code,200,result.json)
         raw=self.http.rows['announcements'][-1];merged=self.g['_np_offer_merge_meta'](raw)
-        self.assertEqual(merged['discount_percent'],23.5);self.assertEqual(merged['target_trader_id'],'owner')
+        self.assertEqual(merged['recovery_scope']['eligible_plan_id'],'plan');self.assertEqual(merged['discount_percent'],23.5);self.assertEqual(merged['target_trader_id'],'owner')
         self.assertTrue(merged['expires_at'].endswith('+00:00'));self.g['send_email_brevo'].assert_called_once()
         self.g['send_email_brevo'].reset_mock();self.http.fail=True
         result=app.test_client().post('/create_private_offer',json=payload);self.assertNotEqual(result.status_code,200)
@@ -144,14 +148,44 @@ class RetentionTests(unittest.TestCase):
         self.g['_np_private_offer_expired']=lambda row:expired(row,deadline-timedelta(seconds=1))
         self.assertEqual(self.c.post('/claim_private_offer',json={'trader_id':'owner','offer_id':'offer'}).status_code,200)
         self.assertEqual(len(self.c.get('/trader_targeted_offers?trader_id=owner').json),1)
-        with self.app.test_request_context():self.assertTrue(self.service.quote({'trader_id':'owner'},20000,'RETURN1')['valid'])
+        with self.app.test_request_context():self.assertTrue(self.service.quote({'trader_id':'owner','plan_id':'plan'},20000,'RETURN1')['valid'])
         self.g['_np_private_offer_expired']=lambda row:expired(row,deadline)
         self.assertEqual(self.c.post('/claim_private_offer',json={'trader_id':'owner','offer_id':'offer'}).status_code,404)
         for path in ['/trader_targeted_offers','/private_offers_for_trader']:self.assertEqual(self.c.get(path+'?trader_id=owner').json,[])
-        with self.app.test_request_context():self.assertFalse(self.service.quote({'trader_id':'owner'},20000,'RETURN1')['valid'])
-        self.assertEqual(self.c.post('/create_challenge_purchase',json={'trader_id':'owner','promo_code':'RETURN1'}).status_code,409)
-        self.assertEqual(self.http.rows['challenge_purchases'],[])
+        with self.app.test_request_context():self.assertFalse(self.service.quote({'trader_id':'owner','plan_id':'plan'},20000,'RETURN1')['valid'])
+        self.assertEqual(self.c.post('/create_challenge_purchase',json={'trader_id':'owner','plan_id':'plan','promo_code':'RETURN1'}).status_code,409)
+        self.assertEqual(self.http.rows['challenge_purchases'],[self.root])
         self.assertEqual(self.offer['status'],'active') # Deadline enforces expiry without waiting for a status-update job.
+
+    def test_account_bound_discount_rejects_other_plans_sizes_cycles_and_forged_scope(self):
+        for changed in [dict(plan_id='other'),dict(account_size=2000000),dict(payout_cycles=5)]:
+            data=dict(trader_id='owner',plan_id='plan',**{k:v for k,v in changed.items() if k!='plan_id'})
+            data.update(changed)
+            with self.app.test_request_context():self.assertFalse(self.service.quote(data,20000,'RETURN1')['valid'])
+            result=self.c.post('/create_challenge_purchase',json=dict(data,promo_code='RETURN1',recovery_scope={'eligible_plan_id':'other'}))
+            self.assertEqual(result.status_code,409);self.assertEqual(self.offer['status'],'active')
+        self.assertEqual(self.http.rows['challenge_purchases'],[self.root])
+    def test_verified_checkout_cannot_substitute_another_plan(self):
+        with self.app.test_request_context(environ_overrides={'np_verified_checkout_plan_v221':{'id':'other','account_size':500000}}):
+            self.assertFalse(self.service.quote({'trader_id':'owner','plan_id':'plan'},20000,'RETURN1')['valid'])
+    def test_old_admin_page_can_bind_only_its_verified_current_breached_account(self):
+        self.t['current_account_id']='source'
+        payload=dict(target_trader_id='owner',discount_percent=30,expires_at=(datetime.now(timezone.utc)+timedelta(days=1)).isoformat())
+        r=self.c.post('/create_private_offer',json=payload);self.assertEqual(r.status_code,200);self.assertEqual(self.created[-1]['recovery_scope']['source_account_id'],'source')
+        self.account['breached_at']=None;self.assertEqual(self.c.post('/create_private_offer',json=payload).status_code,400)
+
+    def test_unscoped_and_changed_source_fail_closed_without_consuming_offer(self):
+        scope=self.offer.pop('recovery_scope')
+        with self.app.test_request_context():self.assertFalse(self.service.quote({'trader_id':'owner','plan_id':'plan'},20000,'RETURN1')['valid'])
+        self.offer['recovery_scope']=scope;self.account['breached_at']=None
+        with self.app.test_request_context():self.assertFalse(self.service.quote({'trader_id':'owner','plan_id':'plan'},20000,'RETURN1')['valid'])
+        self.assertEqual(self.offer['status'],'active')
+    def test_new_offer_requires_owned_breached_account_and_exposes_exact_scope(self):
+        payload=dict(target_trader_id='owner',discount_percent=30,expires_at=(datetime.now(timezone.utc)+timedelta(days=1)).isoformat())
+        self.assertEqual(self.c.post('/create_private_offer',json=payload).status_code,400)
+        self.assertEqual(self.c.post('/create_private_offer',json=dict(payload,source_account_id='foreign')).status_code,400)
+        r=self.c.get('/admin/private_offer_accounts?trader_id=owner');self.assertEqual(r.status_code,200);self.assertEqual(r.json['accounts'][0]['source_account_id'],'source')
+        r=self.c.post('/claim_private_offer',json={'trader_id':'owner','offer_id':'offer'});self.assertEqual(r.json['data']['recovery_scope']['eligible_plan_id'],'plan')
 
     def test_invalid_numeric_and_partial_identity_never_match(self):
         for n in [0,-1,100,True,'NaN','Infinity']:
