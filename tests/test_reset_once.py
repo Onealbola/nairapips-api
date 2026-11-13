@@ -11,3 +11,14 @@ class ResetOnceTests(unittest.TestCase):
  def test_unused_source_and_payout_renewal_do_not_consume_breach_reset(self):
   previous=Mock(return_value={'eligible':True});g={'_np_reset_policy':previous};install(g)
   self.assertTrue(g['_np_reset_policy']({'archive_reason':'NP_CONSUMED:PAYOUT:123'})['eligible'])
+
+ def test_global_delivery_authorities_block_every_stage_and_preserve_unused_sources(self):
+  for stage in ('phase1','phase2','funded'):
+   for evidence in ({'reset_consumed_at':'now'},{'archive_reason':'reset_consumed replacement_account_id=fresh'}):
+    policy=Mock();entitlement=Mock(return_value={'eligible':True});verify=Mock(return_value=True)
+    g={'_np_reset_policy':policy,'_np_reset_entitlement_for_source':entitlement,'_np_verify_exact_paid_reset_order':verify};install(g)
+    source=dict(id='old',stage=stage,**evidence)
+    self.assertFalse(g['_np_reset_entitlement_for_source'](source,{})['eligible'])
+    self.assertFalse(g['_np_verify_exact_paid_reset_order'](source,{},'new-order','paid_reset'))
+    entitlement.assert_not_called();verify.assert_not_called()
+    self.assertTrue(g['_np_verify_exact_paid_reset_order']({'id':'unused','stage':stage},{},'first-order','paid_reset'))
