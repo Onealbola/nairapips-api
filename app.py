@@ -9213,6 +9213,9 @@ def trader_bootstrap():
                     "authority": "TRADER_BOOTSTRAP_V70",
                 })
 
+        from reset_journey_scope import reset_actions as _np_current_reset_actions
+        previous_reset_actions = _np_current_reset_actions(globals(), trader, account_rows, purchases, previous_reset_actions)
+
         _v70_priority = {
             "PAYMENT_UNDER_REVIEW": 500,
             "PAYMENT_REQUIRED": 450,

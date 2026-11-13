@@ -27,6 +27,8 @@
  };
  const primary=npPrimaryResetOpportunity;
  npPrimaryResetOpportunity=function(){const a=anchor();if(!a)return primary();return npResetOpportunityForSource(a.id)||null;};
+ const terminal=npJourneyTerminalNoActive;
+ npJourneyTerminalNoActive=function(){const a=anchor(),action=a?npPreviousResetActionForAccount(a.id):null;if(action&&action.eligible&&['PAYMENT_REQUIRED','PAYMENT_UNDER_REVIEW','PAYMENT_APPROVED_WAITING_MT5'].includes(action.code))return null;return terminal();};
  const synchronize=npSynchronizeGlobalLifecycleDisplay;
  npSynchronizeGlobalLifecycleDisplay=function(){const a=anchor();if(a&&npIsBreached(a))return;return synchronize();};
 })();
