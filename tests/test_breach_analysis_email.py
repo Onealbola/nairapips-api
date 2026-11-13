@@ -101,6 +101,24 @@ class DeliveryTests(unittest.TestCase):
  def test_lost_claim_cannot_send_duplicate(self):
   self.s.enqueue(self.f.a);old=self.case();self.s.save(self.case(),dict(json.loads(old['value']),state='sending'))
   self.assertFalse(self.s.deliver(old));self.s.http.post.assert_not_called()
+ def test_future_breach_email_copies_configured_admin_once(self):
+  self.s.g.update(ADMIN_ALERT_EMAIL='admin@example.test',OWNER_ALERT_EMAIL='ADMIN@example.test')
+  self.s.enqueue(self.f.a);self.assertTrue(self.s.deliver(self.case()))
+  payload=self.s.http.post.call_args.kwargs['json']
+  self.assertEqual(payload['to'],[{'email':'trader@example.test'}]);self.assertEqual(payload['bcc'],[{'email':'admin@example.test'}])
+  self.assertEqual(json.loads(self.case()['value'])['admin_copies'],['admin@example.test'])
+ def test_admin_copy_of_existing_email_does_not_resend_to_trader(self):
+  self.s.g.update(ADMIN_ALERT_EMAIL='admin@example.test',OWNER_ALERT_EMAIL='owner@example.test')
+  self.s.enqueue(self.f.a);self.s.deliver(self.case());customer=json.loads(self.case()['value'])
+  self.assertTrue(self.s.enqueue(self.f.a,explicit=True,admin_only=True));self.assertFalse(self.s.enqueue(self.f.a,explicit=True,admin_only=True))
+  case=copy.deepcopy(self.s.store[PREFIX+A+':admin-copy']);self.assertTrue(self.s.deliver(case))
+  payload=self.s.http.post.call_args.kwargs['json']
+  self.assertEqual(payload['to'],[{'email':'admin@example.test'},{'email':'owner@example.test'}]);self.assertNotIn('trader@example.test',str(payload['to']))
+  self.assertNotEqual(payload['headers']['idempotencyKey'],customer['attempt_id']);self.assertEqual(json.loads(self.case()['value'])['provider_id'],customer['provider_id'])
+ def test_admin_trading_own_account_does_not_receive_duplicate_copy(self):
+  self.s.g['ADMIN_ALERT_EMAIL']='trader@example.test'
+  self.s.enqueue(self.f.a);self.s.deliver(self.case())
+  self.assertNotIn('bcc',self.s.http.post.call_args.kwargs['json'])
  def test_uncertain_provider_acceptance_is_not_resent(self):
   self.s.enqueue(self.f.a);self.s.http.post.side_effect=TimeoutError()
   self.assertFalse(self.s.deliver(self.case()));self.assertEqual(json.loads(self.case()['value'])['state'],'unconfirmed')

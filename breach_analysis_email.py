@@ -138,6 +138,12 @@ class Notifier:
         self.headers={'apikey':key,'Authorization':'Bearer '+key,'Prefer':'return=representation'}
         self.lock=threading.Lock();self.last={};self.started_at=now()
     def ready(self):return bool(self.g.get('BREVO_API_KEY') and self.g.get('FROM_EMAIL'))
+    def admins(self):
+        result=[]
+        for value in (self.g.get('ADMIN_ALERT_EMAIL'),self.g.get('OWNER_ALERT_EMAIL')):
+            email=str(value or '').strip()
+            if EMAIL.fullmatch(email) and email.casefold() not in {e.casefold() for e in result}:result.append(email)
+        return result
     def read(self,table,params):
         r=self.http.get(self.base+table,headers=self.headers,params=dict(params,select='*'),timeout=(2,8));r.raise_for_status();rows=r.json()
         if not isinstance(rows,list):raise ValueError('Breach email read failed')
@@ -157,11 +163,12 @@ class Notifier:
             self.insert(CONTROL,value);rows=self.read('package_studio_private_settings',{'key':'eq.'+CONTROL,'limit':'1'})
         if len(rows)!=1:raise ValueError('Breach email activation unavailable')
         return rows[0]
-    def enqueue(self,a,explicit=False):
+    def enqueue(self,a,explicit=False,admin_only=False):
         from assignment_corrections import voided
         if not a.get('breached_at') or voided(a):return False
-        value=dict(account_id=a['id'],trader_id=a['trader_id'],breached_at=a['breached_at'],state='pending',created_at=now(),explicit=explicit,attempt_id=str(uuid.uuid5(uuid.NAMESPACE_URL,'nairapips-breach-email:'+a['id']+':'+a['breached_at'])))
-        return self.insert(PREFIX+a['id'],value)
+        suffix=':admin-copy' if admin_only else ''
+        value=dict(account_id=a['id'],trader_id=a['trader_id'],breached_at=a['breached_at'],state='pending',created_at=now(),explicit=explicit,audience='admin_copy' if admin_only else 'trader',attempt_id=str(uuid.uuid5(uuid.NAMESPACE_URL,'nairapips-breach-email:'+a['id']+':'+a['breached_at']+suffix)))
+        return self.insert(PREFIX+a['id']+suffix,value)
     def collect(self):
         stored=self.activation();control=json.loads(stored['value'])
         at=control['cursor_at'];aid=control['cursor_id']
@@ -185,7 +192,11 @@ class Notifier:
         trader=people[0];email=str(trader.get('email') or '').strip()
         if not EMAIL.fullmatch(email):raise ValueError('Registered recipient email unavailable')
         subject,content,text=render(context,trader.get('name') or 'Trader')
-        return dict(context=context,recipient=email,subject=subject,html=content,text=text)
+        admins=self.admins()
+        if case.get('audience')=='admin_copy':
+            if not admins:raise ValueError('Admin copy recipient is not configured')
+            return dict(context=context,recipient=admins[0],recipients=admins,admin_copies=[],subject='Admin copy — '+subject,html=content,text=text)
+        return dict(context=context,recipient=email,recipients=[email],admin_copies=[a for a in admins if a.casefold()!=email.casefold()],subject=subject,html=content,text=text)
     def deliver(self,stored):
         case=json.loads(stored['value'])
         if case.get('state')!='pending':return False
@@ -195,18 +206,20 @@ class Notifier:
             from datetime import timedelta
             attempts=int(case.get('evidence_checks',0))+1
             self.save(stored,dict(case,state='needs_review' if attempts>=5 else 'pending',evidence_checks=attempts,error=str(exc)[:250],checked_at=now(),retry_after=(datetime.now(timezone.utc)+timedelta(seconds=60)).isoformat()));return False
-        claimed=dict(case,state='sending',claimed_at=now(),recipient=mail['recipient'],subject=mail['subject'],analysis=mail['context'])
+        claimed=dict(case,state='sending',claimed_at=now(),recipient=mail['recipient'],recipients=mail['recipients'],admin_copies=mail['admin_copies'],subject=mail['subject'],analysis=mail['context'])
         if not self.save(stored,claimed):return False
         # Re-read the canonical account immediately before external delivery; an
         # audited correction or a changed breach identity cancels this message.
         try:
             confirmed=self.prepare(case)
-            if confirmed['recipient']!=mail['recipient'] or confirmed['context']['rules_hash']!=mail['context']['rules_hash']:
+            if confirmed['recipients']!=mail['recipients'] or confirmed['admin_copies']!=mail['admin_copies'] or confirmed['context']['rules_hash']!=mail['context']['rules_hash']:
                 raise ValueError('Recipient or purchased rules changed before delivery')
         except Exception as exc:
             self.save(stored,dict(claimed,state='needs_review',error=str(exc)[:250]));return False
         try:
-            r=self.http.post('https://api.brevo.com/v3/smtp/email',headers={'api-key':self.g['BREVO_API_KEY'],'Content-Type':'application/json'},json={'sender':{'name':'NairaPips','email':self.g['FROM_EMAIL']},'to':[{'email':mail['recipient']}],'subject':mail['subject'],'htmlContent':mail['html'],'textContent':mail['text'],'tags':['breach_analysis'],'headers':{'idempotencyKey':case['attempt_id']}},timeout=(2,10))
+            payload={'sender':{'name':'NairaPips','email':self.g['FROM_EMAIL']},'to':[{'email':e} for e in mail['recipients']],'subject':mail['subject'],'htmlContent':mail['html'],'textContent':mail['text'],'tags':['breach_analysis'],'headers':{'idempotencyKey':case['attempt_id']}}
+            if mail['admin_copies']:payload['bcc']=[{'email':e} for e in mail['admin_copies']]
+            r=self.http.post('https://api.brevo.com/v3/smtp/email',headers={'api-key':self.g['BREVO_API_KEY'],'Content-Type':'application/json'},json=payload,timeout=(2,10))
             if 200<=r.status_code<300:
                 try:provider_id=r.json().get('messageId')
                 except Exception:provider_id=None
@@ -222,7 +235,8 @@ class Notifier:
             context=self.g.get('_NP_RENEWAL_REST_V211');token=None
             try:
                 if context is not None:token=context.set(True)
-                logger(mail['recipient'],mail['subject'],email_type='breach',status='sent' if result['state']=='accepted' else result['state'],trader_id=case['trader_id'],message=mail['text'],provider_response=json.dumps({'messageId':result.get('provider_id'),'acceptance':result['state'],'account_id':case['account_id']}),error=result.get('error') or '')
+                for recipient in mail['recipients']+mail['admin_copies']:
+                    logger(recipient,mail['subject'],email_type='breach_admin_copy' if case.get('audience')=='admin_copy' or recipient in mail['admin_copies'] else 'breach',status='sent' if result['state']=='accepted' else result['state'],trader_id=case['trader_id'],message=mail['text'],provider_response=json.dumps({'messageId':result.get('provider_id'),'acceptance':result['state'],'account_id':case['account_id']}),error=result.get('error') or '')
             except Exception:pass
             finally:
                 if token is not None:context.reset(token)
