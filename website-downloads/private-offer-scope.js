@@ -1,12 +1,16 @@
 /* Account-bound recovery offers; backend independently verifies every quote/write. */
 (function(){
 'use strict';
-if(window.NPRecoveryOfferScope==='20261113-v1')return;
-window.NPRecoveryOfferScope='20261113-v1';
+if(window.NPRecoveryOfferScope==='20261113-v2')return;
+window.NPRecoveryOfferScope='20261113-v2';
 const session=()=>typeof SESSION!=='undefined'?SESSION:null;
 const saved=()=>{try{return JSON.parse(sessionStorage.getItem('np_pending_private_offer')||'null')}catch(_){return null}};
 function clear(){const s=session();if(s){s.pendingPrivateOfferId='';s.pendingPrivateOfferCode='';s.pendingPrivateOfferScope=null}try{sessionStorage.removeItem('np_pending_private_offer')}catch(_){}}
 function pending(){const s=session(),old=saved();return s?.pendingPrivateOfferScope||s?.offers?.find(o=>String(o.id)===String(s.pendingPrivateOfferId||old?.id))?.recovery_scope||old?.scope||null}
+if(typeof window.safeFetchJson==='function'){
+ const fetchCore=window.safeFetchJson;
+ window.safeFetchJson=async function(...args){const result=await fetchCore.apply(this,args);if(String(args[0]).includes('/create_challenge_purchase')&&result?.success===true)clear();return result};
+}
 if(typeof window.purchasePlan==='function'){
  const core=window.purchasePlan;
  window.purchasePlan=function(id,code,...rest){
