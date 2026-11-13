@@ -2,7 +2,7 @@ import copy,json,unittest,uuid
 from datetime import datetime,timezone,timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock,patch
-from breach_analysis_email import evidence,render,Notifier,PREFIX,CONTROL,now
+from breach_analysis_email import evidence,render,Notifier,PREFIX,ADMIN_PREFIX,CONTROL,now
 from equity_drawdown import spec,initial,evaluate
 from plan_risk_controls import freeze
 from flask import Flask,jsonify
@@ -111,7 +111,7 @@ class DeliveryTests(unittest.TestCase):
   self.s.g.update(ADMIN_ALERT_EMAIL='admin@example.test',OWNER_ALERT_EMAIL='owner@example.test')
   self.s.enqueue(self.f.a);self.s.deliver(self.case());customer=json.loads(self.case()['value'])
   self.assertTrue(self.s.enqueue(self.f.a,explicit=True,admin_only=True));self.assertFalse(self.s.enqueue(self.f.a,explicit=True,admin_only=True))
-  case=copy.deepcopy(self.s.store[PREFIX+A+':admin-copy']);self.assertTrue(self.s.deliver(case))
+  case=copy.deepcopy(self.s.store[ADMIN_PREFIX+A]);self.assertTrue(self.s.deliver(case))
   payload=self.s.http.post.call_args.kwargs['json']
   self.assertEqual(payload['to'],[{'email':'admin@example.test'},{'email':'owner@example.test'}]);self.assertNotIn('trader@example.test',str(payload['to']))
   self.assertNotEqual(payload['headers']['idempotencyKey'],customer['attempt_id']);self.assertEqual(json.loads(self.case()['value'])['provider_id'],customer['provider_id'])

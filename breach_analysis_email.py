@@ -12,6 +12,7 @@ from flask import jsonify,request
 from business_email import EMAIL
 
 PREFIX='breach_analysis_email_v1:'
+ADMIN_PREFIX='breach_analysis_admin_copy_v1:'
 CONTROL='breach_analysis_email_activation_v1'
 RELEASE='breach-explanation-20261113-v1'
 
@@ -168,7 +169,7 @@ class Notifier:
         if not a.get('breached_at') or voided(a):return False
         suffix=':admin-copy' if admin_only else ''
         value=dict(account_id=a['id'],trader_id=a['trader_id'],breached_at=a['breached_at'],state='pending',created_at=now(),explicit=explicit,audience='admin_copy' if admin_only else 'trader',attempt_id=str(uuid.uuid5(uuid.NAMESPACE_URL,'nairapips-breach-email:'+a['id']+':'+a['breached_at']+suffix)))
-        return self.insert(PREFIX+a['id']+suffix,value)
+        return self.insert((ADMIN_PREFIX if admin_only else PREFIX)+a['id'],value)
     def collect(self):
         stored=self.activation();control=json.loads(stored['value'])
         at=control['cursor_at'];aid=control['cursor_id']
@@ -244,7 +245,8 @@ class Notifier:
     def cycle(self):
         if not self.ready() or not self.lock.acquire(False):return
         try:
-            collected=self.collect();rows=self.read('package_studio_private_settings',{'key':'like.'+PREFIX+'*','value':'like.*"state": "pending"*','order':'updated_at.asc','limit':'20'})
+            collected=self.collect();rows=[]
+            for prefix in (PREFIX,ADMIN_PREFIX):rows.extend(self.read('package_studio_private_settings',{'key':'like.'+prefix+'*','value':'like.*"state": "pending"*','order':'updated_at.asc','limit':'20'}))
             accepted=0;checked=0
             for stored in rows:
                 pending=json.loads(stored['value'])
@@ -284,10 +286,14 @@ def install(app,g):
     def breach_email_status():
         _,error=g['_require_admin']()
         if error is not None:return error
-        params={'key':'like.'+PREFIX+'*','order':'updated_at.desc','limit':'30'}
+        params={'order':'updated_at.desc','limit':'30'}
         try:
-            if request.args.get('account_id'):params['key']='eq.'+PREFIX+str(uuid.UUID(request.args['account_id']))
-            rows=service.read('package_studio_private_settings',params)
+            if request.args.get('account_id'):
+                identity=str(uuid.UUID(request.args['account_id']));params['key']='in.('+PREFIX+identity+','+ADMIN_PREFIX+identity+')'
+                rows=service.read('package_studio_private_settings',params)
+            else:
+                rows=[]
+                for prefix in (PREFIX,ADMIN_PREFIX):rows.extend(service.read('package_studio_private_settings',dict(params,key='like.'+prefix+'*')))
             cases=[json.loads(r['value']) for r in rows]
             response=jsonify(success=True,release=RELEASE,ready=service.ready(),last=service.last,emails=cases);response.headers['Cache-Control']='no-store, private';return response
         except ValueError:return jsonify(success=False,error='Supply a valid account identity'),400
