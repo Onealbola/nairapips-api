@@ -60231,6 +60231,8 @@ app.config["NP_PROGRESS_PLAN_BRIDGE"] = _np_progress_bridge
 app.config["NP_PROGRESS_SHARED_CATALOG"] = _np_shared_catalog
 from progress_lifecycle import install as _np_install_progress_lifecycle
 _np_install_progress_lifecycle(globals())
+from phase2_resets import install as _np_install_phase2_resets
+_np_install_phase2_resets(globals())
 
 from private_offer_retention import install as _np_install_private_offer_retention
 _np_install_private_offer_retention(app, globals())

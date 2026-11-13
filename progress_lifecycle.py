@@ -103,7 +103,9 @@ def install(g):
                 required=route[route.index(normalized)-1]
                 passed=[a for a in real if recorded_pass(a,purchase,required)]
                 if not passed:raise ValueError('The exact preceding package phase has not passed broker verification')
-                if normalized=='phase2' and any(a.get('stage') in ('phase2','funded') for a in real):
+                paid_phase2_reset=(normalized=='phase2' and callable(g.get('_np_phase2_paid_reset_authority'))
+                    and g['_np_phase2_paid_reset_authority'](purchase,chain,normalized,staff,note))
+                if normalized=='phase2' and any(a.get('stage') in ('phase2','funded') for a in real) and not paid_phase2_reset:
                     raise ValueError('This phase-pass entitlement has already been used')
             if normalized not in ROUTE:raise ValueError('Unknown package stage')
         return old_assign(trader,mt5,stage,purchase,staff,note)
@@ -126,7 +128,7 @@ def install(g):
             if is_progress_purchase(purchase):
                 route=purchase_route(purchase)
                 return dict(model={3:'progress_two_phase',2:'progress_one_phase',1:'progress_instant'}[len(route)],label=' → '.join(s.upper() for s in route),
-                    challenge_reset='NOT_INCLUDED',funded_breach_reset='NOT_INCLUDED',
+                    challenge_reset='PAID_PHASE2_IF_CONFIGURED' if 'phase2' in route else 'NOT_INCLUDED',funded_breach_reset='NOT_INCLUDED',
                     payout_renewal='UNLIMITED_WHILE_FUNDED')
             return old_model(purchase,rows)
         g['_np_progression_plan_model']=model
