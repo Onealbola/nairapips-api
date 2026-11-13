@@ -60237,6 +60237,8 @@ from phase2_resets import install as _np_install_phase2_resets
 _np_install_phase2_resets(globals())
 from reset_journey_scope import install as _np_install_reset_journey_scope
 _np_install_reset_journey_scope(globals())
+from reset_once import install as _np_install_reset_once
+_np_install_reset_once(globals())
 
 from private_offer_retention import install as _np_install_private_offer_retention
 _np_install_private_offer_retention(app, globals())

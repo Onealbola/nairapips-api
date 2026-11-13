@@ -116,6 +116,12 @@ class Phase2ResetTests(unittest.TestCase):
   assign();self.base_assign.assert_called_once();self.assertTrue(self.a['breached_at'])
   self.child={'id':'fresh','mt5_login':'new'}
   with self.assertRaises(ValueError):assign()
+ def test_consumed_source_blocks_assignment_even_when_child_lookup_or_mirror_fields_are_missing(self):
+  self.enable();self.paid()
+  self.a['archive_reason']+=' | reset_consumed replacement_account_id=already-issued replacement_mt5=123'
+  self.child=None
+  with self.assertRaises(ValueError):self.assign()
+  self.base_assign.assert_not_called()
  def test_legacy_routes_keep_their_existing_policy(self):
   self.p['journey_source']='legacy';self.assertEqual(self.policy()['reason'],'reset_not_available')
  def test_real_payment_creation_approval_inventory_retry_and_consumption_flow(self):

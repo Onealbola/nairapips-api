@@ -4,6 +4,7 @@ Never reopens a breached account. A verified payment buys one fresh same-stage
 delivery; original trading rules, pass evidence and breach journals are retained.
 """
 import re
+from reset_once import consumed
 from decimal import Decimal
 from progress_lifecycle import is_progress_purchase,purchase_route
 from progress_plan_bridge import managed_id,plan_row,PREFIX
@@ -67,6 +68,7 @@ def install(g):
         verified=[]
         for source in real:
             if source.get('stage')!=stage or not g['_np_reset_account_is_breached'](source):continue
+            if consumed(source):return False
             if str(source.get('purchase_id'))!=str(purchase['id']) or str(source.get('trader_id'))!=str(purchase['trader_id']):return False
             markers=re.findall(r'\[NP_ENTITLEMENT:'+kind+r':([^\]]+)\]',str(source.get('archive_reason') or ''),re.I)
             for oid in set(markers):
