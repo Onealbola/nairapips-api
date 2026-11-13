@@ -105,6 +105,17 @@ class Phase2ResetTests(unittest.TestCase):
   self.chain.append(dict(self.a,id='funded',stage='funded'))
   with self.assertRaises(ValueError):self.assign()
   self.base_assign.assert_not_called()
+ def test_phase1_configured_reset_requires_exact_paid_proof_and_never_reopens_source(self):
+  self.a['stage']='phase1';self.chain.remove(self.parent)
+  self.package.update(phase1_reset_enabled=True,phase1_reset_fee=6000)
+  self.assertEqual((self.policy()['kind'],self.policy()['price']),('paid_challenge',6000))
+  self.g['_np_reset_order_refs_v43']=lambda o:dict(source_account_id='source',parent_purchase_id='purchase',stage='phase1')
+  def assign():return self.g['_assign_mt5_to_trader']({'id':'owner'},{'id':'new','pool_class':'phase'},'phase1',self.p,{'role':'system'},'paid reset')
+  with self.assertRaises(ValueError):assign()
+  self.paid();self.order.update(fee=6000,admin_note='[NP_RESET_REQUEST:source:purchase:phase1] [NP_ENTITLEMENT:challenge_reset_paid:order]')
+  assign();self.base_assign.assert_called_once();self.assertTrue(self.a['breached_at'])
+  self.child={'id':'fresh','mt5_login':'new'}
+  with self.assertRaises(ValueError):assign()
  def test_legacy_routes_keep_their_existing_policy(self):
   self.p['journey_source']='legacy';self.assertEqual(self.policy()['reason'],'reset_not_available')
  def test_real_payment_creation_approval_inventory_retry_and_consumption_flow(self):

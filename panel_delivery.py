@@ -29,7 +29,7 @@ def register_panel_delivery(app, root=None):
 
     @app.get('/public/trader-catalogue.js')
     def trader_catalogue_script():
-        r=make_response((assets/'account-plan-selector.js').read_text()+'\n'+(assets/'trader-catalog-sync.js').read_text()+'\n'+(assets/'account-reporting.js').read_text()+'\n'+(assets/'private-offer-scope.js').read_text());r.mimetype='application/javascript'
+        r=make_response((assets/'account-plan-selector.js').read_text()+'\n'+(assets/'trader-catalog-sync.js').read_text()+'\n'+(assets/'account-reporting.js').read_text()+'\n'+(assets/'private-offer-scope.js').read_text()+'\n'+(assets/'reset-journey-scope.js').read_text());r.mimetype='application/javascript'
         r.headers['Cache-Control']='no-store, max-age=0'
         r.headers['X-Content-Type-Options']='nosniff'
         return r
