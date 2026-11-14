@@ -253,7 +253,9 @@ class Notifier:
                 if pending.get('state')!='pending' or (pending.get('retry_after') and stamp(pending['retry_after'])>datetime.now(timezone.utc)):continue
                 accepted+=bool(self.deliver(stored));checked+=1
                 if checked>=5:break
-            self.last=dict(checked_at=now(),collected=collected,checked=checked,accepted=accepted)
+            from breach_email_delivery import cycle as delivery_cycle
+            delivery_checked=delivery_cycle(self)
+            self.last=dict(checked_at=now(),collected=collected,checked=checked,accepted=accepted,delivery_checked=delivery_checked)
         except Exception as exc:self.last=dict(checked_at=now(),error=str(exc)[:180])
         finally:self.lock.release()
     def start(self):
