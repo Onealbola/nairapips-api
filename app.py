@@ -59246,6 +59246,11 @@ def _np_v206_payout_guard(base, action):
             others = [row for row in ledger if str(row.get("id") or "") != pid and payout_status(row) in open_states]
             if action in {"create", "approve", "paid"} and others:
                 return bad("Another payout request already exists for this account. Review the existing request; no additional payout was authorized.", 409)
+            if action in {'create','approve','paid'}:
+                try:
+                    __import__('payout_profit_target').enforce_schedule(globals(), account)
+                except ValueError as exc:
+                    return bad(str(exc),409)
             if action in {'create','approve','paid'} and __import__('withdrawal_controls').read(account):
                 value = payload.get('amount') if action=='create' else (payout or {}).get('amount')
                 rule_quote = _np_verified_payout_quote(account, {'id':account.get('trader_id')})
@@ -60312,6 +60317,9 @@ def _payout_eligibility(trader, requested_account_id=None):
         return eligible, reason, account
     except Exception:
         return False, 'Your purchased payout schedule could not be verified.', account
+
+from payout_profit_target import install as _np_install_payout_profit_target
+_np_install_payout_profit_target(globals())
 
 # Start these existing workers only after every final assignment guard is installed.
 _np_start_lifecycle_worker_v40()

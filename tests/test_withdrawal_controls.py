@@ -41,7 +41,7 @@ class WithdrawalTests(unittest.TestCase):
   with self.assertRaises(ValueError):w.validate_request(row,5000,dict(q,verified_profit=49999.99))
   with self.assertRaises(ValueError):w.validate_request(row,30000.01,q)
   with self.assertRaises(ValueError):w.validate_request(row,5000,{'verified':False},require_verified=True)
-  w.validate_request(row,5000,{'verified':False}) # receivable, pending proof only
+  with self.assertRaises(ValueError):w.validate_request(row,5000,{'verified':False}) # target must be proven before submission
  def test_unmarked_legacy_custom_cap_gate_and_no_cap(self):
   self.assertEqual(w.cap_percent({}),15)
   with patch.dict('os.environ',{},clear=True):
