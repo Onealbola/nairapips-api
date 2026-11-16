@@ -106,6 +106,18 @@ def register_panel_delivery(app, root=None):
         response.headers['Cache-Control']='no-store, max-age=0'
         return response
 
+    @app.get('/downloads/unused-account-recovery.py')
+    def unused_account_recovery_module():
+        response=send_file(Path(__file__).resolve().parent/'unused_account_recovery.py',mimetype='text/plain',conditional=False,etag=False,max_age=0)
+        response.headers['Cache-Control']='no-store, max-age=0'
+        return response
+
+    @app.get('/downloads/unused-account-recovery.ps1')
+    def unused_account_recovery_installer():
+        response=send_file(assets/'unused-account-recovery.ps1',mimetype='text/plain',conditional=False,etag=False,max_age=0)
+        response.headers['Cache-Control']='no-store, max-age=0'
+        return response
+
     @app.get('/downloads/dd-history-session.ps1')
     def dd_history_session_download():
         response=send_file(assets/'nairapips-dd-history-session.ps1',mimetype='text/plain',as_attachment=True,download_name='NairaPips-DD-History-Session.ps1',conditional=False,etag=False,max_age=0)
