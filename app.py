@@ -60321,6 +60321,9 @@ def _payout_eligibility(trader, requested_account_id=None):
 from payout_profit_target import install as _np_install_payout_profit_target
 _np_install_payout_profit_target(globals())
 
+from unused_account_seed import install as _np_install_unused_account_seed
+_np_install_unused_account_seed(app,globals())
+
 # Start these existing workers only after every final assignment guard is installed.
 _np_start_lifecycle_worker_v40()
 _np_start_reset_autofire_v43()

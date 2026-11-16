@@ -11,7 +11,7 @@ $folder = Split-Path -Parent $target
 $module = Join-Path $folder 'unused_account_recovery.py'
 $tempModule = Join-Path $env:TEMP ('np-unused-' + [guid]::NewGuid() + '.py')
 Invoke-WebRequest 'https://nairapips-api.onrender.com/downloads/unused-account-recovery.py' -UseBasicParsing -OutFile $tempModule
-if ((Get-FileHash $tempModule -Algorithm SHA256).Hash.ToLowerInvariant() -ne '49e0f9aa207a590b98bc672f11dc5e8012acb2c7ab62771a12d5bb228f7d2ae3') { throw 'Recovery module checksum failed. Nothing changed.' }
+if ((Get-FileHash $tempModule -Algorithm SHA256).Hash.ToLowerInvariant() -ne '2d263145a8dcb6c2488547cbd3cecefbefb6f0b2ed904cd18f4892b3c49d8621') { throw 'Recovery module checksum failed. Nothing changed.' }
 $source = [IO.File]::ReadAllText($target)
 $hook = "from unused_account_recovery import install as _np_unused_recovery`n_np_unused_recovery(globals())`n"
 if (-not $source.Contains('_np_unused_recovery(globals())')) {

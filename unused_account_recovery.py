@@ -40,7 +40,7 @@ def prove(mt5,row):
     positions=mt5.positions_get();orders=mt5.orders_get()
     if positions is None or orders is None or positions or orders or total!=capital:raise ValueError('Empty positions/orders and reconciled funding required')
     exact()
-    return dict(release=RELEASE,verified_at=at.isoformat(),mt5_login=login,funding_tickets=sorted(str(x) for x in seen),funding_total=str(total),trading_deals=0)
+    return dict(release=RELEASE,verified_at=at.isoformat(),mt5_login=login,account_id=rules['account_id'],trader_id=rules['trader_id'],rules_hash=rules_hash(rules),capital=str(capital),balance=str(capital),equity=str(capital),profit='0',credit='0',positions=0,orders=0,funding_tickets=sorted(str(x) for x in seen),funding_total=str(total),trading_deals=0)
 
 def install(g):
     previous=g['verified_live_info']
@@ -67,11 +67,25 @@ def install(g):
             for latch in root.glob('breach_latch_shard_*.json'):
                 raw=latch.read_text(encoding='utf-8-sig');json.loads(raw)
                 if str(row['mt5_login']) in raw or rules['account_id'] in raw:raise ValueError('Existing breach latch prevents recovery')
+            seed=g.get('_np_unused_cloud_seed') or cloud_seed
+            state=seed(g,row,proof)
+            if state.get('rules_hash')!=rules_hash(rules) or state.get('breached') is not False:raise ValueError('Cloud journal is terminal or conflicts with purchased rules')
             with account_lock(path.with_suffix('.lock')):
                 if not path.exists():
-                    state=dict(initial(rules),unused_account_recovery=proof)
                     with open(path,'x',encoding='utf-8') as stream:
                         json.dump(state,stream,sort_keys=True);stream.flush();os.fsync(stream.fileno())
                     g['log'](f'UNUSED STATIC DAILY JOURNAL RECOVERED MT5={row["mt5_login"]}; full broker history verified; no historical journal replaced','WARNING')
             return super().assess(row,equity,observed_at,*args,**kwargs)
     g['EquityDrawdownJournal']=GuardedJournal
+
+def rules_hash(rules):
+    from equity_drawdown import fingerprint
+    return fingerprint(rules)
+
+def cloud_seed(g,row,proof):
+    import requests
+    key=os.environ.get('NP_EQUITY_TRAILING_INGEST_KEY') or g.get('LIVE_STATE_KEY')
+    if not key:raise ValueError('Authenticated collector key required')
+    response=requests.post('https://nairapips-api.onrender.com/collector/unused-account-journal',headers={'X-NP-Trailing-Key':key},json={'account_id':row['drawdown_rules']['account_id'],'proof':proof},timeout=(3,10))
+    response.raise_for_status()
+    return response.json()['state']
