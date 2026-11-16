@@ -54,6 +54,16 @@ def install(g):
     base=g['EquityDrawdownJournal']
     class GuardedJournal(base):
         def assess(self,row,equity,observed_at,*args,**kwargs):
+            try:return self._assess(row,equity,observed_at,*args,**kwargs)
+            except ValueError as exc:
+                import time
+                last=getattr(self,'_review_logged',{})
+                login=str(row.get('mt5_login') or '')
+                if time.monotonic()-last.get(login,-1000)>60:
+                    g['log'](f'UNUSED JOURNAL REVIEW MT5={login}: {str(exc)[:180]} | NO RULE OR LATCH CHANGE','WARNING')
+                    last[login]=time.monotonic();self._review_logged=last
+                raise
+        def _assess(self,row,equity,observed_at,*args,**kwargs):
             try:return super().assess(row,equity,observed_at,*args,**kwargs)
             except ValueError as exc:
                 if str(exc)!='Existing account watermark must be recovered; it cannot be reset':raise
