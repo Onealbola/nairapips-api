@@ -17,8 +17,10 @@ def checked_seed(account,proof,now=None):
     capital=money(rules['capital'])
     for key in ('capital','balance','equity','funding_total'):
         if money(proof.get(key))!=capital:raise ValueError('Exact funded capital required')
-    for key in ('profit','credit','positions','orders','trading_deals'):
+    for key in ('profit','credit','positions','trading_deals'):
         if money(proof.get(key))!=0:raise ValueError('Account must never have traded and have no exposure')
+    orders=proof.get('orders')
+    if type(orders) is not int or not 0<=orders<=1024:raise ValueError('Verified pending-order count required')
     tickets=proof.get('funding_tickets')
     if not isinstance(tickets,list) or not tickets or len(tickets)!=len(set(tickets)) or not all(str(t).isdigit() for t in tickets):raise ValueError('Exact funding tickets required')
     return dict(initial(rules),unused_account_recovery=proof)

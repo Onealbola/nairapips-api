@@ -96,10 +96,18 @@ class RecoveryTests(unittest.TestCase):
    self.assertEqual(prove(self.mt5,self.row)['trading_deals'],0);sleep.assert_called_once_with(.25)
   self.mt5.orders_get.side_effect=None;self.mt5.orders_get.return_value=(N(ticket=2),)
   with patch('time.sleep') as sleep:
-   with self.assertRaisesRegex(ValueError,'pending orders'):prove(self.mt5,self.row)
-   sleep.assert_not_called()
+   self.assertEqual(prove(self.mt5,self.row)['orders'],1);sleep.assert_not_called()
  def test_incomplete_funding_remains_blocked_after_bounded_retries(self):
   self.deal.profit=1400000
   with patch('time.sleep') as sleep:
    with self.assertRaisesRegex(ValueError,'funding=1400000'):prove(self.mt5,self.row)
    self.assertEqual(sleep.call_count,4)
+
+ def test_pending_orders_do_not_count_as_executed_trades_or_open_positions(self):
+  from unused_account_seed import checked_seed
+  self.row['monitoring_enabled']=True;self.mt5.orders_get.return_value=(N(ticket=9),)
+  proof=prove(self.mt5,self.row)
+  self.assertEqual(proof['positions'],0);self.assertEqual(proof['orders'],1)
+  self.assertFalse(checked_seed(self.row,proof)['breached'])
+  self.mt5.positions_get.return_value=(N(ticket=10),)
+  with self.assertRaisesRegex(ValueError,'Open positions'):prove(self.mt5,self.row)

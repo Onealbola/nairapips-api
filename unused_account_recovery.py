@@ -38,11 +38,11 @@ def _prove_once(mt5,row):
         if datetime.fromtimestamp(float(d.time_msc or d.time*1000)/1000,timezone.utc)>at:raise ValueError('Future broker deal')
         total+=sum((money(getattr(d,k,0)) for k in ('profit','commission','swap','fee')),Decimal(0))
     positions=mt5.positions_get();orders=mt5.orders_get()
-    if positions or orders:raise ValueError('Open positions or pending orders prevent unused-account recovery')
+    if positions:raise ValueError('Open positions prevent unused-account recovery: count='+str(len(positions)))
     if positions is None or orders is None or total!=capital:
         raise ValueError('Recovery proof incomplete: positions='+('unavailable' if positions is None else str(len(positions)))+', orders='+('unavailable' if orders is None else str(len(orders)))+', funding='+str(total)+', required='+str(capital))
     exact()
-    return dict(release=RELEASE,verified_at=at.isoformat(),mt5_login=login,account_id=rules['account_id'],trader_id=rules['trader_id'],rules_hash=rules_hash(rules),capital=str(capital),balance=str(capital),equity=str(capital),profit='0',credit='0',positions=0,orders=0,funding_tickets=sorted(str(x) for x in seen),funding_total=str(total),trading_deals=0)
+    return dict(release=RELEASE,verified_at=at.isoformat(),mt5_login=login,account_id=rules['account_id'],trader_id=rules['trader_id'],rules_hash=rules_hash(rules),capital=str(capital),balance=str(capital),equity=str(capital),profit='0',credit='0',positions=0,orders=len(orders),funding_tickets=sorted(str(x) for x in seen),funding_total=str(total),trading_deals=0)
 
 def prove(mt5,row):
     import time
