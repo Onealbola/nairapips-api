@@ -89,3 +89,17 @@ class RecoveryTests(unittest.TestCase):
   with patch('unused_account_seed.verify_ingest'):
    self.assertEqual(client.post('/collector/unused-account-journal',json={'account_id':self.row['id'],'proof':proof}).status_code,409)
   http.post.assert_not_called();http.patch.assert_not_called()
+
+ def test_loading_empty_order_response_is_retried_but_exposure_is_not(self):
+  self.mt5.orders_get.side_effect=[None,()]
+  with patch('time.sleep') as sleep:
+   self.assertEqual(prove(self.mt5,self.row)['trading_deals'],0);sleep.assert_called_once_with(.25)
+  self.mt5.orders_get.side_effect=None;self.mt5.orders_get.return_value=(N(ticket=2),)
+  with patch('time.sleep') as sleep:
+   with self.assertRaisesRegex(ValueError,'pending orders'):prove(self.mt5,self.row)
+   sleep.assert_not_called()
+ def test_incomplete_funding_remains_blocked_after_bounded_retries(self):
+  self.deal.profit=1400000
+  with patch('time.sleep') as sleep:
+   with self.assertRaisesRegex(ValueError,'funding=1400000'):prove(self.mt5,self.row)
+   self.assertEqual(sleep.call_count,4)

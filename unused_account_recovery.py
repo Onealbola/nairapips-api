@@ -20,7 +20,7 @@ def coherent(info):
         return b>=0 and e>=0 and abs(e-b-p-c)<=Decimal('.01')
     except Exception:return False
 
-def prove(mt5,row):
+def _prove_once(mt5,row):
     rules=row['drawdown_rules'];login=str(row['mt5_login']);capital=money(rules['capital'])
     if rules['drawdown_type']!='STATIC' or money(rules.get('daily_drawdown',0))<=0:raise ValueError('Only unused static daily accounts can recover this way')
     if any(row.get(k) for k in ('breached_at','breach_at','reset_consumed_at')) or any(k in str(row.get('account_status') or row.get('status') or '').lower() for k in ('breach','archive','closed','passed','reset','locked')):raise ValueError('Terminal account cannot recover')
@@ -38,9 +38,20 @@ def prove(mt5,row):
         if datetime.fromtimestamp(float(d.time_msc or d.time*1000)/1000,timezone.utc)>at:raise ValueError('Future broker deal')
         total+=sum((money(getattr(d,k,0)) for k in ('profit','commission','swap','fee')),Decimal(0))
     positions=mt5.positions_get();orders=mt5.orders_get()
-    if positions is None or orders is None or positions or orders or total!=capital:raise ValueError('Empty positions/orders and reconciled funding required')
+    if positions or orders:raise ValueError('Open positions or pending orders prevent unused-account recovery')
+    if positions is None or orders is None or total!=capital:
+        raise ValueError('Recovery proof incomplete: positions='+('unavailable' if positions is None else str(len(positions)))+', orders='+('unavailable' if orders is None else str(len(orders)))+', funding='+str(total)+', required='+str(capital))
     exact()
     return dict(release=RELEASE,verified_at=at.isoformat(),mt5_login=login,account_id=rules['account_id'],trader_id=rules['trader_id'],rules_hash=rules_hash(rules),capital=str(capital),balance=str(capital),equity=str(capital),profit='0',credit='0',positions=0,orders=0,funding_tickets=sorted(str(x) for x in seen),funding_total=str(total),trading_deals=0)
+
+def prove(mt5,row):
+    import time
+    for attempt in range(5):
+        try:return _prove_once(mt5,row)
+        except ValueError as exc:
+            if attempt==4 or not (str(exc).startswith('Recovery proof incomplete:') or str(exc)=='Complete funding history required'):raise
+            time.sleep(.25)
+
 
 def install(g):
     previous=g['verified_live_info']
