@@ -17,7 +17,7 @@ try:
  sql(schema);sql(Path('migrations/20261020_plan_payout_cycles.sql').read_text())
  sql('''ALTER TABLE challenge_plans ADD name text,ADD account_size numeric,ADD challenge_journey jsonb,ADD fee numeric,ADD updated_at timestamptz;
  ALTER TABLE challenge_purchases ADD account_size numeric,ADD challenge_journey jsonb,ADD payment_status text,ADD package_contract_id uuid,ADD admin_note text,ADD fee numeric;
- CREATE TABLE package_studio_private_settings(key text PRIMARY KEY,value text,updated_at timestamptz,updated_by text);''')
+ CREATE TABLE package_studio_private_settings(key text PRIMARY KEY,value text CHECK (octet_length(value) <= 1048576),updated_at timestamptz,updated_by text);''')
  owner=str(uuid.uuid4());ids=[str(uuid.uuid4()) for _ in range(9)];planids=[str(uuid.uuid4()) for _ in range(5)]
  for pid,size,route in zip(planids,[500000,1000000,2000000,2500000,1000000],[['phase1','funded']]*4+[['phase1','phase2','funded']]):
   sql(f"INSERT INTO challenge_plans VALUES('{pid}',3,'plan',{size},'{json.dumps(route)}',40000,now());")
@@ -45,6 +45,7 @@ try:
  sql(f"INSERT INTO challenge_purchases(id,trader_id,payout_cycles,lifecycle_state,status) VALUES('{new_id}','{owner}',0,'phase1_active','approved_active');")
  sql(f"UPDATE challenge_purchases SET lifecycle_state='funded_active' WHERE id='{ids[0]}';")
  rollback=Path('migrations/20261117_restore_existing_purchase_cycles.sql').read_text()
+ sql(f"ALTER TABLE challenge_purchases ADD COLUMN large_unrelated_metadata text DEFAULT repeat('x',400000);")
  sql(rollback)
  assert sql(f"SELECT payout_cycles FROM challenge_purchases WHERE id='{ids[0]}';").strip()=='3'
  assert sql(f"SELECT lifecycle_state FROM challenge_purchases WHERE id='{ids[0]}';").strip()=='funded_active'

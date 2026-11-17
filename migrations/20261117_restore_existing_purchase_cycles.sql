@@ -22,7 +22,7 @@ BEGIN
   RAISE EXCEPTION 'Audited purchase ownership changed or row missing; review required.';
  END IF;
  INSERT INTO public.package_studio_private_settings(key,value,updated_at,updated_by)
- SELECT 'open_one_phase_cycles_rollback_20261117_v1',jsonb_build_object('at',now(),'scope','Restore original purchases; new purchases only for future plan edits','purchases_before',jsonb_agg(to_jsonb(p)),'status','restoring')::text,now(),'owner_new_purchases_only'
+ SELECT 'open_one_phase_cycles_rollback_20261117_v1',jsonb_build_object('at',now(),'scope','Restore original purchases; new purchases only for future plan edits','purchases_before',jsonb_agg(jsonb_build_object('id',p.id,'payout_cycles',p.payout_cycles)),'status','restoring')::text,now(),'owner_new_purchases_only'
  FROM public.challenge_purchases p JOIN jsonb_array_elements(original->'purchases_before') b ON p.id=(b->>'id')::uuid;
  ALTER TABLE public.challenge_purchases DISABLE TRIGGER np_keep_purchase_cycles;
  UPDATE public.challenge_purchases p SET
