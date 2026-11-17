@@ -5,7 +5,7 @@ Financial APIs retain their authentication and authorization; no session is embe
 from pathlib import Path
 from flask import send_file, make_response
 
-RELEASE='hosted-admin-mobile-navigation-2026-10-22'
+RELEASE='organised-mobile-panels-2026-11-17'
 
 def register_panel_delivery(app, root=None):
     assets=Path(root) if root else Path(__file__).resolve().parent/'website-downloads'
@@ -171,6 +171,25 @@ def register_panel_delivery(app, root=None):
         response=send_file(assets/'nairapips-admin-small.zip',mimetype='application/zip',as_attachment=True,
             download_name='NairaPips-Private-Offers-Update.zip',conditional=False,etag=False,max_age=0)
         response.headers['Cache-Control']='no-store, max-age=0'
+        return response
+
+    @app.get('/downloads/mobile-panels-update.zip')
+    def mobile_panels_update_archive():
+        return mobile_archive('nairapips-mobile-update.zip','NairaPips-Mobile-Panels-Update.zip')
+
+    @app.get('/downloads/mobile-admin-update.zip')
+    def mobile_admin_update_archive():
+        return mobile_archive('nairapips-admin-mobile.zip','NairaPips-Admin-Mobile.zip')
+
+    @app.get('/downloads/mobile-trader-update.zip')
+    def mobile_trader_update_archive():
+        return mobile_archive('nairapips-trader-mobile.zip','NairaPips-Trader-Mobile.zip')
+
+    def mobile_archive(filename,download_name):
+        response=send_file(assets/filename,mimetype='application/zip',as_attachment=True,
+            download_name=download_name,conditional=False,etag=False,max_age=0)
+        response.headers['Cache-Control']='no-store, max-age=0'
+        response.headers['X-Content-Type-Options']='nosniff'
         return response
 
     @app.get('/downloads/sales-outcomes-update.zip')

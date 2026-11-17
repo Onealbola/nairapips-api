@@ -4,6 +4,16 @@ from flask import Flask,jsonify
 from panel_delivery import register_panel_delivery,RELEASE
 
 class PanelDeliveryTests(unittest.TestCase):
+    def test_individual_mobile_downloads_match_builds(self):
+        for route,filename in [('mobile-admin-update.zip','nairapips-admin-mobile.zip'),('mobile-trader-update.zip','nairapips-trader-mobile.zip')]:
+            r=self.client.get('/downloads/'+route)
+            self.assertEqual(r.status_code,200)
+            self.assertEqual(r.mimetype,'application/zip')
+            self.assertIn('attachment',r.headers['Content-Disposition'])
+            self.assertEqual(r.data,Path('website-downloads',filename).read_bytes())
+            self.assertIn('no-store',r.headers['Cache-Control'])
+            r.close()
+
     def test_catalogue_bundle_updates_both_sites_without_replacing_homepage(self):
         import io
         r=self.client.get('/downloads/catalogue-sync-update.zip')
@@ -15,6 +25,23 @@ class PanelDeliveryTests(unittest.TestCase):
             self.assertIn('dashboard/trader_clean.html',z.namelist())
             self.assertNotIn('index.html',z.namelist())
             self.assertEqual(z.read('dashboard/trader_clean.html'),Path('website-downloads/trader_clean.html').read_bytes())
+        r.close()
+
+    def test_mobile_update_contains_matching_panels_and_assets(self):
+        from io import BytesIO
+        r=self.client.get('/downloads/mobile-panels-update.zip')
+        self.assertEqual(r.status_code,200)
+        self.assertEqual(r.mimetype,'application/zip')
+        self.assertIn('attachment',r.headers['Content-Disposition'])
+        self.assertIn('no-store',r.headers['Cache-Control'])
+        with zipfile.ZipFile(BytesIO(r.data)) as z:
+            self.assertEqual(z.read('dashboard/trader_clean.html'),Path('website-downloads/trader_clean.html').read_bytes())
+            self.assertEqual(z.read('admin/admin_clean.html'),Path('website-downloads/admin_clean_small.html').read_bytes())
+            import re
+            admin=z.read('admin/admin_clean.html').decode()
+            for path in re.findall(r'src="\./(admin-assets/[^"]+)"',admin):
+                self.assertGreater(len(z.read('admin/'+path)),0)
+            self.assertTrue(all(not p.startswith('/') and '..' not in p.split('/') for p in z.namelist()))
         r.close()
 
     def test_sales_outcomes_update_is_a_real_zip_download(self):
