@@ -12303,6 +12303,21 @@ window.npClaimPrivateOffer=async function(id){
  const validate=validatePayoutForm;
  validatePayoutForm=function(){const reason=blocked();if(reason){const button=document.getElementById('po-submit'),warning=document.getElementById('po-warning');if(button)button.disabled=true;if(warning)warning.textContent=reason;return false;}return validate();};
 })();
+
+/* Owner-configured unlimited plans include their cycles in the base price. */
+(function(){
+ if(typeof npBuyerRender==='function'){
+  const render=npBuyerRender;
+  npBuyerRender=function(catalog,...args){
+   const result=render(catalog,...args);
+   if(Number(catalog?.default_cycles)===0&&catalog?.cycle_options?.length===1){
+    const toggle=document.getElementById('pur-cycle-toggle');
+    if(toggle){toggle.checked=false;toggle.disabled=true;const label=toggle.closest('label');if(label){label.hidden=true;label.style.display='none';}}
+   }
+   return result;
+  };
+ }
+})();
 </script>
 <script src="https://nairapips-api.onrender.com/public/trader-catalogue.js"></script></body>
 </html>
@@ -12789,8 +12804,7 @@ window.NAIRAPIPS_HISTORIC_TRUTH_RELEASE='V191_ACCOUNT_TRUTH_SINGLE_SOURCE_2026_1
 
 <!-- V192 ACCOUNT TRUTH + LIVE MONITOR UPDATE · 07 OCT 2026 -->
 
-<script>
-/* Trader notices use verified purchase history, never today's plan default. */
+<script>/* Trader notices use verified purchase history, never today's plan default. */
 (function(){
 'use strict';
 let busy=false;
@@ -12799,7 +12813,7 @@ function markup(row){
  const label=text(row.plan)+' · Purchase '+text(row.purchase_id.slice(0,8));
  if(!row.verified)return `<article><strong>${label}</strong><p>Your payout cycle records need checking. Please contact support before requesting another payout.</p></article>`;
  const legacy=row.limit==null||row.limit===0;
- const title=row.completed?'Payout cycles completed':row.final_cycle_active?'Your final funded account':row.remaining===1?'Your final payout cycle remains':'Your payout cycles';
+ const title=row.limit===0?'Unlimited payout cycles':row.completed?'Payout cycles completed':row.final_cycle_active?'Your final funded account':row.remaining===1?'Your final payout cycle remains':'Your payout cycles';
  const message=legacy?`${row.paid} payout${row.paid===1?'':'s'} received · ${row.limit===0?'Unlimited cycles':'Your existing purchase terms apply; no cycle limit is recorded.'}`:row.completed?'All payouts included in this purchase have been received. No further payout is available under this purchase.':`${row.paid} of ${row.limit} payouts received · ${row.remaining} remaining`;
  const final=row.final_cycle_active?'<p>This is your final funded account for this purchase. After its final payout, this purchase closes. No further funded account or payout is included.</p>':'';
  const pending=row.reserved?`<p>${row.reserved} payout request${row.reserved===1?' is':'s are'} pending or processing. These count as received only after payment.</p>`:'';
@@ -12829,7 +12843,6 @@ setInterval(()=>{if(!document.hidden)load();},30000);
 window.addEventListener('focus',load);
 window.NAIRAPIPS_TRADER_CYCLE_NOTICE_RELEASE='trader-cycle-notice-2026-10-23';
 })();
-
 </script>
 
 <script>

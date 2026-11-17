@@ -23,9 +23,10 @@ def progress_report(guard, purchases, accounts, payouts):
             for payout in ledger:payout_map[str(payout['id'])]=dict(purchase_id=pid,blocked=True,reason=reason,renewal_blocked=True,renewal_reason=reason)
             continue
         if purchase.get('payout_cycles') in (None,0):
-            if pid not in LEGACY_DISPLAY_PURCHASE_IDS:continue
+            open_plan=(purchase.get('payout_cycles')==0 and purchase.get('account_size') in (500000,1000000,2000000) and purchase.get('challenge_journey')==['phase1','funded'])
+            if pid not in LEGACY_DISPLAY_PURCHASE_IDS and not open_plan:continue
             relevant=[p for p in ledger if str(p.get('status') or '').lower() in OPEN|{'paid'} or p.get('paid_at')]
-            if not relevant:continue
+            if not relevant and not open_plan:continue
             paid=set();reserved=set();verified=True
             by_id={str(a['id']):a for a in scope}
             for payout in relevant:
@@ -72,7 +73,7 @@ def progress_report(guard, purchases, accounts, payouts):
             'review_required':sum(not r['verified'] for r in result)}}
 
 def read_progress(guard, trader_id=None):
-    params={'or':'(payout_cycles.gt.0,id.in.('+','.join(sorted(LEGACY_DISPLAY_PURCHASE_IDS))+'))','select':'id,trader_id,trader_name,plan_name,payout_cycles,lifecycle_state'}
+    params={'or':'(payout_cycles.gt.0,and(payout_cycles.eq.0,account_size.in.(500000,1000000,2000000)),id.in.('+','.join(sorted(LEGACY_DISPLAY_PURCHASE_IDS))+'))','select':'id,trader_id,trader_name,plan_name,payout_cycles,lifecycle_state,account_size,challenge_journey'}
     if trader_id:params['trader_id']='eq.'+str(trader_id)
     purchases=guard.rows('challenge_purchases',params)
     if trader_id:

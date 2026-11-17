@@ -64,14 +64,30 @@ class CyclePriceStore(ControlsStore):
         return self.persist(doc, raw, actor)
 
 
-def priced_plan(plan, prices, category='standard'):
+def included_unlimited(plan):
+    """Owner can turn the cycle limit off/on using the saved plan control.
+
+    Only these one-phase NGN products include unlimited at their base price;
+    buyer-selected unlimited upgrades on other products retain their surcharge.
+    """
+    try:
+        return (bool(plan.get('id')) and Decimal(str(plan.get('account_size'))) in {Decimal(500000),Decimal(1000000),Decimal(2000000)}
+            and list(plan.get('challenge_journey') or [])==['phase1','funded']
+            and plan.get('payout_cycles')==0 and not plan.get('payout_cycle_extra')
+            and not plan.get('package_contract_id')
+            and str(plan.get('currency') or plan.get('currency_code') or 'NGN').upper()=='NGN')
+    except (InvalidOperation,ValueError,TypeError):return False
+
+
+def priced_plan(plan, prices, category='standard', included=None):
     if is_managed(plan):
         return commercial_plan(plan)
     row = dict(plan)
     if str(row.get('product_category') or 'standard').lower() != category:
         return row
     cycles = cycle_limit(row.get('payout_cycles') if row.get('payout_cycles') is not None else DEFAULT_CYCLES)
-    extra = 0 if cycles in FREE_CYCLES else prices[str(cycles)]
+    open_cycles=included_unlimited(plan) if included is None else included
+    extra = 0 if cycles in FREE_CYCLES or open_cycles else prices[str(cycles)]
     if extra is None:
         raise ValueError('Set the extra cost for this payout cycle option in Business Settings before selling this plan')
     base = money(row.get('base_fee', row.get('fee', 0)))
@@ -94,17 +110,20 @@ def purchase_plan(plan, prices, cycles=DEFAULT_CYCLES):
         if cycles is not None and str(cycles) not in ("0", "3"):
             raise ValueError("This package includes continuing payouts; its cycle terms cannot be changed")
         return commercial_plan(plan)
-    cycles = cycle_limit(DEFAULT_CYCLES if cycles is None else cycles)
+    open_cycles=included_unlimited(plan)
+    cycles = 0 if open_cycles else cycle_limit(DEFAULT_CYCLES if cycles is None else cycles)
     category = str(plan.get('product_category') or 'standard').lower()
     if category not in {'standard', 'premium'}:
         raise ValueError('Unknown plan market')
-    return priced_plan({**plan, 'payout_cycles': cycles}, prices, category=category)
+    return priced_plan({**plan, 'payout_cycles': cycles}, prices, category=category, included=open_cycles)
 
 
 def purchase_catalog(plan, prices):
     if is_managed(plan):
         return commercial_plan(plan)
     row = purchase_plan(plan, prices, DEFAULT_CYCLES)
+    if included_unlimited(plan):
+        return {**row,'cycle_options':[dict(cycles=0,available=True,extra=0,fee=row['fee'])],'default_cycles':0,'payout_cycle_limit_enabled':False}
     options = []
     for cycles in (1, 2, 3, 4, 5, 0):
         try:

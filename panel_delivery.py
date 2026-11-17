@@ -29,7 +29,7 @@ def register_panel_delivery(app, root=None):
 
     @app.get('/public/trader-catalogue.js')
     def trader_catalogue_script():
-        r=make_response((assets/'account-plan-selector.js').read_text()+'\n'+(assets/'trader-catalog-sync.js').read_text()+'\n'+(assets/'account-reporting.js').read_text()+'\n'+(assets/'private-offer-scope.js').read_text()+'\n'+(assets/'reset-journey-scope.js').read_text()+'\n'+(assets/'payout-profit-target.js').read_text());r.mimetype='application/javascript'
+        r=make_response((assets/'account-plan-selector.js').read_text()+'\n'+(assets/'trader-catalog-sync.js').read_text()+'\n'+(assets/'account-reporting.js').read_text()+'\n'+(assets/'private-offer-scope.js').read_text()+'\n'+(assets/'reset-journey-scope.js').read_text()+'\n'+(assets/'payout-profit-target.js').read_text()+'\n'+(assets/'included-open-cycles.js').read_text());r.mimetype='application/javascript'
         r.headers['Cache-Control']='no-store, max-age=0'
         r.headers['X-Content-Type-Options']='nosniff'
         return r
@@ -103,6 +103,12 @@ def register_panel_delivery(app, root=None):
     def dd_supervisor_repair_download():
         response=send_file(assets/'nairapips-dd-supervisor-repair.zip',mimetype='application/zip',as_attachment=True,
             download_name='NairaPips-DD-Supervisor-Repair.zip',conditional=False,etag=False,max_age=0)
+        response.headers['Cache-Control']='no-store, max-age=0'
+        return response
+
+    @app.get('/downloads/open-one-phase-cycles.sql')
+    def open_one_phase_cycles_upgrade_sql():
+        response=send_file(Path(__file__).resolve().parent/'migrations'/'20261117_open_one_phase_cycles.sql',mimetype='text/plain',conditional=False,etag=False,max_age=0)
         response.headers['Cache-Control']='no-store, max-age=0'
         return response
 
