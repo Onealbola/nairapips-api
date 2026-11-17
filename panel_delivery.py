@@ -108,7 +108,11 @@ def register_panel_delivery(app, root=None):
 
     @app.get('/downloads/open-one-phase-cycles.sql')
     def open_one_phase_cycles_upgrade_sql():
-        response=send_file(Path(__file__).resolve().parent/'migrations'/'20261117_open_one_phase_cycles.sql',mimetype='text/plain',conditional=False,etag=False,max_age=0)
+        return 'Withdrawn: plan changes apply to new purchases only.', 410
+
+    @app.get('/downloads/restore-existing-purchase-cycles.sql')
+    def restore_existing_purchase_cycles_sql():
+        response=send_file(Path(__file__).resolve().parent/'migrations'/'20261117_restore_existing_purchase_cycles.sql',mimetype='text/plain',conditional=False,etag=False,max_age=0)
         response.headers['Cache-Control']='no-store, max-age=0'
         return response
 

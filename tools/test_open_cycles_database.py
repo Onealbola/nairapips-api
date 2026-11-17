@@ -2,7 +2,10 @@
 import ast,subprocess,uuid,time,json
 from pathlib import Path
 name='np-open-cycle-test-'+uuid.uuid4().hex[:8]
-def run(*a,**kw):return subprocess.run(a,check=True,text=True,capture_output=True,**kw).stdout
+def run(*a,**kw):
+ r=subprocess.run(a,text=True,capture_output=True,**kw)
+ if r.returncode: raise subprocess.CalledProcessError(r.returncode,a,output=r.stdout,stderr=r.stderr)
+ return r.stdout
 def sql(q):return run('docker','exec','-i',name,'psql','-U','postgres','-v','ON_ERROR_STOP=1','-At',input=q)
 try:
  run('docker','run','--rm','-d','--name',name,'--network','none','--tmpfs','/var/lib/postgresql/data','-e','POSTGRES_HOST_AUTH_METHOD=trust','postgres:16-bookworm')
@@ -24,7 +27,7 @@ try:
  aid=str(uuid.uuid4());payout=str(uuid.uuid4())
  sql(f"INSERT INTO trader_accounts(id,trader_id,purchase_id,mt5_login,stage,account_status) VALUES('{aid}','{owner}','{ids[1]}','123','funded','archived');INSERT INTO payouts(id,trader_id,trader_account_id,mt5_login,status,paid_at) VALUES('{payout}','{owner}','{aid}','123','paid',now());")
  before=sql('SELECT row_to_json(p)::text FROM payouts p;SELECT row_to_json(a)::text FROM trader_accounts a;')
- migration=Path('migrations/20261117_open_one_phase_cycles.sql').read_text();sql(migration)
+ migration=Path('tests/fixtures/historical_open_cycles_upgrade.sql').read_text();sql(migration)
  assert sql("SELECT count(*) FROM challenge_plans WHERE payout_cycles=0;").strip()=='3'
  assert sql("SELECT count(*) FROM challenge_purchases WHERE payout_cycles=0;").strip()=='4'
  assert sql(f"SELECT lifecycle_state FROM challenge_purchases WHERE id='{ids[1]}';").strip()=='funded_waiting_mt5'
@@ -37,5 +40,22 @@ try:
  except subprocess.CalledProcessError:pass
  sql(f"UPDATE challenge_plans SET payout_cycles=3 WHERE id='{planids[0]}';")
  assert sql(f"SELECT payout_cycles FROM challenge_purchases WHERE id='{ids[0]}';").strip()=='0'
- print('PASS: scoped unlimited upgrade, immutable snapshot restoration, paid renewal decision, exact audit, replay safety, reactivation for future plans, and unchanged payout/account history.')
+ # A new purchase made after the upgrade must retain unlimited terms.
+ new_id=str(uuid.uuid4())
+ sql(f"INSERT INTO challenge_purchases(id,trader_id,payout_cycles,lifecycle_state,status) VALUES('{new_id}','{owner}',0,'phase1_active','approved_active');")
+ sql(f"UPDATE challenge_purchases SET lifecycle_state='funded_active' WHERE id='{ids[0]}';")
+ rollback=Path('migrations/20261117_restore_existing_purchase_cycles.sql').read_text()
+ sql(rollback)
+ assert sql(f"SELECT payout_cycles FROM challenge_purchases WHERE id='{ids[0]}';").strip()=='3'
+ assert sql(f"SELECT lifecycle_state FROM challenge_purchases WHERE id='{ids[0]}';").strip()=='funded_active'
+ assert sql(f"SELECT lifecycle_state FROM challenge_purchases WHERE id='{ids[1]}';").strip()=='funded_cycles_completed'
+ assert sql(f"SELECT payout_cycles IS NULL FROM challenge_purchases WHERE id='{ids[8]}';").strip()=='t'
+ assert sql(f"SELECT payout_cycles FROM challenge_purchases WHERE id='{new_id}';").strip()=='0'
+ assert sql("SELECT tgenabled FROM pg_trigger WHERE tgname='np_keep_purchase_cycles';").strip()=='O'
+ assert sql('SELECT row_to_json(p)::text FROM payouts p;SELECT row_to_json(a)::text FROM trader_accounts a;')==before
+ sql(rollback)
+ assert sql("SELECT count(*) FROM package_studio_private_settings;").strip()=='2'
+ print('PASS: historical restoration and new purchase preservation; original regression checks:  scoped unlimited upgrade, immutable snapshot restoration, paid renewal decision, exact audit, replay safety, reactivation for future plans, and unchanged payout/account history.')
+except subprocess.CalledProcessError as e:
+ print(e.stderr);raise
 finally:subprocess.run(['docker','rm','-f',name],capture_output=True)
