@@ -60297,6 +60297,9 @@ _np_install_business_email_delivery(app, globals())
 from breach_analysis_email import install as _np_install_breach_analysis_email
 _np_install_breach_analysis_email(app, globals())
 
+from recall_email import install as _np_install_recall_email
+_np_install_recall_email(app, globals())
+
 @app.route("/drawdown_version", methods=["GET", "POST"])
 def np_drawdown_version_v233():
     # POST verifies the deployed collector credential without reading or writing accounts.
