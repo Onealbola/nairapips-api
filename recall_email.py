@@ -19,6 +19,7 @@ def render(login,name):
     if not re.fullmatch(r'\d{1,20}',str(login)):raise ValueError('Exact MT5 login is required')
     subject=f'MT5 account {login} recalled — await admin instructions'
     body=(f'Hello {{{{name}}}},\n\nNairaPips Admin has recalled MT5 account {login}.\n\n'
+          'A recalled account is no longer authorised for trading and must not be used again. '
           'Please stop using this account and ignore the login credentials previously issued for it. '
           'The recalled account has been removed from your trader dashboard.\n\n'
           'Please wait for further instructions from NairaPips Admin. '

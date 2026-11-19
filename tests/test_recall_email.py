@@ -30,6 +30,7 @@ class RecallEmailTests(unittest.TestCase):
  def test_wording_is_account_specific_branded_and_contains_no_passwords(self):
   subject,html,text=render('123456789','Amina <Trader>')
   self.assertIn('123456789',subject);self.assertIn('ignore the login credentials',text);self.assertIn('wait for further instructions',text)
+  self.assertIn('no longer authorised for trading and must not be used again',text)
   self.assertIn('Amina &lt;Trader&gt;',html);self.assertNotIn('master_password',text)
   with self.assertRaises(ValueError):render('<script>','Trader')
  def test_one_receipt_for_each_exact_account_and_only_future_confirmed_recalls(self):

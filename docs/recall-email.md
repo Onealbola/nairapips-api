@@ -2,7 +2,8 @@
 
 Future Management Recall/Hold and Universal Recall actions notify the exact
 registered trader. The branded message identifies the withdrawn MT5 login,
-asks the trader to stop using that account and disregard its old credentials,
+states that a recalled account is no longer authorised for trading and must not
+be used again, asks the trader to disregard its old credentials,
 and asks them to wait for admin instructions. Any replacement is communicated
 separately. Passwords, internal recall markers and account balances are excluded.
 
