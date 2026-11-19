@@ -20,3 +20,15 @@ The backend-hosted aliases use the same updated source files after the API appli
 Run `python tools/package_mobile_panels.py` from the repository. Shared CSS and JavaScript live in `tools/mobile-panels.css` and `tools/mobile-panels.js`; the builder embeds them in both full admin variants and the trader HTML, then regenerates the compact admin and delivery archives. Repeated builds produce identical content and do not duplicate the mobile assets.
 
 Run `node tests/test_mobile_panels_browser.js` with Playwright and Chromium installed. It uses intercepted offline requests and synthetic sessions, exercises actual panel rendering from 320px to 1440px, and checks trader navigation, menu filtering/focus, table overflow and dialogs. The existing admin mobile-navigation, Sales Outcomes, access-review and panel-delivery tests also apply. Browser checks do not authenticate to production or submit real financial requests.
+
+## Touch-scroll correction — 19 November 2026
+
+The legacy `overflow-x:hidden` on the body created an intermediate scrolling
+container. Combined with mobile `overscroll-behavior-y:none`, Android finger
+gestures could not reach the document scroller. Mobile overflow now uses clipping
+without creating that intermediate container and allows vertical scroll chaining.
+The menu retains its temporary body lock and accessible modal behavior.
+
+`node tests/test_mobile_scroll_browser.js` uses real touch-start/move/end events
+in mobile Chromium and selects modules through the actual drawer. The previous
+release reproduced zero vertical movement; the corrected release scrolls.

@@ -1399,7 +1399,9 @@ linear-gradient(145deg,#260608,#070707 72%);box-shadow:0 28px 85px rgba(0,0,0,.5
 .np-mobile-menu-empty[hidden],.np-trader-backdrop[hidden]{display:none!important}
 @media(max-width:900px){
  html{scroll-padding-top:80px;scroll-padding-bottom:calc(var(--np-mobile-dock) + env(safe-area-inset-bottom) + 18px)}
- body{overscroll-behavior-y:none}
+ /* Allow touch scrolling to reach the document through the legacy body overflow container. */
+ html{overflow-x:clip!important;overflow-y:auto!important}
+ body{overflow-x:clip!important;overflow-y:visible;overscroll-behavior-y:auto}
  .app{width:100%;grid-template-columns:minmax(0,1fr)!important;min-height:100dvh}
  .app:has(>.sidebar){grid-template-rows:auto 1fr}
  .app main,.app .main,.np-page-frame,.np-module-body,#content{min-width:0;max-width:100%}
@@ -12986,7 +12988,7 @@ setInterval(()=>{if(!document.hidden&&SESSION.auth_token&&['dashboard','announce
 (function(){
  'use strict';
  if(window.NP_MOBILE_PANELS)return;
- window.NP_MOBILE_PANELS='2026-11-17';
+ window.NP_MOBILE_PANELS='2026-11-19-scroll-fix';
  const mq=window.matchMedia('(max-width:900px)');
  let drawer=null,opener=null,oldOverflow='',frame=0;
  const inerted=new Map();

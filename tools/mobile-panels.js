@@ -2,7 +2,7 @@
 (function(){
  'use strict';
  if(window.NP_MOBILE_PANELS)return;
- window.NP_MOBILE_PANELS='2026-11-17';
+ window.NP_MOBILE_PANELS='2026-11-19-scroll-fix';
  const mq=window.matchMedia('(max-width:900px)');
  let drawer=null,opener=null,oldOverflow='',frame=0;
  const inerted=new Map();
