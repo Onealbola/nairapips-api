@@ -1332,6 +1332,7 @@ def _trader_account_progression_metadata(row):
 
 def _trader_safe_account_row(row):
     progression = _trader_account_progression_metadata(row)
+    progression["recalled_delivery"] = __import__("recalled_account_visibility").recalled(row)
     row = _only_fields(row, _TRADER_ACCOUNT_RESPONSE_FIELDS)
     if isinstance(row, dict):
         row.update(progression)
@@ -59114,12 +59115,16 @@ def _np_v204_live_refresh_response(resp):
     data = response.get_json(silent=True)
     if not isinstance(data, dict):
         return response
+    from flask import request, has_request_context
+    trader_visibility = has_request_context() and (request.endpoint in ("trader_bootstrap", "trader_current_account", "trader_dashboard_payload") or (request.endpoint == "admin_trader_accounts_feed" and bool(request.args.get("trader_id"))))
     # Admin compatibility responses repeat rows under data/accounts/trader_accounts.
     # Decorate every alias in batches; the browser prefers accounts over data.
     if isinstance(data.get("data"), list):
         from admin_account_live import overlay_account_lists
         data = overlay_account_lists(data, requests, SUPABASE_URL,
             SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY, _np_v198_is_live_row)
+        if trader_visibility:
+            __import__("recalled_account_visibility").trader_view(data)
         response.set_data(json.dumps(data, default=str))
         response.content_type = "application/json"
         response.headers["Cache-Control"] = "no-store"
@@ -59142,6 +59147,8 @@ def _np_v204_live_refresh_response(resp):
                 root[key] = decorated["_single_" + key][0]
         from assignment_corrections import trader_view
         trader_view(root)
+        if trader_visibility:
+            __import__("recalled_account_visibility").trader_view(root)
         current = root.get("current_account") or root.get("account") or {}
         if current.get("latest_monitoring_snapshot"):
             root["latest_monitoring"] = current["latest_monitoring_snapshot"]
