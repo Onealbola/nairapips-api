@@ -32,3 +32,12 @@ The menu retains its temporary body lock and accessible modal behavior.
 `node tests/test_mobile_scroll_browser.js` uses real touch-start/move/end events
 in mobile Chromium and selects modules through the actual drawer. The previous
 release reproduced zero vertical movement; the corrected release scrolls.
+
+## Funded card fitting — 19 November 2026
+
+A previous-account reset notice could set the implicit dashboard grid's minimum
+width through its long authority label. The funded view alone did not reproduce
+this. Mobile dashboard tracks now use zero-minimum sizing, card children can
+shrink, and long reset/funded labels wrap. The funded regression test includes
+the actual reset-action panel and long release label at 320–768px, and verifies
+the entire passport card fits in the viewport. Scroll behavior is rechecked.

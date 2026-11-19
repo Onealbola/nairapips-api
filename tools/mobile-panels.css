@@ -114,6 +114,13 @@
  .app #credsBox .copy-row input{flex:1;min-width:0!important;width:100%}
  .app #credsBox .copy-row .btn{width:auto!important;flex-shrink:0;min-width:44px}
  .app .topbar-right{flex-wrap:wrap;width:100%;gap:8px!important}
+ .app .np-smart-dashboard,.app .np-funded-elite{grid-template-columns:minmax(0,1fr)!important;min-width:0;max-width:100%}
+ .app .np-smart-dashboard>*,.app .np-funded-elite>*,.app .np-fe-hero-grid>*,.app .np-smart-panel>*,.app .np-recovery-grid>*{min-width:0;max-width:100%}
+ .app .np-smart-panel,.app .np-recovery-vault,.app .np-fe-hero,.app .np-fe-passport,.app .np-fe-tile{overflow-wrap:anywhere}
+ .app .np-fe-hero-grid,.app .np-fe-main,.app .np-fe-bottom{grid-template-columns:minmax(0,1fr)!important}
+ .app .np-smart-panel-head,.app .np-fe-panel-head{flex-wrap:wrap;min-width:0}
+ .app .np-fe-eyebrow{max-width:100%;white-space:normal;overflow-wrap:anywhere;letter-spacing:.1em}
+ .app .np-fe-proof>span,.app .np-fe-passport .code{max-width:100%;white-space:normal;overflow-wrap:anywhere}
  .app .np-fe-journey{grid-template-columns:repeat(2,minmax(0,1fr))!important}
  #content [style*="display:flex"]:has(>input),#content [style*="display:flex"]:has(>select),#content [style*="display:flex"]:has(>.btn){flex-wrap:wrap!important;gap:10px!important}
  #content .flex:has(>input):has(>select){display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:10px!important;width:100%}

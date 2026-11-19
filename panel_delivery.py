@@ -183,7 +183,7 @@ def register_panel_delivery(app, root=None):
 
     @app.get('/downloads/mobile-trader-update.zip')
     def mobile_trader_update_archive():
-        return mobile_archive('nairapips-trader-mobile.zip','NairaPips-Trader-Mobile-Scroll-Fix.zip')
+        return mobile_archive('nairapips-trader-mobile.zip','NairaPips-Trader-Mobile-Card-Fix.zip')
 
     def mobile_archive(filename,download_name):
         response=send_file(assets/filename,mimetype='application/zip',as_attachment=True,
