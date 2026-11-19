@@ -25,3 +25,11 @@ The existing service-only private settings table stores the activation cursor
 and receipts under `recall_email_activation_v1` and `recall_email_v1:<account UUID>`.
 Normal email logs use `account_recall`. No schema, website upload, financial,
 entitlement, broker or original recall-lifecycle changes are required.
+
+Admin and owner copies use the configured `ADMIN_ALERT_EMAIL` and
+`OWNER_ALERT_EMAIL` addresses, deduplicated without case sensitivity. Copies
+are BCC recipients on the same claimed, provider-idempotent submission as the
+trader email. The receipt records those recipients, and normal email logs
+include `account_recall_admin_copy`. An admin who is already the trader recipient
+receives one copy. Missing valid admin-copy configuration requires review instead
+of silently omitting the copy.

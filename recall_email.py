@@ -35,6 +35,12 @@ class Notifier:
         self.headers={'apikey':key,'Authorization':'Bearer '+key,'Prefer':'return=representation'}
         self.started_at=now();self.lock=threading.Lock();self.queue=queue.Queue();self.last={}
     def ready(self):return bool(self.g.get('BREVO_API_KEY') and self.g.get('FROM_EMAIL'))
+    def admins(self):
+        addresses=[]
+        for value in (self.g.get('ADMIN_ALERT_EMAIL'),self.g.get('OWNER_ALERT_EMAIL')):
+            address=str(value or '').strip()
+            if EMAIL.fullmatch(address) and address.casefold() not in {a.casefold() for a in addresses}:addresses.append(address)
+        return addresses
     def read(self,table,params):
         r=self.http.get(self.base+table,headers=self.headers,params={'select':'*',**params},timeout=(2,8));r.raise_for_status();rows=r.json()
         if not isinstance(rows,list):raise ValueError('Recall notification read unavailable')
@@ -88,7 +94,9 @@ class Notifier:
         trader=people[0];email=str(trader.get('email') or '').strip()
         if not EMAIL.fullmatch(email):raise ValueError('Registered recall email unavailable')
         subject,content,text=render(case['mt5_login'],trader.get('name') or 'Trader')
-        return dict(recipient=email,subject=subject,html=content,text=text)
+        admins=self.admins()
+        if not admins:raise ValueError('Admin recall-copy recipient unavailable')
+        return dict(recipient=email,admin_copies=[a for a in admins if a.casefold()!=email.casefold()],subject=subject,html=content,text=text)
     def deliver(self,stored):
         case=json.loads(stored['value'])
         if case.get('state')!='pending' or (case.get('retry_after') and stamp(case['retry_after'])>datetime.now(timezone.utc)):return False
@@ -98,16 +106,18 @@ class Notifier:
             self.save(stored,dict(case,state='needs_review' if checks>=5 else 'pending',evidence_checks=checks,error='Recall or recipient could not be verified',retry_after=(datetime.now(timezone.utc)+timedelta(seconds=60)).isoformat()));return False
         if mail is None:
             self.save(stored,dict(case,state='cancelled',reason='Account is no longer recalled'));return False
-        claimed=dict(case,state='sending',claimed_at=now(),recipient=mail['recipient'],subject=mail['subject'])
+        claimed=dict(case,state='sending',claimed_at=now(),recipient=mail['recipient'],admin_copies=mail['admin_copies'],subject=mail['subject'])
         if not self.save(stored,claimed):return False
         try:
             confirmed=self.prepare(case)
-            if confirmed is None or confirmed['recipient']!=mail['recipient']:
+            if confirmed is None or confirmed['recipient']!=mail['recipient'] or confirmed['admin_copies']!=mail['admin_copies']:
                 self.save(stored,dict(claimed,state='cancelled',reason='Recall or recipient changed before sending'));return False
         except Exception:
             self.save(stored,dict(claimed,state='needs_review',error='Final recall check unavailable'));return False
         try:
-            r=self.http.post('https://api.brevo.com/v3/smtp/email',headers={'api-key':self.g['BREVO_API_KEY'],'Content-Type':'application/json'},json={'sender':{'name':'NairaPips','email':self.g['FROM_EMAIL']},'to':[{'email':mail['recipient']}],'subject':mail['subject'],'htmlContent':mail['html'],'textContent':mail['text'],'tags':['account_recall'],'headers':{'idempotencyKey':case['attempt_id']}},timeout=(2,10))
+            payload={'sender':{'name':'NairaPips','email':self.g['FROM_EMAIL']},'to':[{'email':mail['recipient']}],'subject':mail['subject'],'htmlContent':mail['html'],'textContent':mail['text'],'tags':['account_recall'],'headers':{'idempotencyKey':case['attempt_id']}}
+            if mail['admin_copies']:payload['bcc']=[{'email':address} for address in mail['admin_copies']]
+            r=self.http.post('https://api.brevo.com/v3/smtp/email',headers={'api-key':self.g['BREVO_API_KEY'],'Content-Type':'application/json'},json=payload,timeout=(2,10))
             if 200<=r.status_code<300:
                 try:provider_id=r.json().get('messageId')
                 except Exception:provider_id=None
@@ -122,7 +132,8 @@ class Notifier:
             context=self.g.get('_NP_RENEWAL_REST_V211');token=None
             try:
                 if context is not None:token=context.set(True)
-                logger(mail['recipient'],mail['subject'],email_type='account_recall',status='sent' if result['state']=='accepted' else result['state'],trader_id=case['trader_id'],message=mail['text'],provider_response=json.dumps({'messageId':result.get('provider_id'),'account_id':case['account_id']}),error=result.get('error') or '')
+                for recipient in [mail['recipient']]+mail['admin_copies']:
+                    logger(recipient,mail['subject'],email_type='account_recall' if recipient==mail['recipient'] else 'account_recall_admin_copy',status='sent' if result['state']=='accepted' else result['state'],trader_id=case['trader_id'],message=mail['text'],provider_response=json.dumps({'messageId':result.get('provider_id'),'account_id':case['account_id']}),error=result.get('error') or '')
             except Exception:pass
             finally:
                 if token is not None:context.reset(token)

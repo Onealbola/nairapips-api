@@ -6,7 +6,7 @@ from recall_email import Notifier,render,install,PREFIX,CONTROL
 AID='11111111-1111-4111-8111-111111111111';TID='22222222-2222-4222-8222-222222222222'
 class MemoryNotifier(Notifier):
  def __init__(self):
-  super().__init__({'requests':Mock(),'SUPABASE_URL':'https://db.invalid','SUPABASE_KEY':'fixture','BREVO_API_KEY':'test','FROM_EMAIL':'admin@example.invalid'})
+  super().__init__({'requests':Mock(),'SUPABASE_URL':'https://db.invalid','SUPABASE_KEY':'fixture','BREVO_API_KEY':'test','FROM_EMAIL':'admin@example.invalid','ADMIN_ALERT_EMAIL':'admin@example.invalid','OWNER_ALERT_EMAIL':'ADMIN@example.invalid'})
   self.docs={};self.fail_claim=False;self.account=dict(id=AID,trader_id=TID,mt5_login='123456789',account_status='archived',archived_at=(datetime.now(timezone.utc)+timedelta(seconds=1)).isoformat(),archive_reason='[NP_MANAGEMENT_HOLD:ACTIVE] [NP_MH_ACCOUNT:'+AID+']')
   self.person=dict(id=TID,name='Amina <Trader>',email='trader@example.invalid')
   self.http.post.return_value=Mock(status_code=201,json=lambda:{'messageId':'provider-123'})
@@ -79,3 +79,17 @@ class RecallEmailTests(unittest.TestCase):
  def test_universal_recall_has_same_notification_protection(self):
   self.service.account['archive_reason']='[NP_UNIVERSAL_RECALL:v] [NP_RECALL_ORIGINAL_ACCOUNT:'+AID+']'
   self.assertTrue(self.enqueue());self.assertTrue(self.service.deliver(self.service.stored()))
+
+ def test_admin_copy_is_in_same_duplicate_protected_send_and_receipt(self):
+  self.enqueue();stored=self.service.stored();self.service.deliver(stored)
+  payload=self.service.http.post.call_args.kwargs['json'];self.assertEqual(payload['bcc'],[{'email':'admin@example.invalid'}])
+  self.assertEqual(json.loads(stored['value'])['admin_copies'],['admin@example.invalid'])
+  self.assertFalse(self.service.deliver(stored));self.service.http.post.assert_called_once()
+ def test_trader_who_is_also_admin_is_not_duplicated(self):
+  self.service.person['email']='ADMIN@example.invalid';self.enqueue();self.service.deliver(self.service.stored())
+  self.assertNotIn('bcc',self.service.http.post.call_args.kwargs['json'])
+ def test_missing_admin_copy_configuration_does_not_silently_send_without_copy(self):
+  self.service.g.update(ADMIN_ALERT_EMAIL='',OWNER_ALERT_EMAIL='invalid');self.enqueue();self.assertFalse(self.service.deliver(self.service.stored()));self.service.http.post.assert_not_called()
+ def test_owner_and_admin_get_separate_valid_addresses_and_audit_entries(self):
+  self.service.g['OWNER_ALERT_EMAIL']='owner@example.invalid';self.service.g['_log_email_bank']=Mock();self.enqueue();self.service.deliver(self.service.stored())
+  payload=self.service.http.post.call_args.kwargs['json'];self.assertEqual(payload['bcc'],[{'email':'admin@example.invalid'},{'email':'owner@example.invalid'}]);self.assertEqual(self.service.g['_log_email_bank'].call_count,3)
