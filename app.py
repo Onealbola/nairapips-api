@@ -3610,6 +3610,8 @@ def _np_purchase_is_rejected_v154(purchase, refresh=False):
 
 
 def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="MT5 assigned"):
+    from purchase_rule_continuity import assignment_purchase
+    purchase, _paid_rule_predecessor = assignment_purchase(trader, mt5, stage, purchase)
 
     # V154: rejected purchase can never receive an MT5, even from a stale
     # Admin tab, delayed request, retry worker, or race with Reject.
@@ -3650,7 +3652,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
             filters=[
                 ("eq", "purchase_id", purchase_id),
                 ("eq", "account_status", "assigned_active"),
-            ],
+            ] + ([("neq", "id", _paid_rule_predecessor)] if _paid_rule_predecessor else []),
             limit=1,
         ) or []
         if existing_purchase:
@@ -3731,6 +3733,10 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
         "created_at": now,
         "updated_at": now,
     }
+    if purchase and purchase.get("id"):
+        from purchase_rule_continuity import account_fields
+        account_row.update(account_fields(account_row, purchase))
+        challenge_journey = account_row["challenge_journey"]
     __import__("plan_risk_controls").assert_assignment_snapshot(account_row, purchase)
     print("V175 ASSIGN STEP: create_trader_account", mt5.get("mt5_login"), flush=True)
     account = (_np_renewal_db_v211().table("trader_accounts").insert(account_row).execute().data or [None])[0]
@@ -3752,7 +3758,7 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
             "status": "approved_active",
             "lifecycle_state": _active_state_for_stage(stage),
             "challenge_journey": challenge_journey,
-            "journey_source": ((purchase or {}).get("journey_source") if _np_is_managed_progress_plan(plan) else __import__("plan_risk_controls").inherit("assigned_account_snapshot",purchase)),
+            "journey_source": purchase.get("journey_source") or __import__("plan_risk_controls").inherit("assigned_account_snapshot",purchase),
             "trader_account_id": account.get("id"),
             "assigned_mt5_id": mt5.get("id"),
             "mt5_login": mt5.get("mt5_login"),
@@ -20502,7 +20508,7 @@ def _np_safe_account_upsert(payload, accounts_by_login=None):
     # schema-safe fallbacks if optional columns do not exist in Supabase
     optional_sets = [
         ["mt5_password", "master_password", "investor_password", "assigned_at", "mt5_access_disabled"],
-        ["purchase_id", "mt5_pool_id", "target_percent", "dd_limit_percent", "dd_used_percent", "absolute_drawdown_percent"],
+        ["mt5_pool_id", "dd_used_percent", "absolute_drawdown_percent"],
         ["current_balance", "current_equity", "highest_equity", "lowest_equity", "profit", "profit_percent"],
     ]
     compact = dict(payload)
@@ -51585,10 +51591,10 @@ def _np_ur_v87_update_compat(table, payload, column, value, optional_keys=()):
 
 def _np_ur_v87_insert_account(payload):
     optional = {
-        "phase", "assigned_at", "challenge_purchase_id", "challenge_journey",
-        "journey_source", "source", "admin_note", "previous_trader_account_id",
+        "phase", "assigned_at", "challenge_purchase_id",
+        "source", "admin_note", "previous_trader_account_id",
         "previous_mt5_login", "replaces_trader_account_id", "phase_label",
-        "payout_split", "lifecycle_state", "target_percent", "dd_limit_percent",
+        "payout_split", "lifecycle_state",
     }
     data = dict(payload or {})
     import uuid
@@ -55684,8 +55690,7 @@ def _np_v122_source_block_reason(source, payout=None):
 
 
 def _np_v122_purchase_hint(source):
-    """Best-effort exact lineage repair. Payout renewal authority is the PAID payout,
-    so absence of purchase_id must not itself block a fresh funded cycle."""
+    """Resolve exact lineage; paid authority and complete purchase rules are separate requirements."""
     s = source or {}
     tid = _np_v122_s(s.get("trader_id"))
     sid = _np_v122_s(s.get("id"))
@@ -55877,6 +55882,27 @@ def _np_v122_finalize(payout, source, child):
     aid = _np_v122_s(c.get("id")); login = _np_v122_s(c.get("mt5_login")); now = now_iso()
     marker = _np_v122_done_marker(pid, aid, login)
 
+    # Validate/restore exact purchased metadata before a partial child can be
+    # monitored or delivered. Status, money and historical breach evidence stay
+    # unchanged; a recovered daily account still requires its broker journal.
+    from purchase_rule_continuity import account_fields, assert_bound
+    rule_purchase, rule_link = _np_v122_purchase_hint(s)
+    if rule_link != "exact":
+        raise RuntimeError("Exact purchase rules are unavailable for renewal completion")
+    try:
+        assert_bound(c, rule_purchase)
+    except ValueError:
+        repair = account_fields(c, rule_purchase, recovered=True)
+        repair["updated_at"] = now
+        query = _np_renewal_db_v211().table("trader_accounts").update(repair).eq("id", aid).eq("trader_id", tid)
+        if c.get("updated_at"):
+            query = query.eq("updated_at", c["updated_at"])
+        confirmed = query.execute().data or []
+        if len(confirmed) != 1:
+            raise RuntimeError("Renewal rule repair changed concurrently; reload this exact account")
+        c = confirmed[0]
+        assert_bound(c, rule_purchase)
+
     # A recovered partial insert is not delivered until monitoring and pointer
     # persistence succeed. Reuse the exact child; never allocate another MT5.
     _np_monitoring_registry_activate(c, predecessor_account_id=sid,
@@ -55888,7 +55914,7 @@ def _np_v122_finalize(payout, source, child):
     source_pid = _np_v122_s(s.get("purchase_id") or s.get("challenge_purchase_id"))
     child_patch = {
         "previous_trader_account_id": sid,
-        "journey_source": "payout_renewal_exact_paid_event_v122",
+        "journey_source": c["journey_source"],
         "updated_at": now,
     }
     if source_pid:
@@ -56106,13 +56132,17 @@ def _np_v122_process(pid, actor=None):
         source = _np_v122_set_candidate(source, pid, claim, mt5.get("mt5_login"))
         note = f"[NP_PAYOUT_RENEWAL_V122:{pid}] PAID PAYOUT RENEWAL; source_account={sid}; exact_once=true"
         try:
-            # Deliberately pass purchase=None. The exact PAID payout + exact funded
-            # source is the renewal authority; this prevents old/missing purchase
-            # mirrors from blocking a valid paid cycle while reusing the proven
-            # low-level assignment primitive and all MT5/pointer/email protections.
-            child, updated = _assign_mt5_to_trader(
-                trader, mt5, "funded", None, actor, note
-            )
+            # Paid-cycle authority remains above. Rules come only from this
+            # exact purchase; skip only its exact predecessor in the duplicate
+            # guard, never another active account or a different purchase.
+            rule_purchase, rule_link = _np_v122_purchase_hint(source)
+            if rule_link != "exact":
+                raise ValueError("Exact purchased rules are unavailable; renewal requires review")
+            from purchase_rule_continuity import paid_renewal_rules
+            with paid_renewal_rules(p, source, rule_purchase):
+                child, updated = _assign_mt5_to_trader(
+                    trader, mt5, "funded", None, actor, note
+                )
         except Exception as exc:
             err = str(exc)[:400]
             try:

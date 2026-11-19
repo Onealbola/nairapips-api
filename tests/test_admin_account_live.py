@@ -110,7 +110,9 @@ class AdminAccountLiveTests(unittest.TestCase):
   self.assertFalse(out['recorded_breach'])
   # A different purchaser cannot supply the missing rule evidence.
   self.purchases[0]['trader_id']='foreign'
-  self.assertEqual(self.decorate()['accounts'][0]['rule_snapshot_status'],'unverified')
+  foreign=self.decorate()['accounts'][0]
+  self.assertEqual(foreign['rule_snapshot_status'],'repair_required')
+  self.assertEqual(foreign['snapshot_repair_scope'],'purchase_evidence_unavailable')
  def test_legacy_ownership_label_without_opt_in_terms_is_not_a_rule_mismatch(self):
   self.a.update(journey_source='post9_purchase_root_immutable',purchase_id='exact-purchase')
   self.purchases=[dict(id='exact-purchase',trader_id='owner',drawdown_type='STATIC',journey_source='legacy')]
