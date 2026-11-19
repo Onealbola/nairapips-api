@@ -179,7 +179,7 @@ def register_panel_delivery(app, root=None):
 
     @app.get('/downloads/mobile-admin-update.zip')
     def mobile_admin_update_archive():
-        return mobile_archive('nairapips-admin-mobile.zip','NairaPips-Admin-Mobile.zip')
+        return mobile_archive('nairapips-admin-mobile.zip','NairaPips-Admin-Mobile-Layout-Fix.zip')
 
     @app.get('/downloads/mobile-trader-update.zip')
     def mobile_trader_update_archive():

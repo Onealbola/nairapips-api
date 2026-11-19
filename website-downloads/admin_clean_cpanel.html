@@ -1532,6 +1532,12 @@ input::placeholder, textarea::placeholder{
  .app #np-admin-sidebar .nav{padding:12px!important;border-radius:11px!important;min-height:46px!important;line-height:1.3!important}
  .app #np-admin-sidebar .nav-section{padding-top:20px!important;font-size:10px!important}
  .app .card,.app .vault,.app .trader-card,.app .purchase-card,.app .acct-card{padding:16px!important;border-radius:16px!important;min-width:0;max-width:100%}
+ /* Admin cards retain their contents inside narrow grid/flex tracks. */
+ #content .grid>*,#content .flex>*,#content .card>*,#content .card2>*,#content .vault>*{min-width:0;max-width:100%}
+ #content .card,#content .card2,#content .vault,#content .trader-card,#content .purchase-card{min-width:0!important;max-width:100%;overflow-wrap:anywhere}
+ #content h1,#content h2,#content h3,#content .trader-contact,#content .trader-ref{overflow-wrap:anywhere}
+ #content .card-head,#content .card-header{flex-wrap:wrap;gap:10px}
+ #content img,#content video,#content canvas,.modal-card img{max-width:100%!important;height:auto;object-fit:contain}
  .app .sec-title{font-size:22px!important;line-height:1.25!important}
  .app .sec-sub{font-size:13px;line-height:1.6}
  .app .np-cockpit-hero{padding:18px!important;border-radius:18px!important;margin-bottom:16px!important}
@@ -2238,7 +2244,7 @@ setInterval(()=>{if(!document.hidden)paint()},2000);
 (function(){
  'use strict';
  if(window.NP_MOBILE_PANELS)return;
- window.NP_MOBILE_PANELS='2026-11-19-card-fit';
+ window.NP_MOBILE_PANELS='2026-11-19-admin-fit';
  const mq=window.matchMedia('(max-width:900px)');
  let drawer=null,opener=null,oldOverflow='',frame=0;
  const inerted=new Map();

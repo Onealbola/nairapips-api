@@ -41,3 +41,15 @@ this. Mobile dashboard tracks now use zero-minimum sizing, card children can
 shrink, and long reset/funded labels wrap. The funded regression test includes
 the actual reset-action panel and long release label at 320–768px, and verifies
 the entire passport card fits in the viewport. Scroll behavior is rechecked.
+
+## Admin mobile layout — 19 November 2026
+
+Admin cards and grid/flex children allow narrow sizing and wrap long contact,
+reference and heading text. Content images fit their cards. Existing horizontal
+table scrolling and mobile drawer permissions remain intact. The admin browser
+regression uses populated account/trader rows and checks module card bounds at
+320, 390, 430 and 768px plus finger scrolling after drawer navigation.
+
+Extract the admin-only ZIP inside `public_html/admin`, including its complete
+`admin-assets` folder. This archive uses a compact HTML file with matching hashed
+JavaScript assets; copying only the HTML is not a complete installation.
