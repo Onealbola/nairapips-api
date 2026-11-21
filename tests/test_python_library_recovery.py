@@ -20,6 +20,7 @@ class LibraryRecoveryTests(unittest.TestCase):
    self.assertIn('Lib/encodings/__init__.py',manifest);self.assertIn('Lib/os.py',manifest)
    self.assertEqual(z.read('RESTORE_MISSING_LIBRARY.ps1'),(ROOT/'python-library-recovery/RESTORE_MISSING_LIBRARY.ps1').read_bytes())
    self.assertIn(b'github.com/python/cpython/archive/refs/tags/v3.11.0.zip',z.read('SOURCE.txt'))
+   self.assertIn(b'PYTHON SOFTWARE FOUNDATION LICENSE',z.read('PYTHON_LICENSE.txt'))
   response.close()
  def test_package_restores_enough_missing_library_to_boot_an_isolated_python_311(self):
   if sys.version_info[:2]!=(3,11):self.skipTest('Bootstrap check requires a Python 3.11 runtime')

@@ -26,6 +26,7 @@ def library_files(source):
 def build(source,output):
     files=library_files(source)
     manifest=json.dumps({n:hashlib.sha256(v).hexdigest() for n,v in sorted(files.items())},sort_keys=True,indent=2).encode()
+    with zipfile.ZipFile(source) as archive:files['PYTHON_LICENSE.txt']=archive.read('cpython-3.11.0/LICENSE')
     files['LIBRARY_SHA256.json']=manifest
     files['RESTORE_MISSING_LIBRARY.ps1']=(ROOT/'python-library-recovery/RESTORE_MISSING_LIBRARY.ps1').read_bytes()
     files['SOURCE.txt']=(f'Official CPython v3.11.0 standard library.\nSource: {SOURCE_URL}\nSource archive SHA256: {SOURCE_SHA256}\nOnly missing files are restored. No existing files are overwritten.\nNo running programs, scheduled tasks, account rules or risk journals are changed.\n').encode()
