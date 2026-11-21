@@ -10432,7 +10432,10 @@ def create_purchase():
         row.update(second_life_snapshot)
         row.update(plan_rule_snapshot)
         row.update(_affiliate_purchase_fields(d, original_fee))
-        created = supabase.table("challenge_purchases").insert(row).execute().data or []
+        purchase_db = supabase_admin if __import__("first_purchase_promo").requested(d) else supabase
+        if purchase_db is None:
+            raise ValueError("First-purchase checkout is temporarily unavailable. Please try again.")
+        created = purchase_db.table("challenge_purchases").insert(row).execute().data or []
         if not created:
             raise RuntimeError("Purchase could not be saved")
         if not str((created[0] or {}).get("payment_proof_url") or "").strip():
@@ -18012,7 +18015,7 @@ def _affiliate_quote_details(d, base_fee):
     """
     base_fee = clean(base_fee)
     if __import__("first_purchase_promo").requested(d):
-        return __import__("first_purchase_promo").quote(d or {}, base_fee, supabase, _authenticated_trader_id_for_request)
+        return __import__("first_purchase_promo").quote(d or {}, base_fee, supabase_admin, _authenticated_trader_id_for_request)
     raw_code = (d or {}).get("affiliate_code") or (d or {}).get("referral_code") or (d or {}).get("ref_code") or (d or {}).get("partner_code") or (d or {}).get("promo_code") or (d or {}).get("code")
     code = _aff_code(raw_code)
     result = {
@@ -60385,7 +60388,7 @@ _np_start_reset_autofire_v43()
 def first_purchase_promo_version():
     guard_ready = False
     try:
-        guard_ready = supabase.rpc("np_first_purchase_promo_eligible_v1", {"p_trader_id":"00000000-0000-0000-0000-000000000000"}).execute().data is False
+        guard_ready = supabase_admin.rpc("np_first_purchase_promo_eligible_v1", {"p_trader_id":"00000000-0000-0000-0000-000000000000"}).execute().data is False
     except Exception:
         pass
     response = jsonify(success=True, guard_ready=guard_ready, code="WELCOME20", discount_percent=20, scope="first_account_purchase_only", resets=False, renewals=False, stacking=False, existing_purchase_history_excluded=True)

@@ -20,8 +20,8 @@ retains the existing policy. Normal referral and private-offer pricing is unchan
 
 A before-insert database trigger rechecks eligibility and exact discount values.
 All purchase inserts share a short transaction lock to prevent parallel first
-orders. A private RLS-protected hashed identity ledger retains future purchase
-history/redemption evidence even if the purchase is later deleted. Ledger keys
+orders. A private RLS-protected hashed identity ledger retains promo-redemption
+evidence even if the purchase is later deleted. Ledger keys
 contain hashes rather than raw email or phone. RPC and ledger privileges are
 server-only; no public/browser role is granted eligibility-history access.
 Existing purchases and financial records are not rewritten.

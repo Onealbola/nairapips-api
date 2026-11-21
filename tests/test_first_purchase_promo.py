@@ -47,7 +47,7 @@ class CheckoutIntegrationTests(unittest.TestCase):
   tree=ast.parse(Path('app.py').read_text())
   nodes=[copy.deepcopy(n) for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in ('_affiliate_quote_details','_affiliate_purchase_fields')]
   db=Mock();db.rpc.return_value.execute.return_value=NS(data=True)
-  scope=dict(clean=lambda x:float(x or 0),supabase=db,_authenticated_trader_id_for_request=lambda x:('customer',None))
+  scope=dict(clean=lambda x:float(x or 0),supabase=db,supabase_admin=db,_authenticated_trader_id_for_request=lambda x:('customer',None))
   exec(compile(ast.Module(body=nodes,type_ignores=[]),'actual-checkout-promo','exec'),scope)
   with Flask(__name__).test_request_context('/create_challenge_purchase'):
    fields=scope['_affiliate_purchase_fields']({'code':'WELCOME20','plan_id':'plan','trader_id':'customer'},20000)
