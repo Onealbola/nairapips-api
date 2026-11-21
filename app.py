@@ -18011,6 +18011,8 @@ def _affiliate_quote_details(d, base_fee):
     Discount reduces customer price. Commission is calculated on the final paid fee.
     """
     base_fee = clean(base_fee)
+    if __import__("first_purchase_promo").requested(d):
+        return __import__("first_purchase_promo").quote(d or {}, base_fee, supabase, _authenticated_trader_id_for_request)
     raw_code = (d or {}).get("affiliate_code") or (d or {}).get("referral_code") or (d or {}).get("ref_code") or (d or {}).get("partner_code") or (d or {}).get("promo_code") or (d or {}).get("code")
     code = _aff_code(raw_code)
     result = {
@@ -18578,6 +18580,14 @@ def validate_affiliate_code():
         payload = (request.json or {}) if request.method == "POST" else dict(request.args)
         code = _aff_code(payload.get("code"))
         if not code: return bad("Code is required")
+        if __import__("first_purchase_promo").requested(payload):
+            base_fee = clean(payload.get("fee") or payload.get("amount"))
+            if payload.get("plan_id"):
+                selected, _ = _np_resolve_purchase_plan(_np_market_cycle_stores, payload["plan_id"], payload.get("payout_cycles", 3))
+                base_fee = selected["fee"]
+            quote = _affiliate_quote_details(payload, base_fee)
+            quote.pop("source", None)
+            return jsonify(success=True,valid=quote["valid"],message=quote["message"],quote=quote,data=quote)
         row = _aff_get_code(code) or _aff_get_partner_by_code(code)
         if not row: return jsonify({"success": False, "valid": False, "error": "Code not found"}), 404
         ok_window, reason = _aff_code_valid_window(row)
@@ -60370,3 +60380,14 @@ _np_install_unused_account_seed(app,globals())
 # Start these existing workers only after every final assignment guard is installed.
 _np_start_lifecycle_worker_v40()
 _np_start_reset_autofire_v43()
+
+@app.get("/first_purchase_promo_version")
+def first_purchase_promo_version():
+    guard_ready = False
+    try:
+        guard_ready = supabase.rpc("np_first_purchase_promo_eligible_v1", {"p_trader_id":"00000000-0000-0000-0000-000000000000"}).execute().data is False
+    except Exception:
+        pass
+    response = jsonify(success=True, guard_ready=guard_ready, code="WELCOME20", discount_percent=20, scope="first_account_purchase_only", resets=False, renewals=False, stacking=False, existing_purchase_history_excluded=True)
+    response.headers["Cache-Control"] = "no-store"
+    return response
