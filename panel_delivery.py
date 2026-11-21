@@ -152,6 +152,12 @@ def register_panel_delivery(app, root=None):
         response.headers['Cache-Control']='no-store, max-age=0'
         return response
 
+    @app.get('/downloads/python311-library-recovery.zip')
+    def python311_library_recovery():
+        response=send_file(assets/'nairapips-python311-library-recovery.zip',mimetype='application/zip',as_attachment=True,download_name='NairaPips-Python311-Library-Recovery.zip',conditional=False,etag=False,max_age=0)
+        response.headers['Cache-Control']='no-store, max-age=0'
+        return response
+
     @app.get('/downloads/static-trailing-dd-update.zip')
     def static_trailing_dd_update():
         response=send_file(assets/'nairapips-static-trailing-dd-update.zip',mimetype='application/zip',as_attachment=True,
