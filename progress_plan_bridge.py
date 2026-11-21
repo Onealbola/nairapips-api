@@ -38,8 +38,8 @@ def readiness(plan, package):
     # The existing deployed risk collector and settlement policy enforce these
     # terms. Other selectable draft terms must not be sold without enforcement.
     from equity_drawdown import runtime_ready
-    if package.get('drawdown_type','STATIC') == 'TRAILING' and not runtime_ready():
-        return False, 'Equity Trailing requires the updated broker-side DD worker before purchases can open'
+    if package.get('drawdown_type','STATIC') == 'TRAILING' and not __import__('balance_trailing').runtime_ready():
+        return False, 'Balance-based percentage trailing requires the updated broker-side DD worker before purchases can open'
     from plan_risk_controls import selected_terms, daily_runtime_ready
     if float(selected_terms(package)['daily_drawdown']) > 0 and not daily_runtime_ready():
         return False, 'Daily drawdown requires all four updated DD shards to be reporting'
@@ -98,6 +98,7 @@ def commercial_plan(plan):
     fee=float(plan['fee'])
     from plan_risk_controls import frozen_terms
     frozen = frozen_terms(plan) or {}
+    plan=__import__('balance_trailing').future_plan(plan)
     return dict(plan, withdrawal_rules=__import__('withdrawal_controls').read(plan), reset_stage_prices=frozen.get('resets',{}), managed_progress=True, offer_version=offer_version(plan), base_fee=fee, fee=fee,
         payout_cycles=0, payout_cycle_extra=0,
         cycle_options=[dict(cycles=0,available=True,extra=0,fee=fee)],default_cycles=0)

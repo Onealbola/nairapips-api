@@ -97,6 +97,8 @@ def priced_plan(plan, prices, category='standard', included=None):
 
 def purchase_plan(plan, prices, cycles=DEFAULT_CYCLES):
     """Price a buyer's selection without changing the saved product or past sales."""
+    from balance_trailing import future_plan
+    plan=future_plan(plan,require_ready=True)
     from withdrawal_controls import needs_broker_update,ready
     if needs_broker_update(plan) and not ready():
         raise ValueError('Custom profit caps require the verified Operations engine update')

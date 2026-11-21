@@ -3690,6 +3690,8 @@ def _assign_mt5_to_trader(trader, mt5, stage, purchase=None, staff=None, note="M
     from equity_drawdown import mode, runtime_ready
     _risk_mode = mode((purchase or {}).get("drawdown_type") if purchase_id else (plan or {}).get("drawdown_type"))
     if _risk_mode == "TRAILING":
+        if __import__("balance_trailing").uses_balance_percent(purchase or plan) and not __import__("balance_trailing").runtime_ready():
+            raise ValueError("Purchased balance-based trailing requires the verified monitoring update")
         if not runtime_ready():
             raise ValueError("Trailing account assignment requires the verified broker DD worker update")
         journey_source = "equity_trailing_v1:" + journey_source
@@ -10036,7 +10038,7 @@ def _np_plan_category_v156(value):
 def _np_plan_rule_snapshot_v156(plan):
     from plan_cycles import cycle_limit
     from plan_commercial import reset_price
-    plan = plan or {}
+    plan = __import__("balance_trailing").future_plan(plan or {}, require_ready=True)
     snapshot = {
         "product_category": _np_plan_category_v156(plan.get("product_category")),
         "drawdown_type": __import__("equity_drawdown").mode(plan.get("drawdown_type")),
@@ -14679,7 +14681,7 @@ def _apply_monitoring_snapshot(trader, payload, source="manual"):
             _observed = payload.get("timestamp") or payload.get("observed_at")
             _equity = payload.get("current_equity") if payload.get("current_equity") is not None else payload.get("equity")
             _trailing_state = DrawdownStateStore(requests, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY).assess(
-                active_account, _risk_purchase, _equity, _observed, peak_equity=payload.get("trailing_highest_equity"), balance=payload.get("current_balance", payload.get("balance")), daily_realised=payload.get("daily_realised"))
+                active_account, _risk_purchase, _equity, _observed, peak_equity=payload.get("trailing_highest_equity"), balance=payload.get("current_balance", payload.get("balance")), daily_realised=payload.get("daily_realised"), peak_balance=payload.get("trailing_highest_balance"))
             if _trailing_state["last_observed_at"] != __import__("equity_drawdown").timestamp(_observed).isoformat():
                 return {"ignored": True, "reason": "out_of_order_trailing_observation"}
     account_start = _num(active_account.get("start_balance"), _num(active_account.get("account_size"), 0)) if active_account else 0
@@ -58782,6 +58784,7 @@ def _np_v198_overlay_latest(row, trader_id="", batch_observations=None):
         try:
             state = read_saved_state(requests, os.environ["SUPABASE_URL"], os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ["SUPABASE_KEY"], out, None)
             out.update(highest_equity=float(state["highest_equity"]), breach_equity_level=float(state["drawdown_floor"]),
+                trailing_formula=state.get("trailing_formula") or (__import__("balance_trailing").FORMULA if __import__("balance_trailing").uses_balance_percent(out) else None), highest_closed_balance=float(state["highest_balance"]) if state.get("highest_balance") is not None else None,
                 worst_dd_used_percent=float(state["worst_used_percent"]), trailing_state_available=True)
         except Exception:
             out["trailing_state_available"] = False
@@ -60316,7 +60319,7 @@ def np_drawdown_version_v233():
         return response
     from equity_drawdown import RELEASE, runtime_ready
     import os
-    return jsonify(success=True, release=RELEASE, modes=["STATIC", "TRAILING"], trailing_basis="highest_equity", trailing_sales_ready=runtime_ready(), issued_accounts_unchanged=True,
+    return jsonify(success=True, release=RELEASE, modes=["STATIC", "TRAILING"], trailing_basis="highest_equity", future_trailing_formula=__import__("balance_trailing").FORMULA, future_trailing_basis="highest_closed_balance", balance_trailing_sales_ready=__import__("balance_trailing").runtime_ready(), trailing_sales_ready=runtime_ready(), issued_accounts_unchanged=True,
         collector_auth_configured=bool(os.environ.get("NP_EQUITY_TRAILING_INGEST_KEY") or os.environ.get("NP_LIVE_STATE_INGEST_KEY")),
         runtime_verification_configured=os.environ.get("NP_EQUITY_TRAILING_VERIFIED")==RELEASE,
         plan_controls_release=__import__("plan_risk_controls").RELEASE,

@@ -66,7 +66,7 @@ def validated_plan(current, changes):
     from equity_drawdown import mode, runtime_ready
     if 'drawdown_type' in result:
         result['drawdown_type'] = mode(result['drawdown_type'])
-    if mode(row.get('drawdown_type')) == 'TRAILING' and row.get('status') == 'active' and not runtime_ready():
+    if mode(row.get('drawdown_type')) == 'TRAILING' and row.get('status') == 'active' and not __import__('balance_trailing').runtime_ready():
         raise ValueError('Save Trailing as an inactive plan until the broker DD worker update is verified')
     if 'status' in changes and changes['status'] not in ('active', 'inactive'):
         raise ValueError('Plan status must be active or inactive')

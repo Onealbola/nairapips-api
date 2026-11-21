@@ -135,7 +135,7 @@ def refresh_lifecycle(accounts, transport, url, key, *, fresh_rows=None):
                     from equity_drawdown import account_mode, mode
                     from decimal import Decimal
                     daily_missing=Decimal((purchased or {}).get('daily_drawdown',0))!=Decimal((assigned or {}).get('daily_drawdown',0))
-                    trading_missing=daily_missing or account_mode(source_row)!=mode(purchase.get('drawdown_type'))
+                    trading_missing=daily_missing or account_mode(source_row)!=mode(purchase.get('drawdown_type')) or (purchased or {}).get('trailing_formula')!=(assigned or {}).get('trailing_formula')
                     if ('max_drawdown' in purchase and purchase.get('max_drawdown') is None
                             and str(row.get('account_status') or '').lower() in ('assigned_active','profit_protected')):
                         trading_missing=True

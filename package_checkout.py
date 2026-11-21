@@ -35,7 +35,11 @@ class PackageOrderStore:
             return r.ok and isinstance(result,dict) and result.get('schema_version')=='NP_PACKAGE_SCHEMA_1' and result.get('ready') is True
         except Exception:return False
     def create_quote(self,trader_id,config,selection):
-        priced=quote(config,selection);contract=make_contract(priced,trader_id)
+        priced=quote(config,selection)
+        from balance_trailing import FORMULA,runtime_ready
+        if priced['selection']['drawdown_type']=='trailing' and not runtime_ready():
+            raise PackageOrderRejected('Balance-based trailing is awaiting the verified monitoring update')
+        contract=make_contract(priced,trader_id,trailing_formula=FORMULA)
         now=datetime.now(timezone.utc)
         row=dict(id=str(uuid4()),trader_id=trader_id,catalog_revision=config['revision'],
                  document=contract['document'],rules_hash=contract['rules_hash'],price=priced['total'],
@@ -62,8 +66,12 @@ class PackageOrderStore:
         validate_contract(saved['document'],saved['rules_hash'])
         if saved['document']['trader_id']!=trader_id or saved['rules_hash']!=body['accepted_rules_hash']:
             raise PackageOrderRejected('The accepted contract does not match this quote')
-        if saved.get('consumed_purchase_id') is None and allow_new is not None:
-            allow_new()
+        if saved.get('consumed_purchase_id') is None:
+            from balance_trailing import FORMULA,runtime_ready
+            for rule in saved['document']['stage_rules'].values():
+                if rule['drawdown_type']=='trailing' and (rule['trailing_formula']!=FORMULA or not runtime_ready()):
+                    raise PackageOrderRejected('Refresh the trailing quote after monitoring verification')
+            if allow_new is not None:allow_new()
         payload=dict(p_trader_id=trader_id,p_quote_id=qid,p_checkout_key=key,p_payment_proof=proof)
         try:
             r=self.transport.post(self.base+'rpc/np_package_checkout',headers=self.headers,json=payload,timeout=(2,7))

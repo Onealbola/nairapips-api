@@ -21,6 +21,14 @@ class AnalysisTests(unittest.TestCase):
   if table=='monitoring_events':return copy.deepcopy(self.events)
   if table=='monitoring_snapshots':return copy.deepcopy(self.snapshots)
   raise AssertionError(table)
+ def test_new_closed_balance_formula_explanation_never_claims_floating_profits_raise_floor(self):
+  from balance_trailing import future_plan
+  self.a=future_plan(self.a);self.p=future_plan(self.p)
+  rules=spec(self.a,self.p)
+  self.state=evaluate(rules,initial(rules),2650000,'2026-11-13T16:12:57.171769+00:00',balance=2700000,peak_balance=3000000)
+  text=render(evidence(self.read,self.a),'Trader')[2]
+  for value in ['Highest closed balance','₦3,000,000.00','₦300,000.00','₦2,700,000.00','Floating profits do not raise']:self.assertIn(value,text)
+  self.assertNotIn('Floating profits raise',text)
  def test_exact_requested_trailing_breakdown_and_timing(self):
   c=evidence(self.read,self.a);subject,content,text=render(c,'Solomon')
   self.assertIn('486193843',subject)

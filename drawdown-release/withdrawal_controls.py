@@ -93,6 +93,8 @@ def needs_broker_update(row):return cap_percent(row)!=Decimal(15)
 def validate_request(row,amount,quote=None,require_verified=False):
     terms=read(row)
     if not terms:return
+    if terms['minimum_profit_enabled'] and not (quote or {}).get('verified'):
+        raise ValueError('Your profit target must be verified against a fresh account update before payout')
     amount=number(amount)
     if terms['minimum_withdrawal_enabled'] and amount<Decimal(terms['minimum_withdrawal']):
         raise ValueError('Minimum withdrawal for this plan is ₦'+format(Decimal(terms['minimum_withdrawal']),',.2f'))

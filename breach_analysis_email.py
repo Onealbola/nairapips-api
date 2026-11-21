@@ -48,9 +48,9 @@ def evidence(read,account):
         if not state.get('breached') or state.get('rules_hash')!=fingerprint(rules):raise ValueError('Exact terminal risk journal is not verified')
         prior=initial(rules);prior['highest_equity']=state['highest_equity']
         realised=state.get('daily_realised')
-        replay=evaluate(rules,prior,decimal(first['equity']),first['observed_at'],balance=decimal(first['balance']),daily_realised=realised)
+        replay=evaluate(rules,prior,decimal(first['equity']),first['observed_at'],balance=decimal(first['balance']),daily_realised=realised,peak_balance=state.get('highest_balance'))
         if not replay['breached'] or decimal(replay['drawdown_floor'])!=decimal(first['floor']):raise ValueError('Saved breach does not replay under purchased rules')
-        observed=first['observed_at'];peak=state['highest_equity']
+        observed=first['observed_at'];peak=state.get('highest_balance') if rules.get('trailing_formula')=='highest_closed_balance_percent' else state['highest_equity']
         # Refuse the known false-daily-input defect rather than emailing a false
         # accusation. Saved trade replays are deduplicated by broker ticket.
         if decimal(rules.get('daily_drawdown',0))>0 and (decimal(first['equity']) if rules['drawdown_type']=='TRAILING' else min(decimal(first['equity']),decimal(first['balance'])))>decimal(replay['overall_floor']) and stamp(observed).astimezone(WAT).date()==stamp(a['created_at']).astimezone(WAT).date():
@@ -73,14 +73,15 @@ def evidence(read,account):
         first=dict(balance=str(event['balance']),equity=str(event['equity']),floor=str(floor))
         observed=None;peak=None;replay={}
     equity=decimal(first['equity']);balance=decimal(first['balance']);floor=decimal(first['floor'])
-    overall_floor=decimal(replay.get('overall_floor',decimal(peak)-decimal(rules['capital'])*decimal(rules['limit'])/100 if rules['drawdown_type']=='TRAILING' else decimal(rules['capital'])*(1-decimal(rules['limit'])/100)))
+    balance_trailing=rules.get('trailing_formula')=='highest_closed_balance_percent'
+    overall_floor=decimal(replay.get('overall_floor',decimal(peak)-(decimal(peak) if balance_trailing else decimal(rules['capital']))*decimal(rules['limit'])/100 if rules['drawdown_type']=='TRAILING' else decimal(rules['capital'])*(1-decimal(rules['limit'])/100)))
     daily_cross=bool(replay.get('daily_floor') is not None and equity<=decimal(replay['daily_floor']))
     overall_cross=(equity if rules['drawdown_type']=='TRAILING' else min(equity,balance))<=overall_floor
     kind='daily' if daily_cross and not overall_cross else 'trailing' if rules['drawdown_type']=='TRAILING' else 'maximum'
     if kind!='daily':floor=overall_floor
     percent=rules.get('daily_drawdown') if kind=='daily' else rules['limit']
-    allowance=decimal(rules['capital'])*decimal(percent)/100
-    values=[('Recorded highest equity',money(peak))] if kind=='trailing' else []
+    allowance=(decimal(peak) if balance_trailing and kind=='trailing' else decimal(rules['capital']))*decimal(percent)/100
+    values=[('Highest closed balance' if balance_trailing else 'Recorded highest equity',money(peak))] if kind=='trailing' else []
     if kind=='daily':values.append(('Net realised trading P&L for the day',money(replay['daily_realised'])))
     values.extend([('Allowed fall from that peak' if kind=='trailing' else 'Daily loss allowance' if kind=='daily' else 'Maximum loss allowance',money(allowance)),
         ('Trailing breach line' if kind=='trailing' else 'Daily breach line' if kind=='daily' else 'Maximum drawdown breach line',money(floor)),
@@ -107,7 +108,7 @@ def evidence(read,account):
         delta=(stamp(recorded)-stamp(observed)).total_seconds()
         if delta < -5:raise ValueError('Breach timestamps conflict')
         if delta>=0:delay=round(delta,1)
-    return dict(account_id=a['id'],purchase_id=p['id'],trader_id=a['trader_id'],login=a['mt5_login'],kind=kind,percent=str(percent),capital=money(rules['capital']),rows=values,
+    return dict(account_id=a['id'],purchase_id=p['id'],trader_id=a['trader_id'],login=a['mt5_login'],kind=kind,trailing_formula=rules.get('trailing_formula'),percent=str(percent),capital=money(rules['capital']),rows=values,
         observed_at=observed,recorded_at=recorded,recording_delay_seconds=delay,below_line=money(floor-(equity if kind in ('trailing','daily') else min(equity,balance))),settled_below_line=money(floor-settled) if settled is not None and settled<=floor else None,rules_hash=fingerprint(rules),release=RELEASE)
 
 def render(context,name):
@@ -118,6 +119,8 @@ def render(context,name):
     explanation=('Floating profits raise the trailing line. This explains why an account can breach while its final loss from the original deposit looks relatively small. The allowed fall is a fixed percentage of the starting account size, and the line never moves down.' if kind=='trailing' else
         'The daily limit includes realised trading P&L and floating P&L for the Nigerian trading day. A confirmed daily breach permanently ends this account.' if kind=='daily' else
         'This maximum drawdown limit is measured from the starting account size. Touching or falling below the breach line ends this account.')
+    if kind=='trailing' and c.get('trailing_formula')=='highest_closed_balance_percent':
+        explanation='Only the highest closed balance raises this trailing line. Floating profits do not raise it. The allowance is the purchased percentage of that highest closed balance, and the line never moves down. Live equity touching or falling below it breaches the account.'
     explanation+=' The recorded risk value was '+c['below_line']+' below the breach line.'
     if c.get('settled_below_line'):explanation+=' The verified balance after closing was also '+c['settled_below_line']+' below that line.'
     def display(t):return stamp(t).astimezone(timezone.utc).strftime('%d %B %Y at %H:%M:%S UTC')

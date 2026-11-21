@@ -51,7 +51,7 @@ class SnapshotConsistencyTests(unittest.TestCase):
   before=SimpleNamespace(balance=5000000,equity=4850000)
   after=SimpleNamespace(login=123,server='Trial9',balance=4850000,equity=4850000,profit=0,credit=0)
   journal=Mock();terminal=Mock();terminal.account_info.return_value=after;terminal.terminal_info.return_value=SimpleNamespace(connected=True)
-  ns=dict(_package_dd_journal=None,_equity_dd_journal=journal,_daily_probe_ready=True,norm=lambda v:str(v or '').strip(),os=__import__('os'),LIVE_STATE_KEY='configured',log=Mock(),dd_rule=lambda row:(True,20,'test'),first_attempted=set(),last_attempted_at={},time=SimpleNamespace(monotonic=lambda:1000),authenticate=lambda row:{'info':before},verified=set(),last_ok={},starting_capital=lambda *args:5000000,invalid_live_capital={},position_evidence=lambda:[],now_iso=lambda:'2026-11-12T16:00:00+00:00',mt5=terminal,AUTH_RETRY_SECONDS=2)
+  ns=dict(_package_dd_journal=None,_equity_dd_journal=journal,_daily_probe_ready=True,_balance_probe_ready=True,norm=lambda v:str(v or '').strip(),os=__import__('os'),LIVE_STATE_KEY='configured',log=Mock(),dd_rule=lambda row:(True,20,'test'),first_attempted=set(),last_attempted_at={},time=SimpleNamespace(monotonic=lambda:1000),authenticate=lambda row:{'info':before},verified=set(),last_ok={},starting_capital=lambda *args:5000000,invalid_live_capital={},position_evidence=lambda:[],now_iso=lambda:'2026-11-12T16:00:00+00:00',mt5=terminal,AUTH_RETRY_SECONDS=2)
   exec(compile(ast.Module(body=[fn],type_ignores=[]),'<worker-inspect>','exec'),ns)
   with patch('plan_risk_controls.daily_percent',return_value=Decimal(5)),patch('plan_risk_controls.broker_daily_realised',return_value=Decimal(-150000)):
    result=ns['inspect']({'mt5_login':'123','mt5_server':'Trial9'})
@@ -61,8 +61,11 @@ class SessionDeliveryTests(unittest.TestCase):
  def test_exact_worker_patch_is_backed_up_and_idempotent(self):
   import importlib.util,tempfile
   spec=importlib.util.spec_from_file_location('session_patch',ROOT/'dd-session-history-release/patch_session.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
-  fixed=(ROOT/'drawdown-release/DD_POLICE_STATIC_TRAILING_V1_20261107.py').read_text();p=m.PARTS
+  current=(ROOT/'drawdown-release/DD_POLICE_STATIC_TRAILING_V1_20261107.py').read_text();p=m.PARTS
+  # Historical patch targets its reviewed daily-only worker, never a newer risk release.
+  with self.assertRaises(ValueError):m.patched(current)
   coverage='    # '+m.MARKER+': coverage follows usable rule evidence.\n'+p['old_verified']+p['old_coverage']+p['anchor']
+  fixed=p['new_auth']+'\ndef inspect(row):\n    info=a["info"]\n    if daily_enabled or not _daily_probe_ready:\n        try:\n            pass\n        except Exception as exc:\n'+p['new_daily']+'        pass\n'+coverage+'    return None\n'
   original=fixed.replace(p['new_auth'],p['old_auth']).replace(coverage,p['anchor']).replace('    info=a["info"]\n',p['old_verified']+'    info=a["info"]\n').replace('    if daily_enabled or not _daily_probe_ready:\n',p['old_coverage']+'    if daily_enabled or not _daily_probe_ready:\n').replace(p['new_daily'],p['old_daily'])
   self.assertEqual(m.patched(original),fixed)
   with tempfile.TemporaryDirectory() as d:

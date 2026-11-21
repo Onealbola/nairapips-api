@@ -33,7 +33,7 @@ def account_lock(path):
 
 class PackageDDJournal:
     def __init__(self,directory):self.directory=Path(directory)
-    def assess(self,row,balance,equity,observed_at):
+    def assess(self,row,balance,equity,observed_at,peak_balance=None):
         try:
             rule=bind_package_account(row,row['package_contract'])
             capital=dec(rule['capital']);balance=dec(balance);equity=dec(equity);now=timestamp(observed_at)
@@ -57,15 +57,21 @@ class PackageDDJournal:
                     high=capital
                     state=dict(account_id=rule['account_id'],contract_id=rule['package_contract_id'],rules_hash=rule['package_rules_hash'],mt5_login=str(row['mt5_login']),highest_equity=money(high),breached=False,first_breach=None)
                 high=high if state["breached"] else max(high,equity)
-                allowance=capital*dec(rule['dd_limit_percent'])/100
+                balance_trailing=rule.get('trailing_formula')=='highest_closed_balance_percent'
                 reference=high if rule['drawdown_type']=='trailing' else capital
+                previous_balance=state.get('highest_balance')
+                if balance_trailing:
+                    if peak_balance is None:raise ValueError('Verified closed balance is required')
+                    reference=max(capital,dec(previous_balance or capital),dec(peak_balance))
+                    state['highest_balance']=money(reference)
+                allowance=(reference if balance_trailing else capital)*dec(rule['dd_limit_percent'])/100
                 floor=reference-allowance
                 new_breach=not state['breached'] and equity<=floor
                 breached=state['breached'] or new_breach
-                dd=max((reference-equity)/capital*100,dec(0))
+                dd=max((reference-equity)/(reference if balance_trailing else capital)*100,dec(0))
                 if breached and state['first_breach'] is None:
                     state['first_breach']={'timestamp':now.isoformat(),'balance':money(balance),'equity':money(equity),'breach_equity_level':money(floor),'drawdown_percent':float(dd),'dd_used_percent':float(dd/dec(rule['dd_limit_percent'])*100)}
-                changed=not file.exists() or dec(state['highest_equity'])!=high or breached!=state['breached']
+                changed=not file.exists() or dec(state['highest_equity'])!=high or breached!=state['breached'] or (balance_trailing and previous_balance!=money(reference))
                 state.update(highest_equity=money(high),breached=breached)
                 if changed:
                     temporary=self.directory/(rule['account_id']+'.'+str(uuid4())+'.tmp')
@@ -75,7 +81,7 @@ class PackageDDJournal:
                         os.replace(temporary,file)
                     finally:
                         if temporary.exists():temporary.unlink()
-                dd=max((reference-equity)/capital*100,dec(0))
+                dd=max((reference-equity)/(reference if balance_trailing else capital)*100,dec(0))
                 return dict(capital=float(capital),limit=rule['dd_limit_percent'],drawdown_type=rule['drawdown_type'],highest_equity=float(high),breach_equity_level=float(floor),drawdown_percent=float(dd),used_percent=float(dd/dec(rule['dd_limit_percent'])*100),breached=breached,new_breach=new_breach,first_breach=state['first_breach'])
         except Exception as exc:
             raise PackageDDUnavailable('Exact package DD state is unavailable; no guessed or reset watermark is permitted') from exc

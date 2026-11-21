@@ -49,7 +49,7 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(product['plan']['drawdown_type'],'TRAILING')
             self.assertFalse(product['purchases_open'])
             self.assertEqual(self.save({identity:{'purchases_open':True}}).status_code,409)
-        with patch.dict('os.environ',{'NP_EQUITY_TRAILING_VERIFIED':RELEASE,'NP_EQUITY_TRAILING_INGEST_KEY':'fixture-only'}):
+        with patch('balance_trailing.runtime_ready',return_value=True):
             self.assertTrue(self.catalog.products()[identity]['checkout_supported'])
             self.assertFalse(next(p for p in self.load().json['products'] if p['id']==identity)['purchases_open'])
         self.assertEqual(self.db.rows['challenge_purchases'],[])

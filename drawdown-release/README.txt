@@ -1,11 +1,14 @@
-NAIRAPIPS STATIC / TRAILING / OPTIONAL DAILY LIMITS — 8 NOVEMBER 2026
+NAIRAPIPS STATIC / TRAILING / OPTIONAL DAILY LIMITS — 21 NOVEMBER 2026
 
 THIS IS A WINDOWS VPS UPDATE, NOT A CPANEL UPDATE.
 No plan, sales checkbox, account terms or reset price is activated by installation.
 
 Static: starting capital minus the fixed naira loss allowance.
-Trailing: highest observed equity minus that same fixed naira allowance.
-Floating profit counts. The trailing floor never falls after a withdrawal/loss.
+New trailing purchases: highest verified CLOSED balance x (1 - DD percent / 100).
+Floating profit never raises the floor. Realised trading growth (net of fees)
+raises the reference; later losses or withdrawals never lower it. Cash deposits
+do not count as trading growth. Live equity touching the floor still breaches.
+Existing trailing purchases retain their original equity/fixed-allowance rule.
 Optional daily limits use today's broker trading net (fees included) plus current
 floating P/L, against starting capital. Deposits/withdrawals are excluded.
 The trading day changes at Nigeria midnight (UTC+1). A breach remains latched.
@@ -23,10 +26,10 @@ never silently reconstructed or cleared.
    not start another supervisor or delete latch, journal, relay or state files.
    The backup directory is printed. No automatic rollback erases stored state.
 5. Verify all four fresh health files report:
-   NAIRAPIPS_DD_POLICE_STATIC_TRAILING_DAILY_V1_20261108
-   and daily_history_probe_ready=true.
+   NAIRAPIPS_DD_POLICE_BALANCE_PERCENT_V1_20261121
+   and daily_history_probe_ready=true and closed_balance_history_probe_ready=true.
    The APIs require all four authenticated shard capability signals before new
-   daily-limit purchases are allowed. Successful installation is recorded as a
+   new balance-based trailing purchases are allowed. Successful installation is recorded as a
    technical capability; per-plan owner checkboxes still decide what sells.
 
 The existing matching ingest keys remain required on the VPS and APIs. Do not

@@ -75,6 +75,10 @@ def freeze(source, terms):
         raise ValueError('Invalid payout schedule')
     if terms.get('resets'):
         payload['resets'] = terms['resets']
+    if terms.get('trailing_formula') is not None:
+        from balance_trailing import FORMULA
+        if terms['trailing_formula']!=FORMULA:raise ValueError('Unsupported frozen trailing formula')
+        payload['trailing_formula']=FORMULA
     encoded = base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).decode().rstrip('=')
     return str(source or '') + MARKER + encoded
 
@@ -86,8 +90,9 @@ def frozen_terms(row):
     try:
         encoded = source.rsplit(MARKER, 1)[1]
         result = json.loads(base64.urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
-        if not {'daily_drawdown', 'payout_frequency'} <= set(result) or set(result)-{'daily_drawdown','payout_frequency','resets'}:
+        if not {'daily_drawdown', 'payout_frequency'} <= set(result) or set(result)-{'daily_drawdown','payout_frequency','resets','trailing_formula'}:
             raise ValueError()
+        if 'trailing_formula' in result and result['trailing_formula']!=__import__('balance_trailing').FORMULA:raise ValueError()
         percentage(result['daily_drawdown'])
         if result['payout_frequency'] not in FREQUENCIES:
             raise ValueError()
@@ -110,6 +115,27 @@ def inherit(source, row):
     terms = frozen_terms(row)
     source = __import__('withdrawal_controls').inherit(source,row)
     return freeze(source, terms) if terms else source
+
+
+def assert_assignment_snapshot(account, purchase):
+    """Refuse a new assignment that would drop its exact purchased controls.
+
+    This validates the proposed insert only; it never edits existing accounts or
+    reconstructs missing broker history from current values.
+    """
+    if not purchase or not purchase.get('id'):
+        return
+    if (str(account.get('purchase_id') or '') != str(purchase['id'])
+            or str(account.get('trader_id') or '') != str(purchase.get('trader_id') or '')):
+        raise ValueError('Assignment risk snapshot belongs to another purchase or owner')
+    if frozen_terms(account) != frozen_terms(purchase):
+        raise ValueError('Assignment stopped: purchased daily, payout or reset rules were not preserved')
+    from withdrawal_controls import read as withdrawal_terms
+    if withdrawal_terms(account) != withdrawal_terms(purchase):
+        raise ValueError('Assignment stopped: purchased withdrawal rules were not preserved')
+    from equity_drawdown import account_mode, mode
+    if account_mode(account) != mode(purchase.get('drawdown_type')):
+        raise ValueError('Assignment stopped: purchased drawdown mode was not preserved')
 
 
 def plan_controls_view(row):
@@ -266,6 +292,8 @@ def daily_runtime_ready():
             params={'select': 'source', 'observed_at': 'gte.' + cutoff, 'limit': '1000'}, timeout=(2, 3))
         response.raise_for_status()
         sources = {row.get('source') for row in response.json()}
+        from balance_trailing import SOURCE_PREFIX
+        sources={str(s).replace(SOURCE_PREFIX,'dd_police_daily_v1_shard_') if str(s).startswith(SOURCE_PREFIX) else s for s in sources}
         expected = {'dd_police_daily_v1_shard_%d_of_4' % n for n in range(1,5)}
         rollback = any(str(source).startswith('dd_police') and source not in expected for source in sources)
         if not confirmed and expected <= sources:
@@ -301,7 +329,7 @@ def daily_breach_proof(account, data, now=None):
         raise ValueError('Account did not purchase daily drawdown')
     state = evaluate(rules, initial(rules), data.get('current_equity',data.get('equity')),
         observed.isoformat(), balance=data.get('current_balance',data.get('balance')),
-        daily_realised=data.get('daily_realised'), peak_equity=data.get('trailing_highest_equity'))
+        daily_realised=data.get('daily_realised'), peak_equity=data.get('trailing_highest_equity'), peak_balance=data.get('trailing_highest_balance'))
     if not state['breached']:
         raise ValueError('Broker evidence does not cross the purchased loss floor')
     return state

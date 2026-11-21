@@ -93,9 +93,9 @@ class SharedCatalog:
             identity='plan:'+str(p['id']);category='premium' if str(p.get('product_category') or '').lower()=='premium' else 'standard'
             result[identity]=dict(id=identity,family=category,name=str(p.get('name') or 'Challenge'),
                 visible=str(p.get('status') or '').lower()=='active',
-                checkout_supported=((not __import__('withdrawal_controls').needs_broker_update(p) or __import__('withdrawal_controls').ready()) and (str(p.get('drawdown_type') or 'STATIC').upper()!='TRAILING' or __import__('equity_drawdown').runtime_ready()) and (__import__('plan_risk_controls').daily_percent(p)<=0 or __import__('plan_risk_controls').daily_runtime_ready())),
-                release_reason=('Custom or disabled profit caps require the verified Operations engine update' if __import__('withdrawal_controls').needs_broker_update(p) and not __import__('withdrawal_controls').ready() else 'Daily drawdown requires four updated DD shards reporting' if __import__('plan_risk_controls').daily_percent(p)>0 and not __import__('plan_risk_controls').daily_runtime_ready() else 'Equity Trailing requires the updated broker-side DD worker before purchases can open' if str(p.get('drawdown_type') or 'STATIC').upper()=='TRAILING' else ''),
-                plan_id=str(p['id']),plan={**{k:p.get(k) for k in PLAN_FIELDS},'reset_stage_prices':(__import__('plan_risk_controls').frozen_terms(p) or {}).get('resets',{}),'withdrawal_rules':__import__('withdrawal_controls').read(p)})
+                checkout_supported=((not __import__('withdrawal_controls').needs_broker_update(p) or __import__('withdrawal_controls').ready()) and (str(p.get('drawdown_type') or 'STATIC').upper()!='TRAILING' or __import__('balance_trailing').runtime_ready()) and (__import__('plan_risk_controls').daily_percent(p)<=0 or __import__('plan_risk_controls').daily_runtime_ready())),
+                release_reason=('Custom or disabled profit caps require the verified Operations engine update' if __import__('withdrawal_controls').needs_broker_update(p) and not __import__('withdrawal_controls').ready() else 'Daily drawdown requires four updated DD shards reporting' if __import__('plan_risk_controls').daily_percent(p)>0 and not __import__('plan_risk_controls').daily_runtime_ready() else 'Balance-based percentage trailing is awaiting the verified monitoring update' if str(p.get('drawdown_type') or 'STATIC').upper()=='TRAILING' else ''),
+                plan_id=str(p['id']),plan={**{k:p.get(k) for k in PLAN_FIELDS},'trailing_formula':__import__('balance_trailing').FORMULA if str(p.get('drawdown_type') or '').upper()=='TRAILING' else None,'reset_stage_prices':(__import__('plan_risk_controls').frozen_terms(p) or {}).get('resets',{}),'withdrawal_rules':__import__('withdrawal_controls').read(p)})
         matrix,_=self.matrix.read(fresh=fresh)
         for p in matrix['config']['plans']:
             for x in p['packages']:
@@ -109,7 +109,7 @@ class SharedCatalog:
                     proposal=True,package=dict(name=x['name'],allocation_name=p['name'],capital=p['capital'],
                         price=x['price'],drawdown=x['drawdown'],profit_share=x['profit_share'],profit_cap=x['profit_cap'],
                         phase1_target=x['phase1_target'],phase2_target=x['phase2_target'],daily_drawdown=x['daily_drawdown'],
-                        payout_mode=x['payout_mode'],drawdown_type=x.get('drawdown_type','STATIC')),_plan=p,_package=x)
+                        payout_mode=x['payout_mode'],drawdown_type=x.get('drawdown_type','STATIC'),trailing_formula=__import__('balance_trailing').FORMULA if x.get('drawdown_type')=='TRAILING' else None),_plan=p,_package=x)
         if self.custom is not None:
             config,_=self.custom.read(fresh=fresh)
             try:ready=bool(config.get('enabled') and self.custom.readiness and self.custom.readiness().get('ready'))
