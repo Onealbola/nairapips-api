@@ -649,7 +649,9 @@ def authenticate(row, master_only=False):
         if pm and pm not in [x[1] for x in candidates]: candidates.append(("pool-master-fallback",pm))
     # NP_VERIFIED_HISTORY_SESSION_20261112: a cached login is not a live session.
     from plan_risk_controls import daily_percent, broker_daily_realised
-    require_history=not master_only and daily_percent(row)>0
+    from balance_trailing import uses_balance_percent,broker_balance_peak,FORMULA
+    balance_history=uses_balance_percent(row) or (row.get('drawdown_rules') or {}).get('trailing_formula')==FORMULA or (row.get('package_contract') or {}).get('document',{}).get('stage_rules',{}).get(str(row.get('stage') or row.get('phase')),{}).get('trailing_formula')==FORMULA
+    require_history=not master_only and (daily_percent(row)>0 or balance_history)
     def live_session():
         terminal=mt5.terminal_info();account=mt5.account_info()
         if (terminal is None or not getattr(terminal,'connected',False)
@@ -689,6 +691,7 @@ def authenticate(row, master_only=False):
             for attempt in range(3):
                 try:
                     realised=broker_daily_realised(mt5,row,now_iso())
+                    if balance_history:broker_balance_peak(mt5,row,now_iso())
                     history_ok=True;break
                 except Exception as exc:
                     if attempt<2:time.sleep(.2)

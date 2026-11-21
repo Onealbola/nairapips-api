@@ -16,6 +16,11 @@ class SessionTests(unittest.TestCase):
   with patch('plan_risk_controls.daily_percent',return_value=Decimal(5)),patch('plan_risk_controls.broker_daily_realised',side_effect=[ValueError('empty'),ValueError('empty'),ValueError('empty'),Decimal('-107795.68')]):
    result=self.call()
   self.assertEqual(result['source'],'row-master-fallback');self.assertEqual([c.kwargs['password'] for c in self.mt5.login.call_args_list],['investor','master'])
+ def test_balance_trailing_without_daily_limit_tries_master_when_investor_cannot_prove_peak(self):
+  from balance_trailing import FORMULA
+  with patch('plan_risk_controls.daily_percent',return_value=Decimal(0)),patch('plan_risk_controls.broker_daily_realised',return_value=Decimal(0)),patch('balance_trailing.broker_balance_peak',side_effect=[ValueError('empty'),ValueError('empty'),ValueError('empty'),Decimal(5000000)]):
+   result=self.ns['authenticate']({'mt5_login':'123','mt5_server':'Trial9','drawdown_rules':{'trailing_formula':FORMULA}})
+  self.assertEqual(result['source'],'row-master-fallback');self.assertEqual(self.mt5.login.call_count,2)
  def test_history_can_finish_loading_without_password_switch(self):
   with patch('plan_risk_controls.daily_percent',return_value=Decimal(5)),patch('plan_risk_controls.broker_daily_realised',side_effect=[ValueError('empty'),Decimal(0)]):result=self.call()
   self.assertEqual(result['source'],'row-investor');self.mt5.login.assert_called_once()
