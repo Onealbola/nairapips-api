@@ -143,7 +143,7 @@ def install(app,ns,store=None):
     def require():
         try:staff=current()
         except StaffUnavailable:return None,fail('Staff access verification is temporarily unavailable.',503)
-        return (staff,None) if staff else (None,fail('Your staff session is inactive. Please sign in again.',401))
+        return (staff,None) if staff else (None,fail('Admin authentication is required: your staff session is inactive. Please sign in again.',401))
     ns['_require_admin']=require
     # Other existing admin helpers must also see the current role/status, not the token's old role.
     def fresh_auth():
@@ -156,7 +156,7 @@ def install(app,ns,store=None):
         token=raw_auth()
         if not token:
             if request.method in ('GET','HEAD') and (request.path in {'/challenge_plans','/announcements','/referral_settings'} or (request.path in {'/trader_accounts','/payouts','/trader_trades'} and request.args.get('trader_id'))):return None
-            if request.path in ADMIN_LEGACY or (request.path.startswith('/admin/') and not request.path.endswith('.html') and request.path not in {'/admin/np_unified_mt5_sync'}):return fail('Administrator sign-in is required.',401)
+            if request.path in ADMIN_LEGACY or (request.path.startswith('/admin/') and not request.path.endswith('.html') and request.path not in {'/admin/np_unified_mt5_sync'}):return fail('Admin authentication is required. Please sign in again.',401)
             return None
         staff,error=require()
         if error is not None:return error

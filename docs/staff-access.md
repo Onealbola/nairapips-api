@@ -39,3 +39,11 @@ standalone admin page. Existing cPanel pages require installing the archive once
 
 Validation uses isolated Flask fixtures and real Chromium fixtures (including
 the exact compact ZIP) without production staff writes or broker operations.
+
+Session recovery compatibility: the local recovery copy can outlive the signed
+server token. Missing/expired/inactive sessions return HTTP 401 with the existing
+admin client's recognized `Admin authentication is required` wording, so the
+client clears its saved session and displays sign-in instead of leaving the
+user stuck on an inventory form. A valid staff session with `mt5pool: edit`
+can create phase/funded inventory without becoming an admin. View-only or
+revoked access remains HTTP 403. Mutations are never automatically replayed.
