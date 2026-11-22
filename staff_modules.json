@@ -1,0 +1,194 @@
+[
+  {
+    "id": "overview",
+    "label": "Overview",
+    "group": "Overview",
+    "owner_only": false
+  },
+  {
+    "id": "traders",
+    "label": "Traders",
+    "group": "People",
+    "owner_only": false
+  },
+  {
+    "id": "addTrader",
+    "label": "Add Trader",
+    "group": "People",
+    "owner_only": false
+  },
+  {
+    "id": "addBulk",
+    "label": "Bulk Add",
+    "group": "People",
+    "owner_only": false
+  },
+  {
+    "id": "accounts",
+    "label": "Accounts",
+    "group": "Trading",
+    "owner_only": false
+  },
+  {
+    "id": "historicTruth",
+    "label": "Historic Truth",
+    "group": "Trading",
+    "owner_only": false
+  },
+  {
+    "id": "funded",
+    "label": "Funded",
+    "group": "Trading",
+    "owner_only": false
+  },
+  {
+    "id": "breached",
+    "label": "Breached",
+    "group": "Trading",
+    "owner_only": false
+  },
+  {
+    "id": "emailStatus",
+    "label": "Email Status",
+    "group": "Trading",
+    "owner_only": false
+  },
+  {
+    "id": "mt5pool",
+    "label": "MT5 Pool",
+    "group": "Trading",
+    "owner_only": false
+  },
+  {
+    "id": "phaseAssign",
+    "label": "Phase Assignment",
+    "group": "Trading",
+    "owner_only": false
+  },
+  {
+    "id": "phase2",
+    "label": "Phase 2",
+    "group": "Trading",
+    "owner_only": false
+  },
+  {
+    "id": "recovery",
+    "label": "Recovery",
+    "group": "Activity",
+    "owner_only": false
+  },
+  {
+    "id": "leads",
+    "label": "Leads",
+    "group": "Activity",
+    "owner_only": false
+  },
+  {
+    "id": "timeline",
+    "label": "Timeline",
+    "group": "Activity",
+    "owner_only": false
+  },
+  {
+    "id": "plans",
+    "label": "Plans",
+    "group": "Money",
+    "owner_only": false
+  },
+  {
+    "id": "purchases",
+    "label": "Purchases",
+    "group": "Money",
+    "owner_only": false
+  },
+  {
+    "id": "payouts",
+    "label": "Payouts",
+    "group": "Money",
+    "owner_only": false
+  },
+  {
+    "id": "revenue",
+    "label": "Revenue",
+    "group": "Money",
+    "owner_only": false
+  },
+  {
+    "id": "announcements",
+    "label": "Announcements",
+    "group": "Community",
+    "owner_only": false
+  },
+  {
+    "id": "offers",
+    "label": "Private Offers",
+    "group": "Community",
+    "owner_only": false
+  },
+  {
+    "id": "offerStrategies",
+    "label": "Offer Strategies",
+    "group": "Community",
+    "owner_only": false
+  },
+  {
+    "id": "support",
+    "label": "Support",
+    "group": "Community",
+    "owner_only": false
+  },
+  {
+    "id": "affiliates",
+    "label": "Affiliates",
+    "group": "Community",
+    "owner_only": false
+  },
+  {
+    "id": "settings",
+    "label": "Settings",
+    "group": "System",
+    "owner_only": false
+  },
+  {
+    "id": "staff",
+    "label": "Staff Management",
+    "group": "System",
+    "owner_only": true
+  },
+  {
+    "id": "actions",
+    "label": "Action Required",
+    "group": "Overview",
+    "owner_only": false
+  },
+  {
+    "id": "league",
+    "label": "Traders League",
+    "group": "Community",
+    "owner_only": false
+  },
+  {
+    "id": "salesOutcomes",
+    "label": "Sales Outcomes",
+    "group": "Money",
+    "owner_only": false
+  },
+  {
+    "id": "blackBook",
+    "label": "Black Book",
+    "group": "System",
+    "owner_only": false
+  },
+  {
+    "id": "accountLinks",
+    "label": "Account Links",
+    "group": "System",
+    "owner_only": false
+  },
+  {
+    "id": "businessEmail",
+    "label": "Email Traders",
+    "group": "Community",
+    "owner_only": false
+  }
+]

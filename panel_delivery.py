@@ -183,6 +183,10 @@ def register_panel_delivery(app, root=None):
     def mobile_panels_update_archive():
         return mobile_archive('nairapips-mobile-update.zip','NairaPips-Mobile-Panels-Update.zip')
 
+    @app.get('/downloads/staff-access-update.zip')
+    def staff_access_update_archive():
+        return mobile_archive('nairapips-staff-access.zip','NairaPips-Staff-Access-Update.zip')
+
     @app.get('/downloads/mobile-admin-update.zip')
     def mobile_admin_update_archive():
         return mobile_archive('nairapips-admin-mobile.zip','NairaPips-Admin-Mobile-Layout-Fix.zip')

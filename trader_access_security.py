@@ -64,7 +64,7 @@ def register_trader_access_security(app,runtime):
     def require_staff():
         admin,error=runtime['_require_admin']()
         if error is not None:return None,error
-        if str((admin or {}).get('role') or '').lower() not in ROLES:return None,(jsonify(success=False,error='Security review is restricted to authorised admin roles.'),403)
+        if str((admin or {}).get('role') or '').lower() not in ROLES and not __import__('staff_access').permissions((admin or {}).get('permissions')).get('accountLinks'):return None,(jsonify(success=False,error='Security review is restricted to authorised admin roles.'),403)
         return admin,None
     def reply(data,status=200):
         response=jsonify(data);response.status_code=status;response.headers['Cache-Control']='no-store, private';response.headers['Vary']='Authorization';return response

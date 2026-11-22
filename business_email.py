@@ -220,7 +220,7 @@ def install(app,g):
     def admin():
         actor,error=g['_require_admin']()
         if error is not None:return None,error
-        if str((actor or {}).get('role') or '').lower() not in ROLES:return None,(jsonify(success=False,error='Admin access is required for business email'),403)
+        if str((actor or {}).get('role') or '').lower() not in ROLES and not __import__('staff_access').permissions((actor or {}).get('permissions')).get('businessEmail'):return None,(jsonify(success=False,error='Admin access is required for business email'),403)
         return actor,None
     def reply(data,status=200):
         r=jsonify(data);r.status_code=status;r.headers['Cache-Control']='no-store, private';return r

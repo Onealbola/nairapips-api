@@ -5,7 +5,7 @@ from panel_delivery import register_panel_delivery,RELEASE
 
 class PanelDeliveryTests(unittest.TestCase):
     def test_individual_mobile_downloads_match_builds(self):
-        for route,filename in [('mobile-admin-update.zip','nairapips-admin-mobile.zip'),('mobile-trader-update.zip','nairapips-trader-mobile.zip')]:
+        for route,filename in [('staff-access-update.zip','nairapips-staff-access.zip'),('mobile-admin-update.zip','nairapips-admin-mobile.zip'),('mobile-trader-update.zip','nairapips-trader-mobile.zip')]:
             r=self.client.get('/downloads/'+route)
             self.assertEqual(r.status_code,200)
             self.assertEqual(r.mimetype,'application/zip')
