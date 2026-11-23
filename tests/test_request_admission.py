@@ -42,7 +42,7 @@ class AdmissionTests(unittest.TestCase):
             response=b''.join(middleware({'PATH_INFO':'/approve_challenge_purchase','REQUEST_METHOD':'POST','HTTP_ORIGIN':'https://nairapips.com'},lambda status,h:headers.append((status,dict(h)))))
             self.assertFalse(json.loads(response)['operation_started'])
             self.assertEqual(headers[0][1]['Access-Control-Allow-Origin'],'https://nairapips.com')
-            for path in ('/staff_login','/healthz/http'):
+            for path in ('/staff_login','/login_trader','/healthz/http'):
                 self.assertEqual(list(middleware({'PATH_INFO':path,'REQUEST_METHOD':'POST'},lambda *a:None)),[b'ok'])
             self.assertNotIn('/approve_challenge_purchase',calls)
         finally:release.set();first.join(3)

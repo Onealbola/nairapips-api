@@ -83,14 +83,13 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_KEY")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY,
-    options=_NPClientOptionsV218(postgrest_client_timeout=8))
+from database_transport import create_database_client as _np_bounded_database_client
+supabase = _np_bounded_database_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Service-role client is used only for protected server-side staff operations.
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase_admin = (
-    create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
-        options=_NPClientOptionsV218(postgrest_client_timeout=8))
+    _np_bounded_database_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     if SUPABASE_SERVICE_ROLE_KEY
     else None
 )

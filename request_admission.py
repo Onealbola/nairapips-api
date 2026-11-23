@@ -18,7 +18,7 @@ def configure_worker_capacity(threads):
 
 
 class RequestAdmissionMiddleware:
-    PRIORITY_PATHS = frozenset({'/staff_login', '/healthz/http', '/admin/auth_check'})
+    PRIORITY_PATHS = frozenset({'/staff_login', '/login_trader', '/healthz/http', '/admin/auth_check'})
     # This small public installer performs no database work. Deliver it even
     # when ordinary business lanes are occupied, so recovery stays reachable.
     RECOVERY_DOWNLOAD_PATHS = frozenset({'/downloads/dd-login-retry.ps1', '/downloads/dd-daily-history.ps1', '/downloads/dd-daily-audit.ps1', '/downloads/dd-history-session.ps1'})
