@@ -86,6 +86,10 @@ def terms_match(current,wanted):
 
 
 def offer_version(plan):
+    # Compare the same prospective terms advertised by commercial_plan.
+    # Older stored TRAILING rows gain the closed-balance formula at checkout;
+    # this projection never edits an issued account or the physical plan row.
+    plan=__import__('balance_trailing').future_plan(plan)
     keys=('id','journey_source','name','account_size','fee','phase1_target','phase2_target',
         'max_drawdown','daily_drawdown','drawdown_type','payout_split','payout_cycles',
         'payout_frequency','challenge_journey','product_category','reset_fee',

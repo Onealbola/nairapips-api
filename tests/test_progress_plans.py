@@ -31,6 +31,28 @@ class ProgressTests(unittest.TestCase):
         self.pid=plan_row(self.allocation,self.package)['id']
         self.legacy=copy.deepcopy(self.db.rows['challenge_plans'])
 
+    def test_trailing_advertised_offer_is_accepted_without_rewriting_stored_terms(self):
+        from unittest.mock import patch
+        from progress_plan_bridge import commercial_plan
+        doc,_=self.matrix.read();doc['config']['plans'][0]['packages'][0]['drawdown_type']='TRAILING'
+        self.matrix.save_draft(dict(revision=0,config=doc['config']),'owner')
+        with patch('balance_trailing.runtime_ready',return_value=True), patch('equity_drawdown.runtime_ready',return_value=True):
+            self.assertEqual(self.save({self.identity:{'purchases_open':True}}).status_code,200)
+            physical=self.bridge.find(self.pid);before=copy.deepcopy(physical)
+            advertised=next(p for p in self.load().json['products'] if p['id']==self.identity)['plan']
+            self.assertEqual(offer_version(physical),advertised['offer_version'])
+            self.assertEqual(commercial_plan(physical)['offer_version'],advertised['offer_version'])
+            accepted=self.client.post('/create_challenge_purchase',json={'plan_id':self.pid,'fee':physical['fee'],'payout_cycles':0,'plan_offer_version':advertised['offer_version']})
+            self.assertEqual(accepted.status_code,200,accepted.json)
+            self.assertEqual(self.bridge.find(self.pid),before)
+            # A real stale offer must still fail before purchase creation.
+            stale=self.client.post('/create_challenge_purchase',json={'plan_id':self.pid,'fee':physical['fee'],'payout_cycles':0,'plan_offer_version':'stale-version'})
+            self.assertEqual(stale.status_code,409);self.assertEqual(stale.json['code'],'PACKAGE_OFFER_CHANGED')
+            for field,value in [('fee',99999),('max_drawdown',12),('payout_split',80),('payout_frequency','Weekly')]:
+                changed=dict(physical,**{field:value})
+                self.assertNotEqual(offer_version(changed),advertised['offer_version'],field)
+            self.assertEqual(self.db.rows['challenge_purchases'],[])
+
     def test_all_default_packages_ready_but_closed_without_customer_mutations(self):
         rows=self.client.get('/admin/catalog_publication').json['products']
         rows=[r for r in rows if r['family']=='progress']
