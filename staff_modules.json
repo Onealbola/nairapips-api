@@ -190,5 +190,11 @@
     "label": "Email Traders",
     "group": "Community",
     "owner_only": false
+  },
+  {
+    "id": "marketStrip",
+    "label": "Market Strip",
+    "group": "Community",
+    "owner_only": false
   }
 ]

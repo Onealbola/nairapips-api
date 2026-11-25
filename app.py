@@ -60379,6 +60379,9 @@ _np_install_payout_profit_target(globals())
 from unused_account_seed import install as _np_install_unused_account_seed
 _np_install_unused_account_seed(app,globals())
 
+from market_strip import install as _np_install_market_strip
+_np_install_market_strip(app, globals())
+
 from staff_access import install as _np_install_staff_access
 _np_install_staff_access(app, globals())
 

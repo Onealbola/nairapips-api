@@ -54,6 +54,7 @@ def permissions(raw):
 def module_for(path):
     """Server-owned route policy: unknown staff operations require the owner."""
     p=path.lower()
+    if p.startswith('/admin/market-strip'):return 'marketStrip'
     if p.startswith('/staff_members') or '/staff_' in p:return 'staff'
     if 'black-book' in p:return 'blackBook'
     if '/trader_access/' in p:return 'accountLinks'

@@ -29,7 +29,7 @@ def register_panel_delivery(app, root=None):
 
     @app.get('/public/trader-catalogue.js')
     def trader_catalogue_script():
-        r=make_response((assets/'account-plan-selector.js').read_text()+'\n'+(assets/'trader-catalog-sync.js').read_text()+'\n'+(assets/'account-reporting.js').read_text()+'\n'+(assets/'private-offer-scope.js').read_text()+'\n'+(assets/'reset-journey-scope.js').read_text()+'\n'+(assets/'payout-profit-target.js').read_text()+'\n'+(assets/'included-open-cycles.js').read_text()+'\n'+(assets/'checkout-terms.js').read_text()+'\n'+(assets/'dashboard-account-state.js').read_text()+'\n'+(assets/'reset-activities.js').read_text()+'\n'+(assets/'account-rows.js').read_text());r.mimetype='application/javascript'
+        r=make_response((assets/'account-plan-selector.js').read_text()+'\n'+(assets/'trader-catalog-sync.js').read_text()+'\n'+(assets/'account-reporting.js').read_text()+'\n'+(assets/'private-offer-scope.js').read_text()+'\n'+(assets/'reset-journey-scope.js').read_text()+'\n'+(assets/'payout-profit-target.js').read_text()+'\n'+(assets/'included-open-cycles.js').read_text()+'\n'+(assets/'checkout-terms.js').read_text()+'\n'+(assets/'dashboard-account-state.js').read_text()+'\n'+(assets/'reset-activities.js').read_text()+'\n'+(assets/'market-strip.js').read_text()+'\n'+(assets/'account-rows.js').read_text());r.mimetype='application/javascript'
         r.headers['Cache-Control']='no-store, max-age=0'
         r.headers['X-Content-Type-Options']='nosniff'
         return r
@@ -188,6 +188,10 @@ def register_panel_delivery(app, root=None):
     @app.get('/downloads/mobile-panels-update.zip')
     def mobile_panels_update_archive():
         return mobile_archive('nairapips-mobile-update.zip','NairaPips-Mobile-Panels-Update.zip')
+
+    @app.get('/downloads/market-strip-admin.zip')
+    def market_strip_admin_archive():
+        return mobile_archive('nairapips-staff-access.zip','NairaPips-Market-Strip-Admin.zip')
 
     @app.get('/downloads/staff-access-update.zip')
     def staff_access_update_archive():
