@@ -10351,8 +10351,8 @@ function renderBreached(){
       ${kpi('Recovery Studio', '5 buckets', 'Recovery offers available')}
     </div>
     <div class="card tab-content"><div style="overflow-x:auto"><table class="compact">
-      <thead><tr><th>Trader</th><th>MT5</th><th>Account Size</th><th>Equity at Breach</th><th>Loss Amount</th><th>Loss %</th><th>Breach Reason</th><th>Breached</th><th>Actions</th></tr></thead>
-      <tbody>${list.length?list.map(t=>{const a=t.current_account||{};const start=Number(a.start_balance||a.account_size||0);const eq=Number(a.current_equity||a.current_balance||start);const loss=Math.max(0,start-eq);const lossPct=start?(loss/start)*100:0;const dd=admDdUsagePercent(a,t);const reason=a.mt5_access_disabled?'MT5 access disabled':'DD limit reached ('+pct(dd)+' used)';return `<tr>
+      <thead><tr><th>Trader</th><th>MT5</th><th>Account Size</th><th>Equity at Breach</th><th>Loss Amount</th><th>Overall Loss %</th><th>Breach Reason</th><th>Breached</th><th>Actions</th></tr></thead>
+      <tbody>${list.length?list.map(t=>{const a=t.current_account||{};const start=Number(a.start_balance||a.account_size||0);const eq=Number(a.current_equity||a.current_balance||start);const loss=Math.max(0,start-eq);const lossPct=start?(loss/start)*100:0;const dd=admDdUsagePercent(a,t);const reason=npAccountBreachReason(a);return `<tr>
         <td><div style="font-weight:700">${esc(t.name||t.email||'—')}</div><div class="text-xs" style="color:#9ca3af">${esc(t.email||'')}</div></td>
         <td style="color:var(--gold);font-family:monospace">${esc(a.mt5_login||'—')}</td>
         <td>${esc(money(a.account_size||start))}</td>
@@ -19493,6 +19493,23 @@ setInterval(()=>{if(!document.hidden)paint()},2000);
 
 </script>
 <!-- NP_MOBILE_SCRIPT_END -->
+
+<!-- NP_RECORDED_RISK_LABELS_V1 -->
+<script>
+/* Describe the recorded cause, never infer it from a clamped usage percentage. */
+window.npAccountBreachReason=function(a){
+ a=a||{};const reason=[a.archive_reason,a.breach_reason,a.breach_source].join(' ');
+ if(/DAILY_DRAWDOWN|daily.loss|daily.drawdown/i.test(reason)){
+  let daily=Number(a.daily_drawdown??a.daily_drawdown_percent);
+  try{const marker='|np_risk_controls_v1:',part=String(a.journey_source||'').split(marker)[1]?.split('|')[0];if(part){const raw=part.replace(/-/g,'+').replace(/_/g,'/');daily=Number(JSON.parse(atob(raw+'='.repeat((4-raw.length%4)%4))).daily_drawdown)}}catch{}
+  return 'Daily drawdown limit reached'+(daily>0?' ('+daily+'% rule)':'');
+ }
+ if(/overall|total.drawdown|static.drawdown|trailing.drawdown/i.test(reason))return 'Overall drawdown limit reached';
+ if(a.mt5_access_disabled)return 'MT5 access disabled — view Intelligence';
+ return 'Recorded breach — view Intelligence';
+};
+
+</script>
 
 <!-- NP_STAFF_ACCESS_V1 -->
 <script>
